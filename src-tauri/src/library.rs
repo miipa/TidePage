@@ -442,7 +442,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
     };
     let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
-    let (toc, docs) = if ext == "epub" {
+    let (toc, docs, warn) = if ext == "epub" {
         let cached = load_epub(&st, &book.path, id)?;
         let docs = cached
             .doc
@@ -457,10 +457,10 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
                     .unwrap_or_default()
             })
             .collect();
-        (cached.doc.toc.clone(), docs)
+        (cached.doc.toc.clone(), docs, None)
     } else if ext == "txt" {
         let cached = load_txt(&st, &book.path, id)?;
-        (cached.2.clone(), Vec::new())
+        (cached.2.clone(), Vec::new(), None)
     } else {
         let doc = mobi_doc_for(&st, &book.path, id)?;
         let toc = doc.toc.clone();
@@ -468,9 +468,14 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         let parts = doc.parts.clone();
         let ver = st.rules_ver.load(Ordering::Relaxed);
         push_cache(&st.txt_cache, id, (ver, Arc::new((html, parts, toc.clone()))), 3);
-        (toc, Vec::new())
+        (toc, Vec::new(), doc.warning)
     };
-    Ok(OpenResult { book, toc, docs })
+    Ok(OpenResult {
+        book,
+        toc,
+        docs,
+        encoding_warning: warn,
+    })
 }
 
 #[tauri::command]

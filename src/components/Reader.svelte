@@ -77,6 +77,7 @@
     try {
       chapterCache.clear();
       book = await api.openBook(bookId);
+      if (book.encoding_warning) toast(book.encoding_warning, "error", true);
       let restore: Progress | null = null;
       try {
         restore = await api.loadProgress(bookId);

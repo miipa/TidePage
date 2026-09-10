@@ -60,6 +60,8 @@ pub struct OpenResult {
     pub book: BookRow,
     pub toc: Vec<TocEntry>,
     pub docs: Vec<String>,
+    #[serde(default)]
+    pub encoding_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
