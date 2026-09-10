@@ -462,7 +462,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         let cached = load_txt(&st, &book.path, id)?;
         (cached.2.clone(), Vec::new())
     } else {
-        let doc = crate::mobi::parse(&book.path)?;
+        let doc = mobi_doc_for(&st, &book.path, id)?;
         let toc = doc.toc.clone();
         let html = doc.html.clone();
         let parts = doc.parts.clone();
@@ -517,7 +517,7 @@ pub async fn get_chapter(
         Some(c) => c.as_ref().clone(),
         None => {
             let entry = if is_mobi {
-                let doc = crate::mobi::parse(&book.path)?;
+                let doc = mobi_doc_for(&st, &book.path, book_id)?;
                 Arc::new((doc.html.clone(), doc.parts.clone(), doc.toc.clone()))
             } else {
                 load_txt(&st, &book.path, book_id)?
@@ -595,6 +595,38 @@ pub fn save_split_rules(state: State<'_, Arc<AppState>>, pattern: String) -> Res
     }
     state.rules_ver.fetch_add(1, Ordering::Relaxed);
     state.txt_cache.lock().unwrap().clear();
+    Ok(())
+}
+
+/// 用当前设置解析 MOBI/AZW3：强制编码 + 图片提取到 res/<book_id>/
+pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crate::mobi::MobiDoc, String> {
+    let force = {
+        let conn = st.db.0.lock().unwrap();
+        db::get_setting(&conn, "mobi.encoding").unwrap_or_default()
+    };
+    let force = {
+        let t = force.trim().to_ascii_lowercase();
+        if t.is_empty() || t == "auto" { None } else { Some(t) }
+    };
+    let dir = st
+        .app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("res")
+        .join(book_id.to_string());
+    let prefix = format!("http://flowread.localhost/res/{book_id}/");
+    crate::mobi::parse_full(path, force.as_deref(), Some((&dir, &prefix)))
+}
+
+#[tauri::command]
+pub fn set_mobi_encoding(state: State<'_, Arc<AppState>>, value: String) -> Result<(), String> {
+    let v = value.trim().to_ascii_lowercase();
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::set_setting(&conn, "mobi.encoding", &v);
+    }
+    state.rules_ver.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1573,7 +1605,7 @@ pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i
             })
             .collect()
     } else {
-        let doc = crate::mobi::parse(&book.path)?;
+        let doc = mobi_doc_for(state.inner(), &book.path, book_id)?;
         doc.toc
             .iter()
             .zip(&doc.parts)
@@ -1797,7 +1829,7 @@ pub async fn get_book_word_count(
         });
     }
     let (content, _r, _t) = if is_mobi {
-        let doc = crate::mobi::parse(&book.path)?;
+        let doc = mobi_doc_for(&st, &book.path, book_id)?;
         (doc.html, Vec::new(), Vec::new())
     } else {
         load_txt(&st, &book.path, book_id)?.as_ref().clone()

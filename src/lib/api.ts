@@ -66,6 +66,7 @@ export const api = {
     invoke<string[]>("webdav_download_progress", { base, user, pass, remotePath, targetDir, session }),
   setSetting: (key: string, value: string) => invoke<void>("set_setting_kv", { key, value }),
   getSetting: (key: string) => invoke<string | null>("get_setting_kv", { key }),
+  setMobiEncoding: (value: string) => invoke<void>("set_mobi_encoding", { value }),
   getAppDataDir: () => invoke<string>("app_data_dir"),
   addBookmark: (bookId: number, chapterIndex: number, title: string, excerpt: string) =>
     invoke<void>("add_bookmark", { bookId, chapterIndex, title, excerpt }),

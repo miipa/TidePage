@@ -26,6 +26,24 @@
   let regexText = $state(config.regex || "");
   let rebuildingFts = $state(false);
   let dataDir = $state("");
+  let mobiEnc = $state("auto");
+
+  $effect(() => {
+    if (tab !== "other") return;
+    api
+      .getSetting("mobi.encoding")
+      .then((v) => (mobiEnc = v && v.trim() ? v.trim().toLowerCase() : "auto"))
+      .catch(() => {});
+  });
+
+  async function saveMobiEnc() {
+    try {
+      await api.setMobiEncoding(mobiEnc);
+      toast("MOBI 编码已设置，重新打开书籍后生效");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
 
   $effect(() => {
     if (tab !== "other") return;
@@ -1027,6 +1045,19 @@
       <button onclick={rebuildIndex} disabled={rebuildingFts}>{rebuildingFts ? "重建中…" : "重建全文索引"}</button>
     </div>
     <p class="tip">配置即阅读设置（字体/主题/布局/AI/WebDAV 等），导出为 JSON 文本备份；换机时在新机粘贴导入即可。</p>
+
+    <p class="sec-title" style="margin-top:18px">MOBI / AZW3</p>
+    <div class="field" style="margin-bottom:10px">
+      <label>正文字符编码</label>
+      <select bind:value={mobiEnc} onchange={saveMobiEnc}>
+        <option value="auto">自动（内嵌 meta 声明 → 文件头声明 → 嗅探）</option>
+        <option value="utf-8">强制 UTF-8</option>
+        <option value="gbk">强制 GBK / GB18030（简体）</option>
+        <option value="big5">强制 Big5（繁体）</option>
+        <option value="windows-1252">强制 Windows-1252（西文）</option>
+      </select>
+      <p class="tip">旧版中文 MOBI 内部编码混乱导致乱码时手动指定，重新打开该书生效。带 DRM（AWZ3 加密）的书会在打开时直接提示需先解密，不再产生乱码。</p>
+    </div>
 
     <p class="sec-title" style="margin-top:18px">自定义 CSS 说明</p>
     <p class="tip">

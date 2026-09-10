@@ -183,6 +183,28 @@ pub fn run() {
                         ),
                     }
                 }
+            } else if let Some(raw) = path.strip_prefix("res/") {
+                // MOBI/AZW3 提取出的正文插图：res/<book_id>/<file>
+                let name = percent_decode(raw);
+                let safe = name.replace('\\', "/");
+                let file = dir.parent().unwrap_or(&dir).join("res").join(&safe);
+                if safe.is_empty() || safe.contains("..") || !file.is_file() {
+                    ("image/png".to_string(), Vec::new())
+                } else {
+                    let ext = safe.rsplit('.').next().unwrap_or("").to_lowercase();
+                    let m = match ext.as_str() {
+                        "png" => "image/png",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        "bmp" => "image/bmp",
+                        _ => "application/octet-stream",
+                    };
+                    match std::fs::read(&file) {
+                        Ok(b) => (m.to_string(), b),
+                        Err(_) => ("image/png".to_string(), Vec::new()),
+                    }
+                }
             } else if let Some(name) = path.strip_prefix("bg/") {
                 match std::fs::read(dir.join(name)) {
                     Ok(b) => (sniff_mime(&b).to_string(), b),
@@ -229,6 +251,7 @@ pub fn run() {
             library::pick_folder,
             library::pick_save,
             library::export_ai,
+            library::set_mobi_encoding,
             library::set_custom_cover,
             library::webdav_test,
             library::webdav_sync_progress,
