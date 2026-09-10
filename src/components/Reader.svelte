@@ -97,8 +97,14 @@
         webdavSync(restore).catch(() => {});
       }
     } catch (e) {
-      openError = String(e);
-      toast(String(e), "error");
+      const s = String(e);
+      const friendly = s.includes("AWZ3EncryptedError")
+        ? "检测到 DRM 保护，无法直接阅读。请移除 DRM 后重试。"
+        : s.includes("ParseTimeoutOrCorrupted")
+          ? "文件畸形或过大，解析已中止（防卡死保护）。"
+          : s;
+      openError = friendly;
+      toast(friendly, "error");
     }
   }
 
