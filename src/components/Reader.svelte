@@ -54,8 +54,6 @@
   let bookmarks: { id: number; chapter_index: number; title: string; excerpt: string }[] = $state([]);
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
-  const shownWarnings = new Set<string>();
-  let warnScopeId = -1;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
   let measureRaf = 0;
   let openError = $state("");
@@ -76,17 +74,10 @@
 
   export async function open(bookId: number) {
     openError = "";
-    if (warnScopeId !== bookId) {
-      warnScopeId = bookId;
-      shownWarnings.clear();
-    }
     try {
       chapterCache.clear();
       book = await api.openBook(bookId);
-      if (book.encoding_warning && !shownWarnings.has(book.encoding_warning)) {
-        shownWarnings.add(book.encoding_warning);
-        toast(book.encoding_warning, "error", true);
-      }
+      if (book.encoding_warning) console.log(book.encoding_warning);
       let restore: Progress | null = null;
       try {
         restore = await api.loadProgress(bookId);
