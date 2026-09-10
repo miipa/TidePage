@@ -43,6 +43,7 @@ export interface OpenResult {
   book: BookRow;
   toc: TocEntry[];
   docs: string[];
+  encoding_warning?: string | null;
 }
 
 export interface SearchHit {

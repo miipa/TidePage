@@ -39,6 +39,8 @@ pub struct MobiDoc {
     pub parts: Vec<(usize, usize)>,
     /// 已写盘的图片数量
     pub image_count: usize,
+    /// 解码质量警告（如源文件编码损坏），供 UI 提示
+    pub warning: Option<String>,
 }
 
 fn u16b(b: &[u8], o: usize) -> u16 {
@@ -195,19 +197,219 @@ pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
 /// 返回**解码前**的原始字节。HUFF/CDIC(compression=0x4438) 使用
 /// mobi crate 内置的 HUFF 解码器（其输出已是文本），其余两种在本函数内
 /// 按 PDB 记录手工解压，以便后续做编码纠偏。
-pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
-    extract_records_and_decompress_limited(mobi, MAX_RECORDS, MAX_HTML_BYTES)
-}
-
 /// 防卡死熔断上限：畸形/超大文件在解析中途即中止，不拖死 UI。
 const MAX_RECORDS: usize = 50_000;
 const MAX_HTML_BYTES: usize = 50 * 1024 * 1024;
 
+// ============================ HUFF/CDIC 字节级解码器 ============================
+// 规范来源：MobileRead "MOBI#HUFF/CDIC"（同 mobi crate 实现，但此处逐 section
+// 输出**原始字节**，不在 Record 内做字符串解码——解码统一在全局字节流上一次性完成）
+
+struct HuffDecoder {
+    dictionary: Vec<Option<(Vec<u8>, bool)>>, // (slice, is_raw)
+    code_dict: [(u8, bool, u32); 256],       // (code_len, term, max_code)
+    min_codes: [u32; 33],
+    max_codes: [u32; 33],
+}
+
+impl HuffDecoder {
+    fn default() -> Self {
+        Self {
+            dictionary: Vec::new(),
+            code_dict: [(0, false, 0); 256],
+            min_codes: [0; 33],
+            max_codes: [u32::MAX; 33],
+        }
+    }
+
+    fn load_huff(&mut self, huff: &[u8]) -> Result<(), String> {
+        if huff.len() < 16 || &huff[0..4] != b"HUFF" || u32b(huff, 4) != 0x18 {
+            return Err("PalmDocFormatError: HUFF 表头无效".to_string());
+        }
+        let cache_off = u32b(huff, 8) as usize;
+        let base_off = u32b(huff, 12) as usize;
+        if cache_off + 256 * 4 > huff.len() || base_off + 32 * 8 > huff.len() {
+            return Err("PalmDocFormatError: HUFF 表偏移越界".to_string());
+        }
+        for (i, code) in self.code_dict.iter_mut().enumerate() {
+            let v = u32b(huff, cache_off + i * 4);
+            let code_len = (v & 0x1F) as u8;
+            let term = (v & 0x80) == 0x80;
+            if code_len == 0 || code_len > 31 {
+                return Err("PalmDocFormatError: HUFF 码长非法".to_string());
+            }
+            if code_len <= 8 && !term {
+                return Err("PalmDocFormatError: HUFF term 位非法".to_string());
+            }
+            let max_code = ((v >> 8) + 1)
+                .checked_shl(32u32.saturating_sub(code_len as u32))
+                .unwrap_or(u32::MAX)
+                .saturating_sub(1);
+            *code = (code_len, term, max_code);
+        }
+        for idx in 1..=32usize {
+            let lo = base_off + (idx - 1) * 8;
+            self.min_codes[idx] = u32b(huff, lo).checked_shl(32 - idx as u32).unwrap_or(0);
+            self.max_codes[idx] = (u32b(huff, lo + 4) + 1)
+                .checked_shl(32 - idx as u32)
+                .unwrap_or(u32::MAX)
+                .saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn load_cdic(&mut self, cdic: &[u8]) -> Result<(), String> {
+        if cdic.len() < 16 || &cdic[0..4] != b"CDIC" || u32b(cdic, 4) != 0x10 {
+            return Err("PalmDocFormatError: CDIC 表头无效".to_string());
+        }
+        let num_phrases = u32b(cdic, 8);
+        let bits = u32b(cdic, 12);
+        if bits > 16 {
+            return Err("PalmDocFormatError: CDIC phrase 位宽非法".to_string());
+        }
+        let existing = self.dictionary.len() as u32;
+        if num_phrases < existing {
+            return Err("PalmDocFormatError: CDIC phrase 数下溢".to_string());
+        }
+        let n = (1u32 << bits).min(num_phrases - existing);
+        if 16 + n as usize * 2 > cdic.len() {
+            return Err("PalmDocFormatError: CDIC 偏移表越界".to_string());
+        }
+        for i in 0..n as usize {
+            let off = u16b(cdic, 16 + i * 2) as usize;
+            let hdr_pos = 16 + off;
+            if hdr_pos + 2 > cdic.len() {
+                return Err("PalmDocFormatError: CDIC phrase 头越界".to_string());
+            }
+            let hdr = u16b(cdic, hdr_pos);
+            let len = (hdr & 0x7FFF) as usize;
+            let start = hdr_pos + 2;
+            if start + len > cdic.len() {
+                return Err("PalmDocFormatError: CDIC phrase 数据越界".to_string());
+            }
+            self.dictionary.push(Some((cdic[start..start + len].to_vec(), (hdr & 0x8000) == 0x8000)));
+        }
+        Ok(())
+    }
+
+    fn unpack(&mut self, data: &[u8], depth: u8, budget: &mut usize) -> Result<Vec<u8>, String> {
+        if depth > 32 {
+            return Err("ParseTimeoutOrCorrupted: HUFF 递归过深（畸形文件）".to_string());
+        }
+        struct BitR<'a> {
+            d: &'a [u8],
+            byte_pos: usize,
+            buf: u64,
+            bits: u32,
+        }
+        impl<'a> BitR<'a> {
+            fn fill(&mut self) {
+                while self.bits <= 56 {
+                    let b = if self.byte_pos < self.d.len() {
+                        let v = self.d[self.byte_pos];
+                        self.byte_pos += 1;
+                        v
+                    } else {
+                        0
+                    };
+                    self.buf = (self.buf << 8) | b as u64;
+                    self.bits += 8;
+                }
+            }
+            fn peek32(&mut self) -> u32 {
+                self.fill();
+                (self.buf >> (self.bits - 32)) as u32
+            }
+            fn skip(&mut self, n: u32) {
+                self.buf <<= n;
+                self.bits -= n;
+            }
+            fn left(&self) -> usize {
+                self.byte_pos.saturating_mul(8).saturating_sub(self.bits as usize)
+            }
+        }
+        let mut br = BitR { d: data, byte_pos: 0, buf: 0, bits: 0 };
+        let total_bits = data.len() * 8;
+        let mut out: Vec<u8> = Vec::new();
+        let mut consumed = 0usize;
+        loop {
+            if consumed >= total_bits {
+                break;
+            }
+            let code = br.peek32();
+            let (code_len, term, mut max_code) = self.code_dict[(code >> 24) as usize];
+            if code_len == 0 {
+                return Err("ParseTimeoutOrCorrupted: HUFF 码表空槽".to_string());
+            }
+            let mut cl = code_len as usize;
+            if !term {
+                match self.min_codes[cl..33].iter().position(|&m| code >= m) {
+                    Some(off) => cl += off,
+                    None => return Err("ParseTimeoutOrCorrupted: HUFF 码定位失败".to_string()),
+                }
+                max_code = self.max_codes[cl.min(32)];
+            }
+            let index = ((max_code.wrapping_sub(code)) >> (32 - cl)) as usize;
+            let entry = self
+                .dictionary
+                .get(index)
+                .and_then(|e| e.clone())
+                .ok_or("ParseTimeoutOrCorrupted: HUFF 字典索引越界")?;
+            let (mut slice, is_raw) = entry;
+            if !is_raw {
+                slice = self.unpack(&slice, depth + 1, budget)?;
+                self.dictionary[index] = Some((slice.clone(), true));
+            }
+            if *budget < slice.len() {
+                return Err("ParseTimeoutOrCorrupted: HUFF 解压输出超上限".to_string());
+            }
+            *budget -= slice.len();
+            out.extend_from_slice(&slice);
+            br.skip(cl as u32);
+            consumed += cl;
+        }
+        let _ = br.left();
+        Ok(out)
+    }
+}
+
+/// HUFF 分支：加载表并逐 section 解压为字节（不做任何字符串解码）
+fn huff_decompress_bytes(mobi: &Mobi, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let m = &mobi.metadata.mobi;
+    let huff_start = m.first_huff_record as usize;
+    let huff_count = m.huff_record_count as usize;
+    let all = mobi.raw_records();
+    let recs = all.records();
+    if huff_start == 0 || huff_count < 2 || huff_start + huff_count > recs.len() {
+        return Err("PalmDocFormatError: HUFF 表记录范围非法".to_string());
+    }
+    let mut dec = HuffDecoder::default();
+    dec.load_huff(recs[huff_start].content)?;
+    for r in &recs[huff_start + 1..huff_start + huff_count] {
+        dec.load_cdic(r.content)?;
+    }
+    let rng = mobi.readable_records_range();
+    let s0 = rng.start.min(recs.len());
+    let e0 = rng.end.min(recs.len()).max(s0);
+    let mut budget = max_bytes;
+    let mut out = Vec::new();
+    for r in &recs[s0..e0] {
+        out.extend(dec.unpack(r.content, 0, &mut budget)?);
+    }
+    Ok(out)
+}
+
+pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
+    extract_records_and_decompress_limited(mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b)
+}
+
+/// 只做"解压 + 拼接"，输出**原始字节流**；字符串解码统一由上层对整个字节流一次完成，
+/// 从根上避免 Record/section 边界截断汉字产生乱码。
 pub fn extract_records_and_decompress_limited(
     mobi: &Mobi,
     max_records: usize,
     max_bytes: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<String>), String> {
     let comp = mobi.compression();
     let recs = mobi.raw_records();
     let range = mobi.readable_records_range();
@@ -223,16 +425,20 @@ pub fn extract_records_and_decompress_limited(
         ));
     }
     match comp {
-        Compression::Huff => {
-            let s = mobi.content_as_string_lossy();
-            if s.len() > max_bytes {
-                return Err(format!(
-                    "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
-                    s.len()
-                ));
+        Compression::Huff => match huff_decompress_bytes(mobi, max_bytes) {
+            Ok(bytes) => Ok((bytes, None)),
+            // 自研 HUFF 解码失败时退回 crate 的 section 级解码（边界可能有瑕疵但不致读不了）
+            Err(_e) => {
+                let s = mobi.content_as_string_lossy();
+                if s.len() > max_bytes {
+                    return Err(format!(
+                        "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
+                        s.len()
+                    ));
+                }
+                Ok((s.into_bytes(), Some("HUFF/CDIC 表异常，已按 section 回退解码，个别字可能有乱码".to_string())))
             }
-            Ok(s.into_bytes())
-        }
+        },
         Compression::PalmDoc => {
             let mut out = Vec::new();
             for r in &all[start..end] {
@@ -243,7 +449,7 @@ pub fn extract_records_and_decompress_limited(
                     ));
                 }
             }
-            Ok(out)
+            Ok((out, None))
         }
         Compression::No => {
             let mut out = Vec::new();
@@ -255,7 +461,7 @@ pub fn extract_records_and_decompress_limited(
                     ));
                 }
             }
-            Ok(out)
+            Ok((out, None))
         }
     }
 }
@@ -267,104 +473,137 @@ fn sniff_meta_charset(raw: &[u8]) -> Option<String> {
     re.captures(&head).map(|c| c[1].to_ascii_lowercase())
 }
 
-fn decode_label(label: &str, raw: &[u8]) -> Option<String> {
+pub struct DecodedText {
+    pub text: String,
+    pub warning: Option<String>,
+}
+
+/// 全字节流一次性解码（严禁在 Record 循环内做任何字符串解码）。
+/// 顺序：用户强制 → 严格 UTF-8 → GBK → Big5 → CP1252 →
+/// 全部失败才进入"修复式解码"（剔除非法字节，不产生 U+FFFD 方块）并回报警告。
+pub fn decode_html_bytes(raw: &[u8], header_enc: TextEncoding, forced: Option<&str>) -> DecodedText {
+    let forced = forced
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto");
+    if let Some(label) = &forced {
+        // 用户指定编码：直接用对应 Decoder 解码整个字节流，有未映射字节则警告
+        if let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+            let (cow, _actual, had_err) = enc.decode(raw);
+            return DecodedText {
+                text: cow.into_owned(),
+                warning: if had_err {
+                    Some(format!("按指定编码 {label} 解码时存在无法映射的字节，可能有个别乱码"))
+                } else {
+                    None
+                },
+            };
+        }
+    }
+    // meta 声明（Latin-1 视图嗅探）。注意：GBK 能"合法地"吞下 UTF-8 字节流，
+    // 所以仅当 UTF-8 整体不可读时才允许 meta 直接接管，防止谎报声明劫持正常书。
+    if utf8_try(raw).is_none() {
+        if let Some(label) = sniff_meta_charset(raw) {
+            if let Some(text) = strict_decode(&label, raw) {
+                return DecodedText { text, warning: None };
+            }
+        }
+    }
+    // 自动链：按文件头声明分层决策。
+    // UTF-8 中文序列被 GBK 两两配对后几乎全合法（错误率高），"GBK 严格成功"不能压过
+    // "UTF-8 头 + 低损坏率"的联合证据；仅当 UTF-8 几乎全线崩（>20% 坏段）才让位给中文编码。
+    match header_enc {
+        TextEncoding::UTF8 | TextEncoding::Unknown(_) => {
+            if let Some((text, dropped)) = utf8_try(raw) {
+                return DecodedText { text, warning: dropped.then_some("源文件含少量损坏字节序列，已自动剔除，可能有极个别缺字".to_string()) };
+            }
+            // UTF-8 损坏率 >20%：头可能谎报，给中文编码机会
+            for label in ["gbk", "big5"] {
+                if let Some(text) = strict_decode(label, raw) {
+                    if cjk_heavy(&text) {
+                        return DecodedText { text, warning: None };
+                    }
+                }
+            }
+            let (text, _n) = utf8_strip_invalid(raw);
+            DecodedText {
+                text,
+                warning: Some("检测到编码异常（源文件存在大量损坏字节序列，已按 UTF-8 尽量修复），可能存在少量乱码".to_string()),
+            }
+        }
+        TextEncoding::CP1252 => {
+            // 头声称 CP1252：西文书多数可严格解析；中文书先试 CJK 占主体的 GBK/Big5
+            for label in ["gbk", "big5"] {
+                if let Some(text) = strict_decode(label, raw) {
+                    if cjk_heavy(&text) {
+                        return DecodedText { text, warning: None };
+                    }
+                }
+            }
+            if let Some((text, dropped)) = utf8_try(raw) {
+                return DecodedText { text, warning: dropped.then_some("源文件含少量损坏字节序列，已自动剔除".to_string()) };
+            }
+            if let Some(text) = strict_decode("windows-1252", raw) {
+                return DecodedText { text, warning: None };
+            }
+            let (text, _n) = utf8_strip_invalid(raw);
+            DecodedText {
+                text,
+                warning: Some("检测到编码异常，可能存在少量乱码".to_string()),
+            }
+        }
+    }
+}
+
+/// UTF-8 严格解码 + 损坏率 ≤1% 时按修复处理（剔除非法字节）。返回 (文本, 是否有剔除)。
+fn utf8_try(raw: &[u8]) -> Option<(String, bool)> {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return Some((s.to_string(), false));
+    }
+    let (text, dropped) = utf8_strip_invalid(raw);
+    // 坏段平均按 ~2 字节算：dropped*200 <= len ⇒ 损坏率 ≤1%
+    if dropped * 200 <= raw.len().max(1) && !text.is_empty() {
+        Some((text, dropped > 0))
+    } else {
+        None
+    }
+}
+
+fn cjk_heavy(s: &str) -> bool {
+    let total = s.chars().count().max(1);
+    let cjk = s
+        .chars()
+        .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
+        .count();
+    cjk * 10 > total
+}
+
+/// 严格解码：要求整个字节流被该编码零错误解析，否则 None（继续尝试下一编码）
+fn strict_decode(label: &str, raw: &[u8]) -> Option<String> {
     let enc = encoding_rs::Encoding::for_label(label.as_bytes())?;
-    let (cow, _actual, _had_err) = enc.decode(raw);
+    let (cow, _actual, had_err) = enc.decode(raw);
+    if had_err {
+        return None;
+    }
     Some(cow.into_owned())
 }
 
-/// GBK/Big5 严格猜测：要求零坏字节且 CJK 达到占比门槛
-fn strict_cjk_guess(raw: &[u8], lang_cjk: bool) -> Option<String> {
-    for label in ["gbk", "gb18030", "big5"] {
-        let enc = encoding_rs::Encoding::for_label(label.as_bytes())?;
-        let (cow, _actual, had_err) = enc.decode(raw);
-        if had_err {
-            continue;
-        }
-        let s = cow.into_owned();
-        let total = s.chars().count().max(1);
-        let cjk = s
-            .chars()
-            .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
-            .count();
-        let ok = if lang_cjk { cjk * 20 > total } else { cjk * 2 > total };
-        if ok {
-            return Some(s);
-        }
-    }
-    None
-}
-
-/// 编码纠偏：优先用户强制指定，其次内嵌 meta 声明，最后 MOBI 头 text encoding；
-/// 全部失败时按 UTF-8 严格、再 CP1252、再 lossy UTF-8 兜底。
-/// 分块 UTF-8 解码：返回 (文本, 非法字节段数)。个别损坏字节不应毁掉整本书。
-fn utf8_chunked(raw: &[u8]) -> (String, usize) {
+fn utf8_strip_invalid(raw: &[u8]) -> (String, usize) {
     let mut s = String::with_capacity(raw.len());
     let mut rest = raw;
-    let mut bad = 0usize;
+    let mut dropped = 0usize;
     loop {
         match std::str::from_utf8(rest) {
             Ok(v) => {
                 s.push_str(v);
-                return (s, bad);
+                return (s, dropped);
             }
             Err(e) => {
-                let upto = e.valid_up_to();
-                s.push_str(&String::from_utf8_lossy(&rest[..upto]));
+                s.push_str(&String::from_utf8_lossy(&rest[..e.valid_up_to()]));
+                // 该 valid_up_to 之前保证合法，lossy 不产生替换符
                 let elen = e.error_len().unwrap_or(1);
-                s.push('\u{FFFD}');
-                bad += 1;
-                rest = &rest[(upto + elen).min(rest.len())..];
+                dropped += 1;
+                rest = &rest[(e.valid_up_to() + elen).min(rest.len())..];
             }
-        }
-    }
-}
-
-pub fn decode_html_bytes(raw: &[u8], header_enc: TextEncoding, forced: Option<&str>, lang_cjk: bool) -> String {
-    let forced = forced
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty() && s != "auto");
-    let meta = sniff_meta_charset(raw);
-    for cand in forced.iter().map(|s| s.as_str()).chain(meta.iter().map(|s| s.as_str())) {
-        if let Some(s) = decode_label(cand, raw) {
-            return s;
-        }
-    }
-    // 无 meta/强制：旧中文书普遍存在"文件头谎报编码 / 记录边界截断产生少量非法序列"的情况。
-    // UTF-8 探测容忍 ≤1% 的损坏字节段；头报 CP1252 的西文书仅在"中文语言 + 大量 CJK"
-    // 时才允许带损 UTF-8，避免把 é/è 等高位字节当损坏。
-    let (utf8_s, bad) = utf8_chunked(raw);
-    let utf8_trusted = match header_enc {
-        TextEncoding::CP1252 if !lang_cjk => bad == 0,
-        _ => bad * 100 <= raw.len().max(1),
-    };
-    if utf8_trusted {
-        let total = utf8_s.chars().count().max(1);
-        let cjk = utf8_s
-            .chars()
-            .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
-            .count();
-        let looks_cjk = cjk * 10 > total;
-        if bad == 0 || looks_cjk || matches!(header_enc, TextEncoding::UTF8 | TextEncoding::Unknown(_)) {
-            return utf8_s;
-        }
-    }
-    drop(utf8_s);
-    match header_enc {
-        TextEncoding::UTF8 | TextEncoding::Unknown(_) => {
-            // 头报 UTF-8 但损坏率过高（常见于实为 GBK 的书）：严格试探 GBK/Big5
-            strict_cjk_guess(raw, true).unwrap_or_else(|| {
-                decode_label("windows-1252", raw)
-                    .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
-            })
-        }
-        TextEncoding::CP1252 => {
-            // 头声称 CP1252 但 UTF-8 探测失败：试 GBK/Big5 严格解码（不允许坏字节），
-            // 文件头语言为中文时 CJK 占比门槛降为 5%，否则要求过半 CJK
-            if let Some(s) = strict_cjk_guess(raw, lang_cjk) {
-                return s;
-            }
-            decode_label("windows-1252", raw).unwrap_or_default()
         }
     }
 }
@@ -577,18 +816,13 @@ pub fn parse_full(
             "AWZ3EncryptedError: MOBI 头 DRM 记录偏移域非空（存在 DRM 记录），请先解密后导入".to_string(),
         );
     }
-    let raw = extract_records_and_decompress(&mobi)?;
-    let is_huff = mobi.compression() == Compression::Huff;
-    let lang_cjk = matches!(
-        mobi.language(),
-        mobi::headers::Language::Chinese | mobi::headers::Language::Unknown
-    );
-    let decoded = if is_huff {
-        String::from_utf8_lossy(&raw).into_owned()
-    } else {
-        decode_html_bytes(&raw, mobi.text_encoding(), force_encoding, lang_cjk)
-    };
-    let mut html = clean_html(&decoded);
+    let (raw, extract_warn) = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES)?;
+    // 一次性全局解码整个字节流（不在任何 Record 内做字符串解码）
+    let mut decoded = decode_html_bytes(&raw, mobi.text_encoding(), force_encoding);
+    if decoded.warning.is_none() {
+        decoded.warning = extract_warn;
+    }
+    let mut html = clean_html(&decoded.text);
     let (toc, parts) = split_mobi_chapters(&html);
     let mut image_count = 0usize;
     if let Some((dir, prefix)) = images {
@@ -614,6 +848,7 @@ pub fn parse_full(
         toc,
         parts,
         image_count,
+        warning: decoded.warning,
     })
 }
 
@@ -698,6 +933,11 @@ mod tests {
     impl Builder {
         fn build(&self) -> Vec<u8> {
             // 记录: rec0=PalmDOC(16)+MOBI(232)+EXTH, rec1..=text chunks, then images
+            let n_text = if self.text.is_empty() {
+                1usize
+            } else {
+                (self.text.len() + 4095) / 4096
+            };
             let exth_body = if self.res121.is_empty() {
                 12usize
             } else {
@@ -724,7 +964,7 @@ mod tests {
             push_u32(&mut rec0, 0); push_u32(&mut rec0, 0); // ortho, inflect
             push_u32(&mut rec0, 0); push_u32(&mut rec0, 0); // index names/keys
             for _ in 0..6 { push_u32(&mut rec0, 0); } // extra indices
-            push_u32(&mut rec0, 2); // first_non_book_index (text 记录为 rec1..rec2)
+            push_u32(&mut rec0, 1 + n_text as u32); // first_non_book_index（文本记录为 rec1..rec(1+n_text)）
             push_u32(&mut rec0, name_rel as u32); // name offset
             let title = "测试之书";
             push_u32(&mut rec0, title.len() as u32); // name length(按字节)
@@ -733,7 +973,7 @@ mod tests {
             rec0.push(0); // language code
             push_u32(&mut rec0, 4); push_u32(&mut rec0, 4); // in/out lang
             push_u32(&mut rec0, 6); // format_version
-            push_u32(&mut rec0, if self.images.is_empty() { 0xFFFFFFFF } else { 2u32 }); // first_image_index
+            push_u32(&mut rec0, if self.images.is_empty() { 0xFFFFFFFF } else { (1 + n_text) as u32 }); // first_image_index
             push_u32(&mut rec0, 0xFFFFFFFF); // first_huff_record
             push_u32(&mut rec0, 0); // huff count
             push_u32(&mut rec0, 0); push_u32(&mut rec0, 0); // huff table off/len
@@ -896,7 +1136,7 @@ mod tests {
         let e = extract_records_and_decompress_limited(&mobi, 50_000, 8).unwrap_err();
         assert!(e.contains("ParseTimeoutOrCorrupted"), "{e}");
         let raw = extract_records_and_decompress(&mobi).unwrap();
-        let html = decode_html_bytes(&raw, mobi.text_encoding(), None, false);
+        let html = decode_html_bytes(&raw, mobi.text_encoding(), None).text;
         let (toc, parts) = split_mobi_chapters(&html);
         assert!(html.contains("第一章") && html.contains("乙"), "{html}");
         assert_eq!(toc.len(), 2, "应识别出两个章节 {toc:?}");
@@ -921,13 +1161,13 @@ mod tests {
         let (big5, _, _) = encoding_rs::BIG5.encode("這裡是繁體中文測試");
         let mut raw_head = b"<html><body>".to_vec();
         raw_head.extend_from_slice(&big5);
-        let html = decode_html_bytes(&raw_head, TextEncoding::UTF8, Some("big5"), false);
+        let html = decode_html_bytes(&raw_head, TextEncoding::UTF8, Some("big5")).text;
         assert!(html.contains("繁體中文"), "{html}");
         // 带 meta 声明时自动纠偏
         let (gbk, _, _) = encoding_rs::GBK.encode("简体中文测试内容");
         let mut raw2 = b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=gbk\">".to_vec();
         raw2.extend_from_slice(&gbk);
-        let html2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None, false);
+        let html2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None).text;
         assert!(html2.contains("简体中文"), "{html2}");
     }
 
@@ -967,6 +1207,55 @@ mod tests {
         assert_eq!(out.matches("<img").count(), 4, "{out}");
     }
 
+    /// 汉字被切断在 Record 边界时，全局一次性解码必须无损还原（不得出现任何 U+FFFD）
+    #[test]
+    fn record_boundary_does_not_break_characters() {
+        // 4500 个汉字（13500 字节）→ Builder 按 4096 切多条记录，字符大概率跨记录被劈开
+        let body: String = "魃饕餮貔貅魑魅魍魎齾龘靐".repeat(340);
+        let html_doc = format!("<p>{body}</p>");
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: html_doc.into_bytes(),
+            images: vec![],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let mobi = Mobi::new(&b).unwrap();
+        let raw = extract_records_and_decompress(&mobi).unwrap();
+        let d = decode_html_bytes(&raw, TextEncoding::UTF8, None);
+        assert!(d.warning.is_none(), "干净文本不应有警告: {:?}", d.warning);
+        assert!(!d.text.contains('\u{FFFD}'), "出现替换符说明仍有 Record 级解码");
+        assert!(d.text.matches("魃").count() >= 340);
+    }
+
+    /// 繁体生僻字：强制 Big5 完美解码；无声明损坏时走修复路径并带警告
+    #[test]
+    fn big5_rare_traditional_and_repair_warning() {
+        let (big5, _, _) = encoding_rs::BIG5.encode("龍馬精神富貴吉祥繁榮昌盛圖騰");
+        let mut raw = b"<html><body>".to_vec();
+        raw.extend_from_slice(&big5);
+        let d = decode_html_bytes(&raw, TextEncoding::UTF8, Some("big5"));
+        assert!(d.text.contains("龍馬精神富貴吉祥繁榮昌盛圖騰"), "{}", d.text);
+        assert!(d.warning.is_none());
+        // 有效 UTF-8 中文 + 注入无法整链解析的垃圾字节 → 全部严格失败 → 修复式（无 U+FFFD）+ 警告
+        let mut raw2: Vec<u8> = Vec::new();
+        for _ in 0..400 {
+            raw2.extend_from_slice("繁體中文測試。".as_bytes());
+        }
+        // 每隔 ~900 字节注入 UTF-8/GBK/Big5/CP1252 全部非法的序列（0x8D 后跟 0xFF：GBK 尾字节非法）
+        let mut i = 900usize;
+        while i < raw2.len() {
+            raw2.splice(i..i, vec![0x8D, 0xFF, 0xFF, 0xFF, 0x81]);
+            i += 950;
+        }
+        let d2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None);
+        assert!(d2.text.contains("繁體中文測試"));
+        assert!(!d2.text.contains('\u{FFFD}'), "修复模式不得输出替换符");
+        assert!(d2.warning.is_some(), "应有编码异常警告: {:?}", d2.warning);
+    }
+
     /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行
     #[test]
     fn real_world_samples_end_to_end() {
@@ -987,7 +1276,17 @@ mod tests {
                 .filter(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
                 .take(8)
                 .collect();
-            eprintln!("{} -> {}ms, toc={}, html={}B, 中文样例={:?}", std::path::Path::new(path).file_name().unwrap().to_string_lossy(), dt.as_millis(), doc.toc.len(), doc.html.len(), plain);
+            let fffd = doc.html.matches('\u{FFFD}').count();
+            eprintln!(
+                "{} -> {}ms, toc={}, html={}B, FFFD={}, warning={:?}, 中文样例={:?}",
+                std::path::Path::new(path).file_name().unwrap().to_string_lossy(),
+                dt.as_millis(),
+                doc.toc.len(),
+                doc.html.len(),
+                fffd,
+                doc.warning,
+                plain
+            );
             assert!(!doc.html.is_empty(), "{path}: 正文为空");
             assert!(doc.toc.len() > 0, "{path}: 无章节");
         }
