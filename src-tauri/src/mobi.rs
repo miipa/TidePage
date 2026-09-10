@@ -30,7 +30,7 @@ use regex::{Captures, Regex};
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MobiDoc {
     pub title: String,
     pub author: String,
@@ -48,6 +48,44 @@ fn u32b(b: &[u8], o: usize) -> u32 {
     b.get(o..o + 4)
         .map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]))
         .unwrap_or(0)
+}
+
+/// 文件级快速 DRM 嗅探：只 seek 读 PDB 头 + record0 头共 <100 字节，
+/// 不整读文件——加密大书也在 1ms 内拒绝，杜绝"一直卡加载"。
+pub fn sniff_drm_file(path: &str) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打开失败: {e}"))?;
+    let fsize = f.metadata().map_err(|e| e.to_string())?.len() as usize;
+    if fsize < 0x56 {
+        return Err("MOBIError: 文件过短，不是有效的 PalmDOC 数据库".to_string());
+    }
+    let mut head = [0u8; 0x56];
+    f.read_exact(&mut head).map_err(|e| e.to_string())?;
+    if head[0..32].starts_with(b"\xeaDRMION\xee") {
+        return Err("AWZ3EncryptedError: 检测到 KFX/DRM 外壳，该书已加密，请先用 DeDRM 等工具解密后再导入".to_string());
+    }
+    if &head[0x40..0x44] != b"MOBI" {
+        return Err("PalmDocFormatError: 文件头 0x40 处 creator 非 \"MOBI\"（缺 BOOKMOBI 魔数）".to_string());
+    }
+    let rec0 = u32b(&head, 0x4E) as usize;
+    if rec0 == 0 || rec0 + 0x10 > fsize {
+        return Err("PalmDocFormatError: rec0 偏移越界".to_string());
+    }
+    f.seek(SeekFrom::Start(rec0 as u64)).map_err(|e| e.to_string())?;
+    let mut pd = [0u8; 16];
+    f.read_exact(&mut pd).map_err(|e| e.to_string())?;
+    let compression = u16b(&pd, 0x00);
+    if !matches!(compression, 1 | 2 | 17480) {
+        return Err(format!("PalmDocFormatError: 未知压缩算法 {compression}"));
+    }
+    let encryption = u16b(&pd, 0x0C);
+    if encryption != 0 {
+        return Err(format!(
+            "AWZ3EncryptedError: 检测到 DRM 加密（record0 偏移 0x0C 处 Encryption Type = {encryption}），\
+             无法读取正文，请先解密（如 DeDRM）后重新导入"
+        ));
+    }
+    Ok(())
 }
 
 /// 第一步：DRM 嗅探拦截。纯字节操作（读头部 <100 字节即返回），
@@ -85,8 +123,12 @@ pub fn detect_drm(bytes: &[u8]) -> Result<(), String> {
     if !matches!(compression, 1 | 2 | 17480) {
         return Err(format!("PalmDocFormatError: 未知压缩算法 {compression}"));
     }
-    // PalmDOC 头偏移 0x0C：Encryption Type。>1（含 AWZ/AZW3 常见值 2）一律拦截；
-    // =1 是旧 Mobipocket DRM，同样无法解密，一并拒绝并说明。
+    // PalmDOC 头偏移 0x0C：Encryption Type（本库三个真实无 DRM 书实测此处=0，
+    // 而 rec0+78+0x1C 处读到 6/8/8——若用后者会把正常书误判为加密）。
+    // MOBI 签名实测位于 rec0+0x10（非 rec0+78）。越界防护：需能读到 rec0+0x0D。
+    if rec0 + 0x0E > bytes.len() {
+        return Err("PalmDocFormatError: record0 头越界".to_string());
+    }
     let encryption = u16b(bytes, rec0 + 0x0C);
     if encryption > 1 {
         return Err(format!(
@@ -154,6 +196,18 @@ pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
 /// mobi crate 内置的 HUFF 解码器（其输出已是文本），其余两种在本函数内
 /// 按 PDB 记录手工解压，以便后续做编码纠偏。
 pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
+    extract_records_and_decompress_limited(mobi, MAX_RECORDS, MAX_HTML_BYTES)
+}
+
+/// 防卡死熔断上限：畸形/超大文件在解析中途即中止，不拖死 UI。
+const MAX_RECORDS: usize = 50_000;
+const MAX_HTML_BYTES: usize = 50 * 1024 * 1024;
+
+pub fn extract_records_and_decompress_limited(
+    mobi: &Mobi,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let comp = mobi.compression();
     let recs = mobi.raw_records();
     let range = mobi.readable_records_range();
@@ -162,12 +216,32 @@ pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
     let all = recs.records();
     let start = range.start.min(all.len());
     let end = range.end.min(all.len()).max(start);
+    if end - start > max_records {
+        return Err(format!(
+            "ParseTimeoutOrCorrupted: 可读记录数 {} 超过上限 {max_records}，文件畸形",
+            end - start
+        ));
+    }
     match comp {
-        Compression::Huff => Ok(mobi.content_as_string_lossy().into_bytes()),
+        Compression::Huff => {
+            let s = mobi.content_as_string_lossy();
+            if s.len() > max_bytes {
+                return Err(format!(
+                    "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
+                    s.len()
+                ));
+            }
+            Ok(s.into_bytes())
+        }
         Compression::PalmDoc => {
             let mut out = Vec::new();
             for r in &all[start..end] {
                 out.extend_from_slice(&decompress_palmdoc_lz77(r.content));
+                if out.len() > max_bytes {
+                    return Err(format!(
+                        "ParseTimeoutOrCorrupted: 解压输出超过 {max_bytes} 字节上限，文件畸形"
+                    ));
+                }
             }
             Ok(out)
         }
@@ -175,6 +249,11 @@ pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
             let mut out = Vec::new();
             for r in &all[start..end] {
                 out.extend_from_slice(r.content);
+                if out.len() > max_bytes {
+                    return Err(format!(
+                        "ParseTimeoutOrCorrupted: 正文超过 {max_bytes} 字节上限，文件畸形"
+                    ));
+                }
             }
             Ok(out)
         }
@@ -194,9 +273,54 @@ fn decode_label(label: &str, raw: &[u8]) -> Option<String> {
     Some(cow.into_owned())
 }
 
+/// GBK/Big5 严格猜测：要求零坏字节且 CJK 达到占比门槛
+fn strict_cjk_guess(raw: &[u8], lang_cjk: bool) -> Option<String> {
+    for label in ["gbk", "gb18030", "big5"] {
+        let enc = encoding_rs::Encoding::for_label(label.as_bytes())?;
+        let (cow, _actual, had_err) = enc.decode(raw);
+        if had_err {
+            continue;
+        }
+        let s = cow.into_owned();
+        let total = s.chars().count().max(1);
+        let cjk = s
+            .chars()
+            .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
+            .count();
+        let ok = if lang_cjk { cjk * 20 > total } else { cjk * 2 > total };
+        if ok {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// 编码纠偏：优先用户强制指定，其次内嵌 meta 声明，最后 MOBI 头 text encoding；
 /// 全部失败时按 UTF-8 严格、再 CP1252、再 lossy UTF-8 兜底。
-pub fn decode_html_bytes(raw: &[u8], header_enc: TextEncoding, forced: Option<&str>) -> String {
+/// 分块 UTF-8 解码：返回 (文本, 非法字节段数)。个别损坏字节不应毁掉整本书。
+fn utf8_chunked(raw: &[u8]) -> (String, usize) {
+    let mut s = String::with_capacity(raw.len());
+    let mut rest = raw;
+    let mut bad = 0usize;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(v) => {
+                s.push_str(v);
+                return (s, bad);
+            }
+            Err(e) => {
+                let upto = e.valid_up_to();
+                s.push_str(&String::from_utf8_lossy(&rest[..upto]));
+                let elen = e.error_len().unwrap_or(1);
+                s.push('\u{FFFD}');
+                bad += 1;
+                rest = &rest[(upto + elen).min(rest.len())..];
+            }
+        }
+    }
+}
+
+pub fn decode_html_bytes(raw: &[u8], header_enc: TextEncoding, forced: Option<&str>, lang_cjk: bool) -> String {
     let forced = forced
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty() && s != "auto");
@@ -206,14 +330,42 @@ pub fn decode_html_bytes(raw: &[u8], header_enc: TextEncoding, forced: Option<&s
             return s;
         }
     }
+    // 无 meta/强制：旧中文书普遍存在"文件头谎报编码 / 记录边界截断产生少量非法序列"的情况。
+    // UTF-8 探测容忍 ≤1% 的损坏字节段；头报 CP1252 的西文书仅在"中文语言 + 大量 CJK"
+    // 时才允许带损 UTF-8，避免把 é/è 等高位字节当损坏。
+    let (utf8_s, bad) = utf8_chunked(raw);
+    let utf8_trusted = match header_enc {
+        TextEncoding::CP1252 if !lang_cjk => bad == 0,
+        _ => bad * 100 <= raw.len().max(1),
+    };
+    if utf8_trusted {
+        let total = utf8_s.chars().count().max(1);
+        let cjk = utf8_s
+            .chars()
+            .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
+            .count();
+        let looks_cjk = cjk * 10 > total;
+        if bad == 0 || looks_cjk || matches!(header_enc, TextEncoding::UTF8 | TextEncoding::Unknown(_)) {
+            return utf8_s;
+        }
+    }
+    drop(utf8_s);
     match header_enc {
-        TextEncoding::UTF8 => match std::str::from_utf8(raw) {
-            Ok(s) => s.to_string(),
-            Err(_) => decode_label("windows-1252", raw)
-                .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned()),
-        },
-        TextEncoding::CP1252 => decode_label("windows-1252", raw).unwrap_or_default(),
-        TextEncoding::Unknown(_) => String::from_utf8_lossy(raw).into_owned(),
+        TextEncoding::UTF8 | TextEncoding::Unknown(_) => {
+            // 头报 UTF-8 但损坏率过高（常见于实为 GBK 的书）：严格试探 GBK/Big5
+            strict_cjk_guess(raw, true).unwrap_or_else(|| {
+                decode_label("windows-1252", raw)
+                    .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
+            })
+        }
+        TextEncoding::CP1252 => {
+            // 头声称 CP1252 但 UTF-8 探测失败：试 GBK/Big5 严格解码（不允许坏字节），
+            // 文件头语言为中文时 CJK 占比门槛降为 5%，否则要求过半 CJK
+            if let Some(s) = strict_cjk_guess(raw, lang_cjk) {
+                return s;
+            }
+            decode_label("windows-1252", raw).unwrap_or_default()
+        }
     }
 }
 
@@ -291,6 +443,10 @@ pub fn extract_images(
 /// 重写 HTML 中的图片引用 → 本地资源 URL：
 ///   `<img recindex="0002">`（MOBI6）、`src="kindle:embed:0001"`（KF8）、
 ///   `<img src="1.jpg">`（按图片出现顺序的数字文件名）
+/// 1x1 全透明 GIF，用于无法解析的 MOBI 图片引用的安全占位
+const TRANSPARENT_PLACEHOLDER: &str =
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
 pub fn rewrite_images(
     html: &str,
     by_rec: &HashMap<u32, String>,
@@ -327,7 +483,11 @@ pub fn rewrite_images(
             if url.is_none() {
                 if let Some(c) = src_re.captures(tag) {
                     let v = c[1].trim();
-                    if !v.starts_with("http") && !v.starts_with("data:") && !v.starts_with('/') {
+                    if !v.contains("kindle:embed")
+                        && !v.starts_with("http")
+                        && !v.starts_with("data:")
+                        && !v.starts_with('/')
+                    {
                         let base = v.rsplit(['/', '\\']).next().unwrap_or("");
                         if let Some(n) = num_re.captures(base).and_then(|d| d[1].parse::<usize>().ok()) {
                             // 数字文件名：0 基（0000.jpg）与 1 基（1.jpg）都尝试
@@ -336,7 +496,35 @@ pub fn rewrite_images(
                     }
                 }
             }
-            let Some(u) = url else { return tag.to_string() };
+            if url.is_none() {
+                // 外部 http/data:/绝对路径 src 是合法引用，保持原样
+                let external_ok = src_re
+                    .captures(tag)
+                    .map(|c| {
+                        let v = c[1].trim();
+                        v.starts_with("http") || v.starts_with("data:") || v.starts_with('/')
+                    })
+                    .unwrap_or(false);
+                if external_ok {
+                    return tag.to_string();
+                }
+                // 含 MOBI 图片引用（recindex / kindle:embed / 本地文件名 src）但解析不到图片：
+                // 换成透明占位图，绝不留下浏览器无法加载的非法 src
+                let is_img_ref = rec_re.is_match(tag) || embed_re.is_match(tag) || src_re.is_match(tag);
+                if !is_img_ref {
+                    return tag.to_string();
+                }
+                let mut out = rec_re.replace_all(tag, "").to_string();
+                out = if src_re.is_match(&out) {
+                    src_re
+                        .replace_all(&out, format!("src=\"{TRANSPARENT_PLACEHOLDER}\""))
+                        .to_string()
+                } else {
+                    out.replacen("<img", &format!("<img src=\"{TRANSPARENT_PLACEHOLDER}\""), 1)
+                };
+                return out;
+            }
+            let u = url.unwrap();
             // 去掉 recindex 属性、重写 src 为本地 URL
             let mut out = rec_re.replace_all(tag, "").to_string();
             if src_re.is_match(&out) {
@@ -375,6 +563,8 @@ pub fn parse_full(
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
 ) -> Result<MobiDoc, String> {
+    // 快速失败路径：不整读文件即拦截 DRM/畸形头
+    sniff_drm_file(path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
     detect_drm(&bytes)?;
     let mobi = Mobi::new(&bytes).map_err(|e| format!("MOBI/AZW3 解析失败: {e:?}"))?;
@@ -389,10 +579,14 @@ pub fn parse_full(
     }
     let raw = extract_records_and_decompress(&mobi)?;
     let is_huff = mobi.compression() == Compression::Huff;
+    let lang_cjk = matches!(
+        mobi.language(),
+        mobi::headers::Language::Chinese | mobi::headers::Language::Unknown
+    );
     let decoded = if is_huff {
         String::from_utf8_lossy(&raw).into_owned()
     } else {
-        decode_html_bytes(&raw, mobi.text_encoding(), force_encoding)
+        decode_html_bytes(&raw, mobi.text_encoding(), force_encoding, lang_cjk)
     };
     let mut html = clean_html(&decoded);
     let (toc, parts) = split_mobi_chapters(&html);
@@ -638,8 +832,40 @@ mod tests {
     }
 
     #[test]
-    fn detect_drm_rejects_bad_magic() {
-        let mut b = vec![0u8; 512];
+    fn sniff_drm_file_fast_path() {
+        let dir = std::env::temp_dir().join(format!("flowread-mobi-sniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 明文：嗅探应放行
+        let ok_file = dir.join("plain.mobi");
+        let b_ok = Builder {
+            compression: 2,
+            encryption: 0,
+            text: b"<p>hi</p>".to_vec(),
+            images: vec![],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        std::fs::write(&ok_file, &b_ok).unwrap();
+        assert!(sniff_drm_file(ok_file.to_str().unwrap()).is_ok());
+        // 加密：仅凭头部即拒绝（不整读/不进解压）
+        let bad_file = dir.join("enc.mobi");
+        let mut b_bad = b_ok.clone();
+        let rec0 = u32b(&b_bad, 0x4E) as usize;
+        let off = rec0 + 0x0C;
+        b_bad[off] = 0;
+        b_bad[off + 1] = 2; // Encryption Type = 2
+        std::fs::write(&bad_file, &b_bad).unwrap();
+        let e = sniff_drm_file(bad_file.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("AWZ3EncryptedError"), "{e}");
+        // 解析入口同样快速失败
+        let e2 = parse_full(bad_file.to_str().unwrap(), None, None).unwrap_err();
+        assert!(e2.contains("AWZ3EncryptedError"), "{e2}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_drm_rejects_bad_magic() {        let mut b = vec![0u8; 512];
         b[0x3C..0x40].copy_from_slice(b"JUNK");
         b[0x40..0x44].copy_from_slice(b"XXXX");
         assert!(detect_drm(&b).unwrap_err().contains("PalmDocFormatError"));
@@ -664,8 +890,13 @@ mod tests {
         detect_drm(&b).unwrap();
         let mobi = Mobi::new(&b).unwrap();
         assert_eq!(mobi.compression(), Compression::No);
+        // 熔断：记录数/输出大小超限时立即报错，不死循环
+        let e = extract_records_and_decompress_limited(&mobi, 0, usize::MAX).unwrap_err();
+        assert!(e.contains("ParseTimeoutOrCorrupted"), "{e}");
+        let e = extract_records_and_decompress_limited(&mobi, 50_000, 8).unwrap_err();
+        assert!(e.contains("ParseTimeoutOrCorrupted"), "{e}");
         let raw = extract_records_and_decompress(&mobi).unwrap();
-        let html = decode_html_bytes(&raw, mobi.text_encoding(), None);
+        let html = decode_html_bytes(&raw, mobi.text_encoding(), None, false);
         let (toc, parts) = split_mobi_chapters(&html);
         assert!(html.contains("第一章") && html.contains("乙"), "{html}");
         assert_eq!(toc.len(), 2, "应识别出两个章节 {toc:?}");
@@ -690,13 +921,13 @@ mod tests {
         let (big5, _, _) = encoding_rs::BIG5.encode("這裡是繁體中文測試");
         let mut raw_head = b"<html><body>".to_vec();
         raw_head.extend_from_slice(&big5);
-        let html = decode_html_bytes(&raw_head, TextEncoding::UTF8, Some("big5"));
+        let html = decode_html_bytes(&raw_head, TextEncoding::UTF8, Some("big5"), false);
         assert!(html.contains("繁體中文"), "{html}");
         // 带 meta 声明时自动纠偏
         let (gbk, _, _) = encoding_rs::GBK.encode("简体中文测试内容");
         let mut raw2 = b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=gbk\">".to_vec();
         raw2.extend_from_slice(&gbk);
-        let html2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None);
+        let html2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None, false);
         assert!(html2.contains("简体中文"), "{html2}");
     }
 
@@ -706,7 +937,7 @@ mod tests {
         jpg.extend_from_slice(&[7u8; 128]);
         let mut png = vec![0x89, b'P', b'N', b'G'];
         png.extend_from_slice(&[9u8; 64]);
-        let text = b"<p>a</p><img recindex=\"0002\"/><img src=\"kindle:embed:0001\"/><img src=\"1.jpg\"/>".to_vec();
+        let text = b"<p>a</p><img recindex=\"0002\"/><img src=\"kindle:embed:0001\"/><img src=\"1.jpg\"/><img src=\"kindle:embed:00FF\"/>".to_vec();
         let b = Builder {
             compression: 1,
             encryption: 0,
@@ -730,5 +961,35 @@ mod tests {
         assert!(!out.contains("recindex"), "{out}");
         assert!(!out.contains("kindle:embed"), "{out}");
         assert!(!out.contains("\"1.jpg\""), "{out}");
+        // 解析不到的 kindle:embed:00FF → 透明占位图，不留非法 src
+        assert!(out.contains("data:image/gif;base64,R0lGODlhAQAB"), "{out}");
+        assert!(!out.contains("00FF"), "{out}");
+        assert_eq!(out.matches("<img").count(), 4, "{out}");
+    }
+
+    /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行
+    #[test]
+    fn real_world_samples_end_to_end() {
+        let env = match std::env::var("FLOWREAD_TEST_MOBI") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("skip: FLOWREAD_TEST_MOBI not set");
+                return;
+            }
+        };
+        for path in env.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let t0 = std::time::Instant::now();
+            let doc = parse_full(path, None, None).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let dt = t0.elapsed();
+            let plain: String = doc
+                .html
+                .chars()
+                .filter(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
+                .take(8)
+                .collect();
+            eprintln!("{} -> {}ms, toc={}, html={}B, 中文样例={:?}", std::path::Path::new(path).file_name().unwrap().to_string_lossy(), dt.as_millis(), doc.toc.len(), doc.html.len(), plain);
+            assert!(!doc.html.is_empty(), "{path}: 正文为空");
+            assert!(doc.toc.len() > 0, "{path}: 无章节");
+        }
     }
 }
