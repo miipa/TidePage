@@ -568,7 +568,7 @@ export async function copyText(text: string) {  try {
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
 
-export const APP_BUILD = "2026.09.10d";
+export const APP_BUILD = "2026.09.10e";
 
 // 与 Rust 主窗口本次启动实际使用的 WebView2 参数保持一致：
 // Windows 上同一 user-data-dir 的 WebView2 环境要求所有窗口的
