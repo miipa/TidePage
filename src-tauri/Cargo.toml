@@ -1,0 +1,44 @@
+[package]
+name = "flowread"
+version = "0.1.0"
+description = "FlowRead - a fast local reading app"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "flowread_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+fancy-regex = "0.14"
+walkdir = "2"
+notify = "6"
+rayon = "1"
+encoding_rs = "0.8"
+chardetng = "0.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+mobi = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+trash = "5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+rfd = "0.15"
+winreg = "0.55"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

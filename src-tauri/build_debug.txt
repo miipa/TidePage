@@ -1,0 +1,93 @@
+warning: unused import: `base64::Engine`
+  --> src\ai.rs:63:13
+   |
+63 |         use base64::Engine;
+   |             ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `tauri::Manager`
+  --> src\lib.rs:15:5
+   |
+15 | use tauri::Manager;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused variable: `state`
+   --> src\library.rs:499:5
+    |
+499 |     state: State<'_, Arc<AppState>>,
+    |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_state`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `serve_cover` is never used
+  --> src\covers.rs:19:8
+   |
+19 | pub fn serve_cover(base: &Path, name: &str) -> (String, Vec<u8>) {
+   |        ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `all_book_paths` is never used
+   --> src\db.rs:272:8
+    |
+272 | pub fn all_book_paths(conn: &Connection) -> Vec<(i64, String)> {
+    |        ^^^^^^^^^^^^^^
+
+warning: function `get_txt_cache` is never used
+   --> src\db.rs:357:8
+    |
+357 | pub fn get_txt_cache(conn: &Connection, book_id: i64) -> Option<(String, String)> {
+    |        ^^^^^^^^^^^^^
+
+warning: function `set_txt_cache` is never used
+   --> src\db.rs:367:8
+    |
+367 | pub fn set_txt_cache(conn: &Connection, book_id: i64, offsets: &str, rules_hash: &str) {
+    |        ^^^^^^^^^^^^^
+
+warning: function `xml_text` is never used
+  --> src\epub.rs:77:4
+   |
+77 | fn xml_text(_e: &quick_xml::events::BytesStart) -> String {
+   |    ^^^^^^^^
+
+warning: function `spine_docs_with_titles` is never used
+   --> src\epub.rs:585:8
+    |
+585 | pub fn spine_docs_with_titles(zip_bytes: &[u8], spine: &[String]) -> Vec<(String, String)> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `font_css_face` is never used
+   --> src\fonts.rs:108:8
+    |
+108 | pub fn font_css_face(app: &tauri::AppHandle) -> String {
+    |        ^^^^^^^^^^^^^
+
+warning: function `covers_dir_of` is never used
+   --> src\library.rs:932:8
+    |
+932 | pub fn covers_dir_of(app: &AppHandle) -> PathBuf {
+    |        ^^^^^^^^^^^^^
+
+warning: struct `SplitRule` is never constructed
+  --> src\models.rs:50:12
+   |
+50 | pub struct SplitRule {
+   |            ^^^^^^^^^
+
+warning: function `is_txt` is never used
+  --> src\txt.rs:33:8
+   |
+33 | pub fn is_txt(path: &str) -> bool {
+   |        ^^^^^^
+
+warning: struct `TxtDoc` is never constructed
+  --> src\txt.rs:38:12
+   |
+38 | pub struct TxtDoc {
+   |            ^^^^^^
+
+warning: `flowread` (lib) generated 14 warnings (run `cargo fix --lib -p flowread` to apply 2 suggestions)
+   Compiling flowread v0.1.0 (C:\Users\A\Documents\a\flowread\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.35s
