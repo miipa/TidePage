@@ -70,28 +70,39 @@ pub fn run() {
             }
             db::migrate_book_ids(&conn);
 
-            // 创建主窗口：按已保存的字体平滑参数注入 WebView2 启动参数（需重启生效）
+            // 创建主窗口：注入 WebView2 字体渲染参数（需重启生效）。
+            // 根治粗体第三方字体（仓耳云黑等）在 ClearType 子像素渲染下"黑成一坨/发糊"：
+            // --disable-lcd-text（灰度抗锯齿）现为强制默认项，不再依赖用户手动配置；
+            // 显式写 --enable-lcd-text 可恢复子像素，--disable-direct-write（GDI 模式）原样尊重。
             let mut main_window_args = String::new();
             {
                 let webview_args = db::get_setting(&conn, "render.webviewArgs").unwrap_or_default();
+                let raw = webview_args.trim().to_string();
+                let render_arg = if raw.is_empty() {
+                    "--disable-lcd-text".to_string()
+                } else if raw.contains("disable-lcd-text")
+                    || raw.contains("disable-direct-write")
+                    || raw.contains("enable-lcd-text")
+                {
+                    raw
+                } else {
+                    format!("--disable-lcd-text {raw}")
+                };
                 let mut wb = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
                     .title("FlowRead 阅读")
                     .inner_size(1380.0, 880.0)
                     .min_inner_size(940.0, 620.0)
                     .center()
                     .visible(false);
-                if !webview_args.trim().is_empty() {
-                    // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项
-                    let full = format!(
-                        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection {}",
-                        webview_args.trim()
-                    );
-                    // 记录本次启动实际生效的参数串：JS 端创建的子窗口必须使用
-                    // 完全相同的 WebView2 启动参数，否则同 user-data-dir 下新建
-                    // 环境会静默失败，产生无法加载页面的“幽灵窗口”
-                    main_window_args = full.clone();
-                    wb = wb.additional_browser_args(&full);
-                }
+                // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项
+                let full = format!(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection {render_arg}"
+                );
+                // 记录本次启动实际生效的参数串：JS 端创建的子窗口必须使用
+                // 完全相同的 WebView2 启动参数，否则同 user-data-dir 下新建
+                // 环境会静默失败，产生无法加载页面的"幽灵窗口"
+                main_window_args = full.clone();
+                wb = wb.additional_browser_args(&full);
                 wb.build()?;
                 db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);
             }

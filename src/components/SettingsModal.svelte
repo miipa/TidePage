@@ -145,7 +145,7 @@
       .getSetting("render.webviewArgs")
       .then((v) => {
         if (!v) return;
-        if (v === "--disable-lcd-text" || v === "--disable-direct-write") {
+        if (v === "--disable-lcd-text" || v === "--disable-direct-write" || v === "--enable-lcd-text") {
           webviewArgs = v;
         } else {
           webviewArgs = "__custom__";
@@ -645,8 +645,9 @@
         bind:value={webviewArgs}
         onchange={() => { if (webviewArgs !== "__custom__") saveWebviewArgs(); }}
       >
-        <option value="">默认（系统 ClearType 子像素）</option>
-        <option value="--disable-lcd-text">柔和（灰度抗锯齿，类似静读天下字体平滑）</option>
+        <option value="">灰度抗锯齿 · 柔和（新默认，已强制，根治粗体发糊/黑成一坨）</option>
+        <option value="--disable-lcd-text">灰度抗锯齿（同上，显式）</option>
+        <option value="--enable-lcd-text">系统 ClearType 子像素（显式恢复旧行为）</option>
         <option value="--disable-direct-write">GDI 旧式渲染（更锐利，接近老式系统）</option>
         <option value="__custom__">自定义参数…</option>
       </select>
