@@ -776,9 +776,108 @@ pub fn rewrite_images(
         .to_string()
 }
 
+/// 部分转换器（多看/kindlegen）会把正文里的实体二次转义成 `&amp;#8226;`，
+/// 浏览器只会解一层 → 用户看到源码字面量。此处做等效 html_escape::decode_html_entities
+/// 的**选择性解码**：数字实体（含被转义的 &amp;#N; / &amp;#xH;）与常见命名实体还原为真实字符。
+/// 刻意保留 `&amp; &lt; &gt; &quot;` 与解码结果会产生 `<`/`>`/`&` 的实体（如 &#60;），
+/// 避免把示例文本里的 "&lt;script&gt;" 还原成活标签（保持既有 sanitize 前提）。
+fn decode_entities(s: &str) -> String {
+    static ENT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)&(?:amp;)?#([xX]?)([0-9a-fA-F]{1,7});").unwrap()
+    });
+    static NAMED_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"&(?:amp;)?(nbsp|bull|middot|hellip|mdash|ndash|lsquo|rsquo|ldquo|rdquo|laquo|raquo|copy|reg|trade|deg|plusmn|times|divide|sect|para|dagger|Dagger|permil|prime|Prime|larr|rarr|uarr|darr|harr|ne|equiv|minus|micro|cedil|circ|tilde|euro|pound|yen|curren|brvbar|pproduct|prod|sum|radic|infin|asymp|isin|not|and|or|cap|cup|int)();").unwrap()
+    });
+    let out = ENT_RE.replace_all(s, |c: &Captures| {
+        let hex = !c[1].is_empty();
+        let cp = u32::from_str_radix(&c[2], if hex { 16 } else { 10 }).unwrap_or(0xFFFFFFFF);
+        match cp {
+            0 => "&\u{FFFD};".to_string(),
+            // 会改变标签结构的解码结果一律保留原样（'<' = 0x3C, '>' = 0x3E, '&' = 0x26）
+            0x3C | 0x3E | 0x26 => c[0].to_string(),
+            v if v > 0x10FFFF => c[0].to_string(),
+            _ => char::from_u32(cp).map(|ch| ch.to_string()).unwrap_or_else(|| c[0].to_string()),
+        }
+    });
+    let out2 = NAMED_RE.replace_all(&out, |c: &Captures| -> String {
+        let mapped: Option<char> = match &c[1] {
+            "nbsp" => Some('\u{A0}'),
+            "bull" => Some('\u{2022}'),
+            "middot" => Some('\u{B7}'),
+            "hellip" => Some('\u{2026}'),
+            "mdash" => Some('\u{2014}'),
+            "ndash" => Some('\u{2013}'),
+            "lsquo" => Some('\u{2018}'),
+            "rsquo" => Some('\u{2019}'),
+            "ldquo" => Some('\u{201C}'),
+            "rdquo" => Some('\u{201D}'),
+            "laquo" => Some('\u{AB}'),
+            "raquo" => Some('\u{BB}'),
+            "copy" => Some('\u{A9}'),
+            "reg" => Some('\u{AE}'),
+            "trade" => Some('\u{2122}'),
+            "deg" => Some('\u{B0}'),
+            "plusmn" => Some('\u{B1}'),
+            "times" => Some('\u{D7}'),
+            "divide" => Some('\u{F7}'),
+            "sect" => Some('\u{A7}'),
+            "para" => Some('\u{B6}'),
+            "dagger" => Some('\u{2020}'),
+            "Dagger" => Some('\u{2021}'),
+            "permil" => Some('\u{2030}'),
+            "prime" => Some('\u{2032}'),
+            "Prime" => Some('\u{2033}'),
+            "larr" => Some('\u{2190}'),
+            "rarr" => Some('\u{2192}'),
+            "uarr" => Some('\u{2191}'),
+            "darr" => Some('\u{2193}'),
+            "harr" => Some('\u{2194}'),
+            "ne" => Some('\u{2260}'),
+            "equiv" => Some('\u{2261}'),
+            "minus" => Some('\u{2212}'),
+            "micro" => Some('\u{B5}'),
+            "cedil" => Some('\u{B8}'),
+            "circ" => Some('\u{2C6}'),
+            "tilde" => Some('\u{2DC}'),
+            "euro" => Some('\u{20AC}'),
+            "pound" => Some('\u{A3}'),
+            "yen" => Some('\u{A5}'),
+            "curren" => Some('\u{A4}'),
+            "brvbar" => Some('\u{A6}'),
+            "prod" => Some('\u{220F}'),
+            "sum" => Some('\u{2211}'),
+            "radic" => Some('\u{221A}'),
+            "infin" => Some('\u{221E}'),
+            "asymp" => Some('\u{2248}'),
+            "isin" => Some('\u{2208}'),
+            "not" => Some('\u{AC}'),
+            "int" => Some('\u{222B}'),
+            _ => None,
+        };
+        match mapped {
+            Some(ch) => ch.to_string(),
+            None => c[0].to_string(),
+        }
+    });
+    out2.to_string()
+}
+
 fn clean_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    // 先移除脚本/样式类危险块（实体解码不会产生新标签，此处防源文件自带）
+    static SCRIPT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?is)<\s*script\b[^>]*>.*?<\s*/\s*script\s*>",
+            r"|<\s*style\b[^>]*>.*?<\s*/\s*style\s*>",
+            r"|<\s*iframe\b[^>]*>.*?<\s*/\s*iframe\s*>",
+            r"|<\s*object\b[^>]*>.*?<\s*/\s*object\s*>",
+            r"|<\s*embed\b[^>]*>.*?<\s*/\s*embed\s*>",
+            r"|<\s*(script|iframe|object|embed)\b[^>]*/?>",
+        ))
+        .unwrap()
+    });
+    let stripped = SCRIPT_RE.replace_all(s, " ");
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
         let code = ch as u32;
         let is_kf8_marker = (0xE000..=0xF8FF).contains(&code);
         let is_bad_ctrl = code < 0x20 && !matches!(ch, '\n' | '\r' | '\t');
@@ -822,7 +921,7 @@ pub fn parse_full(
     if decoded.warning.is_none() {
         decoded.warning = extract_warn;
     }
-    let mut html = clean_html(&decoded.text);
+    let mut html = clean_html(&decode_entities(&decoded.text));
     let (toc, parts) = split_mobi_chapters(&html);
     let mut image_count = 0usize;
     if let Some((dir, prefix)) = images {
@@ -1254,6 +1353,24 @@ mod tests {
         assert!(d2.text.contains("繁體中文測試"));
         assert!(!d2.text.contains('\u{FFFD}'), "修复模式不得输出替换符");
         assert!(d2.warning.is_some(), "应有编码异常警告: {:?}", d2.warning);
+    }
+
+    #[test]
+    fn entity_decode_and_script_strip() {
+        // 双重转义实体（转换器产物）与裸数字实体都要还原
+        let s = "<p>&amp;#8226; a&amp;#8226;&#8226;&#x2022;&amp;nbsp;&nbsp;</p>";
+        let d = decode_entities(s);
+        assert_eq!(d, "<p>• a•••\u{A0}\u{A0}</p>", "{d}");
+        // 结构安全：不得把转义标签还原成活标签，&#60;/&amp; 保留
+        let e = "&lt;script&gt;alert(1)&lt;/script&gt; &#60;b&#62; &amp;#38;";
+        let d2 = decode_entities(e);
+        assert!(d2.contains("&lt;script&gt;"), "{d2}");
+        assert!(d2.contains("&#60;b&#62;"), "{d2}");
+        assert!(!d2.contains("<script>"), "{d2}");
+        // 源文件自带 script 块 → clean_html 剥离
+        let c = clean_html("<p>x</p><script>evil()</script><style>p{}</style><p>y</p>");
+        assert!(!c.contains("evil"), "{c}");
+        assert!(c.contains("<p>x</p>") && c.contains("<p>y</p>"), "{c}");
     }
 
     /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行

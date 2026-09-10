@@ -209,6 +209,13 @@
         if (entry) pg = entry.at === "tail" ? Math.max(0, pageCount - 1) : 0;
         gotoPage(Math.max(0, Math.min(pg, Math.max(0, pageCount - 1))), true);
         setTimeout(recheckPages, 350);
+        if (entry?.at === "tail") {
+          // 字体加载后页数可能再变：重测后再钉回最后一页
+          setTimeout(() => {
+            recheckPages();
+            gotoPage(Number.MAX_SAFE_INTEGER, true);
+          }, 420);
+        }
       }
       try {
         localStorage.setItem(
@@ -249,8 +256,11 @@
     else if (fromEnd) toast("已是最后一章");
   }
 
-  function prevChapter() {
-    if (book && chapterNum > 0) loadChapter(chapterNum - 1);
+  function prevChapter(toEnd = false) {
+    if (book && chapterNum > 0) {
+      // toEnd=true：跨章回溯落到上一章末尾（翻页语义）；false：显式跳章从章首（原有语义）
+      loadChapter(chapterNum - 1, undefined, toEnd ? { at: "tail", extra: 0 } : undefined);
+    }
   }
 
   function maybeAutoAi() {
@@ -456,7 +466,7 @@
 
   function prevPage() {
     if (page > 0) gotoPage(page - 1);
-    else if (chapterNum > 0) prevChapter();
+    else if (chapterNum > 0) prevChapter(true); // 首页回翻 → 上一章【末尾】，而非章首
   }
 
   function relayout() {
