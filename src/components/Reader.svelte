@@ -808,6 +808,12 @@
 ${fontFaces}
 ${overrideRule}
 ${r.cssExtra || ""}
+/* 硬编码根治发糊：置于最后确保同特异度下覆盖用户 CSS（灰度抗锯齿已在 WebView2 参数层强制） */
+#chapter-content {
+  font-synthesis-weight: none !important;
+  text-rendering: geometricPrecision !important;
+  letter-spacing: 0.05em !important;
+}
 `;
   }
 
