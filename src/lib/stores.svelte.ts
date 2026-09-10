@@ -537,8 +537,23 @@ export function dismissToast(id: number) {
   if (i >= 0) toasts.items.splice(i, 1);
 }
 
-export async function copyText(text: string) {
-  try {
+// 去除图片/SVG/样式等非文本标签：带插图（尤其 base64 内嵌）的章节
+// 若直接按 HTML 截断传给 AI，会把正文挤出截断范围导致“没有文字”
+export function stripNonTextHtml(html: string): string {
+  if (!html) return "";
+  return html
+    .replace(/<img\b[^>]*>/gi, "")
+    .replace(/<picture\b[\s\S]*?<\/picture>/gi, "")
+    .replace(/<source\b[^>]*>/gi, "")
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, "")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, "")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, "")
+    .replace(/<video\b[\s\S]*?(<\/video>)?/gi, "")
+    .replace(/<audio\b[\s\S]*?(<\/audio>)?/gi, "")
+    .replace(/<iframe\b[\s\S]*?(<\/iframe>)?/gi, "");
+}
+
+export async function copyText(text: string) {  try {
     await navigator.clipboard.writeText(text);
   } catch {
     const ta = document.createElement("textarea");
@@ -553,7 +568,7 @@ export async function copyText(text: string) {
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
 
-export const APP_BUILD = "2026.09.07i";
+export const APP_BUILD = "2026.09.07j";
 
 // 与 Rust 主窗口本次启动实际使用的 WebView2 参数保持一致：
 // Windows 上同一 user-data-dir 的 WebView2 环境要求所有窗口的

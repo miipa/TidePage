@@ -16,6 +16,7 @@
     toggleAi,
     ZONE_DEFS,
     copyText,
+    stripNonTextHtml,
     type BindAction,
     type ZoneKey,
   } from "../lib/stores.svelte";
@@ -145,6 +146,11 @@
     }
   }
 
+  function aiCtxHtml(h: string): string {
+    const s = stripNonTextHtml(h);
+    return s.length > 400_000 ? s.slice(0, 400_000) : s;
+  }
+
   async function loadChapter(
     idx: number,
     restore?: Progress,
@@ -202,7 +208,7 @@
           "fr.ai.ctx",
           JSON.stringify({
             title: `${book.book.title} · ${ch.title}`,
-            html: ch.html.length > 400_000 ? ch.html.slice(0, 400_000) : ch.html,
+            html: aiCtxHtml(ch.html),
           })
         );
       } catch { /* ignore */ }
@@ -245,7 +251,7 @@
       const ch = { title: chapter.title, html: chapter.html };
       window.dispatchEvent(
         new CustomEvent("flowread-ai-chapter", {
-          detail: { title: ch.title, html: ch.html },
+          detail: { title: ch.title, html: aiCtxHtml(ch.html) },
         }),
       );
       // 跨窗口广播：AI 独立窗口也能收到
@@ -253,7 +259,7 @@
         .then((m) =>
           m.emit("flowread-ai-chapter", {
             title: ch.title,
-            html: ch.html.length > 400_000 ? ch.html.slice(0, 400_000) : ch.html,
+            html: aiCtxHtml(ch.html),
           })
         )
         .catch(() => {});
@@ -262,7 +268,7 @@
           "fr.ai.ctx",
           JSON.stringify({
             title: `${book?.book.title ?? ""} · ${ch.title}`,
-            html: ch.html.length > 400_000 ? ch.html.slice(0, 400_000) : ch.html,
+            html: aiCtxHtml(ch.html),
           }),
         );
       } catch { /* ignore */ }
