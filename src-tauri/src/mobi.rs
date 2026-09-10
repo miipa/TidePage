@@ -776,30 +776,27 @@ pub fn rewrite_images(
         .to_string()
 }
 
-/// 部分转换器（多看/kindlegen）会把正文里的实体二次转义成 `&amp;#8226;`，
-/// 浏览器只会解一层 → 用户看到源码字面量。此处做等效 html_escape::decode_html_entities
-/// 的**选择性解码**：数字实体（含被转义的 &amp;#N; / &amp;#xH;）与常见命名实体还原为真实字符。
-/// 刻意保留 `&amp; &lt; &gt; &quot;` 与解码结果会产生 `<`/`>`/`&` 的实体（如 &#60;），
-/// 避免把示例文本里的 "&lt;script&gt;" 还原成活标签（保持既有 sanitize 前提）。
-fn decode_entities(s: &str) -> String {
+/// 文本节点内的实体解码（数字 + 命名），返回 (结果, 命中实体数)
+fn decode_entities_text(s: &str) -> (String, usize) {
     static ENT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)&(?:amp;)?#([xX]?)([0-9a-fA-F]{1,7});").unwrap()
-    });
-    static NAMED_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"&(?:amp;)?(nbsp|bull|middot|hellip|mdash|ndash|lsquo|rsquo|ldquo|rdquo|laquo|raquo|copy|reg|trade|deg|plusmn|times|divide|sect|para|dagger|Dagger|permil|prime|Prime|larr|rarr|uarr|darr|harr|ne|equiv|minus|micro|cedil|circ|tilde|euro|pound|yen|curren|brvbar|pproduct|prod|sum|radic|infin|asymp|isin|not|and|or|cap|cup|int)();").unwrap()
     });
     let out = ENT_RE.replace_all(s, |c: &Captures| {
         let hex = !c[1].is_empty();
         let cp = u32::from_str_radix(&c[2], if hex { 16 } else { 10 }).unwrap_or(0xFFFFFFFF);
         match cp {
-            0 => "&\u{FFFD};".to_string(),
-            // 会改变标签结构的解码结果一律保留原样（'<' = 0x3C, '>' = 0x3E, '&' = 0x26）
+            0 => c[0].to_string(),
             0x3C | 0x3E | 0x26 => c[0].to_string(),
             v if v > 0x10FFFF => c[0].to_string(),
             _ => char::from_u32(cp).map(|ch| ch.to_string()).unwrap_or_else(|| c[0].to_string()),
         }
     });
+    static NAMED_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"&(?:amp;)?(nbsp|bull|middot|hellip|mdash|ndash|lsquo|rsquo|ldquo|rdquo|laquo|raquo|copy|reg|trade|deg|plusmn|times|divide|sect|para|dagger|Dagger|permil|prime|Prime|larr|rarr|uarr|darr|harr|ne|equiv|minus|micro|cedil|circ|tilde|euro|pound|yen|curren|brvbar|prod|sum|radic|infin|asymp|isin|not|and|or|cap|cup|int)();").unwrap()
+    });
+    let mut hits = 0usize;
     let out2 = NAMED_RE.replace_all(&out, |c: &Captures| -> String {
+        hits += 1;
         let mapped: Option<char> = match &c[1] {
             "nbsp" => Some('\u{A0}'),
             "bull" => Some('\u{2022}'),
@@ -851,6 +848,10 @@ fn decode_entities(s: &str) -> String {
             "asymp" => Some('\u{2248}'),
             "isin" => Some('\u{2208}'),
             "not" => Some('\u{AC}'),
+            "and" => Some('\u{2227}'),
+            "or" => Some('\u{2228}'),
+            "cap" => Some('\u{2229}'),
+            "cup" => Some('\u{222A}'),
             "int" => Some('\u{222B}'),
             _ => None,
         };
@@ -859,25 +860,178 @@ fn decode_entities(s: &str) -> String {
             None => c[0].to_string(),
         }
     });
-    out2.to_string()
+    (out2.to_string(), hits)
 }
 
+
+/// 标准 tokenizer 定界 + 原始标签透传管线（结构零破坏）：
+/// - 标签（属性原文、mbp:pagebreak、recindex）逐 token 从 tokenizer 重序列化；
+///   属性值中 `&`/`"` 重新转义（tokenizer 已解码，浏览器还要再解一次，转义回填保证值一致且结构安全）
+/// - 文本节点缓冲合并后选择性实体解码（`&amp;#N;` 双重转义、`&#N;`、命名实体），
+///   并把解码出的 `<`/`>` 再转义防文本变标签
+/// - `<script>`/`<style>` 连内容丢弃；检测到未闭合 RAWTEXT 时改为"去标签留文本"（正文优先）
+pub fn decode_and_sanitize(html: &str) -> String {
+    use html5ever::tokenizer::{TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct St {
+        out: String,
+        pending_text: String, // tokenizer 在实体边界切分 CharacterTokens，须合并后统一解码
+        drop_raw: Option<String>,
+        dangling: bool,
+    }
+    impl St {
+        fn flush(&mut self) {
+            if self.pending_text.is_empty() {
+                return;
+            }
+            let t = std::mem::take(&mut self.pending_text);
+            let (d, _e) = decode_entities_text(&t);
+            // 解码可能引入裸 < >（源自 &lt; 等实体的双重语义），重新转义保证只作文本；
+            // tokenizer 对畸形实体/输入按规范产 U+FFFD，同样剔除（与 strip 策略一致）
+            for ch in d.chars() {
+                match ch {
+                    '<' => self.out.push_str("&lt;"),
+                    '>' => self.out.push_str("&gt;"),
+                    '\u{FFFD}' => {}
+                    c => self.out.push(c),
+                }
+            }
+        }
+    }
+    struct Sink(Rc<RefCell<St>>);
+    impl Sink {
+        fn ser_attr_value(&self, v: &str, out: &mut String) {
+            for c in v.chars() {
+                match c {
+                    '&' => out.push_str("&amp;"),
+                    '"' => out.push_str("&quot;"),
+                    // tokenizer 对属性内畸形实体会规范产出 U+FFFD，剔除（属性值无害化）
+                    '\u{FFFD}' => {}
+                    c => out.push(c),
+                }
+            }
+        }
+    }
+    impl TokenSink for Sink {
+        type Handle = ();
+        fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+            let mut st = self.0.borrow_mut();
+            match token {
+                Token::TagToken(tag) => {
+                    st.flush();
+                    let name = tag.name.to_string();
+                    let ln = name.to_ascii_lowercase();
+                    let is_raw = ln == "script" || ln == "style";
+                    if is_raw {
+                        if matches!(tag.kind, TagKind::StartTag) && !tag.self_closing {
+                            if st.dangling {
+                                return TokenSinkResult::Continue; // 悬空模式：去标签，文本按普通处理
+                            }
+                            st.drop_raw = Some(ln);
+                            return TokenSinkResult::Continue;
+                        }
+                        if matches!(tag.kind, TagKind::EndTag) {
+                            st.drop_raw = None;
+                            return TokenSinkResult::Continue;
+                        }
+                    }
+                    if st.drop_raw.is_some() {
+                        return TokenSinkResult::Continue;
+                    }
+                    let is_end = matches!(tag.kind, TagKind::EndTag);
+                    let mut s = String::with_capacity(name.len() + 8);
+                    s.push('<');
+                    if is_end {
+                        s.push('/');
+                    }
+                    s.push_str(&name);
+                    if !is_end {
+                        for a in tag.attrs.iter() {
+                            s.push(' ');
+                            s.push_str(&a.name.local.to_string());
+                            let v = a.value.to_string();
+                            if !v.is_empty() {
+                                s.push_str("=\"");
+                                self.ser_attr_value(&v, &mut s);
+                                s.push('"');
+                            }
+                        }
+                        if tag.self_closing {
+                            s.push_str("/>");
+                            st.out.push_str(&s);
+                            return TokenSinkResult::Continue;
+                        }
+                    }
+                    s.push('>');
+                    st.out.push_str(&s);
+                }
+                Token::CharacterTokens(chars) => {
+                    if st.drop_raw.is_some() {
+                        return TokenSinkResult::Continue;
+                    }
+                    st.pending_text.push_str(&chars.to_string());
+                }
+                Token::DoctypeToken(dt) => {
+                    st.flush();
+                    let n = dt.name.map(|x| x.to_string()).unwrap_or_default();
+                    if !n.is_empty() {
+                        st.out.push_str("<!DOCTYPE ");
+                        st.out.push_str(&n);
+                        st.out.push('>');
+                    }
+                }
+                _ => {}
+            }
+            TokenSinkResult::Continue
+        }
+    }
+
+    let dangling = has_dangling_rawtext(html);
+    let st = Rc::new(RefCell::new(St {
+        out: String::with_capacity(html.len() + 1024),
+        pending_text: String::new(),
+        drop_raw: None,
+        dangling,
+    }));
+    let tok = Tokenizer::new(Sink(st.clone()), html5ever::tokenizer::TokenizerOpts::default());
+    let q = html5ever::tokenizer::BufferQueue::default();
+    q.push_back(html.into());
+    let _res = tok.feed(&q);
+    tok.end();
+    let mut b = st.borrow_mut();
+    b.flush();
+    std::mem::take(&mut b.out)
+}
+/// 悬空 RAWTEXT 检测：`<style` 与 `</style` 数量不等时，tokenizer 会把未闭合 style
+/// 之后的正文全吞进 CSS 文本——此时保留文本只去标签（正文优先于完美）。
+fn has_dangling_rawtext(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    for tag in ["style", "script", "textarea", "title"] {
+        let (mut opens, mut closes) = (0usize, 0usize);
+        let mut from = 0usize;
+        while let Some(i) = find_sub(&lower, tag, from) {
+            if i > 0 && lower.as_bytes()[i - 1] == b'<' {
+                opens += 1;
+            } else if i > 1 && lower.as_bytes()[i - 1] == b'/' && lower.as_bytes()[i - 2] == b'<' {
+                closes += 1;
+            }
+            from = i + tag.len();
+        }
+        if opens != closes {
+            return true;
+        }
+    }
+    false
+}fn find_sub(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    hay.get(from..).and_then(|s| s.find(needle).map(|i| from + i))
+}
+
+/// 字符级过滤（KF8 私有区标记/控制字符），在 DOM 清理与实体解码之后执行
 fn clean_html(s: &str) -> String {
-    // 先移除脚本/样式类危险块（实体解码不会产生新标签，此处防源文件自带）
-    static SCRIPT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(concat!(
-            r"(?is)<\s*script\b[^>]*>.*?<\s*/\s*script\s*>",
-            r"|<\s*style\b[^>]*>.*?<\s*/\s*style\s*>",
-            r"|<\s*iframe\b[^>]*>.*?<\s*/\s*iframe\s*>",
-            r"|<\s*object\b[^>]*>.*?<\s*/\s*object\s*>",
-            r"|<\s*embed\b[^>]*>.*?<\s*/\s*embed\s*>",
-            r"|<\s*(script|iframe|object|embed)\b[^>]*/?>",
-        ))
-        .unwrap()
-    });
-    let stripped = SCRIPT_RE.replace_all(s, " ");
-    let mut out = String::with_capacity(stripped.len());
-    for ch in stripped.chars() {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
         let code = ch as u32;
         let is_kf8_marker = (0xE000..=0xF8FF).contains(&code);
         let is_bad_ctrl = code < 0x20 && !matches!(ch, '\n' | '\r' | '\t');
@@ -921,7 +1075,9 @@ pub fn parse_full(
     if decoded.warning.is_none() {
         decoded.warning = extract_warn;
     }
-    let mut html = clean_html(&decode_entities(&decoded.text));
+    // NUL/控制字符必须在 tokenizer 之前剔除（tag-name 状态按规范会把 NUL 变成 U+FFFD 混进标签名）；
+    // 之后再清一次：实体解码可能还原出 PUA/控制字符
+    let mut html = clean_html(&decode_and_sanitize(&clean_html(&decoded.text)));
     let (toc, parts) = split_mobi_chapters(&html);
     let mut image_count = 0usize;
     if let Some((dir, prefix)) = images {
@@ -1356,23 +1512,31 @@ mod tests {
     }
 
     #[test]
-    fn entity_decode_and_script_strip() {
-        // 双重转义实体（转换器产物）与裸数字实体都要还原
-        let s = "<p>&amp;#8226; a&amp;#8226;&#8226;&#x2022;&amp;nbsp;&nbsp;</p>";
-        let d = decode_entities(s);
-        assert_eq!(d, "<p>• a•••\u{A0}\u{A0}</p>", "{d}");
-        // 结构安全：不得把转义标签还原成活标签，&#60;/&amp; 保留
-        let e = "&lt;script&gt;alert(1)&lt;/script&gt; &#60;b&#62; &amp;#38;";
-        let d2 = decode_entities(e);
-        assert!(d2.contains("&lt;script&gt;"), "{d2}");
-        assert!(d2.contains("&#60;b&#62;"), "{d2}");
-        assert!(!d2.contains("<script>"), "{d2}");
-        // 源文件自带 script 块 → clean_html 剥离
-        let c = clean_html("<p>x</p><script>evil()</script><style>p{}</style><p>y</p>");
-        assert!(!c.contains("evil"), "{c}");
-        assert!(c.contains("<p>x</p>") && c.contains("<p>y</p>"), "{c}");
+    fn entity_decode_and_sanitize() {
+        // 双重转义与裸实体均还原；属性内永不解码（回归根因）
+        let d = decode_and_sanitize("<p>&amp;#8226; a&amp;#8226;&#8226;&#x2022;&amp;nbsp;</p>");
+        assert!(d.contains("• a•••"), "{d}");
+        assert!(d.contains(" "), "{d}");
+        let g = decode_and_sanitize("<p style=\"text-align:&and;center\" title=\"x&amp;y\">a &amp; b &and;</p>");
+        // 属性经 tokenizer 解码后按**等值**序列化（`&and;`→`∧` 不再引入裸引号破坏标签结构；
+        // `&amp;` 回填转义），文本实体还原
+        assert!(g.contains("text-align:∧center"), "属性值等价且结构完好: {g}");
+        assert!(g.contains("title=\"x&amp;y\""), "属性 & 转义回填: {g}");
+        assert!(g.contains("a & b ∧"), "文本节点实体解码: {g}");
+        assert_eq!(g.matches('<').count(), g.matches('>').count(), "标签结构完好: {g}");
+        // script/style 连内容丢弃；标签/属性结构保留
+        let c = decode_and_sanitize("<p>x</p><script>evil()</script><p>y</p>");
+        assert!(!c.contains("evil") && c.contains("<p>x</p>") && c.contains("<p>y</p>"), "{c}");
+        let c2 = decode_and_sanitize("<p>ok</p><style>.a{font-family:\"N\";aid:\"x\"}</style><p>keep</p>");
+        assert!(!c2.contains("aid:") && !c2.contains("font-family"), "CSS 不得泄漏: {c2}");
+        assert!(c2.contains("ok") && c2.contains("keep"), "{c2}");
+        // 未闭合 style：保留正文（宁可 CSS 露出也不吞正文）
+        let c3 = decode_and_sanitize("<p>a</p><style>.x{y:z}<p>body-must-survive</p>");
+        assert!(c3.contains("body-must-survive"), "{c3}");
+        // mbp:pagebreak 与 recindex 属性原样保留
+        let m = decode_and_sanitize("<p>1</p><mbp:pagebreak/><img recindex=\"0002\" alt=\"0\"/>");
+        assert!(m.contains("mbp:pagebreak") && m.contains("recindex=\"0002\""), "{m}");
     }
-
     /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行
     #[test]
     fn real_world_samples_end_to_end() {

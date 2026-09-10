@@ -37,6 +37,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rfd = "0.15"
 winreg = "0.55"
 base64 = "0.22"
+html5ever = "0.39"
+tendril = "0.5"
 
 [profile.release]
 opt-level = 3

@@ -54,6 +54,8 @@
   let bookmarks: { id: number; chapter_index: number; title: string; excerpt: string }[] = $state([]);
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
+  const shownWarnings = new Set<string>();
+  let warnScopeId = -1;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
   let measureRaf = 0;
   let openError = $state("");
@@ -74,10 +76,17 @@
 
   export async function open(bookId: number) {
     openError = "";
+    if (warnScopeId !== bookId) {
+      warnScopeId = bookId;
+      shownWarnings.clear();
+    }
     try {
       chapterCache.clear();
       book = await api.openBook(bookId);
-      if (book.encoding_warning) toast(book.encoding_warning, "error", true);
+      if (book.encoding_warning && !shownWarnings.has(book.encoding_warning)) {
+        shownWarnings.add(book.encoding_warning);
+        toast(book.encoding_warning, "error", true);
+      }
       let restore: Progress | null = null;
       try {
         restore = await api.loadProgress(bookId);
@@ -194,14 +203,15 @@
         pos = Math.max(0, Math.min(pos, maxScroll));
         scroller?.jumpTo(pos, true);
         scheduleCommit();
-        if ((restore && restore.chapter_ratio > 0) || entry?.at === "tail") {
+        if (restore && restore.chapter_ratio > 0) {
           setTimeout(() => {
             measureScroll();
-            let p2 = 0;
-            if (entry) p2 = entry.at === "tail" ? maxScroll - (entry.extra || 0) : entry.extra || 0;
-            else if (restore) p2 = restore.chapter_ratio * maxScroll;
+            const p2 = restore.chapter_ratio * maxScroll;
             scroller?.jumpTo(Math.max(0, Math.min(p2, maxScroll)), true);
           }, 300);
+        }
+        if (entry?.at === "tail") {
+          requestAnimationFrame(() => pinToEnd());
         }
       } else {
         measurePages();
@@ -210,11 +220,7 @@
         gotoPage(Math.max(0, Math.min(pg, Math.max(0, pageCount - 1))), true);
         setTimeout(recheckPages, 350);
         if (entry?.at === "tail") {
-          // 字体加载后页数可能再变：重测后再钉回最后一页
-          setTimeout(() => {
-            recheckPages();
-            gotoPage(Number.MAX_SAFE_INTEGER, true);
-          }, 420);
+          requestAnimationFrame(() => pinToEnd());
         }
       }
       try {
@@ -353,6 +359,29 @@
     if (!contentEl || !scrollWrap) return;
     maxScroll = Math.max(0, scrollWrap.scrollHeight - contentEl.clientHeight);
     scroller?.setMax(maxScroll);
+  }
+
+  /// 递归 rAF 钉到章末：直到（图片等延迟加载后）滚动位置真正落底/页数稳定才停止。
+  /// scroll：scrollTop + clientHeight >= scrollHeight - 5；page：钉住最后一页且 pageCount 不再变。
+  function pinToEnd(r = 0) {
+    if (r > 180) return;
+    let done = false;
+    if (config.reader.mode === "scroll") {
+      measureScroll();
+      scroller?.jumpTo(maxScroll, true);
+      done =
+        !contentEl ||
+        !scrollWrap ||
+        maxScroll - scrollTop <= 5 ||
+        scrollTop + contentEl.clientHeight >= scrollWrap.scrollHeight - 5;
+    } else {
+      const before = pageCount;
+      recheckPages();
+      gotoPage(Number.MAX_SAFE_INTEGER, true);
+      done = before === pageCount && (pageCount <= 1 || page >= pageCount - 1);
+    }
+    if (done) return;
+    requestAnimationFrame(() => pinToEnd(r + 1));
   }
 
   let scrollBase = 0;
