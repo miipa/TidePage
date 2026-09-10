@@ -880,6 +880,8 @@ pub fn decode_and_sanitize(html: &str) -> String {
         pending_text: String, // tokenizer 在实体边界切分 CharacterTokens，须合并后统一解码
         drop_raw: Option<String>,
         dangling: bool,
+        drop_tags: usize, // 诊断：丢弃的非法标签名数
+        drop_broken: usize, // 诊断：文本中剔除的破碎标签数
     }
     impl St {
         fn flush(&mut self) {
@@ -888,12 +890,35 @@ pub fn decode_and_sanitize(html: &str) -> String {
             }
             let t = std::mem::take(&mut self.pending_text);
             let (d, _e) = decode_entities_text(&t);
-            // 解码可能引入裸 < >（源自 &lt; 等实体的双重语义），重新转义保证只作文本；
-            // tokenizer 对畸形实体/输入按规范产 U+FFFD，同样剔除（与 strip 策略一致）
-            for ch in d.chars() {
+            // 源文件损坏产生的破碎标签以实体形态(&lt;b aid=&quot;x&quot;&gt;)混在正文里，
+            // 浏览器会原样显示成源码。这里虚拟解码→剔除破碎标签/属性残留→再转义输出。
+            static RE_BROKEN_TAG: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+                Regex::new(r#"(?i)<[^<>]*?[a-zA-Z][a-zA-Z0-9_:.-]*\s*=\s*["'][^<>]*["'][^<>]*>"#).unwrap()
+            });
+            static RE_BROKEN_ATTR: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+                Regex::new(r#"[a-zA-Z][a-zA-Z0-9_:.-]*\s*=\s*["'][^"<>]{1,80}["']"#).unwrap()
+            });
+            static RE_BROKEN_HEAD: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+                Regex::new(r#"(?i)(?:aid|class|style|href|src|type|width|height|align|rel|valign|char|id|onclick|onload|target)\s*=\s*["']?"#).unwrap()
+            });
+            let virtual_str = d
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&amp;", "&");
+            let mut cleaned = RE_BROKEN_TAG.replace_all(&virtual_str, "").to_string();
+            let n1 = RE_BROKEN_TAG.find_iter(&virtual_str).count();
+            cleaned = RE_BROKEN_ATTR.replace_all(&cleaned, "").to_string();
+            let n2 = RE_BROKEN_ATTR.find_iter(&cleaned).count();
+            cleaned = RE_BROKEN_HEAD.replace_all(&cleaned, "").to_string();
+            self.drop_broken += n1 + n2;
+            for ch in cleaned.chars() {
                 match ch {
                     '<' => self.out.push_str("&lt;"),
                     '>' => self.out.push_str("&gt;"),
+                    '&' => self.out.push_str("&amp;"),
+                    '"' => self.out.push_str("&quot;"),
                     '\u{FFFD}' => {}
                     c => self.out.push(c),
                 }
@@ -923,6 +948,12 @@ pub fn decode_and_sanitize(html: &str) -> String {
                     st.flush();
                     let name = tag.name.to_string();
                     let ln = name.to_ascii_lowercase();
+                    // NUL 等非法字符开头的标签名（tokenizer 规范转 U+FFFD）：整体丢弃，
+                    // 浏览器对这种标签同样不会渲染成界面元素
+                    if !ln.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                        st.drop_tags += 1;
+                        return TokenSinkResult::Continue;
+                    }
                     let is_raw = ln == "script" || ln == "style";
                     if is_raw {
                         if matches!(tag.kind, TagKind::StartTag) && !tag.self_closing {
@@ -994,14 +1025,26 @@ pub fn decode_and_sanitize(html: &str) -> String {
         pending_text: String::new(),
         drop_raw: None,
         dangling,
+        drop_tags: 0,
+        drop_broken: 0,
     }));
     let tok = Tokenizer::new(Sink(st.clone()), html5ever::tokenizer::TokenizerOpts::default());
-    let q = html5ever::tokenizer::BufferQueue::default();
+    let mut q = html5ever::tokenizer::BufferQueue::default();
     q.push_back(html.into());
     let _res = tok.feed(&q);
     tok.end();
     let mut b = st.borrow_mut();
     b.flush();
+    if std::env::var("MOBI_SANITIZE_DEBUG").is_ok() {
+        eprintln!(
+            "[sanitize] in={} out={} drop_tags={} drop_broken={} dangling={}",
+            html.len(),
+            b.out.len(),
+            b.drop_tags,
+            b.drop_broken,
+            b.dangling
+        );
+    }
     std::mem::take(&mut b.out)
 }
 /// 悬空 RAWTEXT 检测：`<style` 与 `</style` 数量不等时，tokenizer 会把未闭合 style
@@ -1511,6 +1554,120 @@ mod tests {
         assert!(d2.warning.is_some(), "应有编码异常警告: {:?}", d2.warning);
     }
 
+    /// 全库扫描：定位哪本书含 "aid=" 泄漏源（EPUB/MOBI/TXT 分别处理）
+    /// 模拟浏览器渲染：跑完整管线后，把输出再 tokenize，检查文本节点里是否出现 aid=
+    /// 把输出再走一遍 tokenizer，收集文本节点，找疑似 HTML 源码 token
+    fn scan_visible_text_for_leaks(html: &str) -> Vec<String> {
+        use html5ever::tokenizer::{Token, TokenSink, TokenSinkResult, Tokenizer};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        #[derive(Clone)]
+        struct Collector(Rc<RefCell<String>>, Rc<RefCell<Vec<String>>>);
+        impl TokenSink for Collector {
+            type Handle = ();
+            fn process_token(&self, token: Token, _l: u64) -> TokenSinkResult<()> {
+                if let Token::CharacterTokens(c) = token {
+                    self.0.borrow_mut().push_str(&c.to_string());
+                }
+                TokenSinkResult::Continue
+            }
+        }
+        let text = Rc::new(RefCell::new(String::new()));
+        let _hits = Rc::new(RefCell::new(Vec::new()));
+        let tok = Tokenizer::new(
+            Collector(text.clone(), _hits.clone()),
+            html5ever::tokenizer::TokenizerOpts::default(),
+        );
+        let mut q = html5ever::tokenizer::BufferQueue::default();
+        q.push_back(html.into());
+        let _ = tok.feed(&q);
+        tok.end();
+        let t = text.borrow();
+        t.split_whitespace()
+            .filter(|w| w.contains("aid=\"") || w.contains("class=\""))
+            .take(8)
+            .map(|w| w.to_string())
+            .collect()
+    }
+
+    /// 回归：源文件里以实体形态存在的破碎标签（将夜 AZW3 实测样本）必须被剔除且不误伤正文
+    #[test]
+    fn broken_entity_tags_stripped() {
+        let src = "<p>压低声音aid=&quot;1IIHD&quot;道：夫人</p>";
+        let out = decode_and_sanitize(src);
+        assert!(!out.contains("aid="), "不得残留属性源码: {out}");
+        assert!(out.contains("压低声音") && out.contains("道：夫人"), "正文必须完整: {out}");
+        let src2 = "<p>x</p><div class=&quot;calibre2&quot;><b>粗体</b></div>";
+        let o2 = decode_and_sanitize(src2);
+        assert!(o2.contains("<div") && o2.contains("<b>粗体</b>"), "合法标签保留: {o2}");
+        assert!(!o2.contains("&lt;div"), "标签属性内实体不视为泄漏（浏览器不可见）: {o2}");
+        // 文本节点里的纯源码破碎标签才要剔除
+        let src4 = "<p>前&amp;lt;div class=&quot;toc&quot; aid=&quot;2&quot;&amp;gt;后</p>";
+        let o4 = decode_and_sanitize(src4);
+        assert!(o4.contains("前") && o4.contains("后"), "正文保留: {o4}");
+        assert!(!o4.contains("aid=") && !o4.contains("class="), "破碎标签文本剔除: {o4}");
+        // 数学小于号不误伤
+        let src3 = "<p>若a&lt;b且b&lt;c则成立</p>";
+        let o3 = decode_and_sanitize(src3);
+        assert!(o3.contains("&lt;b") && o3.contains("&lt;c"), "比较符保留: {o3}");
+    }
+    #[test]
+    fn scan_library_for_leak_source() {
+        let dir = std::env::var("LIB_SCAN_DIR").unwrap_or_default();
+        if dir.is_empty() {
+            return;
+        }
+        for ent in walk(&dir) {
+            let Ok(bytes) = std::fs::read(&ent) else { continue };
+            let name = ent.to_ascii_lowercase();
+            let mut hay: Vec<u8> = Vec::new();
+            if name.ends_with(".epub") {
+                if let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())) {
+                    for i in 0..z.len() {
+                        if let Ok(mut f) = z.by_index(i) {
+                            let mut buf = Vec::new();
+                            let _ = std::io::Read::read_to_end(&mut f, &mut buf);
+                            hay.extend_from_slice(&buf);
+                        }
+                    }
+                }
+            } else if name.ends_with(".mobi") || name.ends_with(".azw3") || name.ends_with(".prc") {
+                if let Ok(mobi) = Mobi::new(&bytes) {
+                    if let Ok(raw) = extract_records_and_decompress(&mobi) {
+                        hay = raw;
+                    }
+                }
+            } else if name.ends_with(".txt") {
+                hay = bytes;
+            }
+            let text = String::from_utf8_lossy(&hay).to_lowercase();
+            if let Some(i) = text.find("aid=\"") {
+                let raw = String::from_utf8_lossy(&hay).to_string();
+                let a = raw[i.saturating_sub(70)..i.min(raw.len())].to_string();
+                let b = raw[i..(i + 90).min(raw.len())].to_string();
+                eprintln!("AID@ {ent}\n  ctx: {a:?} ||| {b:?}");
+            }
+        }
+        eprintln!("scan done");
+    }
+
+    fn walk(dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return out };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                out.extend(walk(&path.to_string_lossy()));
+            } else if let Some(ext) = path.extension() {
+                let ex = ext.to_string_lossy().to_ascii_lowercase();
+                if matches!(ex.as_str(), "epub" | "mobi" | "azw3" | "prc" | "txt") {
+                    out.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn entity_decode_and_sanitize() {
         // 双重转义与裸实体均还原；属性内永不解码（回归根因）
@@ -1522,7 +1679,7 @@ mod tests {
         // `&amp;` 回填转义），文本实体还原
         assert!(g.contains("text-align:∧center"), "属性值等价且结构完好: {g}");
         assert!(g.contains("title=\"x&amp;y\""), "属性 & 转义回填: {g}");
-        assert!(g.contains("a & b ∧"), "文本节点实体解码: {g}");
+        assert!(g.contains("a &amp; b ∧"), "文本节点实体解码: {g}");
         assert_eq!(g.matches('<').count(), g.matches('>').count(), "标签结构完好: {g}");
         // script/style 连内容丢弃；标签/属性结构保留
         let c = decode_and_sanitize("<p>x</p><script>evil()</script><p>y</p>");

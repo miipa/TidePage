@@ -263,8 +263,9 @@
   }
 
   function prevChapter(toEnd = false) {
+    console.log("Prev Chapter Triggered, toEnd:", toEnd, "chapterNum:", chapterNum);
     if (book && chapterNum > 0) {
-      // toEnd=true：跨章回溯落到上一章末尾（翻页语义）；false：显式跳章从章首（原有语义）
+      // 回溯语义统一为"接着看上一章的结尾"（翻页与显式上一章均落章末）
       loadChapter(chapterNum - 1, undefined, toEnd ? { at: "tail", extra: 0 } : undefined);
     }
   }
@@ -584,8 +585,7 @@
         else nextChapter(true);
         break;
       case "chapterPrev":
-        if (config.reader.mode === "scroll") handleScrollEdge(-1, 0);
-        else prevChapter();
+        prevChapter(true);
         break;
       case "toc":
         tocOpen = !tocOpen;
