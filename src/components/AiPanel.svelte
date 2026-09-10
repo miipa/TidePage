@@ -13,6 +13,7 @@
     copyText,
     THEMES,
     AI_WIN_LABEL,
+    stripNonTextHtml,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -203,7 +204,7 @@
 
   function chapterText(html: string, limit = 9000): string {
     const div = document.createElement("div");
-    div.innerHTML = html;
+    div.innerHTML = stripNonTextHtml(html);
     const text = (div.textContent ?? "").replace(/\s+/g, " ").trim();
     return text.length > limit ? text.slice(0, limit) + "……(后文截断)" : text;
   }
@@ -423,7 +424,7 @@ ${readerStyle.extra}
     // 可视框只保留栏盒宽度：下一页的栏完全不可见（与主阅读器一致，杜绝“露半栏”）
     aiClip.style.marginLeft = `${side}px`;
     aiClip.style.marginRight = `${side}px`;
-    const total = Math.max(1, Math.ceil(maxCol / 340));
+    const total = 1; // 单栏：AI 面板拉宽也只显示一栏，多出的空间给正文
     const colW = Math.floor((maxCol - (total - 1) * gap) / total);
     aiColW = total * colW + (total - 1) * gap;
     aiStep = maxCol + gap;
