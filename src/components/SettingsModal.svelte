@@ -623,6 +623,16 @@
       </div>
     </div>
 
+    <div class="field">
+      <label>西文字体（拉丁字母/数字优先使用，中文字形仍走上方字体）</label>
+      <select bind:value={config.reader.latinFont} onchange={saveConfig}>
+        <option value="">保持默认（跟随正文字体）</option>
+        <option value="Georgia">Georgia</option>
+        <option value="Times New Roman">Times New Roman</option>
+      </select>
+      <p class="tip">用于改善中英混排时拉丁字符字形（雅黑自带西文较平庸）；AI 窗口同步生效。</p>
+    </div>
+
     <div class="grid3">
       <div class="field">
         <label>字号 {config.reader.fontSize}px</label>
@@ -934,7 +944,7 @@
       {/if}
       <div class="field" style="margin-bottom:12px">
         <label>AI 窗口自定义 CSS（仅阅读样式生效；作用于正文 .ai-mark）</label>
-        <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark pre { font-size: 0.9em; }"}></textarea>
+        <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark { color: #333; }"}></textarea>
         <p class="tip">勾选"跟随阅读界面"时，字号/行距/边距/缩进与正文完全一致；取消勾选后可单独设置。</p>
       </div>
     {/if}
