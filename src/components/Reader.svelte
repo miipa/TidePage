@@ -812,12 +812,13 @@ ${fontFaces}
 ${overrideRule}
 ${r.cssExtra || ""}
 /* 硬编码根治发糊：置于最后确保同特异度下覆盖用户 CSS（灰度抗锯齿已在 WebView2 参数层强制） */
-/* :root 前缀提升特异度(0,2,1)，保证永远压过动态注入的旧版 #chapter-content 规则，
-   且不依赖样式表加载顺序（AI 阅读样式内联 font-family 才能生效） */
+/* :root 前缀提升特异度(0,2,1)，保证永远压过动态注入的旧版 #chapter-content 规则。
+   该规则只作用于 #chapter-content 元素本身；AI 面板是 .body 下 .stage 的兄弟节点，
+   与本规则无同一元素竞争，AI 字体由 readerCss 的 !important 规则独立保证 */
 :root #chapter-content {
   font-synthesis-weight: none !important;
   text-rendering: geometricPrecision !important;
-  letter-spacing: var(--rdr-ls, 0.05em) !important;
+  letter-spacing: var(--rdr-ls, 0.05em) !important;${r.punctuationCompression ? `\n  font-feature-settings: "palt" 1 !important;` : ""}
 }
 `;
   }
@@ -840,6 +841,7 @@ ${r.cssExtra || ""}
     void r.fauxBold;
     void r.fauxItalic;
     void r.letterSpacing;
+    void r.punctuationCompression;
     const css = buildDynamicCss();
     if (!styleTag) {
       styleTag = document.createElement("style");
@@ -867,6 +869,7 @@ ${r.cssExtra || ""}
     r.fauxBold;
     r.fauxItalic;
     r.letterSpacing;
+    r.punctuationCompression;
     saveConfig();
     tick().then(scheduleRelayout);
   });

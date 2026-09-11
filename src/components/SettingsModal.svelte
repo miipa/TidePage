@@ -67,7 +67,15 @@
       const txt = await navigator.clipboard.readText();
       const obj = JSON.parse(txt);
       if (!obj || typeof obj !== "object" || !obj.reader) throw new Error("剪贴板不是有效的配置");
-      Object.assign(config, obj);
+      Object.assign(config, {
+        ...obj,
+        reader: { ...config.reader, ...obj.reader },
+        ai: {
+          ...config.ai,
+          ...(obj.ai || {}),
+          style: { ...config.ai.style, ...(obj.ai?.style || {}) },
+        },
+      });
       saveConfig();
       toast("已从剪贴板导入配置");
     } catch (e) {
@@ -683,6 +691,14 @@
       </div>
     </div>
     <p class="tip">关闭伪粗体/伪斜体可避免中文字体自动“假加粗/假斜”导致发糊发脏；字距微调可让正文更透气。</p>
+
+    <div class="field">
+      <label class="check">
+        <input type="checkbox" bind:checked={config.reader.punctuationCompression} onchange={saveConfig} />
+        压缩全角标点（实验性）
+      </label>
+      <p class="tip">仅影响正文与 AI 阅读窗口；可能改变总页数，不会自动跳到末页。</p>
+    </div>
     <hr />
 
     <div class="grid3">
