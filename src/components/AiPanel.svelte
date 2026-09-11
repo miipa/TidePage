@@ -345,6 +345,7 @@
     const t = THEMES[config.reader.theme];
     const r = config.reader;
     const s = config.ai.style;
+    const latin = r.latinFont || ""; // 西文优先为全局偏好：抽屉/独立窗口/AI 自定义模式统一生效
     const fontOk = s.followReader || !!s.fontFamily;
     const fs = s.followReader ? r.fontSize : (s.fontSize || r.fontSize);
     const lh = s.followReader ? r.lineHeight : (s.lineHeight > 0 ? s.lineHeight : r.lineHeight);
@@ -360,23 +361,27 @@
       mv: s.followReader ? r.marginV : (s.marginV > 0 ? s.marginV : r.marginV),
       bg: (!s.followReader && s.bgColor) || r.bgColor || t.bg,
       fg: (!s.followReader && s.fgColor) || r.fgColor || t.fg,
+      latin,
       indent: s.followReader ? r.indent : (s.indent || r.indent),
       ls: r.letterSpacing,
       extra: s.cssExtra || "",
     };
   });
 
-  function fontStack(raw: string): string {
-    const parts = (raw || "")
-      .split(",")
+  function fontStack(raw: string, latinFirst?: string): string {
+    const norm = (list: string[]) => list
       .map((x) => x.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean);
-    if (!parts.length) return '"Microsoft YaHei", "Segoe UI", sans-serif';
-    return parts.map((x) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(x) ? x : `"${x}"`)).join(", ");
+      .filter(Boolean)
+      .map((x) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(x) ? x : `"${x}"`))
+      .join(", ");
+    const base = norm((raw || "").split(","));
+    const latin = norm([latinFirst || ""]);
+    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
+    return base ? `${latin}, ${base}` : latin;
   }
 
   const readerVars = $derived(
-    `--ai-font:${fontStack(readerStyle.font)};--ai-fs:${readerStyle.size}px;--ai-lh:${readerStyle.lh};` +
+    `--ai-font:${fontStack(readerStyle.font, readerStyle.latin)};--ai-fs:${readerStyle.size}px;--ai-lh:${readerStyle.lh};` +
     `--ai-ps:${readerStyle.ps}em;--ai-bg:${readerStyle.bg};--ai-fg:${readerStyle.fg};--ai-ls:${readerStyle.ls}em;` +
     `--ai-indent:${readerStyle.indent}`
   );
@@ -1171,6 +1176,9 @@ ${readerStyle.extra}
     text-justify: inter-ideograph;
     overflow-wrap: break-word;
     cursor: default;
+    /* 与 Reader 的 --rdr-font（已含 latinFont 前置）同一机制；
+       动态注入的 .ai-panel.reader .ai-mark !important 在其之后加载，稳定覆盖此基础值 */
+    font-family: var(--rdr-font, "Microsoft YaHei", "Segoe UI", sans-serif);
   }
 
   .ai-mark :global(h1), .ai-mark :global(h2), .ai-mark :global(h3), .ai-mark :global(h4) {

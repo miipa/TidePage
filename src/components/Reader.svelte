@@ -753,13 +753,16 @@
     };
   });
 
-  function fontStack(raw: string): string {
-    const parts = (raw || "")
-      .split(",")
-      .map((s) => s.trim().replace(/^[\"']|[\"']$/g, ""))
-      .filter(Boolean);
-    if (!parts.length) return '"Microsoft YaHei", "Segoe UI", sans-serif';
-    return parts.map((s) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(s) ? s : `"${s}"`)).join(", ");
+  function fontStack(raw: string, latinFirst?: string): string {
+    const norm = (list: string[]) => list
+      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+      .map((s) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(s) ? s : `"${s}"`))
+      .join(", ");
+    const base = norm((raw || "").split(","));
+    const latin = norm([latinFirst || ""]);
+    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
+    return base ? `${latin}, ${base}` : latin;
   }
 
   function readerVars(): string {
@@ -769,7 +772,7 @@
     return [
       `--rdr-bg:${bg}`,
       `--rdr-fg:${fg}`,
-      `--rdr-font:${fontStack(config.reader.fontFamily)}`,
+      `--rdr-font:${fontStack(config.reader.fontFamily, config.reader.latinFont)}`,
       `--rdr-fs:${config.reader.fontSize}px`,
       `--rdr-lh:${config.reader.lineHeight}`,
       `--rdr-ps:${config.reader.paraSpacing}em`,
@@ -809,7 +812,9 @@ ${fontFaces}
 ${overrideRule}
 ${r.cssExtra || ""}
 /* 硬编码根治发糊：置于最后确保同特异度下覆盖用户 CSS（灰度抗锯齿已在 WebView2 参数层强制） */
-#chapter-content {
+/* :root 前缀提升特异度(0,2,1)，保证永远压过动态注入的旧版 #chapter-content 规则，
+   且不依赖样式表加载顺序（AI 阅读样式内联 font-family 才能生效） */
+:root #chapter-content {
   font-synthesis-weight: none !important;
   text-rendering: geometricPrecision !important;
   letter-spacing: var(--rdr-ls, 0.05em) !important;
@@ -855,6 +860,7 @@ ${r.cssExtra || ""}
     r.marginV;
     r.indent;
     r.fontFamily;
+    r.latinFont;
     r.cssExtra;
     r.overrideBookCss;
     r.customFonts;

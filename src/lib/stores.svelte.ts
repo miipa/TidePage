@@ -94,6 +94,7 @@ export interface ReaderConfig {
   duo: boolean;
   anim: boolean;
   fontFamily: string;
+  latinFont: string;
   fontSize: number;
   lineHeight: number;
   paraSpacing: number;
@@ -231,6 +232,7 @@ const DEFAULTS: AppConfig = {
     duo: false,
     anim: true,
     fontFamily: '"Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif',
+    latinFont: "",
     fontSize: 29,
     lineHeight: 1.55,
     paraSpacing: 0.5,
