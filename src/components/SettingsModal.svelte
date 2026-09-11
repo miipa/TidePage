@@ -922,10 +922,20 @@
             </div>
           </div>
         </div>
+        <div class="field" style="margin-bottom:10px">
+          <label>首行缩进（AI 阅读样式）</label>
+          <select bind:value={config.ai.style.indent} onchange={saveConfig}>
+            <option value="0em">不缩进</option>
+            <option value="1em">缩进 1 字</option>
+            <option value="2em">缩进 2 字</option>
+            <option value="3em">缩进 3 字</option>
+          </select>
+        </div>
       {/if}
       <div class="field" style="margin-bottom:12px">
         <label>AI 窗口自定义 CSS（仅阅读样式生效；作用于正文 .ai-mark）</label>
-        <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark p { text-indent: 2em; }"}></textarea>
+        <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark pre { font-size: 0.9em; }"}></textarea>
+        <p class="tip">勾选"跟随阅读界面"时，字号/行距/边距/缩进与正文完全一致；取消勾选后可单独设置。</p>
       </div>
     {/if}
 

@@ -287,6 +287,7 @@
 
   /* ---------- 翻页辅助数据 ---------- */
   let lastAi = -1;
+  let followEnd = false; // 用户处于/选择跟随末页：新回复与流式增长时钉住最后一页；手动翻页即解除
 
   function qShort(m: Msg | undefined): string {
     if (!m) return "";
@@ -359,6 +360,7 @@
       mv: s.followReader ? r.marginV : (s.marginV > 0 ? s.marginV : r.marginV),
       bg: (!s.followReader && s.bgColor) || r.bgColor || t.bg,
       fg: (!s.followReader && s.fgColor) || r.fgColor || t.fg,
+      indent: s.followReader ? r.indent : (s.indent || r.indent),
       ls: r.letterSpacing,
       extra: s.cssExtra || "",
     };
@@ -375,7 +377,8 @@
 
   const readerVars = $derived(
     `--ai-font:${fontStack(readerStyle.font)};--ai-fs:${readerStyle.size}px;--ai-lh:${readerStyle.lh};` +
-    `--ai-ps:${readerStyle.ps}em;--ai-bg:${readerStyle.bg};--ai-fg:${readerStyle.fg};--ai-ls:${readerStyle.ls}em`
+    `--ai-ps:${readerStyle.ps}em;--ai-bg:${readerStyle.bg};--ai-fg:${readerStyle.fg};--ai-ls:${readerStyle.ls}em;` +
+    `--ai-indent:${readerStyle.indent}`
   );
 
   const readerCss = $derived(`
@@ -384,9 +387,10 @@
   font-family: var(--ai-font) !important;
   font-size: var(--ai-fs) !important;
   line-height: var(--ai-lh) !important;
-  letter-spacing: var(--ai-ls) !important;
+  letter-spacing: var(--ai-ls, 0.05em) !important;
 }
-.ai-panel.reader .ai-mark p { margin: var(--ai-ps) 0 !important; text-indent: 0 !important; }
+.ai-panel.reader .ai-mark p { margin: var(--ai-ps) 0 !important; text-indent: var(--ai-indent, 0em) !important; }
+.ai-panel.reader .ai-mark p.li { text-indent: -1.4em !important; }
 .ai-panel.reader .ai-q-title { font-family: var(--ai-font) !important; }
 ${readerStyle.extra}
 `);
@@ -413,6 +417,9 @@ ${readerStyle.extra}
   /* ---------- 阅读样式：整屏分栏翻页 ---------- */
   function measureAi() {
     if (!isReader || !aiClip || !aiInner) return;
+    // 隐藏/叠层遮挡期间不测量：零宽瞬态会把 aiPages 误缩为 1，
+    // 导致恢复布局后 wasAtEnd 误判、无辜把用户从中间页弹到末页
+    if (!aiClip.offsetParent) return;
     const r = readerStyle;
     const T = aiClip.parentElement ? aiClip.parentElement.clientWidth : aiClip.clientWidth;
     const H = aiClip.clientHeight;
@@ -435,14 +442,17 @@ ${readerStyle.extra}
     st.columnWidth = `${colW}px`;
     st.columnGap = `${gap}px`;
     const cols = Math.max(1, Math.round((aiInner.scrollWidth + gap) / (colW + gap)));
-    aiPages = Math.max(1, Math.ceil(cols / total));
+    const newPages = Math.max(1, Math.ceil(cols / total));
+    // 末页跟随只看 followEnd（新回复时置位、手动交互清零），
+    // 不依赖"当前是否恰在末页"——布局瞬态（弹层遮挡/回流）不会误判跳页
+    aiPages = newPages;
+    aiPage = followEnd ? aiPages - 1 : Math.min(aiPage, aiPages - 1);
     const starts: number[] = [];
     for (const pg of aiInner.querySelectorAll<HTMLElement>(".ai-reply")) {
       const col = Math.round(pg.offsetLeft / (colW + gap));
       starts.push(Math.min(aiPages - 1, Math.max(0, Math.floor(col / total))));
     }
     pageStarts = starts;
-    aiPage = Math.min(aiPage, aiPages - 1);
     applyAiPage();
   }
 
@@ -467,6 +477,7 @@ ${readerStyle.extra}
   }
 
   function aiFlip(dir: number) {
+    followEnd = false;
     const np = Math.max(0, Math.min(aiPage + dir, aiPages - 1));
     aiPage = np;
     applyAiPage();
@@ -541,6 +552,7 @@ ${readerStyle.extra}
   }
 
   function aiSeekFrac(f: number) {
+    followEnd = false;
     if (aiPages <= 1) { aiPage = 0; applyAiPage(); return; }
     aiPage = Math.max(0, Math.min(Math.round(f * (aiPages - 1)), aiPages - 1));
     applyAiPage();
@@ -572,7 +584,9 @@ ${readerStyle.extra}
     ro = new ResizeObserver(() => scheduleMeasure());
     ro.observe(aiClip);
     if (aiInner) ro.observe(aiInner);
-    const t = setTimeout(() => scheduleMeasure(true), 300);
+    // 仅重新测量（measureAi 内部按 followEnd 决定是否钉末页）；
+    // 不能用 force，否则 readerStyle（含缩进）每次变化重跑本 effect 会把用户从中间页弹到末页
+    const t = setTimeout(() => scheduleMeasure(), 300);
     return () => {
       clearTimeout(t);
       ro?.disconnect();
@@ -580,12 +594,13 @@ ${readerStyle.extra}
     };
   });
 
-  // 阅读样式下自动跳到最新一页
+  // 阅读样式下自动跳到最新一页（置位跟随；用户手动翻页时解除）
   $effect(() => {
     if (!isReader) return;
     void msgs.length;
     const last = msgs[msgs.length - 1];
     if (last && last.role === "assistant") {
+      followEnd = true;
       queueMicrotask(() => scheduleMeasure(true));
     }
   });
@@ -765,7 +780,7 @@ ${readerStyle.extra}
               class:cur={aiReplyOfPage === gi}
               title={(gi > 0 && msgs[gi - 1]?.role === "user" ? qShort(msgs[gi - 1]) : "回复 " + (gi + 1))}
               style={`flex:${segWeight(gi)} 1 0`}
-              onclick={(e) => { e.stopPropagation(); aiPage = segPageOf(gi); applyAiPage(); }}
+              onclick={(e) => { e.stopPropagation(); followEnd = false; aiPage = segPageOf(gi); applyAiPage(); }}
             ></div>
           {/each}
         </div>
