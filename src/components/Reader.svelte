@@ -812,7 +812,7 @@ ${r.cssExtra || ""}
 #chapter-content {
   font-synthesis-weight: none !important;
   text-rendering: geometricPrecision !important;
-  letter-spacing: 0.05em !important;
+  letter-spacing: var(--rdr-ls, 0.05em) !important;
 }
 `;
   }
