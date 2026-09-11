@@ -164,6 +164,7 @@ export interface AiStyleConfig {
   marginV: number;
   bgColor: string;
   fgColor: string;
+  indent: string;
   cssExtra: string;
 }
 
@@ -357,6 +358,7 @@ p {
       marginV: 0,
       bgColor: "",
       fgColor: "",
+      indent: "1em",
       cssExtra: "",
     },
   },
@@ -435,7 +437,7 @@ function load(): AppConfig {
     const saved = JSON.parse(raw);
     let indent = saved.reader?.indent;
     if (typeof indent === "boolean") indent = indent ? "2em" : "0em";
-    if (indent == null) indent = "2em";
+    if (indent == null) indent = "1em";
     const merged: AppConfig = {
       reader: {
         ...DEFAULTS.reader,
