@@ -121,6 +121,7 @@ export interface ReaderConfig {
   scrollBounce: boolean;
   scrollBounceStrength: number;
   scrollBounceThreshold: number;
+  punctuationCompression: boolean;
   multiWindow: boolean;
   statusPos: "left" | "center" | "right" | "none";
   statusColor: string;
@@ -290,6 +291,7 @@ p {
     scrollBounce: true,
     scrollBounceStrength: 0.5,
     scrollBounceThreshold: 340,
+    punctuationCompression: false,
     multiWindow: false,
     statusPos: "center",
     statusColor: "",
