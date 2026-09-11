@@ -470,6 +470,15 @@ function load(): AppConfig {
         merged.reader.bindings[act] = arr.map((k) => (normBindKey(k) === "esc" ? "Esc" : k));
       }
     }
+    // 一次性迁移：字距旧默认 0.045 → 0.05（v0.1.20 起 0.05 为确定默认值）。
+    // 仅当存量值【恰好等于旧默认】时上抬；用户手动调过的其他值（含 0.044/0.046）不动。
+    // flag 防重复执行。
+    try {
+      if (!localStorage.getItem("flowread.lsmig.v1")) {
+        if (merged.reader.letterSpacing === 0.045) merged.reader.letterSpacing = 0.05;
+        localStorage.setItem("flowread.lsmig.v1", "1");
+      }
+    } catch { /* ignore */ }
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -568,7 +577,7 @@ export async function copyText(text: string) {  try {
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
 
-export const APP_BUILD = "2026.09.11c";
+export const APP_BUILD = "2026.09.11d";
 
 // 与 Rust 主窗口本次启动实际使用的 WebView2 参数保持一致：
 // Windows 上同一 user-data-dir 的 WebView2 环境要求所有窗口的
