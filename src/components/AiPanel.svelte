@@ -398,6 +398,7 @@
 .ai-panel.reader .ai-mark p.li { text-indent: -1.4em !important; }
 .ai-panel.reader .ai-q-title { font-family: var(--ai-font) !important; }
 ${readerStyle.extra}
+${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-feature-settings: "palt" 1 !important; }` : ""}
 `);
 
   let aiStyleTag: HTMLStyleElement | null = null;
@@ -584,6 +585,7 @@ ${readerStyle.extra}
     void aiInner;
     void readerStyle;
     void panelWidth;
+    void config.reader.punctuationCompression; // 开关切换改变正文宽度 → 重新分页（不 force，不弹末页）
     if (!isReader || !aiClip) return;
     ro?.disconnect();
     ro = new ResizeObserver(() => scheduleMeasure());

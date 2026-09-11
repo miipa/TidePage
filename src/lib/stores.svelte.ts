@@ -498,6 +498,18 @@ export function applyConfigJson(json: string) {
     if (json === JSON.stringify(config)) return;
     const obj = JSON.parse(json);
     if (!obj || typeof obj !== "object" || !obj.reader || !obj.ai) return;
+    obj.reader = {
+      ...structuredClone(DEFAULTS.reader),
+      ...obj.reader,
+      bindings: {
+        ...structuredClone(DEFAULT_BINDINGS),
+        ...(obj.reader.bindings || {}),
+      },
+      zones: {
+        ...structuredClone(DEFAULT_ZONES),
+        ...(obj.reader.zones || {}),
+      },
+    };
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
