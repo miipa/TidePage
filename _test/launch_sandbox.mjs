@@ -1,7 +1,9 @@
-// 通过受守卫启动器启动沙箱。守卫失败 → 不产生任何进程。
+// 受守卫沙箱启动器 v2：buildSandboxEnv 通过后才到达 spawnImpl；Node 直接 spawn
+// cmd.exe（无 bat、无 PowerShell Start-Process 间接层），child.pid 即真实树根。
+// 调用方必须 try/finally，finally 里 killTree(child.pid)。
 import path from "node:path";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildSandboxEnv } from "./isolation_guard.mjs";
 
@@ -14,20 +16,29 @@ export function launchSandbox({
   logFile = path.join(path.dirname(process.env.LOCALAPPDATA || ""), "Temp", "fr_test_profiles", "sandbox_dev.log"),
   spawnImpl = spawn,
 } = {}) {
-  // ↓ 校验失败即 throw，spawnImpl 不可达（必改1#4/#5）
+  // ↓ 校验失败即 throw，spawnImpl 不可达
   const finalEnv = buildSandboxEnv(env, { cdpPort });
-  // 写批处理到沙箱根内；经 powershell Start-Process(ShellExecute) 分离启动——已实测该方式
-  // 能脱离本工具进程树存活；finalEnv（已验证 WEBVIEW2_USER_DATA_FOLDER + 注入端口）全链继承。
-  const bat = path.join(path.dirname(logFile), "sandbox_dev.cmd");
-  fs.mkdirSync(path.dirname(bat), { recursive: true });
-  fs.writeFileSync(bat, `@echo off\r\ncd /d "${REPO}"\r\nnpm.cmd run tauri dev > "${logFile}" 2>&1\r\n`);
-  const ps = `Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c','"${bat}"'`;
-  const encoded = Buffer.from(ps, "utf16le").toString("base64");
-  const child = spawnImpl("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  const fd = fs.openSync(logFile, "a");
+  const child = spawnImpl("cmd.exe", ["/d", "/s", "/c", "npm.cmd run tauri dev"], {
     cwd: REPO,
     env: finalEnv,
-    stdio: "ignore",
+    stdio: ["ignore", fd, fd],
     windowsHide: true,
+    detached: false,
   });
   return { child, env: finalEnv, cdp: `http://127.0.0.1:${cdpPort}` };
+}
+
+// 杀 cmd→npm→tauri CLI→cargo/vite→flowread 全树 + 沙箱内 WebView2 浏览器进程；循环直到归零。
+export function killTree(pid) {
+  try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* already gone */ }
+}
+export function sweepSandboxWebviews(userdataNeedle) {
+  const psScript =
+    "$p=Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -match '" + userdataNeedle + "' };" +
+    "foreach($x in $p){ Stop-Process -Id $x.ProcessId -Force -EA SilentlyContinue }; @($p).Count";
+  try {
+    return Number(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", psScript], { encoding: "utf8" }).trim()) || 0;
+  } catch { return 0; }
 }
