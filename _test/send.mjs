@@ -7,11 +7,14 @@ const CHIP = ".prompt-chip:not(.add)";
 
 export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null, allowUnsupported = false } = {}) {
   return withSendGuard(cdp.evalJs, async () => {
-    // 守卫第二层：off 且端点不可用（非 Ollama 且未配置非思考模型）→ 测试侧拦截；
+    // 守卫第二层：off 时按与前端 reasoningOffUsable 相同逻辑判定可用性（含策略），不可用才拦截；
     // allowUnsupported 仅用于验证应用侧 run() 拦截本身
-    const state = await cdp.evalJs(`(()=>{const c=JSON.parse(localStorage.getItem('flowread.config.v1'));const p=c.ai.profiles[Math.min(c.ai.active|0,c.ai.profiles.length-1)];return {mode:c.ai.reasoningMode, provider:p.provider, offModel:(p.reasoningOffModel||'').trim()}})()`);
-    if (!allowUnsupported && state.mode === "off" && state.provider !== "ollama" && !state.offModel) {
-      throw new Error(`发送拦截：reasoningMode=off 而激活端点 ${state.provider} 未配置非思考模型（不可用），测试不点击、不假装关闭。`);
+    const state = await cdp.evalJs(`(()=>{const c=JSON.parse(localStorage.getItem('flowread.config.v1'));const p=c.ai.profiles[Math.min(c.ai.active|0,c.ai.profiles.length-1)];return {mode:c.ai.reasoningMode, provider:p.provider, strategy:p.reasoningOffStrategy||'switch-model', offModel:(p.reasoningOffModel||'').trim(), model:(p.model||'').trim()}})()`);
+    const plainId = (s) => !!s && s.length <= 160 && !s.startsWith('/') && !s.includes('://') && /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(s);
+    const usable = state.mode !== "off" || state.provider === "ollama"
+      || (state.strategy === "switch-model" ? plainId(state.offModel) : plainId(state.model));
+    if (!allowUnsupported && state.mode === "off" && !usable) {
+      throw new Error(`发送拦截：reasoningMode=off 而激活端点 ${state.provider}（策略 ${state.strategy}）不可用，测试不点击、不假装关闭。`);
     }
     return cdp.evalJs(`(async()=>{
       const sleep=ms=>new Promise(r=>setTimeout(r,ms));

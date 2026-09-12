@@ -11,6 +11,20 @@ pub struct AiConfig {
     /// "auto" | "off"；仅 Ollama /api/chat 协议明确支持 think:false，
     /// 其他适配器收到 off 必须显式报错，不得静默按 auto 或注入未知字段
     pub reasoning_mode: String,
+    /// off 时 OpenAI 兼容端点的关闭策略：switch-model(默认,无注入) / json-think-false /
+    /// query-think-false / header-think-false。任何策略都不得把参数并入 model 字段。
+    pub reasoning_strategy: String,
+}
+
+/// 模型ID形状守卫（与前端 isPlainModelId 对齐）：只允许字母数字与 . _ / : -，
+/// 拒空/前导/ / :// ；防止把 JSON 片段、?query、-H 请求头、curl 整行塞进 model。
+pub fn valid_model_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 160
+        && !s.starts_with('/')
+        && !s.contains("://")
+        && s.chars().next().map_or(false, |c| c.is_ascii_alphanumeric())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '-'))
 }
 
 pub fn build_client(proxy_mode: &str, proxy_url: &str) -> Result<reqwest::Client, String> {
@@ -224,21 +238,32 @@ pub async fn stream_chat(
         }
         (b, false)
     } else {
-        // OpenAI 兼容端点：协议层无统一关闭字段，off 时绝不注入 think/reasoning_effort/thinking 等未知字段
-        // （可能被 400）。合法的 off 由上层显式改用用户配置的 reasoningOffModel 后按普通请求发送；
-        // “不可用”场景（未配置非推理模型）在 JS run() 发送前拦截，不会走到这里。
-        (
-            json!({
-                "model": cfg.model,
-                "messages": msgs,
-                "stream": true,
-                "temperature": 0.7
-            }),
-            !cfg.api_key.is_empty(),
-        )
+        // OpenAI 兼容端点：off 时按用户显式选择的策略注入，且绝不把参数并入 model。
+        // auto 模式不发送任何关闭参数。未选/伪造策略一律不注入（回落 switch-model 语义=无注入）。
+        if !valid_model_id(&cfg.model) {
+            let msg = "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。".to_string();
+            let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": &msg, "done": true}));
+            return Err(msg);
+        }
+        let mut b = json!({
+            "model": cfg.model,
+            "messages": msgs,
+            "stream": true,
+            "temperature": 0.7
+        });
+        if cfg.reasoning_mode == "off" && cfg.reasoning_strategy == "json-think-false" {
+            b["think"] = json!(false);
+        }
+        (b, !cfg.api_key.is_empty())
     };
 
-    let mut req = http.post(&url).timeout(std::time::Duration::from_secs(300));
+    // query / header 策略只在 off + OpenAI 兼容对应策略时追加，且不改 model。
+    let final_url = off_query_url(&url, is_ollama, &cfg.reasoning_mode, &cfg.reasoning_strategy);
+
+    let mut req = http.post(&final_url).timeout(std::time::Duration::from_secs(300));
+    if !is_ollama && cfg.reasoning_mode == "off" && cfg.reasoning_strategy == "header-think-false" {
+        req = req.header("X-Think-Enabled", "false");
+    }
     if use_auth {
         use base64::Engine;
         let cred = format!("Bearer {}", cfg.api_key);
@@ -378,4 +403,46 @@ pub async fn stream_chat(
     }
     emit_delta(&app, &id, "", true);
     Ok(())
+}
+
+/// query 策略下拼装最终 URL（纯函数，便于单测）。仅 off+OpenAI 兼容+query-think-false 追加 think=false。
+pub fn off_query_url(url: &str, is_ollama: bool, mode: &str, strategy: &str) -> String {
+    if !is_ollama && mode == "off" && strategy == "query-think-false" {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{}{}think=false", url, sep)
+    } else {
+        url.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_id_shape() {
+        assert!(valid_model_id("TARGET"));
+        assert!(valid_model_id("deepseek-chat"));
+        assert!(valid_model_id("openai/gpt-4o"));
+        assert!(valid_model_id("llama3:latest"));
+        assert!(!valid_model_id(""));
+        assert!(!valid_model_id("TARGET\" , \"think\": false"));
+        assert!(!valid_model_id("TARGET?think=false"));
+        assert!(!valid_model_id("-H \"X-Think: 1\""));
+        assert!(!valid_model_id("http://evil/v1/completions"));
+        assert!(!valid_model_id("/v1/completions"));
+        assert!(!valid_model_id("X-Think-Enabled: false"));
+    }
+
+    #[test]
+    fn query_only_when_off_openai() {
+        let base = "http://h/v1/chat/completions";
+        assert_eq!(off_query_url(base, false, "off", "query-think-false"), "http://h/v1/chat/completions?think=false");
+        assert_eq!(off_query_url("http://h/c?a=1", false, "off", "query-think-false"), "http://h/c?a=1&think=false");
+        assert_eq!(off_query_url(base, false, "auto", "query-think-false"), base);
+        assert_eq!(off_query_url(base, false, "off", "json-think-false"), base);
+        assert_eq!(off_query_url(base, false, "off", "header-think-false"), base);
+        assert_eq!(off_query_url(base, false, "off", "switch-model"), base);
+        assert_eq!(off_query_url(base, true, "off", "query-think-false"), base);
+    }
 }

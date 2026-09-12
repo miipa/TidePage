@@ -16,6 +16,8 @@
     stripNonTextHtml,
     providerSupportsReasoningOff,
     reasoningOffUsable,
+    isPlainModelId,
+    sanitizeOffStrategy,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -225,18 +227,30 @@
       toast("请先在设置 → AI 配置端点", "error");
       return;
     }
-    // 发送开始即快照（mode/主模型/非思考模型）：生成途中任何修改只影响下一次请求
+    // 发送开始即快照（mode/主模型/非思考模型/策略）：生成途中任何修改只影响下一次请求
     const reasoningMode = config.ai.reasoningMode;
     const mainModel = profile.model;
     const offModel = (profile.reasoningOffModel || "").trim();
+    const strategy = sanitizeOffStrategy(profile.reasoningOffStrategy);
     if (reasoningMode === "off" && !reasoningOffUsable(profile)) {
       toast(providerSupportsReasoningOff(profile.provider)
         ? "关闭思考请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。"
-        : "该 OpenAI 兼容端点未配置「关闭思考模型」：请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。请在设置中显式填写一个非推理模型，或切回「自动」。", "error");
+        : (strategy === "switch-model"
+            ? "该端点关闭方式为「切换非思考模型」，但『关闭思考模型』未填合法模型ID：请求已拦截（不会按 auto 偷发，不猜模型）。"
+            : "主模型ID含非法字符或关闭方式无效：请求已拦截（不会按 auto 偷发）。"), "error");
       return;
     }
-    // off+非Ollama：明确改用用户配置的非推理模型（用户显式配置，非暗中切换）；Ollama 保持原模型+think:false
-    const useModel = reasoningMode === "off" && !providerSupportsReasoningOff(profile.provider) && offModel ? offModel : mainModel;
+    // 模型形状守卫：任何策略下 model 只能是纯模型ID（拒 JSON/URL/curl/请求头文本）
+    if (!isPlainModelId(mainModel)) {
+      toast("主模型ID含非法字符（请求头/JSON/URL/curl 不能作为模型ID），请求已拦截。", "error");
+      return;
+    }
+    // switch-model+off：显式改用用户填的非思考模型；其余策略只走请求层注入，model 永不变
+    const useModel = reasoningMode === "off" && strategy === "switch-model" && !providerSupportsReasoningOff(profile.provider) ? offModel : mainModel;
+    if (reasoningMode === "off" && !isPlainModelId(useModel)) {
+      toast("『关闭思考模型』必须是纯模型ID，请求已拦截。", "error");
+      return;
+    }
     const id = `s${++sessionSeq}-${Date.now()}`;
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
@@ -274,6 +288,7 @@
         proxyMode: profile.proxyMode,
         proxyUrl: profile.proxyUrl,
         reasoningMode,
+        reasoningStrategy: strategy,
       });
     } catch (e) {
       reply.content += `\n\n[错误] ${e}`;

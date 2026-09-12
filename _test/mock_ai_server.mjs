@@ -17,8 +17,18 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => (raw += c));
   req.on("end", async () => {
     let body; try { body = JSON.parse(raw); } catch { body = raw; }
-    const red = body && typeof body === "object" ? { ...body, messages: (body.messages || []).map((m) => ({ role: m.role, len: (m.content || "").length })) } : body;
-    fs.appendFileSync(LOG, JSON.stringify({ t: Date.now(), path: req.url, auth: req.headers.authorization ? "present" : "none", body: red }) + "\n");
+    const red = body && typeof body === "object" ? { ...body, messages: (body.messages || []).map((m) => ({ role: m.role, len: (m.content || "").length })), prompt: typeof body.prompt === "string" ? { len: body.prompt.length, head: body.prompt.slice(0, 40) } : body.prompt } : body;
+    // 捕获出站形状：完整 path(含 query)、method、白名单 header（不记 Authorization 正文，只记存在）
+    const capture = {
+      t: Date.now(),
+      url: req.url,
+      path: req.url,
+      method: req.method,
+      auth: req.headers.authorization ? "present" : "none",
+      thinkHeader: req.headers["x-think-enabled"] ?? null,
+      body: red,
+    };
+    fs.appendFileSync(LOG, JSON.stringify(capture) + "\n");
     const sk = body?.model;
     const thinking = sk === "mock-thinking";
     if (req.url === "/api/chat") {
