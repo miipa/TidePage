@@ -191,6 +191,16 @@ export function providerSupportsReasoningOff(provider: string): boolean {
   return provider === "ollama";
 }
 
+// 单一能力闸门：当激活端点不支持明确关闭思考时，把持久化的 off 归一为 auto，
+// 保证不会“保存 off 后每次发送都报错”。在 load/applyConfigJson/端点切换处统一调用。
+export function normalizeAiCapability(ai: AiConfig): AiConfig {
+  const active = ai.profiles[Math.min(ai.active | 0, ai.profiles.length - 1)] ?? ai.profiles[0];
+  if (ai.reasoningMode === "off" && (!active || !providerSupportsReasoningOff(active.provider))) {
+    ai.reasoningMode = "auto";
+  }
+  return ai;
+}
+
 export const DEFAULT_AI_PROFILES: AiProfile[] = [
   {
     name: "DeepSeek",
@@ -408,7 +418,7 @@ function migrateAi(savedAi: any): AiConfig {
       base.prompts = savedAi.prompts;
     }
     base.active = Math.min(Math.max(savedAi.active | 0, 0), base.profiles.length - 1);
-    return base;
+    return normalizeAiCapability(base);
   }
   let profiles: AiProfile[];
   const legacyUrl = savedAi?.baseUrl || savedAi?.apiKey || savedAi?.model;
@@ -434,7 +444,7 @@ function migrateAi(savedAi: any): AiConfig {
   if (savedAi?.action === "custom" && savedAi?.customPrompt) {
     prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt });
   }
-  return {
+  return normalizeAiCapability({
     enabled: !!savedAi?.enabled,
     autoOnChapter: savedAi?.autoOnChapter ?? true,
     system: savedAi?.system ?? DEFAULTS.ai.system,
@@ -444,7 +454,7 @@ function migrateAi(savedAi: any): AiConfig {
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
     reasoningMode: savedAi?.reasoningMode === "off" ? "off" : "auto",
-  };
+  });
 }
 
 function load(): AppConfig {
@@ -530,6 +540,7 @@ export function applyConfigJson(json: string) {
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
+    normalizeAiCapability(config.ai);
   } catch {
     /* ignore */
   }

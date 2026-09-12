@@ -325,6 +325,16 @@ pub async fn stream_chat(
             }
             if is_ollama {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    // off 模式收到非空 thinking = 服务/模型未真正执行关闭，显式报错而非静默丢弃
+                    if cfg.reasoning_mode == "off" {
+                        if let Some(think) = v.pointer("/message/thinking").and_then(|t| t.as_str()) {
+                            if !think.is_empty() {
+                                let msg = "服务或模型未执行关闭思考（off 模式仍返回 thinking 内容）".to_string();
+                                emit_err(&app, &id, &msg);
+                                return Err(msg);
+                            }
+                        }
+                    }
                     if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_str()) {
                         got_any = true;
                         let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
