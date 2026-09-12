@@ -7,10 +7,11 @@ const CHIP = ".prompt-chip:not(.add)";
 
 export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null, allowUnsupported = false } = {}) {
   return withSendGuard(cdp.evalJs, async () => {
-    // 守卫第二层：off + 不支持的 provider → 测试侧拦截；allowUnsupported 仅用于验证应用侧拦截本身
-    const state = await cdp.evalJs(`(()=>{const c=JSON.parse(localStorage.getItem('flowread.config.v1'));const p=c.ai.profiles[Math.min(c.ai.active|0,c.ai.profiles.length-1)];return {mode:c.ai.reasoningMode, provider:p.provider}})()`);
-    if (!allowUnsupported && state.mode === "off" && state.provider !== "ollama") {
-      throw new Error(`发送拦截：reasoningMode=off 而激活端点为 ${state.provider}（不支持明确关闭），测试不点击、不假装关闭。`);
+    // 守卫第二层：off 且端点不可用（非 Ollama 且未配置非思考模型）→ 测试侧拦截；
+    // allowUnsupported 仅用于验证应用侧 run() 拦截本身
+    const state = await cdp.evalJs(`(()=>{const c=JSON.parse(localStorage.getItem('flowread.config.v1'));const p=c.ai.profiles[Math.min(c.ai.active|0,c.ai.profiles.length-1)];return {mode:c.ai.reasoningMode, provider:p.provider, offModel:(p.reasoningOffModel||'').trim()}})()`);
+    if (!allowUnsupported && state.mode === "off" && state.provider !== "ollama" && !state.offModel) {
+      throw new Error(`发送拦截：reasoningMode=off 而激活端点 ${state.provider} 未配置非思考模型（不可用），测试不点击、不假装关闭。`);
     }
     return cdp.evalJs(`(async()=>{
       const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -18,6 +19,7 @@ export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null
       if(!d) throw new Error('sendTestPrompt: 未找到 .ai-panel');
       const chip=d.querySelector(${JSON.stringify(CHIP)});
       if(!chip) throw new Error('sendTestPrompt: 未找到提示词芯片');
+      for(let w=0;w<100 && d.querySelector(${JSON.stringify(CHIP)}).disabled;w++) await sleep(200); // 等待上一条流式结束，避免点击被忽略
       const before=d.querySelectorAll('.ai-mark').length;
       chip.click();
       await sleep(150);

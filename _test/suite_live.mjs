@@ -28,6 +28,8 @@ const openSettings=async(tab)=>{ document.querySelector('button[title="设置"]'
 const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(200); };
 const uiSet=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('select'),'uiSet '+labelText); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const uiInput=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('input'),'uiInput '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
+const labelField=(t)=>[...document.querySelectorAll('.field')].find(f=>f.querySelector('label')?.textContent.includes(t));
+const uiInputByLabel=async(labelText,val)=>{ const s=await wait(()=>labelField(labelText)?.querySelector('input'),'uiInputByLabel '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const setReasoningUI=async(v)=>{ await openSettings('AI'); const s=await wait(()=>field('思考模式')?.querySelector('select'),'rs'); s.value=v; s.dispatchEvent(new Event('change',{bubbles:true})); closeSettings(); await sleep(400); };
 const paltBox=async(want)=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); if(cb.checked!==want){ cb.click(); await sleep(500);} else { await sleep(50);} };
 const paltToggle=async()=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); const want=!cb.checked; cb.click(); await sleep(500); return want; };
@@ -109,7 +111,8 @@ try {
   await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
   out.seedReadback = await M.evalJs(H(`
     const c=cfgRead(); const p=c.ai.profiles[0];
-    return {name:p.name,provider:p.provider,baseUrl:p.baseUrl,model:p.model,keyLen:(p.apiKey||'').length,enabled:c.ai.enabled,reasoning:c.ai.reasoningMode};
+    return {name:p.name,provider:p.provider,baseUrl:p.baseUrl,model:p.model,keyLen:(p.apiKey||'').length,enabled:c.ai.enabled,reasoning:c.ai.reasoningMode,
+      f_oldConfig_fieldPresent:'reasoningOffModel' in p, f_oldConfig_value:p.reasoningOffModel};
   `));
 
   log("B");
@@ -189,6 +192,63 @@ try {
     const e2 = await sendTestPrompt(M);
     out.E_secondReq = { req: brief(mockReqs()[n1]), completed: e2 };
     await M.evalJs(H(`await setReasoningUI("auto")`));
+  }
+
+  log("D2/E2 openai-compat 关闭思考模型");
+  {
+    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','openai'); closeSettings(); await sleep(400); return cfgRead().ai.profiles[0].provider`));
+    out.D2_offDisabledEmpty = await M.evalJs(H(`
+      await openSettings('AI');
+      const sel=await wait(()=>field('思考模式')?.querySelector('select'),'rs');
+      const offOpt=sel.querySelector('option[value="off"]');
+      const tip=field('思考模式').textContent.includes('关闭思考模型');
+      closeSettings();
+      return { offOptionDisabled: offOpt.disabled, tipExplainsConfig: tip, currentMode: sel.value };
+    `));
+    // 模拟“外部导入”形成 unsupported+off：写 localStorage 后必须 reload 让内存生效（否则测的不是 off）
+    await M.evalJs(H(`const c=cfgRead(); c.ai.reasoningMode="off"; localStorage.setItem("flowread.config.v1", JSON.stringify(c)); setTimeout(()=>location.reload(),200); return 1`));
+    await sleep(4500);
+    await ensureReady(M);
+    await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
+    try { await sendTestPrompt(M); out.D2_emptyTestBlocked = "NOT-BLOCKED!!"; }
+    catch (e) { out.D2_emptyTestBlocked = e.message.slice(0, 60); }
+    const nApp = mockReqs().length;
+    await sendTestPrompt(M, { allowUnsupported: true });
+    await sleep(800);
+    out.D2_emptyAppGuard = await M.evalJs(H(`return { toastBlocked: toastsNow().includes('已拦截'), marks: document.querySelectorAll('.ai-panel .ai-mark').length }`));
+    out.D2_emptyAppGuard_mockDelta = mockReqs().length - nApp;
+    // 配置非思考模型（显式手动输入，非预填）
+    out.D2_afterConfig = await M.evalJs(H(`
+      await openSettings('AI');
+      await uiInputByLabel('关闭思考模型','mock-off-model');
+      const sel=field('思考模式').querySelector('select');
+      const enabled=!sel.querySelector('option[value="off"]').disabled;
+      const showUse=field('思考模式').textContent.includes('关闭思考时将使用模型：mock-off-model') || field('思考模式').textContent.includes('将使用模型：mock-off-model');
+      sel.value="off"; sel.dispatchEvent(new Event('change',{bubbles:true}));
+      closeSettings(); await sleep(400);
+      return { offNowSelectable: enabled, uiShowsOffModel: showUse, mode: cfgRead().ai.reasoningMode };
+    `));
+    let n0 = mockReqs().length;
+    out.D2_off_usesOffModel = { send: await sendTestPrompt(M), req: { path: mockReqs()[n0]?.path, model: mockReqs()[n0]?.body?.model, think: mockReqs()[n0] && "think" in mockReqs()[n0].body ? mockReqs()[n0].body.think : "(absent)", unknownKeys: mockReqs()[n0] ? Object.keys(mockReqs()[n0].body).filter((k) => /think|reason|effort|thinking/i.test(k)) : [] } };
+    await M.evalJs(H(`await setReasoningUI("auto"); return 1`));
+    n0 = mockReqs().length;
+    out.D2_auto_usesMainModel = { send: await sendTestPrompt(M), reqModel: mockReqs()[n0]?.body?.model };
+    // E2 流中 auto→off：当前请求模型不变，下一条才换
+    const n1 = mockReqs().length;
+    let firstModel = null;
+    const e2 = await sendTestPrompt(M, {
+      onStarted: async () => {
+        await sleep(500);
+        firstModel = mockReqs()[n1]?.body?.model ?? null;
+        await M.evalJs(H(`await setReasoningUI("off")`));
+      },
+    });
+    out.E2_midStream = { firstReqModel: firstModel, completed: e2 };
+    const n2 = mockReqs().length;
+    const e2b = await sendTestPrompt(M);
+    out.E2_secondReq = { model: mockReqs()[n2]?.body?.model, completed: e2b };
+    // 恢复：ollama + auto（供 G 分页阶段使用主模型 mock）
+    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); await setReasoningUI("auto"); return {prov:cfgRead().ai.profiles[0].provider, mode:cfgRead().ai.reasoningMode}`));
   }
 
   log("F");

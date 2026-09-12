@@ -15,6 +15,7 @@
     ZONE_DEFS,
     DEFAULT_ZONES,
     providerSupportsReasoningOff,
+    reasoningOffUsable,
     type BindAction,
     type ZoneAction,
     type ThemeKey,
@@ -218,10 +219,10 @@
   // 由 AiPanel.run() 发送前拦截（必改#3/#4 的语义区分）。
   function onProviderChange() {
     saveConfig();
-    if (config.ai.reasoningMode === "off" && !providerSupportsReasoningOff(ap.provider)) {
+    if (config.ai.reasoningMode === "off" && !reasoningOffUsable(ap)) {
       config.ai.reasoningMode = "auto";
       saveConfig();
-      toast("新端点（OpenAI 兼容）协议层不支持明确关闭思考，思考模式已切回「自动」。", "info");
+      toast("新端点不支持关闭思考（非 Ollama 且未配置「关闭思考模型」），思考模式已切回「自动」。", "info");
     }
   }
 
@@ -235,6 +236,7 @@
       model: src.model,
       proxyMode: src.proxyMode,
       proxyUrl: src.proxyUrl,
+      reasoningOffModel: "", // 不预填：新端点的非思考模型必须用户显式配置
     });
     config.ai.active = config.ai.profiles.length - 1;
     saveConfig();
@@ -1079,13 +1081,25 @@
       <label for="ai-reasoning-mode">思考模式</label>
       <select id="ai-reasoning-mode" bind:value={config.ai.reasoningMode} onchange={saveConfig}>
         <option value="auto">自动（由模型决定）</option>
-        <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考（仅Ollama）</option>
+        <option value="off" disabled={!reasoningOffUsable(ap)}>关闭思考</option>
       </select>
-      <p class="tip"><b>关闭思考（仅Ollama）</b>：off 时请求体显式下发 <code>"think": false</code>。此能力仅经本地 mock 验证（出站字段与「off 仍返回 thinking 则报错」防线）；<b>真实 Ollama 思考模型未验证</b>。</p>
-      {#if !providerSupportsReasoningOff(ap.provider)}
-        <p class="tip" style="color:var(--danger)">当前端点（OpenAI 兼容，含 DeepSeek）协议层无统一的关闭思考字段：「关闭思考」不可选，不注入任何未知字段（避免 400），拦截请求不会被报告为“已关闭”。如需无思考输出，请在模型栏显式改用非推理模型（如 deepseek-chat）——本程序不会暗中换模型。</p>
+      {#if providerSupportsReasoningOff(ap.provider)}
+        <p class="tip"><b>关闭思考（Ollama）</b>：off 时请求体显式下发 <code>"think": false</code>，原模型不变。仅经本地 mock 验证出站字段与「off 仍返回 thinking 则报错」防线；<b>真实 Ollama 思考模型未验证</b>。</p>
+      {:else if (ap.reasoningOffModel || "").trim()}
+        <p class="tip"><b>关闭思考（显式换模型）</b>：{config.ai.reasoningMode === "off" ? `关闭思考时将使用模型：${ap.reasoningOffModel}` : `选择「关闭思考」后将使用模型：${ap.reasoningOffModel}`}；主模型「{ap.model}」不变，请求体不含任何 think/reasoning 未知字段（换模型由你显式配置，非暗中切换）。仅经本地 mock 验证。</p>
+      {:else}
+        <p class="tip" style="color:var(--danger)">「关闭思考」不可用：OpenAI 兼容端点协议层无统一 off 字段，本程序不猜测/不预填/不暗中换模型。如需关闭思考，请先在下方「关闭思考模型」填写该端点提供的非推理模型；不配置则 off 下请求将被拦截。</p>
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
+      {#if !providerSupportsReasoningOff(ap.provider)}
+        <div class="field" style="margin-top:6px">
+          <label for="ai-reasoning-off-model">关闭思考模型（非推理模型，仅「关闭思考」时使用）</label>
+          <input id="ai-reasoning-off-model" bind:value={ap.reasoningOffModel} onchange={saveConfig} placeholder="留空 = 本端点不可用「关闭思考」；需手动填写，程序不预填" />
+          {#if config.ai.reasoningMode === "off" && (ap.reasoningOffModel || "").trim()}
+            <p class="tip">关闭思考时将使用模型：{ap.reasoningOffModel}</p>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <div class="row-inline" style="margin-bottom:10px">

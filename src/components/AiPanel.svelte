@@ -15,6 +15,7 @@
     AI_WIN_LABEL,
     stripNonTextHtml,
     providerSupportsReasoningOff,
+    reasoningOffUsable,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -224,12 +225,18 @@
       toast("请先在设置 → AI 配置端点", "error");
       return;
     }
-    // 发送开始即快照：生成途中切换思考模式只影响下一次请求，不污染当前流
+    // 发送开始即快照（mode/主模型/非思考模型）：生成途中任何修改只影响下一次请求
     const reasoningMode = config.ai.reasoningMode;
-    if (reasoningMode === "off" && !providerSupportsReasoningOff(profile.provider)) {
-      toast("当前接口不支持明确关闭思考：该请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。请切回「自动」或改用 Ollama 端点。", "error");
+    const mainModel = profile.model;
+    const offModel = (profile.reasoningOffModel || "").trim();
+    if (reasoningMode === "off" && !reasoningOffUsable(profile)) {
+      toast(providerSupportsReasoningOff(profile.provider)
+        ? "关闭思考请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。"
+        : "该 OpenAI 兼容端点未配置「关闭思考模型」：请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。请在设置中显式填写一个非推理模型，或切回「自动」。", "error");
       return;
     }
+    // off+非Ollama：明确改用用户配置的非推理模型（用户显式配置，非暗中切换）；Ollama 保持原模型+think:false
+    const useModel = reasoningMode === "off" && !providerSupportsReasoningOff(profile.provider) && offModel ? offModel : mainModel;
     const id = `s${++sessionSeq}-${Date.now()}`;
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
@@ -261,7 +268,7 @@
         provider: profile.provider,
         baseUrl: profile.baseUrl,
         apiKey: profile.apiKey,
-        model: profile.model,
+        model: useModel,
         system,
         messages: [["user", userText]],
         proxyMode: profile.proxyMode,
@@ -690,14 +697,14 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     tick().then(() => scheduleMeasure(true));
   }
 
-  // 用户主动切端点：若新端点不支持关闭思考而当前为 off，显式切回 auto + toast + 保存。
+  // 用户主动切端点：若新端点不可用 off（非 Ollama 且未配置非思考模型），显式切回 auto + toast + 保存。
   // （非用户操作形成的 unsupported+off 不在此处理，由 run() 发送前拦截兜底）
   function onActiveChange() {
     saveConfig();
-    if (config.ai.reasoningMode === "off" && profile && !providerSupportsReasoningOff(profile.provider)) {
+    if (config.ai.reasoningMode === "off" && profile && !reasoningOffUsable(profile)) {
       config.ai.reasoningMode = "auto";
       saveConfig();
-      toast("新端点（OpenAI 兼容）不支持明确关闭思考，思考模式已切回「自动」。", "info");
+      toast("新端点不支持关闭思考（非 Ollama 且未配置「关闭思考模型」），已切回「自动」。", "info");
     }
   }
 </script>
