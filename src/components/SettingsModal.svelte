@@ -213,13 +213,17 @@
     paltDelta = paltWidthDeltaPx();
   });
 
-  // 端点切到不支持关闭思考的 provider 时，把已存的 off 归一回 auto，避免每次发送都被拦截
-  $effect(() => {
+  // 用户“主动”切换到不支持关闭思考的 provider 时：显式提示并切回 auto，随后保存。
+  // 仅在 change 事件触发——导入/跨窗同步形成的 unsupported+off 不在此静默改值，
+  // 由 AiPanel.run() 发送前拦截（必改#3/#4 的语义区分）。
+  function onProviderChange() {
+    saveConfig();
     if (config.ai.reasoningMode === "off" && !providerSupportsReasoningOff(ap.provider)) {
       config.ai.reasoningMode = "auto";
       saveConfig();
+      toast("新端点（OpenAI 兼容）协议层不支持明确关闭思考，思考模式已切回「自动」。", "info");
     }
-  });
+  }
 
   function addProfile() {
     const src = ap ?? DEFAULT_AI_PROFILES[0];
@@ -1015,7 +1019,7 @@
     <div class="field">
       <label>当前端点（阅读界面 AI 面板也可快速切换）</label>
       <div class="row-inline">
-        <select bind:value={config.ai.active} onchange={saveConfig}>
+        <select bind:value={config.ai.active} onchange={onProviderChange}>
           {#each config.ai.profiles as p, i (p.name + i)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
@@ -1031,8 +1035,8 @@
         <input bind:value={ap.name} onchange={saveConfig} />
       </div>
       <div class="field">
-        <label>服务商</label>
-        <select bind:value={ap.provider} onchange={saveConfig}>
+        <label for="ai-provider-sel">服务商</label>
+        <select id="ai-provider-sel" bind:value={ap.provider} onchange={onProviderChange}>
           <option value="openai">OpenAI 兼容 API</option>
           <option value="ollama">Ollama 本地</option>
         </select>
@@ -1077,8 +1081,10 @@
         <option value="auto">自动（由模型决定）</option>
         <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考</option>
       </select>
-      {#if !providerSupportsReasoningOff(ap.provider)}
-        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：OpenAI/DeepSeek 协议层无统一的 off 参数（本端点不可选「关闭思考」）。如需关闭思考请改用支持 think 参数的 Ollama 端点；若该 DeepSeek 模型本身不产生思考，则「自动」即已足够。</p>
+      {#if providerSupportsReasoningOff(ap.provider)}
+        <p class="tip">Ollama：off 时请求体显式下发 <code>"think": false</code>（协议级字段）。已在本地 mock 验证出站字段与「off 仍返回 thinking 则报错」防线；<b>真实 Ollama 思考模型未在本机验证</b>。若服务端忽略 think 参数仍返回 thinking，客户端会显式报错而非假装已关闭。</p>
+      {:else}
+        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：OpenAI-compatible 协议层无统一 off 参数，「关闭思考」不可选，且绝不注入未知字段（避免 400）。DeepSeek 若需无思考输出应换非思考模型（如 deepseek-chat），本程序不会暗中换模型。</p>
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
     </div>

@@ -191,15 +191,11 @@ export function providerSupportsReasoningOff(provider: string): boolean {
   return provider === "ollama";
 }
 
-// 单一能力闸门：当激活端点不支持明确关闭思考时，把持久化的 off 归一为 auto，
-// 保证不会“保存 off 后每次发送都报错”。在 load/applyConfigJson/端点切换处统一调用。
-export function normalizeAiCapability(ai: AiConfig): AiConfig {
-  const active = ai.profiles[Math.min(ai.active | 0, ai.profiles.length - 1)] ?? ai.profiles[0];
-  if (ai.reasoningMode === "off" && (!active || !providerSupportsReasoningOff(active.provider))) {
-    ai.reasoningMode = "auto";
-  }
-  return ai;
-}
+// 生命周期约定（勿改成静默归一）：
+// - 持久化/迁移只校验枚举："off" 保留、其余回落 "auto"；绝不按 provider 偷改值。
+// - 用户主动切换到不支持的 provider：在设置页显式切回 auto + toast + 保存。
+// - 外部导入/跨窗同步形成 unsupported+off：值原样保留，发送前由 AiPanel 拦截
+//   （禁止按 auto 偷发），见 AiPanel.run() 的 reasoningMode 守卫。
 
 export const DEFAULT_AI_PROFILES: AiProfile[] = [
   {
@@ -418,7 +414,7 @@ function migrateAi(savedAi: any): AiConfig {
       base.prompts = savedAi.prompts;
     }
     base.active = Math.min(Math.max(savedAi.active | 0, 0), base.profiles.length - 1);
-    return normalizeAiCapability(base);
+    return base;
   }
   let profiles: AiProfile[];
   const legacyUrl = savedAi?.baseUrl || savedAi?.apiKey || savedAi?.model;
@@ -444,7 +440,7 @@ function migrateAi(savedAi: any): AiConfig {
   if (savedAi?.action === "custom" && savedAi?.customPrompt) {
     prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt });
   }
-  return normalizeAiCapability({
+  return {
     enabled: !!savedAi?.enabled,
     autoOnChapter: savedAi?.autoOnChapter ?? true,
     system: savedAi?.system ?? DEFAULTS.ai.system,
@@ -454,7 +450,7 @@ function migrateAi(savedAi: any): AiConfig {
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
     reasoningMode: savedAi?.reasoningMode === "off" ? "off" : "auto",
-  });
+  };
 }
 
 function load(): AppConfig {
@@ -540,7 +536,8 @@ export function applyConfigJson(json: string) {
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
-    normalizeAiCapability(config.ai);
+    // 注意：这里只做枚举校验（上方），绝不按 provider 归一 reasoningMode——
+    // 跨窗/导入带来的 unsupported+off 必须原样保留，由发送前的拦截负责（必改#4）。
   } catch {
     /* ignore */
   }
@@ -621,7 +618,7 @@ export async function copyText(text: string) {  try {
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
 
-export const APP_BUILD = "2026.09.11d";
+export const APP_BUILD = "2026.09.11f";
 
 // 与 Rust 主窗口本次启动实际使用的 WebView2 参数保持一致：
 // Windows 上同一 user-data-dir 的 WebView2 环境要求所有窗口的

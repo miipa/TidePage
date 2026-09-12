@@ -689,6 +689,17 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     saveConfig();
     tick().then(() => scheduleMeasure(true));
   }
+
+  // 用户主动切端点：若新端点不支持关闭思考而当前为 off，显式切回 auto + toast + 保存。
+  // （非用户操作形成的 unsupported+off 不在此处理，由 run() 发送前拦截兜底）
+  function onActiveChange() {
+    saveConfig();
+    if (config.ai.reasoningMode === "off" && profile && !providerSupportsReasoningOff(profile.provider)) {
+      config.ai.reasoningMode = "auto";
+      saveConfig();
+      toast("新端点（OpenAI 兼容）不支持明确关闭思考，思考模式已切回「自动」。", "info");
+    }
+  }
 </script>
 
 <svelte:window onkeydown={onGlobalKeys} />
@@ -702,7 +713,7 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={onActiveChange}>
           {#each config.ai.profiles as p, i (p.name + i)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
@@ -817,7 +828,7 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={onActiveChange}>
           {#each config.ai.profiles as p, i (p.name + i)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
