@@ -14,6 +14,7 @@
     THEMES,
     AI_WIN_LABEL,
     stripNonTextHtml,
+    providerSupportsReasoningOff,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -223,6 +224,12 @@
       toast("请先在设置 → AI 配置端点", "error");
       return;
     }
+    // 发送开始即快照：生成途中切换思考模式只影响下一次请求，不污染当前流
+    const reasoningMode = config.ai.reasoningMode;
+    if (reasoningMode === "off" && !providerSupportsReasoningOff(profile.provider)) {
+      toast("当前接口不支持明确关闭思考：该请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。请切回「自动」或改用 Ollama 端点。", "error");
+      return;
+    }
     const id = `s${++sessionSeq}-${Date.now()}`;
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
@@ -259,6 +266,7 @@
         messages: [["user", userText]],
         proxyMode: profile.proxyMode,
         proxyUrl: profile.proxyUrl,
+        reasoningMode,
       });
     } catch (e) {
       reply.content += `\n\n[错误] ${e}`;
