@@ -96,12 +96,15 @@ pub fn run() {
                     .visible(false);
                 // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项
                 // wry 程序化参数优先于 WEBVIEW2_* 环境变量，故 CDP 端口只能在此注入：
-                // 源码不含任何固定端口——仅当运行环境显式提供 FR_TEST_CDP_PORT（受守卫测试
-                // 启动器注入、构建期拦截 9222）才开启远程调试；生产/发布环境无此变量=永无调试端口。
+                // 仅 debug 构建编译该分支（测试沙箱用），release 二进制不含此代码路径与字符串，
+                // 不依赖发布前人工删码。源码本身不含任何固定端口号。
+                #[cfg(debug_assertions)]
                 let cdp_extra = match std::env::var("FR_TEST_CDP_PORT") {
-                    Ok(p) if !p.is_empty() && p != "9222" => format!(" --remote-debugging-port={p}"),
+                    Ok(p) if !p.is_empty() => format!(" --remote-debugging-port={p}"),
                     _ => String::new(),
                 };
+                #[cfg(not(debug_assertions))]
+                let cdp_extra = String::new();
                 let full = format!(
                     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection {render_arg}{cdp_extra}"
                 );

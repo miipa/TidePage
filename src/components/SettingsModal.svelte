@@ -1079,9 +1079,9 @@
       <label for="ai-reasoning-mode">思考模式</label>
       <select id="ai-reasoning-mode" bind:value={config.ai.reasoningMode} onchange={saveConfig}>
         <option value="auto">自动（由模型决定）</option>
-        <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考</option>
+        <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考（仅Ollama）</option>
       </select>
-      <p class="tip"><b>关闭思考目前仅支持 Ollama</b>：off 时请求体显式下发 <code>"think": false</code>。此能力仅经本地 mock 验证（出站字段与「off 仍返回 thinking 则报错」防线）；<b>真实 Ollama 思考模型未验证</b>。</p>
+      <p class="tip"><b>关闭思考（仅Ollama）</b>：off 时请求体显式下发 <code>"think": false</code>。此能力仅经本地 mock 验证（出站字段与「off 仍返回 thinking 则报错」防线）；<b>真实 Ollama 思考模型未验证</b>。</p>
       {#if !providerSupportsReasoningOff(ap.provider)}
         <p class="tip" style="color:var(--danger)">当前端点（OpenAI 兼容，含 DeepSeek）协议层无统一的关闭思考字段：「关闭思考」不可选，不注入任何未知字段（避免 400），拦截请求不会被报告为“已关闭”。如需无思考输出，请在模型栏显式改用非推理模型（如 deepseek-chat）——本程序不会暗中换模型。</p>
       {/if}
