@@ -178,6 +178,49 @@
     config.ai.profiles[Math.min(config.ai.active, config.ai.profiles.length - 1)] ?? config.ai.profiles[0]
   );
 
+  // palt 能力检测：与 Reader/AiPanel 相同的 fontStack 归一化（本地副本，不动既有两处实现）
+  function rdrFontStack(): string {
+    const norm = (list: string[]) => list
+      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+      .map((s) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(s) ? s : `"${s}"`))
+      .join(", ");
+    const base = norm((config.reader.fontFamily || "").split(","));
+    const latin = norm([config.reader.latinFont || ""]);
+    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
+    return base ? `${latin}, ${base}` : latin;
+  }
+  const PALT_TEXT = "，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》";
+  function paltWidthDeltaPx(): number {
+    const stack = rdrFontStack();
+    const mk = (ffs: string) => {
+      const s = document.createElement("span");
+      s.style.cssText = "position:absolute;left:-99999px;top:0;white-space:nowrap;font-size:29px;";
+      s.style.fontFamily = stack;
+      s.style.fontFeatureSettings = ffs;
+      s.textContent = PALT_TEXT;
+      document.body.appendChild(s);
+      const w = s.getBoundingClientRect().width;
+      s.remove();
+      return w;
+    };
+    return mk("normal") - mk('"palt" 1');
+  }
+  let paltDelta = $state<number | null>(null);
+  $effect(() => {
+    void config.reader.fontFamily;
+    void config.reader.latinFont;
+    paltDelta = paltWidthDeltaPx();
+  });
+
+  // 端点切到不支持关闭思考的 provider 时，把已存的 off 归一回 auto，避免每次发送都被拦截
+  $effect(() => {
+    if (config.ai.reasoningMode === "off" && !providerSupportsReasoningOff(ap.provider)) {
+      config.ai.reasoningMode = "auto";
+      saveConfig();
+    }
+  });
+
   function addProfile() {
     const src = ap ?? DEFAULT_AI_PROFILES[0];
     config.ai.profiles.push({
@@ -699,6 +742,9 @@
         压缩全角标点（实验性）
       </label>
       <p class="tip">仅影响正文与 AI 阅读窗口；可能改变总页数，不会自动跳到末页。</p>
+      {#if config.reader.punctuationCompression && paltDelta !== null && Math.abs(paltDelta) < 0.5}
+        <p class="tip" style="color:var(--danger)">当前正文字体不支持比例标点，开关不会改变主正文排版。</p>
+      {/if}
     </div>
     <hr />
 
@@ -1026,13 +1072,13 @@
     </div>
 
     <div class="field" style="margin-bottom:10px">
-      <label>思考模式</label>
-      <select bind:value={config.ai.reasoningMode} onchange={saveConfig}>
+      <label for="ai-reasoning-mode">思考模式</label>
+      <select id="ai-reasoning-mode" bind:value={config.ai.reasoningMode} onchange={saveConfig}>
         <option value="auto">自动（由模型决定）</option>
-        <option value="off">关闭思考</option>
+        <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考</option>
       </select>
-      {#if config.ai.reasoningMode === "off" && !providerSupportsReasoningOff(ap.provider)}
-        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：选择「关闭思考」后新请求将被拦截，不会静默按 auto 发送。</p>
+      {#if !providerSupportsReasoningOff(ap.provider)}
+        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：OpenAI/DeepSeek 协议层无统一的 off 参数（本端点不可选「关闭思考」）。如需关闭思考请改用支持 think 参数的 Ollama 端点；若该 DeepSeek 模型本身不产生思考，则「自动」即已足够。</p>
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
     </div>
