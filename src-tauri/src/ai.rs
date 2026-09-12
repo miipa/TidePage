@@ -8,6 +8,9 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// "auto" | "off"；仅 Ollama /api/chat 协议明确支持 think:false，
+    /// 其他适配器收到 off 必须显式报错，不得静默按 auto 或注入未知字段
+    pub reasoning_mode: String,
 }
 
 pub fn build_client(proxy_mode: &str, proxy_url: &str) -> Result<reqwest::Client, String> {
@@ -209,16 +212,25 @@ pub async fn stream_chat(
     }
 
     let (body, use_auth) = if is_ollama {
-        (
-            json!({
-                "model": cfg.model,
-                "messages": msgs,
-                "stream": true,
-                "options": {"num_ctx": 8192}
-            }),
-            false,
-        )
+        let mut b = json!({
+            "model": cfg.model,
+            "messages": msgs,
+            "stream": true,
+            "options": {"num_ctx": 8192}
+        });
+        // think 是 Ollama /api/chat 的协议级字段（官方 API 文档），off 时显式下发
+        if cfg.reasoning_mode == "off" {
+            b["think"] = json!(false);
+        }
+        (b, false)
     } else {
+        // 通用 OpenAI-compatible 端点没有统一明确的关闭字段；off 时显式失败，
+        // 不静默按 auto 发送，也不注入 reasoning_effort 等未知字段（可能被 400）
+        if cfg.reasoning_mode == "off" {
+            let msg = "当前 OpenAI 兼容端点不支持明确关闭思考（协议层无统一 off 字段），请求已拦截".to_string();
+            let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": msg, "done": true}));
+            return Err(msg);
+        }
         (
             json!({
                 "model": cfg.model,
@@ -264,7 +276,7 @@ pub async fn stream_chat(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
-    let is_sse = ct.contains("text/event-stream");
+    let is_sse = ct.contains("text/event-stream") || (is_ollama && ct.contains("ndjson"));
 
     let emit_delta = |app: &tauri::AppHandle, id: &str, content: &str, done: bool| {
         let _ = app.emit(

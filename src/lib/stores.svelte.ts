@@ -179,6 +179,16 @@ export interface AiConfig {
   prompts: PromptItem[];
   display: "chat" | "reader";
   style: AiStyleConfig;
+  reasoningMode: AiReasoningMode;
+}
+
+export type AiReasoningMode = "auto" | "off";
+
+// 仅按协议判定的单一事实源：Ollama /api/chat 明确记录 think 参数；
+// 通用 OpenAI-compatible 端点没有统一明确的“关闭思考”字段（reasoning_effort
+// 仅部分 OpenAI 模型支持，第三方端点可能以未知字段拒绝），不得盲塞。
+export function providerSupportsReasoningOff(provider: string): boolean {
+  return provider === "ollama";
 }
 
 export const DEFAULT_AI_PROFILES: AiProfile[] = [
@@ -365,6 +375,7 @@ p {
       indent: "1em",
       cssExtra: "",
     },
+    reasoningMode: "auto",
   },
   regex: "",
 };
@@ -386,6 +397,7 @@ function migrateAi(savedAi: any): AiConfig {
     style: { ...structuredClone(DEFAULTS.ai.style), ...(savedAi?.style || {}) },
   } as AiConfig;
   if (base.display !== "reader") base.display = "chat";
+  if (base.reasoningMode !== "off") base.reasoningMode = "auto";
   const hasNew = Array.isArray(savedAi?.profiles) && savedAi.profiles.length;
   if (hasNew) {
     base.profiles = savedAi.profiles.map((p: any) => ({
@@ -431,6 +443,7 @@ function migrateAi(savedAi: any): AiConfig {
     prompts,
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
+    reasoningMode: savedAi?.reasoningMode === "off" ? "off" : "auto",
   };
 }
 
@@ -510,7 +523,9 @@ export function applyConfigJson(json: string) {
         ...(obj.reader.zones || {}),
       },
     };
+    obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
+    if (obj.ai.reasoningMode !== "off") obj.ai.reasoningMode = "auto";
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];

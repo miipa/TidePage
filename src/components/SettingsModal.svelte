@@ -14,6 +14,7 @@
     DEFAULT_BINDINGS,
     ZONE_DEFS,
     DEFAULT_ZONES,
+    providerSupportsReasoningOff,
     type BindAction,
     type ZoneAction,
     type ThemeKey,
@@ -1022,6 +1023,18 @@
           <input bind:value={ap.proxyUrl} onchange={saveConfig} placeholder="http://127.0.0.1:7897" />
         </div>
       {/if}
+    </div>
+
+    <div class="field" style="margin-bottom:10px">
+      <label>思考模式</label>
+      <select bind:value={config.ai.reasoningMode} onchange={saveConfig}>
+        <option value="auto">自动（由模型决定）</option>
+        <option value="off">关闭思考</option>
+      </select>
+      {#if config.ai.reasoningMode === "off" && !providerSupportsReasoningOff(ap.provider)}
+        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：选择「关闭思考」后新请求将被拦截，不会静默按 auto 发送。</p>
+      {/if}
+      <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
     </div>
 
     <div class="row-inline" style="margin-bottom:10px">
