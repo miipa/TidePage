@@ -147,6 +147,8 @@ export interface AiProfile {
   model: string;
   proxyMode: "auto" | "direct" | "custom";
   proxyUrl: string;
+  /** 关闭思考时改用的非推理模型（OpenAI 兼容端点显式配置；空=该端点不可选 off）。禁止预填/猜测 */
+  reasoningOffModel: string;
 }
 
 export interface PromptItem {
@@ -191,6 +193,13 @@ export function providerSupportsReasoningOff(provider: string): boolean {
   return provider === "ollama";
 }
 
+// off 是否可用：Ollama 走协议 think:false；其他端点仅当用户显式填写了非推理模型时可用
+// （发送时明确改用该模型——由用户配置驱动，不是暗中换模型；不给兼容端点猜/塞未知字段）。
+export function reasoningOffUsable(profile: AiProfile | null | undefined): boolean {
+  if (!profile) return false;
+  return providerSupportsReasoningOff(profile.provider) || !!(profile.reasoningOffModel || "").trim();
+}
+
 // 生命周期约定（勿改成静默归一）：
 // - 持久化/迁移只校验枚举："off" 保留、其余回落 "auto"；绝不按 provider 偷改值。
 // - 用户主动切换到不支持的 provider：在设置页显式切回 auto + toast + 保存。
@@ -206,6 +215,7 @@ export const DEFAULT_AI_PROFILES: AiProfile[] = [
     model: "deepseek-chat",
     proxyMode: "auto",
     proxyUrl: "",
+    reasoningOffModel: "",
   },
 ];
 
@@ -429,6 +439,7 @@ function migrateAi(savedAi: any): AiConfig {
         model: savedAi?.model ?? "",
         proxyMode: pm,
         proxyUrl: savedAi?.proxyUrl ?? "",
+        reasoningOffModel: savedAi?.reasoningOffModel ?? "",
       },
     ];
   } else {
@@ -530,6 +541,8 @@ export function applyConfigJson(json: string) {
       },
     };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
+    obj.ai.profiles = (Array.isArray(obj.ai.profiles) && obj.ai.profiles.length ? obj.ai.profiles : structuredClone(DEFAULTS.ai.profiles))
+      .map((p: any) => ({ ...structuredClone(DEFAULT_AI_PROFILES[0]), ...p }));
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
     if (obj.ai.reasoningMode !== "off") obj.ai.reasoningMode = "auto";
     if (obj.ai.display !== "reader") obj.ai.display = "chat";

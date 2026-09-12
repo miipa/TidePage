@@ -95,13 +95,20 @@ pub fn run() {
                     .center()
                     .visible(false);
                 // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项
-                // wry 程序化参数优先于 WEBVIEW2_* 环境变量，故 CDP 端口只能在此注入：
-                // 仅 debug 构建编译该分支（测试沙箱用），release 二进制不含此代码路径与字符串，
-                // 不依赖发布前人工删码。源码本身不含任何固定端口号。
+                // wry 程序化参数优先于 WEBVIEW2_* 环境变量，故 CDP 端口只能在此注入；
+                // 仅 debug 构建编译该分支（release 二进制不含此代码路径与字符串）。
+                // 严格校验堵住“绕过测试侧守卫直接启动 debug exe”：必须纯数字 parse::<u16>、
+                // 拒绝 0 与 9222；注入串只由解析后的数字重建，env 原始值中的任何附加字符
+                // （空格/其它参数）都进不了命令行；固定仅监听 127.0.0.1。
                 #[cfg(debug_assertions)]
                 let cdp_extra = match std::env::var("FR_TEST_CDP_PORT") {
-                    Ok(p) if !p.is_empty() => format!(" --remote-debugging-port={p}"),
-                    _ => String::new(),
+                    Ok(raw) => match raw.trim().parse::<u16>() {
+                        Ok(port) if port != 0 && port != 9222 => format!(
+                            " --remote-debugging-address=127.0.0.1 --remote-debugging-port={port}"
+                        ),
+                        _ => String::new(),
+                    },
+                    Err(_) => String::new(),
                 };
                 #[cfg(not(debug_assertions))]
                 let cdp_extra = String::new();

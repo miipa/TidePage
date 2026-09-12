@@ -224,13 +224,9 @@ pub async fn stream_chat(
         }
         (b, false)
     } else {
-        // 通用 OpenAI-compatible 端点没有统一明确的关闭字段；off 时显式失败，
-        // 不静默按 auto 发送，也不注入 reasoning_effort 等未知字段（可能被 400）
-        if cfg.reasoning_mode == "off" {
-            let msg = "当前 OpenAI 兼容端点不支持明确关闭思考（协议层无统一 off 字段），请求已拦截".to_string();
-            let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": msg, "done": true}));
-            return Err(msg);
-        }
+        // OpenAI 兼容端点：协议层无统一关闭字段，off 时绝不注入 think/reasoning_effort/thinking 等未知字段
+        // （可能被 400）。合法的 off 由上层显式改用用户配置的 reasoningOffModel 后按普通请求发送；
+        // “不可用”场景（未配置非推理模型）在 JS run() 发送前拦截，不会走到这里。
         (
             json!({
                 "model": cfg.model,
