@@ -1081,10 +1081,9 @@
         <option value="auto">自动（由模型决定）</option>
         <option value="off" disabled={!providerSupportsReasoningOff(ap.provider)}>关闭思考</option>
       </select>
-      {#if providerSupportsReasoningOff(ap.provider)}
-        <p class="tip">Ollama：off 时请求体显式下发 <code>"think": false</code>（协议级字段）。已在本地 mock 验证出站字段与「off 仍返回 thinking 则报错」防线；<b>真实 Ollama 思考模型未在本机验证</b>。若服务端忽略 think 参数仍返回 thinking，客户端会显式报错而非假装已关闭。</p>
-      {:else}
-        <p class="tip" style="color:var(--danger)">当前接口不支持明确关闭思考：OpenAI-compatible 协议层无统一 off 参数，「关闭思考」不可选，且绝不注入未知字段（避免 400）。DeepSeek 若需无思考输出应换非思考模型（如 deepseek-chat），本程序不会暗中换模型。</p>
+      <p class="tip"><b>关闭思考目前仅支持 Ollama</b>：off 时请求体显式下发 <code>"think": false</code>。此能力仅经本地 mock 验证（出站字段与「off 仍返回 thinking 则报错」防线）；<b>真实 Ollama 思考模型未验证</b>。</p>
+      {#if !providerSupportsReasoningOff(ap.provider)}
+        <p class="tip" style="color:var(--danger)">当前端点（OpenAI 兼容，含 DeepSeek）协议层无统一的关闭思考字段：「关闭思考」不可选，不注入任何未知字段（避免 400），拦截请求不会被报告为“已关闭”。如需无思考输出，请在模型栏显式改用非推理模型（如 deepseek-chat）——本程序不会暗中换模型。</p>
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
     </div>
