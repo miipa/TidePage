@@ -149,6 +149,29 @@ export interface AiProfile {
   proxyUrl: string;
   /** 关闭思考时改用的非推理模型（OpenAI 兼容端点显式配置；空=该端点不可选 off）。禁止预填/猜测 */
   reasoningOffModel: string;
+  /** 关闭思考的 distributor 协议策略。模型字段永远只放真实模型ID，任何策略都不得把 think/query/header 并入 model */
+  reasoningOffStrategy: AiReasoningOffStrategy;
+}
+
+export type AiReasoningOffStrategy =
+  | "switch-model"
+  | "json-think-false"
+  | "query-think-false"
+  | "header-think-false";
+
+// 模型ID形状校验：只允许 字母数字 与 . _ / : -（如 deepseek-chat、openai/gpt-4o、llama3:latest）。
+// 拒绝空/含空白（→ "X-Think-Enabled: false"、"-H .."、curl 整行）/引号/花括号/等号/问号（→ ?think=false）/
+// 协议 :// 或前导斜杠（→ 完整URL、/v1/completions 路径）。不猜服务端，只做形状拦截。
+export function isPlainModelId(s: string): boolean {
+  if (!s || s.length > 160 || s.startsWith("/")) return false;
+  if (s.includes("://")) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(s);
+}
+
+// 策略枚举消毒：未知/伪造值一律回落 switch-model（不猜服务端支持的策略）。
+const OFF_STRATEGIES: AiReasoningOffStrategy[] = ["switch-model", "json-think-false", "query-think-false", "header-think-false"];
+export function sanitizeOffStrategy(v: unknown): AiReasoningOffStrategy {
+  return OFF_STRATEGIES.includes(v as AiReasoningOffStrategy) ? (v as AiReasoningOffStrategy) : "switch-model";
 }
 
 export interface PromptItem {
@@ -193,11 +216,16 @@ export function providerSupportsReasoningOff(provider: string): boolean {
   return provider === "ollama";
 }
 
-// off 是否可用：Ollama 走协议 think:false；其他端点仅当用户显式填写了非推理模型时可用
-// （发送时明确改用该模型——由用户配置驱动，不是暗中换模型；不给兼容端点猜/塞未知字段）。
+// off 是否可用：Ollama 走协议 think:false；OpenAI 兼容端点按用户显式选择的策略判定：
+// - switch-model：必须已填写合法非推理模型ID
+// - json/query/header-think-false：策略本身即关闭手段，但要求当前(或切换后)主模型ID是合法纯ID
+// 换模型/加字段均由用户显式配置驱动，程序不猜服务端、不把参数并入 model。
 export function reasoningOffUsable(profile: AiProfile | null | undefined): boolean {
   if (!profile) return false;
-  return providerSupportsReasoningOff(profile.provider) || !!(profile.reasoningOffModel || "").trim();
+  if (providerSupportsReasoningOff(profile.provider)) return true;
+  const s = profile.reasoningOffStrategy || "switch-model";
+  if (s === "switch-model") return isPlainModelId((profile.reasoningOffModel || "").trim());
+  return isPlainModelId((profile.model || "").trim());
 }
 
 // 生命周期约定（勿改成静默归一）：
@@ -216,6 +244,7 @@ export const DEFAULT_AI_PROFILES: AiProfile[] = [
     proxyMode: "auto",
     proxyUrl: "",
     reasoningOffModel: "",
+    reasoningOffStrategy: "switch-model",
   },
 ];
 
@@ -419,6 +448,7 @@ function migrateAi(savedAi: any): AiConfig {
     base.profiles = savedAi.profiles.map((p: any) => ({
       ...structuredClone(DEFAULT_AI_PROFILES[0]),
       ...p,
+      reasoningOffStrategy: sanitizeOffStrategy(p?.reasoningOffStrategy),
     }));
     if (Array.isArray(savedAi.prompts) && savedAi.prompts.length) {
       base.prompts = savedAi.prompts;
@@ -440,6 +470,7 @@ function migrateAi(savedAi: any): AiConfig {
         proxyMode: pm,
         proxyUrl: savedAi?.proxyUrl ?? "",
         reasoningOffModel: savedAi?.reasoningOffModel ?? "",
+        reasoningOffStrategy: savedAi?.reasoningOffStrategy ?? "switch-model",
       },
     ];
   } else {

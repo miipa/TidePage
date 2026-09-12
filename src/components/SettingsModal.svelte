@@ -237,6 +237,7 @@
       proxyMode: src.proxyMode,
       proxyUrl: src.proxyUrl,
       reasoningOffModel: "", // 不预填：新端点的非思考模型必须用户显式配置
+      reasoningOffStrategy: "switch-model", // 默认最保守策略：不猜 distributor 支持任何注入方式
     });
     config.ai.active = config.ai.profiles.length - 1;
     saveConfig();
@@ -1085,16 +1086,32 @@
       </select>
       {#if providerSupportsReasoningOff(ap.provider)}
         <p class="tip"><b>关闭思考（Ollama）</b>：off 时请求体显式下发 <code>"think": false</code>，原模型不变。仅经本地 mock 验证出站字段与「off 仍返回 thinking 则报错」防线；<b>真实 Ollama 思考模型未验证</b>。</p>
-      {:else if (ap.reasoningOffModel || "").trim()}
-        <p class="tip"><b>关闭思考（显式换模型）</b>：{config.ai.reasoningMode === "off" ? `关闭思考时将使用模型：${ap.reasoningOffModel}` : `选择「关闭思考」后将使用模型：${ap.reasoningOffModel}`}；主模型「{ap.model}」不变，请求体不含任何 think/reasoning 未知字段（换模型由你显式配置，非暗中切换）。仅经本地 mock 验证。</p>
       {:else}
-        <p class="tip" style="color:var(--danger)">「关闭思考」不可用：OpenAI 兼容端点协议层无统一 off 字段，本程序不猜测/不预填/不暗中换模型。如需关闭思考，请先在下方「关闭思考模型」填写该端点提供的非推理模型；不配置则 off 下请求将被拦截。</p>
+        <div class="field" style="margin:6px 0">
+          <label for="ai-reasoning-strategy">关闭思考方式（distributor 协议，须先“仅回复OK”实测该协议被接受，本程序不猜）</label>
+          <select id="ai-reasoning-strategy" bind:value={ap.reasoningOffStrategy} onchange={saveConfig}>
+            <option value="switch-model">切换非思考模型（仅改 model 字段）</option>
+            <option value="json-think-false">请求体加 "think": false</option>
+            <option value="query-think-false">URL 查询加 ?think=false</option>
+            <option value="header-think-false">请求头加 X-Think-Enabled: false</option>
+          </select>
+        </div>
+        {#if ap.reasoningOffStrategy === "switch-model"}
+          {#if (ap.reasoningOffModel || "").trim()}
+            <p class="tip"><b>关闭思考（显式换模型）</b>：{config.ai.reasoningMode === "off" ? `关闭思考时将使用模型：${ap.reasoningOffModel}` : `选择「关闭思考」后将使用模型：${ap.reasoningOffModel}`}；主模型「{ap.model}」不变，请求体不含任何 think/query/header 注入（换模型由你显式配置，非暗中切换）。仅经本地 mock 验证。</p>
+          {:else}
+            <p class="tip" style="color:var(--danger)">「关闭思考」不可用：方式为「切换非思考模型」但未填合法模型ID。本程序不猜测/不预填/不暗中换模型；请在下方填写，或改用其它已实测的方式。</p>
+          {/if}
+        {:else}
+          <p class="tip"><b>当前方式：</b>{ap.reasoningOffStrategy === "json-think-false" ? "off 时请求体附加 \"think\": false" : ap.reasoningOffStrategy === "query-think-false" ? "off 时请求 URL 附加 ?think=false" : "off 时请求头附加 X-Think-Enabled: false"}；model 字段始终只用主模型「{ap.model}」，不并入任何参数/URL/请求头文本。仅当该 distributor 实测接受此协议方可选择；未实测请用「自动」。</p>
+        {/if}
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
-      {#if !providerSupportsReasoningOff(ap.provider)}
+      {#if !providerSupportsReasoningOff(ap.provider) && ap.reasoningOffStrategy === "switch-model"}
         <div class="field" style="margin-top:6px">
           <label for="ai-reasoning-off-model">关闭思考模型（非推理模型，仅「关闭思考」时使用）</label>
-          <input id="ai-reasoning-off-model" bind:value={ap.reasoningOffModel} onchange={saveConfig} placeholder="留空 = 本端点不可用「关闭思考」；需手动填写，程序不预填" />
+          <input id="ai-reasoning-off-model" bind:value={ap.reasoningOffModel} onchange={saveConfig} placeholder="只填非思考模型 ID，例如 model-chat；不要填 JSON、URL、curl 或请求头" />
+          <p class="tip">此项通过切换模型关闭思考，不会发送 think:false 或自定义请求头。</p>
           {#if config.ai.reasoningMode === "off" && (ap.reasoningOffModel || "").trim()}
             <p class="tip">关闭思考时将使用模型：{ap.reasoningOffModel}</p>
           {/if}
