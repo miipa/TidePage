@@ -1,49 +1,24 @@
 // 测试发送唯一入口。除本文件外，任何测试脚本不得点击 .prompt-chip、
 // 不得调用 firePrompt()/api.aiChat —— 全部发送必须经 sendTestPrompt()，
 // 其内部先 withSendGuard（从页面实时读 config，校验所有 ai.profiles 为本机回环）。
+// “关闭思考”功能已移除，发送行为恒为 auto；本入口不再有第二层策略守卫。
 import { withSendGuard } from "./isolation_guard.mjs";
 
 const CHIP = ".prompt-chip:not(.add)";
 
-export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null, allowUnsupported = false } = {}) {
+export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null } = {}) {
   return withSendGuard(cdp.evalJs, async () => {
-    // 守卫第二层：off 时按与前端一致的完整逻辑判定（策略消毒/legacy 映射、probe 匹配、解析器实现）。
-    // allowUnsupported 仅用于验证应用侧 run() 拦截本身
-    const state = await cdp.evalJs(`(()=>{const c=JSON.parse(localStorage.getItem('flowread.config.v1'));const p=c.ai.profiles[Math.min(c.ai.active|0,c.ai.profiles.length-1)];return {mode:c.ai.reasoningMode, provider:p.provider, strategy:p.reasoningOffStrategy||'switch-model', offModel:(p.reasoningOffModel||'').trim(), model:(p.model||'').trim(), baseUrl:p.baseUrl, probe:p.protocolProbe||null}})()`);
-    const plainId = (s) => !!s && s.length <= 160 && !s.startsWith('/') && !s.includes('://') && /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(s);
-    const sanitize = (v) => {
-      const cur = ["switch-model","chat-json-think-false","completions-json-think-false","model-complete-query-think-false","model-complete-header-think-false"];
-      if (cur.includes(v)) return v;
-      const legacy = { "json-think-false":"chat-json-think-false", "query-think-false":"model-complete-query-think-false", "header-think-false":"model-complete-header-think-false" };
-      return legacy[v] || "switch-model";
-    };
-    const normBase = (u) => (u || "").trim().replace(/\/+$/, "");
-    const implemented = (s) => s === "chat-json-think-false" || s === "completions-json-think-false";
-    const s = sanitize(state.strategy);
-    let usable = true;
-    if (state.mode === "off" && state.provider !== "ollama") {
-      usable = s === "switch-model"
-        ? plainId(state.offModel)
-        : (implemented(s) && !!state.probe
-            && normBase(state.probe.baseUrl) === normBase(state.baseUrl)
-            && (state.probe.model || "") === state.model
-            && (state.probe.strategies || []).includes(s)
-            && plainId(state.model));
-    }
-    if (!allowUnsupported && state.mode === "off" && !usable) {
-      throw new Error(`发送拦截：reasoningMode=off 端点 ${state.provider} 策略 ${s} 不可用（未探针验证/解析器未实现/端点或模型变更失效/模型ID非法），测试不点击、不假装关闭。`);
-    }
     return cdp.evalJs(`(async()=>{
       const sleep=ms=>new Promise(r=>setTimeout(r,ms));
       const d=document.querySelector('.ai-panel');
       if(!d) throw new Error('sendTestPrompt: 未找到 .ai-panel');
       const chip=d.querySelector(${JSON.stringify(CHIP)});
       if(!chip) throw new Error('sendTestPrompt: 未找到提示词芯片');
-      for(let w=0;w<100 && d.querySelector(${JSON.stringify(CHIP)}).disabled;w++) await sleep(200); // 等待上一条流式结束，避免点击被忽略
+      for(let w=0;w<100 && d.querySelector(${JSON.stringify(CHIP)}).disabled;w++) await sleep(200);
       const before=d.querySelectorAll('.ai-mark').length;
       chip.click();
       await sleep(150);
-      ${onStarted || allowUnsupported ? "return {__started:true, before};" : ""}
+      ${onStarted ? "return {__started:true, before};" : ""}
       const max=${Math.ceil(timeoutMs / 200)};
       for(let i=0;i<max;i++){
         const ms=d.querySelectorAll('.ai-mark');
@@ -51,7 +26,6 @@ export async function sendTestPrompt(cdp, { timeoutMs = 90_000, onStarted = null
         if(ms.length>before && !d.querySelector(${JSON.stringify(CHIP)}).disabled){
           return {before, marks: ms.length, len: last.textContent.length,
                   err: last.textContent.includes('[错误]'),
-                  guardMsg: last.textContent.includes('未执行关闭思考'),
                   streamLoading: d.querySelector(${JSON.stringify(CHIP)}).disabled,
                   thinkUI: document.querySelectorAll('[class*=think],[class*=reason]').length};
         }
@@ -82,7 +56,6 @@ export async function waitReplyDone(cdp, { timeoutMs = 90_000, before = 0 } = {}
       if(last && ms.length>${before || 0} && !d.querySelector(${JSON.stringify(CHIP)}).disabled){
         return {marks: ms.length, len: last.textContent.length,
                 err: last.textContent.includes('[错误]'),
-                guardMsg: last.textContent.includes('未执行关闭思考'),
                 streamLoading: d.querySelector(${JSON.stringify(CHIP)}).disabled,
                 thinkUI: document.querySelectorAll('[class*=think],[class*=reason]').length};
       }
@@ -92,13 +65,13 @@ export async function waitReplyDone(cdp, { timeoutMs = 90_000, before = 0 } = {}
   })()`);
 }
 
-// 发送但预期被守卫拦截（用于反例/C 导入场景断言）：断言未点击即 throw。
+// 断言发送被守卫拦截（本机端点校验），不点击。
 export async function expectSendBlocked(cdp, reasonIncludes = "非本机端点") {
   let err = null;
   try { await withSendGuard(cdp.evalJs, async () => { throw new Error("__SHOULD_NOT_REACH__"); }); }
   catch (e) { err = e; }
   if (!err) throw new Error("守卫未拦截，发送路径可达 —— fail-open，不可接受");
   if (err.message.includes("__SHOULD_NOT_REACH__")) throw new Error("守卫放行后进入了 action，失败");
-  if (!err.message.includes(reasonIncludes)) throw new Error(`拦截原因不符：${err.message}`);
+  if (!reasonIncludes || !err.message.includes(reasonIncludes)) throw new Error(`拦截原因不符：${err.message}`);
   return err.message;
 }

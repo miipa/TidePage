@@ -147,112 +147,19 @@ export interface AiProfile {
   model: string;
   proxyMode: "auto" | "direct" | "custom";
   proxyUrl: string;
-  /** 关闭思考时改用的非推理模型（OpenAI 兼容端点显式配置；空=该端点不可选 off）。禁止预填/猜测 */
-  reasoningOffModel: string;
-  /** 关闭思考的 distributor 协议策略。每个策略绑定完整协议包（URL+body结构+query/header+解析器）；
-   *  模型字段永远只放真实模型ID，任何策略都不得把 think/query/header/URL 并入 model */
-  reasoningOffStrategy: AiReasoningOffStrategy;
-  /** 协议探针结果：记录在哪个 baseUrl 上验证过哪些策略；baseUrl 变更后自动失效 */
-  protocolProbe: AiProtocolProbe | null;
 }
 
-export type AiReasoningOffStrategy =
-  | "switch-model"
-  | "chat-json-think-false"
-  | "completions-json-think-false"
-  | "model-complete-query-think-false"
-  | "model-complete-header-think-false";
-
-export interface AiProtocolProbe {
-  baseUrl: string;
-  model: string;
-  strategies: AiReasoningOffStrategy[];
-  at: number;
-}
-
-// 模型ID形状校验：只允许 字母数字 与 . _ / : -（如 deepseek-chat、openai/gpt-4o、llama3:latest）。
-// 拒绝空/含空白（→ "X-Think-Enabled: false"、"-H .."、curl 整行）/引号/花括号/等号/问号（→ ?think=false）/
-// 协议 :// 或前导斜杠（→ 完整URL、/v1/completions 路径）。不猜服务端，只做形状拦截。
-export function isPlainModelId(s: string): boolean {
-  if (!s || s.length > 160 || s.startsWith("/")) return false;
-  if (s.includes("://")) return false;
-  return /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(s);
-}
-
-// 策略枚举消毒（含上一版未发布的旧名映射）；未知/伪造值一律回落 switch-model。
-const OFF_STRATEGIES: AiReasoningOffStrategy[] = [
-  "switch-model",
-  "chat-json-think-false",
-  "completions-json-think-false",
-  "model-complete-query-think-false",
-  "model-complete-header-think-false",
-];
-const LEGACY_STRATEGY_MAP: Record<string, AiReasoningOffStrategy> = {
-  "json-think-false": "chat-json-think-false",
-  "query-think-false": "model-complete-query-think-false",
-  "header-think-false": "model-complete-header-think-false",
-};
-export function sanitizeOffStrategy(v: unknown): AiReasoningOffStrategy {
-  const s = String(v ?? "");
-  if ((OFF_STRATEGIES as string[]).includes(s)) return s as AiReasoningOffStrategy;
-  return LEGACY_STRATEGY_MAP[s] ?? "switch-model";
-}
-
-export const PROTOCOL_STRATEGIES: AiReasoningOffStrategy[] = [
-  "chat-json-think-false",
-  "completions-json-think-false",
-  "model-complete-query-think-false",
-  "model-complete-header-think-false",
-];
-
-// model-complete 两种：请求构造已定义，但响应解析器在真实探针给出实际字段前不实现、不猜。
-export function protocolStrategyImplemented(s: AiReasoningOffStrategy): boolean {
-  return s === "chat-json-think-false" || s === "completions-json-think-false";
-}
-
-const normBase = (u: string) => (u || "").trim().replace(/\/+$/, "");
-
-// 探针结果注册：baseUrl 必须与当前端点一致（换端点→旧验证自动失效）；
-// 策略必须在允许列表内；model-complete 探针结果可存储（供后续补解析器），但永不放行发送。
-export function parseProbeLine(line: string): { ok: boolean; error?: string; probe?: AiProtocolProbe } {
-  const m = /FLOWREAD_PROTOCOL=(\{[\s\S]*\})/.exec(line || "");
-  if (!m) return { ok: false, error: "未找到 FLOWREAD_PROTOCOL= 结果行" };
-  try {
-    const j = JSON.parse(m[1]);
-    if (typeof j.baseUrl !== "string" || !j.baseUrl) return { ok: false, error: "探针结果缺 baseUrl" };
-    if (typeof j.model !== "string" || !j.model) return { ok: false, error: "探针结果缺 model（换模型验证即失效）" };
-    if (!Array.isArray(j.strategies) || !j.strategies.length) return { ok: false, error: "探针结果缺 strategies" };
-    const bad = j.strategies.filter((s: unknown) => !(PROTOCOL_STRATEGIES as string[]).includes(String(s)));
-    if (bad.length) return { ok: false, error: `探针结果含未知策略: ${bad.join(",")}` };
-    return { ok: true, probe: { baseUrl: normBase(j.baseUrl), model: j.model.trim(), strategies: j.strategies, at: Number(j.at) || Date.now() } };
-  } catch (e) {
-    return { ok: false, error: `探针结果解析失败: ${e}` };
+// 物理清除已废弃的“关闭思考”残留键（不隐藏、不保留）：
+// 迁移/同步/导入路径一律调用，确保导出的 profile 中不再出现这些键，
+// 发送链也永远读不到它们，行为恒为 auto。
+export function stripReasoningArtifacts(ai: any): void {
+  if (!ai) return;
+  delete ai.reasoningMode;
+  for (const p of ai.profiles || []) {
+    delete p.reasoningOffModel;
+    delete p.reasoningOffStrategy;
+    delete p.protocolProbe;
   }
-}
-
-export function probeVerified(p: AiProfile | null | undefined, s: AiReasoningOffStrategy): boolean {
-  if (!p?.protocolProbe) return false;
-  // 换端点或换模型 → 旧验证立即失效（不沿用上一端点/模型的能力结论）
-  if (normBase(p.protocolProbe.baseUrl) !== normBase(p.baseUrl)) return false;
-  if ((p.protocolProbe.model || "") !== (p.model || "").trim()) return false;
-  return (p.protocolProbe.strategies || []).includes(s);
-}
-
-// 注册探针结果时的匹配检查（不匹配直接拒绝导入，避免“存了但永不生效”的困惑状态）
-export function probeMatchesProfile(probe: AiProtocolProbe, p: AiProfile | null | undefined): { ok: boolean; reason?: string } {
-  if (!p) return { ok: false, reason: "无激活端点" };
-  if (normBase(probe.baseUrl) !== normBase(p.baseUrl)) {
-    return { ok: false, reason: `探针端点(${probe.baseUrl})与当前端点(${p.baseUrl || "空"})不一致` };
-  }
-  if ((probe.model || "") !== (p.model || "").trim()) {
-    return { ok: false, reason: `探针模型(${probe.model})与当前主模型(${p.model || "空"})不一致` };
-  }
-  return { ok: true };
-}
-
-// 策略选项是否可选：探针验证过且解析器已实现才放行；其余禁用并提示“当前端点未验证”。
-export function strategySelectable(p: AiProfile | null | undefined, s: AiReasoningOffStrategy): boolean {
-  return probeVerified(p, s) && protocolStrategyImplemented(s);
 }
 
 export interface PromptItem {
@@ -285,35 +192,11 @@ export interface AiConfig {
   prompts: PromptItem[];
   display: "chat" | "reader";
   style: AiStyleConfig;
-  reasoningMode: AiReasoningMode;
 }
 
-export type AiReasoningMode = "auto" | "off";
-
-// 仅按协议判定的单一事实源：Ollama /api/chat 明确记录 think 参数；
-// 通用 OpenAI-compatible 端点没有统一明确的“关闭思考”字段（reasoning_effort
-// 仅部分 OpenAI 模型支持，第三方端点可能以未知字段拒绝），不得盲塞。
-export function providerSupportsReasoningOff(provider: string): boolean {
-  return provider === "ollama";
-}
-
-// off 是否可用：Ollama 走协议 think:false；OpenAI 兼容端点按策略判定：
-// - switch-model：必须已填合法非推理模型ID（同一 TARGET 靠协议参数关闭时，无此方案）
-// - 协议策略：必须【已探针验证 + 解析器已实现】+ 主模型为合法纯ID。
-// 探针未证实的协议一律不可用（UI 禁用、发送前拦截），不猜服务端、不把参数并入 model。
-export function reasoningOffUsable(profile: AiProfile | null | undefined): boolean {
-  if (!profile) return false;
-  if (providerSupportsReasoningOff(profile.provider)) return true;
-  const s = sanitizeOffStrategy(profile.reasoningOffStrategy);
-  if (s === "switch-model") return isPlainModelId((profile.reasoningOffModel || "").trim());
-  return strategySelectable(profile, s) && isPlainModelId((profile.model || "").trim());
-}
-
-// 生命周期约定（勿改成静默归一）：
-// - 持久化/迁移只校验枚举："off" 保留、其余回落 "auto"；绝不按 provider 偷改值。
-// - 用户主动切换到不支持的 provider：在设置页显式切回 auto + toast + 保存。
-// - 外部导入/跨窗同步形成 unsupported+off：值原样保留，发送前由 AiPanel 拦截
-//   （禁止按 auto 偷发），见 AiPanel.run() 的 reasoningMode 守卫。
+// “关闭思考”功能已于 v0.1.24 后彻底移除（UI/发送链/存储三层都无残留）：
+// AI 请求行为恒为 auto（模型服务端默认）。历史遗留键由 stripReasoningArtifacts
+// 在 load/migrate 与 applyConfigJson（跨窗同步/导入）两条入口物理删除。
 
 export const DEFAULT_AI_PROFILES: AiProfile[] = [
   {
@@ -324,9 +207,6 @@ export const DEFAULT_AI_PROFILES: AiProfile[] = [
     model: "deepseek-chat",
     proxyMode: "auto",
     proxyUrl: "",
-    reasoningOffModel: "",
-    reasoningOffStrategy: "switch-model",
-    protocolProbe: null,
   },
 ];
 
@@ -502,7 +382,6 @@ p {
       indent: "1em",
       cssExtra: "",
     },
-    reasoningMode: "auto",
   },
   regex: "",
 };
@@ -524,14 +403,14 @@ function migrateAi(savedAi: any): AiConfig {
     style: { ...structuredClone(DEFAULTS.ai.style), ...(savedAi?.style || {}) },
   } as AiConfig;
   if (base.display !== "reader") base.display = "chat";
-  if (base.reasoningMode !== "off") base.reasoningMode = "auto";
+  stripReasoningArtifacts(base);
   const hasNew = Array.isArray(savedAi?.profiles) && savedAi.profiles.length;
   if (hasNew) {
     base.profiles = savedAi.profiles.map((p: any) => ({
       ...structuredClone(DEFAULT_AI_PROFILES[0]),
       ...p,
-      reasoningOffStrategy: sanitizeOffStrategy(p?.reasoningOffStrategy),
     }));
+    stripReasoningArtifacts(base);
     if (Array.isArray(savedAi.prompts) && savedAi.prompts.length) {
       base.prompts = savedAi.prompts;
     }
@@ -551,9 +430,6 @@ function migrateAi(savedAi: any): AiConfig {
         model: savedAi?.model ?? "",
         proxyMode: pm,
         proxyUrl: savedAi?.proxyUrl ?? "",
-        reasoningOffModel: savedAi?.reasoningOffModel ?? "",
-        reasoningOffStrategy: sanitizeOffStrategy(savedAi?.reasoningOffStrategy),
-        protocolProbe: null,
       },
     ];
   } else {
@@ -574,15 +450,27 @@ function migrateAi(savedAi: any): AiConfig {
     prompts,
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
-    reasoningMode: savedAi?.reasoningMode === "off" ? "off" : "auto",
   };
 }
 
+let reasoningMigrationDirty = false;
 function load(): AppConfig {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return structuredClone(DEFAULTS);
     const saved = JSON.parse(raw);
+    // “关闭思考”已彻底移除：迁移时若发现存量旧键，加载后立即物理写回，保证导出的 profile 不含这些键。
+    const aiSaved = saved.ai || {};
+    const profSaved: any[] = Array.isArray(aiSaved.profiles) ? aiSaved.profiles : [];
+    const hasLegacyAiKey = Object.prototype.hasOwnProperty.call(aiSaved, "reasoningMode");
+    const hasLegacyProfKey = profSaved.some(
+      (p: any) =>
+        p &&
+        (Object.prototype.hasOwnProperty.call(p, "reasoningOffModel") ||
+          Object.prototype.hasOwnProperty.call(p, "reasoningOffStrategy") ||
+          Object.prototype.hasOwnProperty.call(p, "protocolProbe")),
+    );
+    reasoningMigrationDirty = hasLegacyAiKey || hasLegacyProfKey;
     let indent = saved.reader?.indent;
     if (typeof indent === "boolean") indent = indent ? "2em" : "0em";
     if (indent == null) indent = "1em";
@@ -636,6 +524,9 @@ function load(): AppConfig {
 }
 
 export const config = $state<AppConfig>(load());
+// 迁移落盘：检测到已废弃的“关闭思考”旧键时，启动即把清理后的配置写回 localStorage。
+// 延后到模块初始化完成（saveConfig 依赖后续声明的状态），避免 TDZ。
+if (reasoningMigrationDirty) setTimeout(saveConfig, 0);
 
 export function applyConfigJson(json: string) {
   try {
@@ -658,13 +549,13 @@ export function applyConfigJson(json: string) {
     obj.ai.profiles = (Array.isArray(obj.ai.profiles) && obj.ai.profiles.length ? obj.ai.profiles : structuredClone(DEFAULTS.ai.profiles))
       .map((p: any) => ({ ...structuredClone(DEFAULT_AI_PROFILES[0]), ...p }));
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
-    if (obj.ai.reasoningMode !== "off") obj.ai.reasoningMode = "auto";
+    stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
-    // 注意：这里只做枚举校验（上方），绝不按 provider 归一 reasoningMode——
-    // 跨窗/导入带来的 unsupported+off 必须原样保留，由发送前的拦截负责（必改#4）。
+    // 跨窗同步/导入同样物理清除废弃的“关闭思考”键（stripReasoningArtifacts），
+    // 保证两端内存与 localStorage 均不再出现这些键，行为恒为 auto。
   } catch {
     /* ignore */
   }

@@ -90,7 +90,7 @@ export const api = {
   aiChat: (args: {
     id: string; provider: string; baseUrl: string; apiKey: string;
     model: string; system: string; messages: [string, string][];
-    proxyMode?: string; proxyUrl?: string; reasoningMode?: string; reasoningStrategy?: string;
+    proxyMode?: string; proxyUrl?: string;
   }) => invoke<void>("ai_chat", args),
   aiTest: (args: {
     provider: string; baseUrl: string; apiKey: string; model: string;

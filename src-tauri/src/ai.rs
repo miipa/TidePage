@@ -8,12 +8,6 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-    /// "auto" | "off"；仅 Ollama /api/chat 协议明确支持 think:false，
-    /// 其他适配器收到 off 必须显式报错，不得静默按 auto 或注入未知字段
-    pub reasoning_mode: String,
-    /// off 时 OpenAI 兼容端点的关闭策略：switch-model(默认,无注入) / json-think-false /
-    /// query-think-false / header-think-false。任何策略都不得把参数并入 model 字段。
-    pub reasoning_strategy: String,
 }
 
 /// 模型ID形状守卫（与前端 isPlainModelId 对齐）：只允许字母数字与 . _ / : -，
@@ -208,74 +202,43 @@ pub async fn stream_chat(
 ) -> Result<(), String> {
     let is_ollama = cfg.provider == "ollama";
 
-    let mut msgs = vec![json!({"role": "system", "content": system.clone()})];
+    let mut msgs = vec![json!({"role": "system", "content": system})];
     for (role, content) in &messages {
         msgs.push(json!({"role": role, "content": content}));
     }
 
-    // 策略决定完整协议包（URL + body 结构 + query/header + 解析器）。auto 一律走 chat 协议且零注入。
-    let (final_url, protocol, body, use_auth, header_think) = if is_ollama {
-        let url = {
-            let base = cfg.base_url.trim_end_matches('/');
-            format!("{base}/api/chat")
-        };
-        let mut b = json!({
+    // “关闭思考”功能已彻底移除：请求构造恒为 auto 行为（零额外注入：不改 body 字段/query/请求头），
+    // Ollama → /api/chat，OpenAI 兼容 → /v1/chat/completions，与功能引入前一致。
+    // 保留模型ID形状守卫：防止把 JSON 片段/URL/请求头/curl 塞进 model。
+    let (final_url, body, use_auth) = if is_ollama {
+        let base = cfg.base_url.trim_end_matches('/');
+        let url = format!("{base}/api/chat");
+        let b = json!({
             "model": cfg.model,
             "messages": msgs,
             "stream": true,
             "options": {"num_ctx": 8192}
         });
-        // think 是 Ollama /api/chat 的协议级字段（官方 API 文档），off 时显式下发
-        if cfg.reasoning_mode == "off" {
-            b["think"] = json!(false);
-        }
-        (url, OffProtocol::Chat, b, false, false)
+        (url, b, false)
     } else {
         if !valid_model_id(&cfg.model) {
             let msg = "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。".to_string();
             let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": &msg, "done": true}));
             return Err(msg);
         }
-        let plan = openai_off_plan(&cfg.base_url, &cfg.model, &cfg.reasoning_mode, &cfg.reasoning_strategy);
-        // model-complete 响应字段未经真实探针确认 → 解析器未实现，发送前显式拒绝（不猜解析、不发空白）
-        if plan.protocol == OffProtocol::ModelCompleteUnsupported {
-            let msg = "model-complete 协议的响应字段未经「仅回复OK」探针确认，解析器未实现：拒绝发送（不猜响应格式）。".to_string();
-            let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": &msg, "done": true}));
-            return Err(msg);
-        }
-        let b = match plan.protocol {
-            OffProtocol::Completions => {
-                // /v1/completions 无 messages 结构：system+user 按顺序合并为 prompt（显式协议映射，非暗改）
-                let mut parts: Vec<String> = Vec::new();
-                if !system.is_empty() { parts.push(system.clone()); }
-                for (_, content) in &messages { parts.push(content.clone()); }
-                let mut j = json!({
-                    "model": cfg.model,
-                    "prompt": parts.join("\n\n"),
-                    "stream": true,
-                    "temperature": 0.7
-                });
-                if plan.body_think { j["think"] = json!(false); }
-                j
-            }
-            _ => {
-                let mut j = json!({
-                    "model": cfg.model,
-                    "messages": msgs,
-                    "stream": true,
-                    "temperature": 0.7
-                });
-                if plan.body_think { j["think"] = json!(false); }
-                j
-            }
-        };
-        (plan.url, plan.protocol, b, !cfg.api_key.is_empty(), plan.header_think)
+        let base = cfg.base_url.trim_end_matches('/');
+        let base = if base.ends_with("/v1") { base.to_string() } else { format!("{base}/v1") };
+        let url = format!("{base}/chat/completions");
+        let b = json!({
+            "model": cfg.model,
+            "messages": msgs,
+            "stream": true,
+            "temperature": 0.7
+        });
+        (url, b, !cfg.api_key.is_empty())
     };
 
     let mut req = http.post(&final_url).timeout(std::time::Duration::from_secs(300));
-    if header_think {
-        req = req.header("X-Think-Enabled", "false");
-    }
     if use_auth {
         use base64::Engine;
         let cred = format!("Bearer {}", cfg.api_key);
@@ -330,14 +293,13 @@ pub async fn stream_chat(
         let content = parsed
             .pointer("/choices/0/message/content")
             .or_else(|| parsed.pointer("/choices/0/delta/content"))
-            .or_else(|| parsed.pointer("/choices/0/text"))
             .or_else(|| parsed.pointer("/message/content"))
             .or_else(|| parsed.pointer("/content"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
         if content.is_empty() {
             let brief: String = text.chars().take(300).collect();
-            let msg = format!("响应协议不匹配：端点返回非流式响应（Content-Type: {ct}），且无该协议正文字段。响应片段：{brief}");
+            let msg = format!("响应协议不匹配：端点返回非流式响应（Content-Type: {ct}），且未包含可识别的正文字段。响应片段：{brief}");
             emit_err(&app, &id, &msg);
             return Err(msg);
         }
@@ -359,16 +321,6 @@ pub async fn stream_chat(
             }
             if is_ollama {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    // off 模式收到非空 thinking = 服务/模型未真正执行关闭，显式报错而非静默丢弃
-                    if cfg.reasoning_mode == "off" {
-                        if let Some(think) = v.pointer("/message/thinking").and_then(|t| t.as_str()) {
-                            if !think.is_empty() {
-                                let msg = "服务或模型未执行关闭思考（off 模式仍返回 thinking 内容）".to_string();
-                                emit_err(&app, &id, &msg);
-                                return Err(msg);
-                            }
-                        }
-                    }
                     if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_str()) {
                         got_any = true;
                         let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
@@ -379,8 +331,8 @@ pub async fn stream_chat(
                 let data = data.trim();
                 if data == "[DONE]" {
                     if !got_any {
-                        // 200 但全程无该协议正文字段 → 显式报错，绝不静默完成出空白回复
-                        let msg = format!("响应协议不匹配：流结束前未找到该协议的正文字段（chat=choices[].delta.content / completions=choices[].text）。响应片段：{}", buf.chars().take(200).collect::<String>());
+                        // 200 但全程无正文字段 → 显式报错，绝不静默完成出空白回复
+                        let msg = format!("响应协议不匹配：流结束前未找到正文字段 choices[].delta.content。响应片段：{}", buf.chars().take(200).collect::<String>());
                         emit_err(&app, &id, &msg);
                         return Err(msg);
                     }
@@ -388,11 +340,13 @@ pub async fn stream_chat(
                     return Ok(());
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(content) = extract_stream_content(protocol, &v) {
+                    if let Some(content) =
+                        v.pointer("/choices/0/delta/content").and_then(|c| c.as_str())
+                    {
                         if !content.is_empty() {
                             got_any = true;
                         }
-                        emit_delta(&app, &id, &content, false);
+                        emit_delta(&app, &id, content, false);
                     }
                 }
             }
@@ -422,62 +376,9 @@ pub async fn stream_chat(
     Ok(())
 }
 
-/// 响应正文解析协议。model-complete 在真实探针确认响应字段前不实现（不猜），命中即发送前拒绝。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffProtocol { Chat, Completions, ModelCompleteUnsupported }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OffPlan {
-    pub url: String,
-    pub protocol: OffProtocol,
-    pub body_think: bool,
-    pub header_think: bool,
-}
-
-/// 每个策略绑定完整协议：URL + body 结构（由 protocol 决定 messages/prompt）+ query/header + 解析器。
-/// 关键：query/header 策略命中 /v1/models/{enc(model)}/complete，绝不落回 chat 路径。
-/// auto 或未知/switch-model 策略：走 chat 协议且零注入（model 由上层已切换）。
-pub fn openai_off_plan(base_url: &str, model: &str, mode: &str, strategy: &str) -> OffPlan {
-    let base = base_url.trim_end_matches('/');
-    let v1 = if base.ends_with("/v1") { base.to_string() } else { format!("{base}/v1") };
-    let chat = || OffPlan { url: format!("{v1}/chat/completions"), protocol: OffProtocol::Chat, body_think: false, header_think: false };
-    if mode != "off" {
-        return chat();
-    }
-    match strategy {
-        "chat-json-think-false" => OffPlan { url: format!("{v1}/chat/completions"), protocol: OffProtocol::Chat, body_think: true, header_think: false },
-        "completions-json-think-false" => OffPlan { url: format!("{v1}/completions"), protocol: OffProtocol::Completions, body_think: true, header_think: false },
-        "model-complete-query-think-false" => OffPlan { url: format!("{v1}/models/{}/complete?think=false", percent_encode(model)), protocol: OffProtocol::ModelCompleteUnsupported, body_think: false, header_think: false },
-        "model-complete-header-think-false" => OffPlan { url: format!("{v1}/models/{}/complete", percent_encode(model)), protocol: OffProtocol::ModelCompleteUnsupported, body_think: false, header_think: true },
-        _ => chat(),
-    }
-}
-
-/// 按协议提取流式增量正文。completions 取 choices[].text；chat 取 choices[].delta.content。
-pub fn extract_stream_content(protocol: OffProtocol, v: &serde_json::Value) -> Option<String> {
-    match protocol {
-        OffProtocol::Chat => v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(String::from),
-        OffProtocol::Completions => v.pointer("/choices/0/text").and_then(|c| c.as_str()).map(String::from),
-        OffProtocol::ModelCompleteUnsupported => None,
-    }
-}
-
-/// 极简 percent-encode（对齐 JS encodeURIComponent）：仅保留 A-Za-z0-9 与 -_.~，其余按 UTF-8 字节 %XX 大写。
-pub fn percent_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn model_id_shape() {
@@ -486,73 +387,11 @@ mod tests {
         assert!(valid_model_id("openai/gpt-4o"));
         assert!(valid_model_id("llama3:latest"));
         assert!(!valid_model_id(""));
-        assert!(!valid_model_id("TARGET\" , \"think\": false"));
-        assert!(!valid_model_id("TARGET?think=false"));
-        assert!(!valid_model_id("-H \"X-Think: 1\""));
+        assert!(!valid_model_id("TARGET\" , \"x\": false"));
+        assert!(!valid_model_id("TARGET?x=false"));
+        assert!(!valid_model_id("-H \"X-Flag: 1\""));
         assert!(!valid_model_id("http://evil/v1/completions"));
         assert!(!valid_model_id("/v1/completions"));
-        assert!(!valid_model_id("X-Think-Enabled: false"));
-    }
-
-    #[test]
-    fn strategy_binds_full_protocol() {
-        let b = "https://h/v1";
-        // chat：URL chat，body think
-        let p = openai_off_plan(b, "TARGET", "off", "chat-json-think-false");
-        assert_eq!(p.url, "https://h/v1/chat/completions");
-        assert_eq!(p.protocol, OffProtocol::Chat);
-        assert!(p.body_think);
-        assert!(!p.header_think);
-        // completions：URL /v1/completions，非 chat 路径
-        let p = openai_off_plan(b, "TARGET", "off", "completions-json-think-false");
-        assert_eq!(p.url, "https://h/v1/completions");
-        assert_eq!(p.protocol, OffProtocol::Completions);
-        assert!(p.body_think);
-        // model-complete query：命中 models/{enc}/complete?think=false，绝不落 chat
-        let p = openai_off_plan(b, "org/mod el", "off", "model-complete-query-think-false");
-        assert_eq!(p.url, "https://h/v1/models/org%2Fmod%20el/complete?think=false");
-        assert_eq!(p.protocol, OffProtocol::ModelCompleteUnsupported);
-        // model-complete header：URL 无 query，header 注入
-        let p = openai_off_plan(b, "TARGET", "off", "model-complete-header-think-false");
-        assert_eq!(p.url, "https://h/v1/models/TARGET/complete");
-        assert!(p.header_think);
-        assert!(!p.url.contains("chat/completions"));
-    }
-
-    #[test]
-    fn auto_has_no_injection_and_switch_model_uses_chat() {
-        for s in ["chat-json-think-false", "completions-json-think-false", "model-complete-query-think-false", "model-complete-header-think-false", "switch-model"] {
-            let p = openai_off_plan("https://h", "TARGET", "auto", s);
-            assert_eq!(p.protocol, OffProtocol::Chat, "auto must stay chat for {s}");
-            assert!(!p.body_think && !p.header_think, "auto must not inject for {s}");
-            assert!(!p.url.contains("think=false"), "auto url clean");
-        }
-        let p = openai_off_plan("https://h", "TARGET", "off", "switch-model");
-        assert_eq!(p.url, "https://h/v1/chat/completions");
-        assert!(!p.body_think && !p.header_think); // switch-model 不改协议参数，model 由上层已切换
-    }
-
-    #[test]
-    fn base_url_without_v1_appended() {
-        assert_eq!(openai_off_plan("https://h/", "M", "off", "completions-json-think-false").url, "https://h/v1/completions");
-        assert_eq!(openai_off_plan("https://h/v1", "M", "off", "chat-json-think-false").url, "https://h/v1/chat/completions");
-    }
-
-    #[test]
-    fn parsers_read_correct_fields() {
-        let chat = json!({ "choices": [{ "delta": { "content": "OK" } }] });
-        assert_eq!(extract_stream_content(OffProtocol::Chat, &chat).as_deref(), Some("OK"));
-        assert_eq!(extract_stream_content(OffProtocol::Completions, &chat), None); // delta 不属于 completions
-        let comp = json!({ "choices": [{ "text": "OK" }] });
-        assert_eq!(extract_stream_content(OffProtocol::Completions, &comp).as_deref(), Some("OK"));
-        assert_eq!(extract_stream_content(OffProtocol::Chat, &comp), None);
-    }
-
-    #[test]
-    fn percent_encode_matches_uri_component() {
-        assert_eq!(percent_encode("TARGET"), "TARGET");
-        assert_eq!(percent_encode("org/model"), "org%2Fmodel");
-        assert_eq!(percent_encode("gpt 4:o.x-y"), "gpt%204%3Ao.x-y");
-        assert_eq!(percent_encode("中文"), "%E4%B8%AD%E6%96%87");
+        assert!(!valid_model_id("X-Flag-Enabled: false"));
     }
 }

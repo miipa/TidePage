@@ -1463,16 +1463,12 @@ pub async fn ai_chat(
     messages: Vec<(String, String)>,
     proxy_mode: Option<String>,
     proxy_url: Option<String>,
-    reasoning_mode: Option<String>,
-    reasoning_strategy: Option<String>,
 ) -> Result<(), String> {
     let cfg = crate::ai::AiConfig {
         provider,
         base_url,
         api_key,
         model,
-        reasoning_mode: reasoning_mode.unwrap_or_else(|| "auto".into()),
-        reasoning_strategy: reasoning_strategy.unwrap_or_else(|| "switch-model".into()),
     };
     let http = crate::ai::build_client(
         proxy_mode.as_deref().unwrap_or("direct"),

@@ -1,21 +1,22 @@
-// 沙箱 A–G 验证套件 v2：自带受守卫启动 + try/finally 进程树回收 + 故障注入模式。
-// FR_FAULT_INJECT=1 → 应用 CDP 就绪后立即人为 throw，验证 finally 树回收归零。
+// FlowRead 实机回归（“关闭思考”功能已彻底移除后的 auto-only 版本）。
+// 覆盖：seed 后旧键不残留、非本机端点守卫、ollama/openai 兼容发送恒 auto（无 think/reasoning 键、形状一致）、
+// 阅读 palt/字体提示、AI 分页不跳末页、发送密钥不泄露、故障注入树回收。
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { connectTarget } from "./cdp.mjs";
 import { sendTestPrompt, expectSendBlocked } from "./send.mjs";
-import { launchSandbox, killTree, sweepSandboxWebviews } from "./launch_sandbox.mjs";
 import { SANDBOX_ROOT } from "./isolation_guard.mjs";
+import { launchSandbox, killTree, sweepSandboxWebviews } from "./launch_sandbox.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 9444;
-const MOCKLOG = path.join(SANDBOX_ROOT, "mock_reqs.jsonl");
-const mockReqs = () => (fs.existsSync(MOCKLOG) ? fs.readFileSync(MOCKLOG, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
-const brief = (r) => ({ path: r.path, model: r.body.model, think: "think" in r.body ? r.body.think : "(absent)", unknownKeys: Object.keys(r.body).filter((k) => /think|reason|effort/i.test(k) && k !== "think") });
-const log = (k) => console.error("STEP " + k);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const log = (s) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const MOCK_LOG = path.join(SANDBOX_ROOT, "mock_reqs.jsonl");
+const mockReqs = () => (fs.existsSync(MOCK_LOG) ? fs.readFileSync(MOCK_LOG, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+const brief = (r) => (r ? { path: r.path, model: r.body?.model, keys: r.keys, think: Object.prototype.hasOwnProperty.call(r.body || {}, "think") } : "n/a");
 
 const HELPER = `
 const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
@@ -29,8 +30,6 @@ const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.
 const uiSet=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('select'),'uiSet '+labelText); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const uiInput=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('input'),'uiInput '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const labelField=(t)=>[...document.querySelectorAll('.field')].find(f=>f.querySelector('label')?.textContent.includes(t));
-const uiInputByLabel=async(labelText,val)=>{ const s=await wait(()=>labelField(labelText)?.querySelector('input'),'uiInputByLabel '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
-const setReasoningUI=async(v)=>{ await openSettings('AI'); const s=await wait(()=>field('思考模式')?.querySelector('select'),'rs'); s.value=v; s.dispatchEvent(new Event('change',{bubbles:true})); closeSettings(); await sleep(400); };
 const paltBox=async(want)=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); if(cb.checked!==want){ cb.click(); await sleep(500);} else { await sleep(50);} };
 const paltToggle=async()=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); const want=!cb.checked; cb.click(); await sleep(500); return want; };
 const toastsNow=()=>[...document.querySelectorAll('.toast-card')].map(t=>t.textContent).join(' | ');
@@ -50,15 +49,11 @@ async function waitForCdp(timeoutMs = 360_000) {
   }
   throw new Error("CDP 未在超时内就绪");
 }
-// 页面就绪判定：可读写 localStorage（跳过过渡期 about:blank 上下文）
 async function ensureReady(cdp, timeoutMs = 60_000) {
   const t0 = Date.now();
   for (;;) {
     try { await cdp.evalJs(`(()=>{localStorage.getItem('flowread.config.v1');return location.href})()`); return; }
-    catch (e) {
-      if (Date.now() - t0 > timeoutMs) throw e;
-      await sleep(500);
-    }
+    catch (e) { if (Date.now() - t0 > timeoutMs) throw e; await sleep(500); }
   }
 }
 function auditTree() {
@@ -95,7 +90,7 @@ try {
   out.seed = await main.evalJs(H(`
     const base=cfgRead();
     const cfg={ reader: { fontFamily: "方正兰亭圆_gbk", fontSize: 27, letterSpacing: 0.05, mode: "page", punctuationCompression: false },
-      ai: { enabled:true, autoOnChapter:false, system: base.ai?.system||"", active:0, reasoningMode:"auto",
+      ai: { enabled:true, autoOnChapter:false, system: base.ai?.system||"", active:0,
         profiles:[{name:"TEST-EP",provider:"ollama",baseUrl:"http://127.0.0.1:18081",apiKey:"sk-GUARDTEST-PLACEHOLDER-9f3k2l",model:"mock",proxyMode:"direct",proxyUrl:""}],
         prompts:[{id:1,name:"测试总结",key:"F1",text:"总结：{chapter}"}], display:"reader", style: base.ai?.style||{} },
       webdav:{enabled:false}, regex:"" };
@@ -111,11 +106,14 @@ try {
   await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
   out.seedReadback = await M.evalJs(H(`
     const c=cfgRead(); const p=c.ai.profiles[0];
-    return {name:p.name,provider:p.provider,baseUrl:p.baseUrl,model:p.model,keyLen:(p.apiKey||'').length,enabled:c.ai.enabled,reasoning:c.ai.reasoningMode,
-      f_oldConfig_fieldPresent:'reasoningOffModel' in p, f_oldConfig_value:p.reasoningOffModel};
+    const has=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);
+    return { name:p.name, provider:p.provider, baseUrl:p.baseUrl, model:p.model, enabled:c.ai.enabled,
+      old_ai_reasoningMode:has(c.ai,'reasoningMode'), old_p_offModel:has(p,'reasoningOffModel'),
+      old_p_offStrategy:has(p,'reasoningOffStrategy'), old_p_probe:has(p,'protocolProbe'),
+      profileKeys:Object.keys(p) };
   `));
 
-  log("B");
+  log("B 非本机端点守卫");
   {
     const n0 = mockReqs().length;
     await M.evalJs(H(`
@@ -126,132 +124,22 @@ try {
     await M.evalJs(H(`const c=cfgRead(); c.ai.profiles=c.ai.profiles.filter(p=>p.name!=="EVIL-DEEPSEEK"); localStorage.setItem("flowread.config.v1", JSON.stringify(c)); return 1`));
   }
 
-  log("C");
+  log("S 发送恒 auto（ollama 两章 + openai 兼容）");
   {
-    out.C_setOffViaUI = await M.evalJs(H(`await setReasoningUI("off"); return cfgRead().ai.reasoningMode`));
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','openai'); closeSettings(); await sleep(300); return 1;`));
-    out.C_revert = await M.evalJs(H(`
-      const t=toastsNow();
-      await openSettings('AI');
-      const sel=await wait(()=>field('思考模式')?.querySelector('select'),'rs');
-      const v={ toastRevert:t.includes('已切回「自动」'), selectValue: sel.value, offDisabled: sel.querySelector('option[value="off"]').disabled, ls: cfgRead().ai.reasoningMode };
-      closeSettings();
-      return v;
-    `));
-    await M.evalJs(H(`setTimeout(()=>location.reload(),100); return 1`));
-    await sleep(4500);
-    await ensureReady(M);
-    out.C_afterReload = await M.evalJs(H(`await openBook(); return {ls: cfgRead().ai.reasoningMode}`));
-    await M.evalJs(H(`const c=cfgRead(); c.ai.reasoningMode="off"; localStorage.setItem("flowread.config.v1", JSON.stringify(c)); setTimeout(()=>location.reload(),200); return 1`));
-    await sleep(4500);
-    await ensureReady(M);
-    out.C_importKeepsOff = await M.evalJs(H(`await openBook(); await openDrawer(); return { ls: cfgRead().ai.reasoningMode, provider: cfgRead().ai.profiles[0].provider }`));
-    try { await sendTestPrompt(M); out.C_testSideGuard = "NOT-BLOCKED!!"; }
-    catch (e) { out.C_testSideGuard = e.message.slice(0, 80); }
-    const n0 = mockReqs().length;
-    await sendTestPrompt(M, { allowUnsupported: true });
-    await sleep(700);
-    out.C_appSideGuard = await M.evalJs(H(`return { toastBlocked: toastsNow().includes('已拦截'), marks: document.querySelectorAll('.ai-panel .ai-mark').length }`));
-    out.C_appGuard_mockDelta = mockReqs().length - n0;
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); return cfgRead().ai.profiles[0].provider`));
-    out.C_backOllama_modeStillOff = await M.evalJs(H(`return cfgRead().ai.reasoningMode`));
-  }
-
-  log("D");
-  {
-    await M.evalJs(H(`await setReasoningUI("auto")`));
     let n0 = mockReqs().length;
-    out.D_auto_mock = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
-    await M.evalJs(H(`await openSettings('AI'); await uiInput('模型','mock-thinking'); closeSettings(); await sleep(300); return 1`));
+    out.S_ollama_A = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
     n0 = mockReqs().length;
-    out.D_auto_thinkingServer = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
-    await M.evalJs(H(`await setReasoningUI("off")`));
-    await M.evalJs(H(`await openSettings('AI'); await uiInput('模型','mock'); closeSettings(); await sleep(300); return 1`));
+    out.S_ollama_B = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
+    out.S_ollama_identicalShape = JSON.stringify(mockReqs()[mockReqs().length - 2]?.keys) === JSON.stringify(mockReqs()[mockReqs().length - 1]?.keys);
+    out.S_noThinkingUI = await M.evalJs(H(`return { thinkUI: document.querySelectorAll('[class*=think],[class*=reason]').length, errorToast: toastsNow().includes('[错误]') };`));
+    // openai 兼容路径：不注入 think/query/header，模型不被替换
+    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','openai'); await uiInput('模型','mock'); closeSettings(); await sleep(300); return 1`));
     n0 = mockReqs().length;
-    out.D_off_compliant = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
-    await M.evalJs(H(`await openSettings('AI'); await uiInput('模型','mock-thinking'); closeSettings(); await sleep(300); return 1`));
-    n0 = mockReqs().length;
-    out.D_off_violating_guard = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
-    await M.evalJs(H(`await setReasoningUI("auto")`));
+    out.S_openai = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
+    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); return 1`));
   }
 
-  log("E");
-  {
-    await M.evalJs(H(`await openSettings('AI'); await uiInput('模型','mock'); closeSettings(); await sleep(300); await setReasoningUI("auto"); return 1`));
-    const n0 = mockReqs().length;
-    let firstBody = null;
-    const e = await sendTestPrompt(M, {
-      onStarted: async () => {
-        await sleep(500);
-        firstBody = mockReqs()[n0];
-        await M.evalJs(H(`await setReasoningUI("off")`));
-      },
-    });
-    out.E_firstStream = { completed: e, firstReqThink: firstBody ? ("think" in firstBody.body ? firstBody.body.think : "(absent)") : "n/a" };
-    const n1 = mockReqs().length;
-    const e2 = await sendTestPrompt(M);
-    out.E_secondReq = { req: brief(mockReqs()[n1]), completed: e2 };
-    await M.evalJs(H(`await setReasoningUI("auto")`));
-  }
-
-  log("D2/E2 openai-compat 关闭思考模型");
-  {
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','openai'); closeSettings(); await sleep(400); return cfgRead().ai.profiles[0].provider`));
-    out.D2_offDisabledEmpty = await M.evalJs(H(`
-      await openSettings('AI');
-      const sel=await wait(()=>field('思考模式')?.querySelector('select'),'rs');
-      const offOpt=sel.querySelector('option[value="off"]');
-      const tip=field('思考模式').textContent.includes('关闭思考模型');
-      closeSettings();
-      return { offOptionDisabled: offOpt.disabled, tipExplainsConfig: tip, currentMode: sel.value };
-    `));
-    // 模拟“外部导入”形成 unsupported+off：写 localStorage 后必须 reload 让内存生效（否则测的不是 off）
-    await M.evalJs(H(`const c=cfgRead(); c.ai.reasoningMode="off"; localStorage.setItem("flowread.config.v1", JSON.stringify(c)); setTimeout(()=>location.reload(),200); return 1`));
-    await sleep(4500);
-    await ensureReady(M);
-    await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
-    try { await sendTestPrompt(M); out.D2_emptyTestBlocked = "NOT-BLOCKED!!"; }
-    catch (e) { out.D2_emptyTestBlocked = e.message.slice(0, 60); }
-    const nApp = mockReqs().length;
-    await sendTestPrompt(M, { allowUnsupported: true });
-    await sleep(800);
-    out.D2_emptyAppGuard = await M.evalJs(H(`return { toastBlocked: toastsNow().includes('已拦截'), marks: document.querySelectorAll('.ai-panel .ai-mark').length }`));
-    out.D2_emptyAppGuard_mockDelta = mockReqs().length - nApp;
-    // 配置非思考模型（显式手动输入，非预填）
-    out.D2_afterConfig = await M.evalJs(H(`
-      await openSettings('AI');
-      await uiInputByLabel('关闭思考模型','mock-off-model');
-      const sel=field('思考模式').querySelector('select');
-      const enabled=!sel.querySelector('option[value="off"]').disabled;
-      const showUse=field('思考模式').textContent.includes('关闭思考时将使用模型：mock-off-model') || field('思考模式').textContent.includes('将使用模型：mock-off-model');
-      sel.value="off"; sel.dispatchEvent(new Event('change',{bubbles:true}));
-      closeSettings(); await sleep(400);
-      return { offNowSelectable: enabled, uiShowsOffModel: showUse, mode: cfgRead().ai.reasoningMode };
-    `));
-    let n0 = mockReqs().length;
-    out.D2_off_usesOffModel = { send: await sendTestPrompt(M), req: { path: mockReqs()[n0]?.path, model: mockReqs()[n0]?.body?.model, think: mockReqs()[n0] && "think" in mockReqs()[n0].body ? mockReqs()[n0].body.think : "(absent)", unknownKeys: mockReqs()[n0] ? Object.keys(mockReqs()[n0].body).filter((k) => /think|reason|effort|thinking/i.test(k)) : [] } };
-    await M.evalJs(H(`await setReasoningUI("auto"); return 1`));
-    n0 = mockReqs().length;
-    out.D2_auto_usesMainModel = { send: await sendTestPrompt(M), reqModel: mockReqs()[n0]?.body?.model };
-    // E2 流中 auto→off：当前请求模型不变，下一条才换
-    const n1 = mockReqs().length;
-    let firstModel = null;
-    const e2 = await sendTestPrompt(M, {
-      onStarted: async () => {
-        await sleep(500);
-        firstModel = mockReqs()[n1]?.body?.model ?? null;
-        await M.evalJs(H(`await setReasoningUI("off")`));
-      },
-    });
-    out.E2_midStream = { firstReqModel: firstModel, completed: e2 };
-    const n2 = mockReqs().length;
-    const e2b = await sendTestPrompt(M);
-    out.E2_secondReq = { model: mockReqs()[n2]?.body?.model, completed: e2b };
-    // 恢复：ollama + auto（供 G 分页阶段使用主模型 mock）
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); await setReasoningUI("auto"); return {prov:cfgRead().ai.profiles[0].provider, mode:cfgRead().ai.reasoningMode}`));
-  }
-
-  log("F");
+  log("F palt/字体提示");
   {
     await M.evalJs(H(`await paltBox(true); return 1`));
     out.F_fangzheng_hint = await M.evalJs(H(`
@@ -264,9 +152,7 @@ try {
       await openSettings('阅读');
       const fv=await wait(()=>field('字体（支持搜索')?.querySelector('.font-value'),'font input');
       fv.value='Noto Sans SC'; fv.dispatchEvent(new Event('input',{bubbles:true})); fv.dispatchEvent(new Event('change',{bubbles:true}));
-      await sleep(200);
-      closeSettings();
-      return cfgRead().reader.fontFamily;
+      await sleep(200); closeSettings(); return cfgRead().reader.fontFamily;
     `));
     await sleep(900);
     out.F_noto_hint = await M.evalJs(H(`
@@ -280,36 +166,15 @@ try {
       const d=document.querySelector('.ai-panel');
       return { chapter: probeEl(document.querySelector('#chapter-content')), drawer: (d && d.querySelector('.ai-mark')) ? probeEl(d.querySelector('.ai-mark')) : "drawer-empty" };
     `));
-    // standalone
-    await M.evalJs(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>x.title&&x.title.includes('弹出为独立窗口'));if(b){b.click();return 1}return 0})()`);
-    await sleep(5000);
-    const st = await connectTarget(PORT, (t) => t.url.includes("ai=1"));
-    await ensureReady(st);
-    await st.evalJs(H(`
-      const p = await wait(() => document.querySelector('.ai-panel'),'sp');
-      if (!p.classList.contains('reader')) { [...p.querySelectorAll('button')].find(x=>x.textContent.includes('阅读样式'))?.click(); await sleep(400); }
-      if (!p.querySelector('.ai-mark')) { p.querySelector('.ai-page')?.insertAdjacentHTML('beforeend','<div class="ai-page ai-reply"><div class="ai-mark"><p>，。！？（）《》</p></div></div>'); }
-      return 1;
-    `));
-    const probeSt = () => st.evalJs(H(`const p=document.querySelector('.ai-panel');const ms=p.querySelectorAll('.ai-mark');return probeEl(ms[ms.length-1]);`));
-    out.F_standalone_on = await probeSt();
     await M.evalJs(H(`await paltBox(false); closeSettings(); return 1`));
-    await sleep(900);
-    out.F_standalone_off = await probeSt();
-    out.F_main_off = await M.evalJs(H(`
-      await openDrawer();
-      const d=document.querySelector('.ai-panel');
-      return { chapter: probeEl(document.querySelector('#chapter-content')), drawer: (d && d.querySelector('.ai-mark')) ? probeEl(d.querySelector('.ai-mark')) : "drawer-empty" };
-    `));
-    st.close();
   }
 
-  log("G");
+  log("G AI 分页不跳末页");
   {
     await M.evalJs(H(`await paltBox(true); closeSettings(); await sleep(600); return 1`));
     await M.evalJs(H(`await openDrawer(); return 1`));
     const hasMark = await M.evalJs(H(`return !!document.querySelector('.ai-panel .ai-mark')`));
-    if (!hasMark) await sendTestPrompt(M);   // 先生成一条回复（落末页），再翻回第 1 页测“不跳末页”
+    if (!hasMark) await sendTestPrompt(M);
     out.G_start = await M.evalJs(H(`
       const pg=()=>Number(document.querySelector('.pctinfo')?.textContent.match(/^(\\d+)\\//)?.[1]||1);
       let g=0; while(pg()<5 && g++<10){ window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true})); await sleep(220);}
