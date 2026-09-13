@@ -8,6 +8,7 @@ export const api = {
   listBooks: () => invoke<BookRow[]>("list_books"),
   rescan: () => invoke<void>("rescan"),
   refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
+  fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
   getChapter: (bookId: number, chapterIndex: number) =>
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex }),

@@ -528,6 +528,12 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
     Ok(res)
 }
 
+/// 任务3：打开入口先查文件是否存在（不存在则由前端弹询问，绝不进入空白阅读）。
+#[tauri::command]
+pub fn file_exists(path: String) -> bool {
+    !path.is_empty() && Path::new(&path).exists()
+}
+
 #[tauri::command]
 pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenResult, String> {
     let book = {

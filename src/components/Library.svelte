@@ -121,6 +121,30 @@
     }
   }
 
+  // 任务3：打开入口先查文件是否存在；不存在则弹确认刷新，绝不进入空白阅读。
+  // 确认 → 刷新目录后停下（不继续打开、不触碰旧 reader 状态）；取消 → 直接返回。
+  async function tryOpenBook(b: BookRow) {
+    let exists = true;
+    try {
+      exists = await api.fileExists(b.path);
+    } catch {
+      exists = true; // 检查失败时不阻断（交由打开流程自行报错）
+    }
+    if (exists) {
+      openBook(b);
+      return;
+    }
+    const ok = await appConfirm(`文件已不存在：\n${b.path}\n\n是否刷新目录？`);
+    if (!ok) return;
+    try {
+      const r = await api.refreshLibrary();
+      toast(`书库已刷新：移除 ${r.removed} 本、新增 ${r.added} 本`);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+    // 无论该书是否仍在索引，都停在这里（不进入空白阅读）
+  }
+
   // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）
   async function refreshAll() {
     try {
@@ -134,7 +158,7 @@
   async function openRandom() {
     try {
       const b = await api.randomBook();
-      if (b) openBook(b);
+      if (b) tryOpenBook(b);
       else toast("书库为空");
     } catch (e) {
       toast(String(e), "error");
@@ -214,7 +238,7 @@
     await refresh();
     if (last) {
       toast(`已添加《${last.title}》到书库（原文件未移动）`);
-      openBook(last);
+      await tryOpenBook(last);
     }
   }
 
@@ -292,7 +316,7 @@
             <div
               class="card"
               style="left:{PAD + ci * cellW + (cellW - cardW) / 2}px; top:{r * cellH}px; width:{cardW}px;"
-              ondblclick={() => openBook(b)}
+              ondblclick={() => tryOpenBook(b)}
               oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
             >
               <div class="cover" style="height:{coverH}px;">
@@ -310,7 +334,7 @@
     {:else}
       <div class="list-inner">
         {#each filtered as b (b.id)}
-          <div class="row" ondblclick={() => openBook(b)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}>
+          <div class="row" ondblclick={() => tryOpenBook(b)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}>
             <img class="row-cover" src={coverUrl(b)} alt="" loading="lazy" />
             <div class="row-meta">
               <div class="t">{b.title}</div>
@@ -335,7 +359,7 @@
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
       <div class="ctx" style="left:{Math.min(ctxMenu.x, gridW - 200)}px; top:{ctxMenu.y}px;">
-        <button onclick={() => { openBook(ctxMenu!.book); ctxMenu = null; }}>📖 打开</button>
+        <button onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}>📖 打开</button>
         {#if ctxMenu.book.format === "txt"}
           <button onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}>⇄ 转换为 EPUB</button>
         {/if}

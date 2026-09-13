@@ -273,6 +273,7 @@ pub fn run() {
             library::list_books,
             library::rescan,
             library::refresh_library,
+            library::file_exists,
             library::open_book,
             library::get_chapter,
             library::save_progress,
