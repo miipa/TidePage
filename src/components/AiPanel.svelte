@@ -18,6 +18,8 @@
     reasoningOffUsable,
     isPlainModelId,
     sanitizeOffStrategy,
+    probeVerified,
+    protocolStrategyImplemented,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -233,11 +235,16 @@
     const offModel = (profile.reasoningOffModel || "").trim();
     const strategy = sanitizeOffStrategy(profile.reasoningOffStrategy);
     if (reasoningMode === "off" && !reasoningOffUsable(profile)) {
-      toast(providerSupportsReasoningOff(profile.provider)
-        ? "关闭思考请求已拦截（不会按 auto 静默发送，也不会注入未知字段）。"
-        : (strategy === "switch-model"
-            ? "该端点关闭方式为「切换非思考模型」，但『关闭思考模型』未填合法模型ID：请求已拦截（不会按 auto 偷发，不猜模型）。"
-            : "主模型ID含非法字符或关闭方式无效：请求已拦截（不会按 auto 偷发）。"), "error");
+      const why = providerSupportsReasoningOff(profile.provider)
+        ? "关闭思考请求已拦截（不会按 auto 静默发送）。"
+        : strategy === "switch-model"
+          ? "该端点关闭方式为「切换非思考模型」，但『关闭思考模型』未填合法模型ID：请求已拦截（不会按 auto 偷发，不猜模型）。"
+          : !protocolStrategyImplemented(strategy)
+            ? "该协议（model-complete）响应字段未经真实探针确认、解析器未实现：请求已拦截，不发出不完整请求。"
+            : !probeVerified(profile, strategy)
+              ? "该协议未经「仅回复OK」探针验证（或端点/模型已变更致验证失效）：请求已拦截，不碰运气发送。"
+              : "主模型ID含非法字符：请求已拦截。";
+      toast(why, "error");
       return;
     }
     // 模型形状守卫：任何策略下 model 只能是纯模型ID（拒 JSON/URL/curl/请求头文本）

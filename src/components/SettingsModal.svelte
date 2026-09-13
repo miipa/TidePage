@@ -16,6 +16,10 @@
     DEFAULT_ZONES,
     providerSupportsReasoningOff,
     reasoningOffUsable,
+    sanitizeOffStrategy,
+    strategySelectable,
+    parseProbeLine,
+    probeMatchesProfile,
     type BindAction,
     type ZoneAction,
     type ThemeKey,
@@ -222,8 +226,26 @@
     if (config.ai.reasoningMode === "off" && !reasoningOffUsable(ap)) {
       config.ai.reasoningMode = "auto";
       saveConfig();
-      toast("新端点不支持关闭思考（非 Ollama 且未配置「关闭思考模型」），思考模式已切回「自动」。", "info");
+      toast("新端点不支持关闭思考（非 Ollama 且未配置可用的关闭方式），思考模式已切回「自动」。", "info");
     }
+  }
+
+  let probeInput = $state("");
+  function importProbe() {
+    const r = parseProbeLine(probeInput);
+    if (!r.ok || !r.probe) {
+      toast(`探针结果注册失败：${r.error}`, "error");
+      return;
+    }
+    const m = probeMatchesProfile(r.probe, ap);
+    if (!m.ok) {
+      toast(`探针结果与当前端点不匹配：${m.reason}（验证不跨端点/模型沿用）`, "error");
+      return;
+    }
+    ap.protocolProbe = r.probe;
+    probeInput = "";
+    saveConfig();
+    toast(`已注册探针验证：${r.probe.strategies.join(", ")}`, "info");
   }
 
   function addProfile() {
@@ -238,6 +260,7 @@
       proxyUrl: src.proxyUrl,
       reasoningOffModel: "", // 不预填：新端点的非思考模型必须用户显式配置
       reasoningOffStrategy: "switch-model", // 默认最保守策略：不猜 distributor 支持任何注入方式
+      protocolProbe: null,
     });
     config.ai.active = config.ai.profiles.length - 1;
     saveConfig();
@@ -1088,23 +1111,37 @@
         <p class="tip"><b>关闭思考（Ollama）</b>：off 时请求体显式下发 <code>"think": false</code>，原模型不变。仅经本地 mock 验证出站字段与「off 仍返回 thinking 则报错」防线；<b>真实 Ollama 思考模型未验证</b>。</p>
       {:else}
         <div class="field" style="margin:6px 0">
-          <label for="ai-reasoning-strategy">关闭思考方式（distributor 协议，须先“仅回复OK”实测该协议被接受，本程序不猜）</label>
+          <label for="ai-reasoning-strategy">关闭思考方式（每个选项绑定完整协议：URL+body 结构+注入位置+解析器；须探针实测并注册，本程序不猜）</label>
           <select id="ai-reasoning-strategy" bind:value={ap.reasoningOffStrategy} onchange={saveConfig}>
-            <option value="switch-model">切换非思考模型（仅改 model 字段）</option>
-            <option value="json-think-false">请求体加 "think": false</option>
-            <option value="query-think-false">URL 查询加 ?think=false</option>
-            <option value="header-think-false">请求头加 X-Think-Enabled: false</option>
+            <option value="switch-model">切换非思考模型（仅改 model 字段，仍走 chat 协议）</option>
+            <option value="chat-json-think-false" disabled={!strategySelectable(ap, "chat-json-think-false")}>chat + 请求体 think:false（POST /v1/chat/completions, messages）{strategySelectable(ap, "chat-json-think-false") ? "" : "（当前端点未验证）"}</option>
+            <option value="completions-json-think-false" disabled={!strategySelectable(ap, "completions-json-think-false")}>completions + 请求体 think:false（POST /v1/completions, prompt）{strategySelectable(ap, "completions-json-think-false") ? "" : "（当前端点未验证）"}</option>
+            <option value="model-complete-query-think-false" disabled={true}>models/complete + 查询 ?think=false（解析器未实现，探针前不猜响应字段）</option>
+            <option value="model-complete-header-think-false" disabled={true}>models/complete + 请求头 X-Think-Enabled:false（解析器未实现，探针前不猜响应字段）</option>
           </select>
         </div>
         {#if ap.reasoningOffStrategy === "switch-model"}
           {#if (ap.reasoningOffModel || "").trim()}
             <p class="tip"><b>关闭思考（显式换模型）</b>：{config.ai.reasoningMode === "off" ? `关闭思考时将使用模型：${ap.reasoningOffModel}` : `选择「关闭思考」后将使用模型：${ap.reasoningOffModel}`}；主模型「{ap.model}」不变，请求体不含任何 think/query/header 注入（换模型由你显式配置，非暗中切换）。仅经本地 mock 验证。</p>
           {:else}
-            <p class="tip" style="color:var(--danger)">「关闭思考」不可用：方式为「切换非思考模型」但未填合法模型ID。本程序不猜测/不预填/不暗中换模型；请在下方填写，或改用其它已实测的方式。</p>
+            <p class="tip" style="color:var(--danger)">「关闭思考」不可用：方式为「切换非思考模型」但未填合法模型ID。若服务商只有同一个 TARGET 模型、不提供独立非思考模型，则当前无换模型方案，需走协议方式（见下方探针）。本程序不猜测/不预填/不暗中换模型。</p>
           {/if}
+        {:else if !strategySelectable(ap, sanitizeOffStrategy(ap.reasoningOffStrategy))}
+          <p class="tip" style="color:var(--danger)">该协议方式未注册有效探针结果（或端点/模型已变更致验证失效）：「关闭思考」将被拦截，不会碰运气发送。</p>
         {:else}
-          <p class="tip"><b>当前方式：</b>{ap.reasoningOffStrategy === "json-think-false" ? "off 时请求体附加 \"think\": false" : ap.reasoningOffStrategy === "query-think-false" ? "off 时请求 URL 附加 ?think=false" : "off 时请求头附加 X-Think-Enabled: false"}；model 字段始终只用主模型「{ap.model}」，不并入任何参数/URL/请求头文本。仅当该 distributor 实测接受此协议方可选择；未实测请用「自动」。</p>
+          <p class="tip"><b>已验证协议</b>：{ap.reasoningOffStrategy}；model 字段恒为主模型「{ap.model}」，不并入任何参数/URL/请求头文本。</p>
         {/if}
+        <div class="field" style="margin-top:6px">
+          <label for="ai-probe-input">注册探针结果（运行 _test/probe_distributor.mjs 后粘贴 FLOWREAD_PROTOCOL= 行）</label>
+          <textarea id="ai-probe-input" class="cssbox" rows="2" bind:value={probeInput} placeholder='FLOWREAD_PROTOCOL=&#123;"baseUrl":"https://…","model":"TARGET","strategies":["chat-json-think-false"],…&#125;'></textarea>
+          <div class="row-inline" style="margin-top:4px">
+            <button onclick={importProbe}>注册验证结果</button>
+            {#if ap.protocolProbe}
+              <span class="tip" style="align-self:center">当前记录：{ap.protocolProbe.baseUrl} · {ap.protocolProbe.model} · {ap.protocolProbe.strategies.join(", ")}</span>
+              <button class="icon" title="清除验证结果" onclick={() => { ap.protocolProbe = null; probeInput = ""; saveConfig(); }}>×</button>
+            {/if}
+          </div>
+        </div>
       {/if}
       <p class="tip">仅影响之后发送的新请求，不中断当前回复。</p>
       {#if !providerSupportsReasoningOff(ap.provider) && ap.reasoningOffStrategy === "switch-model"}

@@ -26,6 +26,7 @@ const server = http.createServer((req, res) => {
       method: req.method,
       auth: req.headers.authorization ? "present" : "none",
       thinkHeader: req.headers["x-think-enabled"] ?? null,
+      keys: body && typeof body === "object" ? Object.keys(body) : [],
       body: red,
     };
     fs.appendFileSync(LOG, JSON.stringify(capture) + "\n");
@@ -45,6 +46,25 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       for (let i = 0; i < N; i++) { res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: CHUNK } }] })}\n\n`); await new Promise((r) => setTimeout(r, 90)); }
       res.write("data: [DONE]\n\n"); res.end();
+      return;
+    }
+    if (req.url.startsWith("/v1/completions")) {
+      // completions 协议：choices[].text 增量帧（探针证实的字段形态；与 chat 的 delta.content 严格分离）
+      const wrong = sk === "mock-wrongshape"; // 协议错配模拟：completions 路径返回 delta 帧
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      for (let i = 0; i < N; i++) {
+        res.write(wrong
+          ? `data: ${JSON.stringify({ choices: [{ delta: { content: CHUNK } }] })}\n\n`
+          : `data: ${JSON.stringify({ id: "cmpl-1", object: "text_completion", choices: [{ index: 0, text: CHUNK, finish_reason: null }] })}\n\n`);
+        await new Promise((r) => setTimeout(r, 90));
+      }
+      res.write("data: [DONE]\n\n"); res.end();
+      return;
+    }
+    if (req.url.includes("/complete")) {
+      // model-complete：app 解析器未实现、发送前必须被拒；若有请求漏到此处，显式 500，绝不伪装成功
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "mock: model-complete must be blocked pre-send" } }));
       return;
     }
     res.writeHead(404).end();
