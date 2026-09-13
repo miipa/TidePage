@@ -521,10 +521,8 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
     };
     if res.removed > 0 || res.added > 0 {
         state.app.emit("library-changed", ()).ok();
-        if res.added > 0 {
-            spawn_meta_worker(state.app.clone());
-        }
     }
+    // A：刷新只做索引对账，不触发任何元数据/AI 任务；新入书 meta_done 保持未生成（=0）。
     Ok(res)
 }
 
