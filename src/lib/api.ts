@@ -7,6 +7,7 @@ export const api = {
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
   rescan: () => invoke<void>("rescan"),
+  refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
   getChapter: (bookId: number, chapterIndex: number) =>
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex }),

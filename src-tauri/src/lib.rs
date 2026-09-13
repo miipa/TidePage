@@ -272,6 +272,7 @@ pub fn run() {
             library::remove_folder,
             library::list_books,
             library::rescan,
+            library::refresh_library,
             library::open_book,
             library::get_chapter,
             library::save_progress,

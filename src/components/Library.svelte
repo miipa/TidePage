@@ -121,6 +121,16 @@
     }
   }
 
+  // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）
+  async function refreshAll() {
+    try {
+      const r = await api.refreshLibrary();
+      toast(`书库已刷新：移除 ${r.removed} 本、新增 ${r.added} 本`);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
   async function openRandom() {
     try {
       const b = await api.randomBook();
@@ -234,7 +244,7 @@
   <div class="toolbar">
     <span class="logo">FlowRead</span>
     <button onclick={addFolder}>＋ 添加文件夹</button>
-    <button onclick={() => { api.rescan(); toast("扫描中…"); }}>⟳ 扫描</button>
+    <button onclick={refreshAll}>⟳ 刷新</button>
     <input class="search" placeholder="搜索书名 / 作者…" bind:value={query} />
     <select bind:value={sortKey} onchange={saveSort}>
       <option value="lastread">按最近阅读</option>

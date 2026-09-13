@@ -434,6 +434,100 @@ pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct RefreshResult {
+    pub removed: usize,
+    pub added: usize,
+}
+
+/// 任务2 核心：一次性对账（纯目录遍历，不新增任何文件系统监听）。
+/// 1) 记录路径在磁盘上不存在的 → 从索引移除并计数；
+/// 2) 扫描集 = 存活记录所在目录 ∪ 已登记书库根目录及其**一级子目录**；
+///    逐目录只扫一层，磁盘存在但索引里没有的书籍新增入库（不做全递归）；
+/// 3) 返回 {removed, added}。不触碰正在阅读的窗口/reader 状态（不强关）。
+pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
+    let records = db::all_book_paths(conn);
+    let mut missing: Vec<String> = Vec::new();
+    let mut survivors: Vec<String> = Vec::new();
+    for (_, p) in &records {
+        if Path::new(p).exists() {
+            survivors.push(p.clone());
+        } else {
+            missing.push(p.clone());
+        }
+    }
+    if !missing.is_empty() {
+        let _ = db::delete_books(conn, &missing);
+    }
+
+    let mut scan_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in &survivors {
+        if let Some(d) = Path::new(p.as_str()).parent() {
+            scan_dirs.insert(d.to_path_buf());
+        }
+    }
+    // 已登记书库根：并入根目录本身 + 其一级子目录（新落在子目录的书也能被发现）。
+    for root in db::list_folders(conn) {
+        let rp = PathBuf::from(&root);
+        if !rp.is_dir() {
+            continue;
+        }
+        scan_dirs.insert(rp.clone());
+        if let Ok(rd) = std::fs::read_dir(&rp) {
+            for entry in rd.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    scan_dirs.insert(sub);
+                }
+            }
+        }
+    }
+
+    let mut added = 0usize;
+    for dir in &scan_dirs {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let fp = entry.path();
+            if !fp.is_file() {
+                continue;
+            }
+            let path = fp.to_string_lossy().into_owned();
+            let ext = match ext_of(&path) {
+                Some(e) => e,
+                None => continue,
+            };
+            if db::get_book_by_path(conn, &path).is_some() {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
+            let mtime = file_mtime(&fp);
+            let title = quick_title(&path);
+            if db::upsert_book(conn, &path, &title, &ext, size, mtime).is_ok() {
+                added += 1;
+            }
+        }
+    }
+    RefreshResult { removed: missing.len(), added }
+}
+
+#[tauri::command]
+pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshResult, String> {
+    let res = {
+        let conn = state.db.0.lock().unwrap();
+        refresh_library_core(&conn)
+    };
+    if res.removed > 0 || res.added > 0 {
+        state.app.emit("library-changed", ()).ok();
+        if res.added > 0 {
+            spawn_meta_worker(state.app.clone());
+        }
+    }
+    Ok(res)
+}
+
 #[tauri::command]
 pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenResult, String> {
     let book = {
@@ -1847,4 +1941,112 @@ pub async fn get_book_word_count(
     let total = text.chars().count() as i64;
     let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
     Ok(WordCount { total, pure })
+}
+
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("fr_refresh_{}_{}_{}", tag, std::process::id(), n));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 必验 A/B：删文件 → removed 计数正确；目录新增文件 → added 计数正确；二次刷新幂等 0/0。
+    #[test]
+    fn refresh_removes_missing_and_discovers_new() {
+        let root = tmp_root("ab");
+        let a = root.join("shelfA");
+        let b = root.join("shelfB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let one = a.join("one.txt");
+        let two = a.join("two.txt");
+        let extra = a.join("extra.txt");
+        let keep = b.join("keep.txt");
+        let dead = b.join("dead.txt");
+        for f in [&one, &two, &keep, &dead] { std::fs::write(f, b"x").unwrap(); }
+        std::fs::write(&extra, b"y").unwrap(); // 磁盘存在但未入库
+
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        db::upsert_book(&conn, &sp(&one), "one", "txt", 1, 0).unwrap();
+        db::upsert_book(&conn, &sp(&two), "two", "txt", 1, 0).unwrap();
+        db::upsert_book(&conn, &sp(&keep), "keep", "txt", 1, 0).unwrap();
+        db::upsert_book(&conn, &sp(&dead), "dead", "txt", 1, 0).unwrap();
+
+        std::fs::remove_file(&dead).unwrap(); // 索引里有、磁盘已删
+        let r1 = refresh_library_core(&conn);
+        assert_eq!(r1.removed, 1, "deleted file must be removed from index");
+        assert_eq!(r1.added, 1, "new file on disk must be added to index");
+        assert!(db::get_book_by_path(&conn, &sp(&dead)).is_none());
+        assert!(db::get_book_by_path(&conn, &sp(&extra)).is_some());
+
+        let r2 = refresh_library_core(&conn);
+        assert_eq!((r2.removed, r2.added), (0, 0), "second refresh must be idempotent");
+
+        std::fs::remove_file(&two).unwrap();
+        let r3 = refresh_library_core(&conn);
+        assert_eq!((r3.removed, r3.added), (1, 0));
+        assert!(db::get_book_by_path(&conn, &sp(&two)).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 非书籍扩展名不得入库；不存在索引记录的目录不会被扫。
+    #[test]
+    fn refresh_ignores_non_book_and_unindexed_dirs() {
+        let root = tmp_root("ign");
+        let a = root.join("shelfA");
+        let other = root.join("nowhere");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let one = a.join("one.txt");
+        std::fs::write(&one, b"x").unwrap();
+        std::fs::write(a.join("note.md"), b"#").unwrap();      // 非书籍扩展名
+        let orphan = other.join("orphan.txt");
+        std::fs::write(&orphan, b"z").unwrap();                 // 无任何记录指向该目录
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        db::upsert_book(&conn, &sp(&one), "one", "txt", 1, 0).unwrap();
+        let r = refresh_library_core(&conn);
+        assert_eq!((r.removed, r.added), (0, 0));
+        assert!(db::get_book_by_path(&conn, &sp(&a.join("note.md"))).is_none());
+        assert!(db::get_book_by_path(&conn, &sp(&orphan)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 必改1(B)：书库根的一级子目录中“未入库过”的新书，刷新时能被发现；二级不递归。
+    #[test]
+    fn refresh_discovers_new_books_in_root_subdir() {
+        let root = tmp_root("rootsub");
+        let shelf = root.join("shelf");
+        std::fs::create_dir_all(&shelf).unwrap();
+        let conn = db::init(&root.join("t.db")).unwrap();
+        db::add_folder(&conn, &shelf.to_string_lossy()).unwrap(); // 登记书库根
+        // 根下一级子目录里放一本“未入库过”的新书
+        let sub = shelf.join("未入库过的一级目录");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("new1.txt"), b"a").unwrap();
+        // 根目录本身直接放的书
+        std::fs::write(shelf.join("inroot.txt"), b"b").unwrap();
+        // 二级子目录（不得被非递归扫描发现）
+        let deep = sub.join("deeper");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.txt"), b"c").unwrap();
+
+        let r = refresh_library_core(&conn);
+        assert_eq!(r.removed, 0);
+        assert_eq!(r.added, 2, "根+一级子目录的新书应被识别");
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        assert!(db::get_book_by_path(&conn, &sp(&sub.join("new1.txt"))).is_some());
+        assert!(db::get_book_by_path(&conn, &sp(&shelf.join("inroot.txt"))).is_some());
+        assert!(db::get_book_by_path(&conn, &sp(&deep.join("deep.txt"))).is_none(), "二级不递归");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
