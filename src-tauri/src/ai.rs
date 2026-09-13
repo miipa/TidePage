@@ -192,6 +192,30 @@ pub async fn test_connection(
     Err(format!("全部尝试失败 → {}", errs.join(" ； ")))
 }
 
+// 出站请求体用结构体声明字段顺序，保证 Object.keys(body) 稳定为约定值，且绝不夹带额外字段。
+#[derive(serde::Serialize)]
+struct OllamaChatBody {
+    messages: Vec<serde_json::Value>,
+    model: String,
+    options: serde_json::Value,
+    stream: bool,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiChatBody {
+    model: String,
+    messages: Vec<serde_json::Value>,
+    stream: bool,
+    temperature: f64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ChatBody {
+    Ollama(OllamaChatBody),
+    OpenAi(OpenAiChatBody),
+}
+
 pub async fn stream_chat(
     app: tauri::AppHandle,
     http: reqwest::Client,
@@ -213,11 +237,11 @@ pub async fn stream_chat(
     let (final_url, body, use_auth) = if is_ollama {
         let base = cfg.base_url.trim_end_matches('/');
         let url = format!("{base}/api/chat");
-        let b = json!({
-            "model": cfg.model,
-            "messages": msgs,
-            "stream": true,
-            "options": {"num_ctx": 8192}
+        let b = ChatBody::Ollama(OllamaChatBody {
+            messages: msgs,
+            model: cfg.model.clone(),
+            options: json!({"num_ctx": 8192}),
+            stream: true,
         });
         (url, b, false)
     } else {
@@ -229,11 +253,11 @@ pub async fn stream_chat(
         let base = cfg.base_url.trim_end_matches('/');
         let base = if base.ends_with("/v1") { base.to_string() } else { format!("{base}/v1") };
         let url = format!("{base}/chat/completions");
-        let b = json!({
-            "model": cfg.model,
-            "messages": msgs,
-            "stream": true,
-            "temperature": 0.7
+        let b = ChatBody::OpenAi(OpenAiChatBody {
+            model: cfg.model.clone(),
+            messages: msgs,
+            stream: true,
+            temperature: 0.7,
         });
         (url, b, !cfg.api_key.is_empty())
     };
@@ -387,11 +411,11 @@ mod tests {
         assert!(valid_model_id("openai/gpt-4o"));
         assert!(valid_model_id("llama3:latest"));
         assert!(!valid_model_id(""));
-        assert!(!valid_model_id("TARGET\" , \"x\": false"));
-        assert!(!valid_model_id("TARGET?x=false"));
-        assert!(!valid_model_id("-H \"X-Flag: 1\""));
+        assert!(!valid_model_id("TARGET\" , \"think\": false"));
+        assert!(!valid_model_id("TARGET?think=false"));
+        assert!(!valid_model_id("-H \"X-Think: 1\""));
         assert!(!valid_model_id("http://evil/v1/completions"));
         assert!(!valid_model_id("/v1/completions"));
-        assert!(!valid_model_id("X-Flag-Enabled: false"));
+        assert!(!valid_model_id("X-Think-Enabled: false"));
     }
 }
