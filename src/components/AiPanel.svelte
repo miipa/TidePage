@@ -14,12 +14,6 @@
     THEMES,
     AI_WIN_LABEL,
     stripNonTextHtml,
-    providerSupportsReasoningOff,
-    reasoningOffUsable,
-    isPlainModelId,
-    sanitizeOffStrategy,
-    probeVerified,
-    protocolStrategyImplemented,
     type PromptItem,
   } from "../lib/stores.svelte";
 
@@ -229,35 +223,6 @@
       toast("请先在设置 → AI 配置端点", "error");
       return;
     }
-    // 发送开始即快照（mode/主模型/非思考模型/策略）：生成途中任何修改只影响下一次请求
-    const reasoningMode = config.ai.reasoningMode;
-    const mainModel = profile.model;
-    const offModel = (profile.reasoningOffModel || "").trim();
-    const strategy = sanitizeOffStrategy(profile.reasoningOffStrategy);
-    if (reasoningMode === "off" && !reasoningOffUsable(profile)) {
-      const why = providerSupportsReasoningOff(profile.provider)
-        ? "关闭思考请求已拦截（不会按 auto 静默发送）。"
-        : strategy === "switch-model"
-          ? "该端点关闭方式为「切换非思考模型」，但『关闭思考模型』未填合法模型ID：请求已拦截（不会按 auto 偷发，不猜模型）。"
-          : !protocolStrategyImplemented(strategy)
-            ? "该协议（model-complete）响应字段未经真实探针确认、解析器未实现：请求已拦截，不发出不完整请求。"
-            : !probeVerified(profile, strategy)
-              ? "该协议未经「仅回复OK」探针验证（或端点/模型已变更致验证失效）：请求已拦截，不碰运气发送。"
-              : "主模型ID含非法字符：请求已拦截。";
-      toast(why, "error");
-      return;
-    }
-    // 模型形状守卫：任何策略下 model 只能是纯模型ID（拒 JSON/URL/curl/请求头文本）
-    if (!isPlainModelId(mainModel)) {
-      toast("主模型ID含非法字符（请求头/JSON/URL/curl 不能作为模型ID），请求已拦截。", "error");
-      return;
-    }
-    // switch-model+off：显式改用用户填的非思考模型；其余策略只走请求层注入，model 永不变
-    const useModel = reasoningMode === "off" && strategy === "switch-model" && !providerSupportsReasoningOff(profile.provider) ? offModel : mainModel;
-    if (reasoningMode === "off" && !isPlainModelId(useModel)) {
-      toast("『关闭思考模型』必须是纯模型ID，请求已拦截。", "error");
-      return;
-    }
     const id = `s${++sessionSeq}-${Date.now()}`;
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
@@ -289,13 +254,11 @@
         provider: profile.provider,
         baseUrl: profile.baseUrl,
         apiKey: profile.apiKey,
-        model: useModel,
+        model: profile.model,
         system,
         messages: [["user", userText]],
         proxyMode: profile.proxyMode,
         proxyUrl: profile.proxyUrl,
-        reasoningMode,
-        reasoningStrategy: strategy,
       });
     } catch (e) {
       reply.content += `\n\n[错误] ${e}`;
@@ -718,17 +681,6 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     saveConfig();
     tick().then(() => scheduleMeasure(true));
   }
-
-  // 用户主动切端点：若新端点不可用 off（非 Ollama 且未配置非思考模型），显式切回 auto + toast + 保存。
-  // （非用户操作形成的 unsupported+off 不在此处理，由 run() 发送前拦截兜底）
-  function onActiveChange() {
-    saveConfig();
-    if (config.ai.reasoningMode === "off" && profile && !reasoningOffUsable(profile)) {
-      config.ai.reasoningMode = "auto";
-      saveConfig();
-      toast("新端点不支持关闭思考（非 Ollama 且未配置「关闭思考模型」），已切回「自动」。", "info");
-    }
-  }
 </script>
 
 <svelte:window onkeydown={onGlobalKeys} />
@@ -742,7 +694,7 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={onActiveChange}>
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
           {#each config.ai.profiles as p, i (p.name + i)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
@@ -857,7 +809,7 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={onActiveChange}>
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
           {#each config.ai.profiles as p, i (p.name + i)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
