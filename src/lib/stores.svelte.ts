@@ -139,14 +139,45 @@ export interface WebdavConfig {
   downloadDir: string;
 }
 
+export type AiProvider = "openai" | "ollama" | "anthropic" | "gemini" | "azure-openai";
+
 export interface AiProfile {
+  /** 稳定唯一 id（用于渲染 key 与端点识别；旧配置迁移时补齐） */
+  id: number;
   name: string;
-  provider: "openai" | "ollama";
+  provider: AiProvider;
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** azure-openai 专用：部署名 */
+  deployment: string;
+  /** azure-openai 专用：api-version */
+  apiVersion: string;
   proxyMode: "auto" | "direct" | "custom";
   proxyUrl: string;
+}
+
+export interface AiProviderMeta {
+  id: AiProvider;
+  label: string;
+  baseUrlHint: string;
+  modelHint: string;
+  needsKey: boolean;
+  /** 需要 deployment / api-version 字段 */
+  azure?: boolean;
+}
+
+// 服务商适配表（前端）：下拉/表单字段/占位提示统一由此驱动，新增 provider 只需在此加一行。
+export const AI_PROVIDERS: AiProviderMeta[] = [
+  { id: "openai", label: "OpenAI 兼容 API", baseUrlHint: "https://api.deepseek.com", modelHint: "deepseek-chat", needsKey: true },
+  { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false },
+  { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true },
+  { id: "gemini", label: "Google Gemini", baseUrlHint: "https://generativelanguage.googleapis.com", modelHint: "gemini-1.5-flash", needsKey: true },
+  { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true },
+];
+
+export function aiProviderMeta(p: string): AiProviderMeta {
+  return AI_PROVIDERS.find((x) => x.id === p) ?? AI_PROVIDERS[0];
 }
 
 // 物理清除已废弃的“关闭思考”残留键（不隐藏、不保留）：
@@ -192,6 +223,8 @@ export interface AiConfig {
   prompts: PromptItem[];
   display: "chat" | "reader";
   style: AiStyleConfig;
+  /** 端点失败时自动切换并重跑上一次操作（默认开） */
+  failover: boolean;
 }
 
 // “关闭思考”功能已于 v0.1.24 后彻底移除（UI/发送链/存储三层都无残留）：
@@ -200,15 +233,108 @@ export interface AiConfig {
 
 export const DEFAULT_AI_PROFILES: AiProfile[] = [
   {
+    id: 1,
     name: "DeepSeek",
     provider: "openai",
     baseUrl: "https://api.deepseek.com",
     apiKey: "",
     model: "deepseek-chat",
+    deployment: "",
+    apiVersion: "",
     proxyMode: "auto",
     proxyUrl: "",
   },
 ];
+
+let profileIdSeq = 1;
+
+/** 补齐缺失/重复的 profile id，保证唯一稳定；返回归一化后的数组本身。 */
+export function ensureProfileIds(profiles: AiProfile[]): void {
+  let max = 0;
+  for (const p of profiles) {
+    if (typeof p.id === "number" && Number.isFinite(p.id) && p.id > max) max = p.id;
+  }
+  const used = new Set<number>();
+  for (const p of profiles) {
+    let id = p.id;
+    if (!Number.isFinite(id) || id <= 0 || used.has(id)) id = ++max;
+    used.add(id);
+    p.id = id;
+  }
+  if (max > profileIdSeq) profileIdSeq = max;
+}
+
+function nextProfileId(): number {
+  return ++profileIdSeq;
+}
+
+function sanitizeProvider(v: any): AiProvider {
+  const s = typeof v === "string" ? v.toLowerCase() : "";
+  if (s === "ollama") return "ollama";
+  if (s === "anthropic" || s === "claude") return "anthropic";
+  if (s === "gemini" || s === "google") return "gemini";
+  if (s === "azure-openai" || s === "azure" || s === "azure_openai") return "azure-openai";
+  return "openai";
+}
+
+/** 用默认字段模板补齐单个 profile（新增字段缺失时用默认值，不丢用户已填内容）。 */
+export function normalizeProfile(p: any): AiProfile {
+  const t = structuredClone(DEFAULT_AI_PROFILES[0]);
+  const src = p && typeof p === "object" ? p : {};
+  const proxyMode =
+    src.proxyMode === "custom" || src.proxyMode === "direct" || src.proxyMode === "auto"
+      ? src.proxyMode
+      : "auto";
+  return {
+    ...t,
+    ...src,
+    name: typeof src.name === "string" ? src.name : t.name,
+    provider: sanitizeProvider(src.provider),
+    baseUrl: typeof src.baseUrl === "string" ? src.baseUrl : "",
+    apiKey: typeof src.apiKey === "string" ? src.apiKey : "",
+    model: typeof src.model === "string" ? src.model : "",
+    deployment: typeof src.deployment === "string" ? src.deployment : "",
+    apiVersion: typeof src.apiVersion === "string" ? src.apiVersion : "",
+    proxyMode,
+    proxyUrl: typeof src.proxyUrl === "string" ? src.proxyUrl : "",
+    id: typeof src.id === "number" && Number.isFinite(src.id) && src.id > 0 ? src.id : 0,
+  };
+}
+
+export function normalizeProfiles(list: any): AiProfile[] {
+  const arr = (Array.isArray(list) && list.length ? list : structuredClone(DEFAULT_AI_PROFILES)).map(
+    (p: any) => normalizeProfile(p),
+  );
+  ensureProfileIds(arr);
+  return arr;
+}
+
+/** 生成不与现有端点重名的名称：优先「新端点」，否则「新端点2/3…」。 */
+export function uniqueEndpointName(profiles: AiProfile[]): string {
+  const names = new Set(profiles.map((p) => (p.name || "").trim()));
+  if (!names.has("新端点")) return "新端点";
+  for (let n = 2; n < 100000; n++) {
+    const cand = `新端点${n}`;
+    if (!names.has(cand)) return cand;
+  }
+  return `新端点${Date.now()}`;
+}
+
+/** 干净的新端点：不复制上一个端点的地址与凭证，provider 默认沿用当前类型。 */
+export function newAiProfile(profiles: AiProfile[], provider: AiProvider = "openai"): AiProfile {
+  return {
+    id: nextProfileId(),
+    name: uniqueEndpointName(profiles),
+    provider,
+    baseUrl: "",
+    apiKey: "",
+    model: "",
+    deployment: "",
+    apiVersion: "",
+    proxyMode: "auto",
+    proxyUrl: "",
+  };
+}
 
 export const DEFAULT_PROMPTS: PromptItem[] = [
   {
@@ -382,6 +508,7 @@ p {
       indent: "1em",
       cssExtra: "",
     },
+    failover: true,
   },
   regex: "",
 };
@@ -406,10 +533,7 @@ function migrateAi(savedAi: any): AiConfig {
   stripReasoningArtifacts(base);
   const hasNew = Array.isArray(savedAi?.profiles) && savedAi.profiles.length;
   if (hasNew) {
-    base.profiles = savedAi.profiles.map((p: any) => ({
-      ...structuredClone(DEFAULT_AI_PROFILES[0]),
-      ...p,
-    }));
+    base.profiles = normalizeProfiles(savedAi.profiles);
     stripReasoningArtifacts(base);
     if (Array.isArray(savedAi.prompts) && savedAi.prompts.length) {
       base.prompts = savedAi.prompts;
@@ -421,17 +545,19 @@ function migrateAi(savedAi: any): AiConfig {
   const legacyUrl = savedAi?.baseUrl || savedAi?.apiKey || savedAi?.model;
   if (legacyUrl) {
     const pm = savedAi?.proxyMode === "custom" ? "custom" : "auto";
-    profiles = [
+    profiles = normalizeProfiles([
       {
         name: "默认",
         provider: savedAi?.provider ?? "openai",
         baseUrl: savedAi?.baseUrl ?? "",
         apiKey: savedAi?.apiKey ?? "",
         model: savedAi?.model ?? "",
+        deployment: savedAi?.deployment ?? "",
+        apiVersion: savedAi?.apiVersion ?? "",
         proxyMode: pm,
         proxyUrl: savedAi?.proxyUrl ?? "",
       },
-    ];
+    ]);
   } else {
     profiles = structuredClone(DEFAULT_AI_PROFILES);
   }
@@ -450,6 +576,7 @@ function migrateAi(savedAi: any): AiConfig {
     prompts,
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
+    failover: savedAi?.failover ?? true,
   };
 }
 
@@ -546,14 +673,17 @@ export function applyConfigJson(json: string) {
       },
     };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
-    obj.ai.profiles = (Array.isArray(obj.ai.profiles) && obj.ai.profiles.length ? obj.ai.profiles : structuredClone(DEFAULTS.ai.profiles))
-      .map((p: any) => ({ ...structuredClone(DEFAULT_AI_PROFILES[0]), ...p }));
+    obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
+    if (obj.ai.failover !== false) obj.ai.failover = true;
+    obj.ai.active = Math.min(Math.max((obj.ai.active as number) | 0, 0), obj.ai.profiles.length - 1);
     stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
+    // 记录为“已保存”，避免收到自身广播回声时重复 apply / 再次广播
+    lastSavedJson = JSON.stringify(config);
     // 跨窗同步/导入同样物理清除废弃的“关闭思考”键（stripReasoningArtifacts），
     // 保证两端内存与 localStorage 均不再出现这些键，行为恒为 auto。
   } catch {
@@ -563,23 +693,38 @@ export function applyConfigJson(json: string) {
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let lastSavedJson = "";
+
+/** 立即写盘并广播（端点切换等需要“即时生效”的场景）。 */
+export function saveConfigNow() {
+  clearTimeout(saveTimer);
+  try {
+    const json = JSON.stringify(config);
+    localStorage.setItem(KEY, json);
+    if (json !== lastSavedJson) {
+      lastSavedJson = json;
+      void import("@tauri-apps/api/event")
+        .then((m) => m.emit("flowread-config", json))
+        .catch(() => {});
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 export function saveConfig() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      const json = JSON.stringify(config);
-      localStorage.setItem(KEY, json);
-      if (json !== lastSavedJson) {
-        lastSavedJson = json;
-        void import("@tauri-apps/api/event")
-          .then((m) => m.emitTo(AI_WIN_LABEL, "flowread-config", json))
-          .catch(() => {});
-      }
-    } catch {
-      /* ignore */
-    }
-  }, 300);
+  saveTimer = setTimeout(saveConfigNow, 300);
 }
+
+// 跨窗双向同步：主窗口与独立 AI 窗口都监听同一广播事件。
+// 用 lastSavedJson 去重，避免自身回声导致的循环（applyConfigJson 不再触发广播）。
+void import("@tauri-apps/api/event")
+  .then((m) =>
+    m.listen<string>("flowread-config", (e) => {
+      if (e.payload && e.payload !== lastSavedJson) applyConfigJson(e.payload);
+    }),
+  )
+  .catch(() => {});
 
 export interface Toast {
   id: number;

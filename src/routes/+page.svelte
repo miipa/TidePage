@@ -81,6 +81,12 @@
   <div class="ai-window-root" style={aiRootStyle}>
     <AiPanel standalone />
   </div>
+  {#if ui.settingsOpen}
+    <div class="overlay" onpointerdown={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}></div>
+    <dialog open onclick={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}>
+      <SettingsModal initialTab="ai" />
+    </dialog>
+  {/if}
 {/if}
 {#if standaloneBook}
   <StandaloneBook />
@@ -145,19 +151,19 @@
       </div>
     </dialog>
   {/if}
-
-  <div class="toast-wrap">
-    {#each toasts.items as t (t.id)}
-      <div class="toast-card" class:error={t.kind === "error"}>
-        <div class="toast-msg">{t.msg}</div>
-        <div class="toast-acts">
-          <button class="icon" title="复制" onclick={() => copyText(t.msg)}>⧉</button>
-          <button class="icon" title="关闭" onclick={() => dismissToast(t.id)}>×</button>
-        </div>
-      </div>
-    {/each}
-  </div>
 {/if}
+
+<div class="toast-wrap">
+  {#each toasts.items as t (t.id)}
+    <div class="toast-card" class:error={t.kind === "error"}>
+      <div class="toast-msg">{t.msg}</div>
+      <div class="toast-acts">
+        <button class="icon" title="复制" onclick={() => copyText(t.msg)}>⧉</button>
+        <button class="icon" title="关闭" onclick={() => dismissToast(t.id)}>×</button>
+      </div>
+    </div>
+  {/each}
+</div>
 
 <style>
   .toast-wrap {

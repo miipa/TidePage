@@ -3,24 +3,30 @@
   import {
     config,
     saveConfig,
+    saveConfigNow,
     THEMES,
     toast,
     ui,
     APP_BUILD,
     copyText,
-    DEFAULT_AI_PROFILES,
+    AI_PROVIDERS,
+    aiProviderMeta,
+    newAiProfile,
     BIND_DEFS,
     comboOf,
     DEFAULT_BINDINGS,
     ZONE_DEFS,
     DEFAULT_ZONES,
+    type AiProvider,
     type BindAction,
     type ZoneAction,
     type ThemeKey,
   } from "../lib/stores.svelte";
   import type { TocEntry } from "../lib/types";
 
-  let tab = $state<"reader" | "split" | "keys" | "webdav" | "ai" | "other">("reader");
+  type SettingsTab = "reader" | "split" | "keys" | "webdav" | "ai" | "other";
+  let { initialTab = "reader" as SettingsTab }: { initialTab?: SettingsTab } = $props();
+  let tab = $state<SettingsTab>(initialTab);
   let webdavTesting = $state(false);
   let webdavStatus = $state("");
   let regexText = $state(config.regex || "");
@@ -176,6 +182,7 @@
   const ap = $derived(
     config.ai.profiles[Math.min(config.ai.active, config.ai.profiles.length - 1)] ?? config.ai.profiles[0]
   );
+  const apMeta = $derived(aiProviderMeta(ap?.provider ?? "openai"));
 
   // palt 能力检测：与 Reader/AiPanel 相同的 fontStack 归一化（本地副本，不动既有两处实现）
   function rdrFontStack(): string {
@@ -213,18 +220,12 @@
   });
 
   function addProfile() {
-    const src = ap ?? DEFAULT_AI_PROFILES[0];
-    config.ai.profiles.push({
-      name: `端点${config.ai.profiles.length + 1}`,
-      provider: src.provider,
-      baseUrl: src.baseUrl,
-      apiKey: src.apiKey,
-      model: src.model,
-      proxyMode: src.proxyMode,
-      proxyUrl: src.proxyUrl,
-    });
+    const provider: AiProvider = ap?.provider ?? "openai";
+    const created = newAiProfile(config.ai.profiles, provider);
+    config.ai.profiles.push(created);
     config.ai.active = config.ai.profiles.length - 1;
-    saveConfig();
+    saveConfigNow();
+    toast(`已新增端点「${created.name}」，请填写地址与密钥`);
   }
 
   function delProfile() {
@@ -234,7 +235,7 @@
     }
     config.ai.profiles.splice(config.ai.active, 1);
     config.ai.active = Math.max(0, Math.min(config.ai.active, config.ai.profiles.length - 1));
-    saveConfig();
+    saveConfigNow();
   }
 
   function copyReaderStyleToAi() {
@@ -295,6 +296,8 @@
         baseUrl: p.baseUrl,
         apiKey: p.apiKey,
         model: p.model,
+        deployment: p.deployment,
+        apiVersion: p.apiVersion,
         proxyMode: p.proxyMode,
         proxyUrl: p.proxyUrl,
       });
@@ -1004,10 +1007,10 @@
     {/if}
 
     <div class="field">
-      <label>当前端点（阅读界面 AI 面板也可快速切换）</label>
+      <label>当前端点（阅读界面 AI 面板也可快速切换；故障转移按此列表顺序依次尝试，当前端点优先）</label>
       <div class="row-inline">
-        <select bind:value={config.ai.active} onchange={saveConfig}>
-          {#each config.ai.profiles as p, i (p.name + i)}
+        <select bind:value={config.ai.active} onchange={saveConfigNow}>
+          {#each config.ai.profiles as p, i (p.id)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
         </select>
@@ -1024,33 +1027,62 @@
       <div class="field">
         <label for="ai-provider-sel">服务商</label>
         <select id="ai-provider-sel" bind:value={ap.provider} onchange={saveConfig}>
-          <option value="openai">OpenAI 兼容 API</option>
-          <option value="ollama">Ollama 本地</option>
+          {#each AI_PROVIDERS as prov (prov.id)}
+            <option value={prov.id}>{prov.label}</option>
+          {/each}
         </select>
       </div>
     </div>
     <div class="field">
-      <label>{ap.provider === "ollama" ? "Ollama 地址" : "API 地址（填到域名即可，自动补 /v1）"}</label>
-      <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={ap.provider === "ollama" ? "http://localhost:11434" : "https://api.deepseek.com"} />
+      <label>
+        {apMeta.id === "ollama"
+          ? "Ollama 地址"
+          : apMeta.azure
+            ? "API 地址（Azure 资源端点）"
+            : apMeta.id === "gemini"
+              ? "API 地址（Google 生成式语言 API 域名）"
+              : apMeta.id === "anthropic"
+                ? "API 地址（Anthropic 域名）"
+                : "API 地址（填到域名即可，自动补 /v1）"}
+      </label>
+      <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={apMeta.baseUrlHint} />
     </div>
+    {#if apMeta.azure}
+      <div class="grid2">
+        <div class="field">
+          <label>部署名（deployment）</label>
+          <input bind:value={ap.deployment} onchange={saveConfig} placeholder="gpt-4o-deploy" />
+        </div>
+        <div class="field">
+          <label>API 版本（api-version）</label>
+          <input bind:value={ap.apiVersion} onchange={saveConfig} placeholder="2024-06-01" />
+        </div>
+      </div>
+    {/if}
     <div class="grid2">
       <div class="field">
         <label>模型</label>
-        <input bind:value={ap.model} onchange={saveConfig} placeholder="deepseek-chat" />
+        <input bind:value={ap.model} onchange={saveConfig} placeholder={apMeta.modelHint} />
       </div>
-      {#if ap.provider !== "ollama"}
+      {#if apMeta.needsKey}
         <div class="field">
           <label>API Key</label>
           <input type="password" bind:value={ap.apiKey} onchange={saveConfig} />
         </div>
       {/if}
     </div>
+    <div class="field">
+      <label class="check">
+        <input type="checkbox" bind:checked={config.ai.failover} onchange={saveConfigNow} />
+        端点失败时自动切换下一个端点并重跑刚才的操作（按列表顺序，最多尝试全部端点）
+      </label>
+    </div>
     <div class="grid2">
       <div class="field">
         <label>网络代理</label>
         <select bind:value={ap.proxyMode} onchange={saveConfig}>
-          <option value="auto">自动（跟随系统/环境代理，等价你其他软件的直连）</option>
-          <option value="direct">强制直连（TUN 模式选这个）</option>
+          <option value="auto">自动（优先生效环境变量，其次 Windows 系统代理；不解析 PAC）</option>
+          <option value="direct">强制直连（忽略环境变量与系统代理，TUN 模式选这个）</option>
           <option value="custom">自定义代理</option>
         </select>
       </div>
@@ -1061,6 +1093,7 @@
         </div>
       {/if}
     </div>
+    <p class="tip">端点顺序即故障转移优先级；测试结果会显示实际命中的链路（自定义/自动/直连）与各链路失败原因。</p>
 
     <div class="row-inline" style="margin-bottom:10px">
       <button onclick={testAi} disabled={aiTesting}>{aiTesting ? "测试中…" : "测试当前端点"}</button>

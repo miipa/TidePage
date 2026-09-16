@@ -281,11 +281,11 @@ fn extract_meta(
             }
         }
         "mobi" | "azw3" | "prc" => {
-            // 涓€娆¤鍙?涓€娆¤В鏋愬悓鏃舵嬁鍒版鏂囦笌灏侀潰锛岄伩鍏嶅澶т功閲嶅鏁磋涓ら亶
+            // 一次读取/一次解析同时拿到正文与封面，避免对大书重复整读两遍
             let (doc_res, cover_bytes) = crate::mobi::parse_with_cover(path);
             match doc_res {
                 Ok(doc) => {
-                    // 浼樺厛涔﹀唴鐪熷疄灏侀潰锛圗XTH201/202/129 鎴栭鍥撅級锛屽け璐ユ墠鍥為€€鍗犱綅 SVG
+                    // 优先书内真实封面（EXTH201/202/129 或首图），失败才回退占位 SVG
                     let cover_file = cover_bytes
                         .and_then(|bytes| {
                             let name = format!("{}.png", db::path_id(path));
@@ -1583,17 +1583,20 @@ pub async fn ai_chat(
     messages: Vec<(String, String)>,
     proxy_mode: Option<String>,
     proxy_url: Option<String>,
-) -> Result<(), String> {
+    deployment: Option<String>,
+    api_version: Option<String>,
+) -> Result<(), crate::ai::AiError> {
+    let proxy_mode = proxy_mode.unwrap_or_else(|| "auto".into());
     let cfg = crate::ai::AiConfig {
         provider,
         base_url,
         api_key,
         model,
+        deployment: deployment.unwrap_or_default(),
+        api_version: api_version.unwrap_or_default(),
     };
-    let http = crate::ai::build_client(
-        proxy_mode.as_deref().unwrap_or("direct"),
-        proxy_url.as_deref().unwrap_or(""),
-    )?;
+    let http = crate::ai::build_client(&proxy_mode, proxy_url.as_deref().unwrap_or(""))
+        .map_err(crate::ai::AiError::config)?;
     crate::ai::stream_chat(app, http, id, cfg, system, messages).await
 }
 
@@ -1605,13 +1608,17 @@ pub async fn ai_test(
     model: String,
     proxy_mode: Option<String>,
     proxy_url: Option<String>,
+    deployment: Option<String>,
+    api_version: Option<String>,
 ) -> Result<String, String> {
     crate::ai::test_connection(
         provider,
         base_url,
         api_key,
         model,
-        proxy_mode.unwrap_or_else(|| "direct".into()),
+        deployment.unwrap_or_default(),
+        api_version.unwrap_or_default(),
+        proxy_mode.unwrap_or_else(|| "auto".into()),
         proxy_url.unwrap_or_default(),
     )
     .await
@@ -1789,7 +1796,7 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
             None => false,
         }
     } else if ext == "mobi" || ext == "azw3" || ext == "prc" {
-        // MOBI/AZW3锛欵XTH201/202/129 鎴?first_image_index 璧烽寮犲浘
+        // MOBI/AZW3：EXTH201/202/129 或 first_image_index 起首张图
         crate::mobi::extract_cover_path(&book.path)
             .map(|b| covers::make_thumbnail(&b, &out).is_ok())
             .unwrap_or(false)

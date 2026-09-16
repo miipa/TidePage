@@ -8,6 +8,64 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// azure-openai 专用：部署名（{base}/openai/deployments/{deployment}/...）
+    pub deployment: String,
+    /// azure-openai 专用：api-version
+    pub api_version: String,
+}
+
+/// 结构化错误：kind 供前端故障转移判定，message 供展示。
+/// 绝不含 apiKey；kind 取值：network / timeout / http_4xx / http_5xx /
+/// protocol / model_id / config / unknown。
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct AiError {
+    pub kind: String,
+    pub message: String,
+}
+
+impl AiError {
+    pub fn new(kind: &str, message: impl Into<String>) -> Self {
+        Self { kind: kind.to_string(), message: message.into() }
+    }
+    pub fn network(message: impl Into<String>) -> Self {
+        Self::new("network", message)
+    }
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new("timeout", message)
+    }
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::new("protocol", message)
+    }
+    pub fn model_id(message: impl Into<String>) -> Self {
+        Self::new("model_id", message)
+    }
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::new("config", message)
+    }
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        let kind = if (400..500).contains(&status) {
+            "http_4xx"
+        } else if (500..600).contains(&status) {
+            "http_5xx"
+        } else {
+            "unknown"
+        };
+        Self::new(kind, message)
+    }
+}
+
+impl std::fmt::Display for AiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+fn classify_req(e: &reqwest::Error) -> AiError {
+    if e.is_timeout() {
+        AiError::timeout(format!("请求超时: {e}"))
+    } else {
+        AiError::network(format!("网络失败: {e}"))
+    }
 }
 
 /// 模型ID形状守卫（与前端 isPlainModelId 对齐）：只允许字母数字与 . _ / : -，
@@ -21,179 +79,209 @@ pub fn valid_model_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '-'))
 }
 
+/* ============================ 代理 ============================ */
+
+fn normalize_proxy_url(raw: &str) -> Result<String, String> {
+    let mut u = raw.trim().trim_end_matches('/').to_string();
+    if u.is_empty() {
+        return Err("代理地址不能为空".into());
+    }
+    if !u.contains("://") {
+        u = format!("http://{u}");
+    }
+    Ok(u)
+}
+
+fn proxy_with_bypass(u: &str) -> Result<reqwest::Proxy, String> {
+    reqwest::Proxy::all(u)
+        .map(|p| p.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")))
+        .map_err(|e| format!("代理地址无效: {u} ({e})"))
+}
+
+/// 解析 `ProxyServer`，兼容 `host:port` 与 `http=host:port;https=host:port` 两种格式。
+fn parse_proxy_server(s: &str) -> String {
+    let s = s.trim();
+    if !s.contains('=') {
+        return s.to_string();
+    }
+    let (mut https, mut http, mut other) = (None, None, None);
+    for part in s.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            match k.as_str() {
+                "https" => https = Some(v.to_string()),
+                "http" => http = Some(v.to_string()),
+                _ => {
+                    if other.is_none() {
+                        other = Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    https.or(http).or(other).unwrap_or_else(|| s.to_string())
+}
+
+#[derive(Clone, Default)]
+pub struct WinProxyInfo {
+    /// 手动配置的系统代理（已解析为 host:port）
+    pub manual: Option<String>,
+    /// PAC 自动配置脚本地址（存在则说明系统用 PAC，本程序不解析）
+    pub pac: Option<String>,
+}
+
+pub fn windows_proxy_info() -> WinProxyInfo {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let mut info = WinProxyInfo::default();
+    let hk = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hk.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") {
+        Ok(k) => k,
+        Err(_) => return info,
+    };
+    let proxy_type: u32 = key.get_value("ProxyType").unwrap_or(0);
+    let auto_url: String = key.get_value("AutoConfigURL").unwrap_or_default();
+    if proxy_type == 2 || !auto_url.trim().is_empty() {
+        info.pac = Some(auto_url);
+    }
+    let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+    if enabled != 0 {
+        if let Ok(server) = key.get_value::<String, _>("ProxyServer") {
+            let s = server.trim();
+            if !s.is_empty() {
+                info.manual = Some(parse_proxy_server(s));
+            }
+        }
+    }
+    info
+}
+
+#[derive(Clone)]
+pub struct ProxyResolution {
+    pub url: Option<String>,
+    pub source: String,
+    pub pac: Option<String>,
+}
+
+/// auto：优先环境变量，其次 Windows 注册表；PAC 仅诊断提示。
+pub fn resolve_auto_proxy() -> ProxyResolution {
+    for k in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return ProxyResolution {
+                    url: Some(v.to_string()),
+                    source: format!("环境变量 {k}"),
+                    pac: None,
+                };
+            }
+        }
+    }
+    let info = windows_proxy_info();
+    if let Some(addr) = info.manual {
+        return ProxyResolution {
+            url: Some(addr),
+            source: "Windows 系统代理".into(),
+            pac: info.pac,
+        };
+    }
+    let source = if info.pac.is_some() {
+        "未检测到环境变量，且系统使用 PAC 自动配置脚本（本程序不解析 PAC）".to_string()
+    } else {
+        "未检测到环境变量或系统代理".to_string()
+    };
+    ProxyResolution { url: None, source, pac: info.pac }
+}
+
 pub fn build_client(proxy_mode: &str, proxy_url: &str) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(20))
         .danger_accept_invalid_certs(true);
-    let with_bypass = |u: String| -> Option<reqwest::Proxy> {
-        reqwest::Proxy::all(&u)
-            .ok()
-            .map(|p| p.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")))
-    };
     match proxy_mode {
-        "custom" => {
-            let mut u = proxy_url.trim().trim_end_matches('/').to_string();
-            if u.is_empty() {
-                return Err("自定义代理地址不能为空".into());
-            }
-            if !u.contains("://") {
-                u = format!("http://{u}");
-            }
-            let p = with_bypass(u.clone()).ok_or_else(|| format!("代理地址无效: {u}"))?;
-            b = b.proxy(p);
-        }
+        // 彻底直连：显式关闭 reqwest 对 HTTP(S)_PROXY 等环境变量的自动读取
         "direct" => {
             b = b.no_proxy();
         }
-        "auto" => {
-            let env_proxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
-                .iter()
-                .find_map(|k| std::env::var(k).ok())
-                .filter(|v| !v.is_empty());
-            let addr = env_proxy.or_else(windows_system_proxy);
-            if let Some(addr) = addr {
-                let u = if addr.contains("://") { addr } else { format!("http://{addr}") };
-                if let Some(p) = with_bypass(u) {
+        "custom" => {
+            let u = normalize_proxy_url(proxy_url)?;
+            b = b.proxy(proxy_with_bypass(&u)?);
+        }
+        // auto（默认）与环境变量/系统代理一致；同时兼容历史遗留的 "system"
+        "auto" | "system" | "" => {
+            let r = resolve_auto_proxy();
+            if let Some(addr) = r.url {
+                if let Ok(p) = proxy_with_bypass(&addr) {
                     b = b.proxy(p);
                 }
+            } else {
+                b = b.no_proxy();
             }
         }
         _ => {
-            if let Some(addr) = windows_system_proxy() {
-                let u = if addr.contains("://") { addr } else { format!("http://{addr}") };
-                if let Some(p) = with_bypass(u) {
-                    b = b.proxy(p);
-                }
-            }
+            b = b.no_proxy();
         }
     }
     b.build().map_err(|e| e.to_string())
 }
 
-fn windows_system_proxy() -> Option<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    let hk = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hk
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        .ok()?;
-    let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
-    if enabled == 0 {
-        return None;
-    }
-    let server: String = key.get_value("ProxyServer").ok()?;
-    if server.is_empty() {
-        return None;
-    }
-    if let Some(pos) = server.find('=') {
-        let (_, rest) = server.split_at(pos);
-        let rest = rest.trim_start_matches('=');
-        let pick = rest.split(';').find(|s| s.contains(":")).unwrap_or(rest);
-        return Some(pick.to_string());
-    }
-    Some(server)
+/* ============================ 服务商适配 ============================ */
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    OpenAi,
+    Ollama,
+    Anthropic,
+    Gemini,
+    Azure,
 }
 
-pub async fn test_connection(
-    provider: String,
-    base_url: String,
-    api_key: String,
-    model: String,
-    proxy_mode: String,
-    proxy_url: String,
-) -> Result<String, String> {
-    let mut clients: Vec<(&'static str, reqwest::Client)> = Vec::new();
-    let primary_name: &'static str = match proxy_mode.as_str() {
-        "custom" => "自定义代理",
-        "system" => "系统代理",
-        _ => "直连",
-    };
-    if let Ok(c) = build_client(&proxy_mode, &proxy_url) {
-        clients.push((primary_name, c));
-    }
-    if proxy_mode != "direct" {
-        if let Ok(c) = build_client("direct", "") {
-            clients.push(("直连(自动回退)", c));
-        }
-    } else if let Some(addr) = windows_system_proxy() {
-        if let Ok(c) = build_client("custom", &addr) {
-            clients.push(("系统代理(自动尝试)", c));
+impl Provider {
+    pub fn parse(s: &str) -> Provider {
+        match s.to_ascii_lowercase().as_str() {
+            "ollama" => Provider::Ollama,
+            "anthropic" | "claude" => Provider::Anthropic,
+            "gemini" | "google" => Provider::Gemini,
+            "azure-openai" | "azure" | "azure_openai" => Provider::Azure,
+            _ => Provider::OpenAi,
         }
     }
-    if clients.is_empty() {
-        clients.push(("直连", build_client("direct", "")?));
+    pub fn label(&self) -> &'static str {
+        match self {
+            Provider::OpenAi => "OpenAI 兼容",
+            Provider::Ollama => "Ollama",
+            Provider::Anthropic => "Anthropic",
+            Provider::Gemini => "Gemini",
+            Provider::Azure => "Azure OpenAI",
+        }
     }
+}
 
-    let is_ollama = provider == "ollama";
-    let (url, body) = if is_ollama {
-        let base = base_url.trim_end_matches('/');
-        (
-            format!("{base}/api/chat"),
-            json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "回复 OK"}],
-                "stream": false,
-                "options": {"num_predict": 8}
-            }),
-        )
+fn strip_trailing_slash(s: &str) -> &str {
+    s.trim().trim_end_matches('/')
+}
+
+fn ensure_v1(base: &str) -> String {
+    if base.ends_with("/v1") {
+        base.to_string()
     } else {
-        let base = base_url.trim_end_matches('/');
-        let base = if base.ends_with("/v1") {
-            base.to_string()
-        } else {
-            format!("{base}/v1")
-        };
-        (
-            format!("{base}/chat/completions"),
-            json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "回复 OK"}],
-                "max_tokens": 8,
-                "stream": false
-            }),
-        )
-    };
-
-    let mut errs = Vec::new();
-    for (name, http) in &clients {
-        let mut req = http.clone().post(&url).timeout(Duration::from_secs(25)).json(&body);
-        if !is_ollama && !api_key.is_empty() {
-            req = req.bearer_auth(&api_key);
-        }
-        let outcome = async {
-            let resp = req.send().await.map_err(|e| format!("网络失败: {e}"))?;
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                let brief: String = text.chars().take(220).collect();
-                return Err(format!("HTTP {status}: {brief}"));
-            }
-            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            let reply = parsed
-                .pointer("/choices/0/message/content")
-                .or_else(|| parsed.pointer("/message/content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            Ok::<String, String>(if reply.is_empty() {
-                "✓ 连接成功".into()
-            } else {
-                format!("✓ 连接成功（{name}），模型回复：{reply}")
-            })
-        }
-        .await;
-        match outcome {
-            Ok(msg) => return Ok(msg),
-            Err(e) => errs.push(format!("【{name}】{e}")),
-        }
+        format!("{base}/v1")
     }
-    Err(format!("全部尝试失败 → {}", errs.join(" ； ")))
 }
 
 // 出站请求体用结构体声明字段顺序，保证 Object.keys(body) 稳定为约定值，且绝不夹带额外字段。
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct OllamaChatBody {
     messages: Vec<serde_json::Value>,
     model: String,
@@ -201,7 +289,7 @@ struct OllamaChatBody {
     stream: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct OpenAiChatBody {
     model: String,
     messages: Vec<serde_json::Value>,
@@ -209,12 +297,377 @@ struct OpenAiChatBody {
     temperature: f64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
+struct AnthropicChatBody {
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<serde_json::Value>,
+    stream: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct GeminiChatBody {
+    contents: Vec<serde_json::Value>,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, Clone)]
 #[serde(untagged)]
 enum ChatBody {
     Ollama(OllamaChatBody),
     OpenAi(OpenAiChatBody),
+    Anthropic(AnthropicChatBody),
+    Gemini(GeminiChatBody),
 }
+
+struct Prepared {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: ChatBody,
+}
+
+fn msgs_json(messages: &[(String, String)]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|(role, content)| json!({"role": role, "content": content}))
+        .collect()
+}
+
+fn anthropic_messages_json(messages: &[(String, String)]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|(role, content)| {
+            let role = if role == "assistant" { "assistant" } else { "user" };
+            json!({"role": role, "content": content})
+        })
+        .collect()
+}
+
+fn gemini_contents_json(messages: &[(String, String)]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|(role, content)| {
+            let role = if role == "assistant" { "model" } else { "user" };
+            json!({"role": role, "parts": [{"text": content}]})
+        })
+        .collect()
+}
+
+/// 统一构造请求：URL / 认证头 / 固定字段顺序的 body。
+fn build_request(
+    p: Provider,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[(String, String)],
+    stream: bool,
+) -> Result<Prepared, AiError> {
+    let base = strip_trailing_slash(&cfg.base_url);
+    if base.is_empty() {
+        return Err(AiError::config("未填写 API 地址"));
+    }
+    if !valid_model_id(&cfg.model) {
+        return Err(AiError::model_id(
+            "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。",
+        ));
+    }
+    match p {
+        Provider::Ollama => Ok(Prepared {
+            url: format!("{base}/api/chat"),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: ChatBody::Ollama(OllamaChatBody {
+                messages: msgs_json(messages),
+                model: cfg.model.clone(),
+                options: json!({"num_ctx": 8192}),
+                stream,
+            }),
+        }),
+        Provider::OpenAi => Ok(Prepared {
+            url: format!("{}/chat/completions", ensure_v1(base)),
+            headers: bearer_headers(&cfg.api_key),
+            body: ChatBody::OpenAi(OpenAiChatBody {
+                model: cfg.model.clone(),
+                messages: msgs_json(messages),
+                stream,
+                temperature: 0.7,
+            }),
+        }),
+        Provider::Azure => {
+            if cfg.deployment.trim().is_empty() {
+                return Err(AiError::config("Azure OpenAI 需要填写部署名（deployment）"));
+            }
+            if !valid_model_id(cfg.deployment.trim()) {
+                return Err(AiError::model_id("Azure 部署名含非法字符，请求已拦截。"));
+            }
+            let api_version = if cfg.api_version.trim().is_empty() {
+                "2024-06-01"
+            } else {
+                cfg.api_version.trim()
+            };
+            Ok(Prepared {
+                url: format!(
+                    "{base}/openai/deployments/{}/chat/completions?api-version={api_version}",
+                    cfg.deployment.trim()
+                ),
+                headers: vec![
+                    ("api-key".into(), cfg.api_key.clone()),
+                    ("Content-Type".into(), "application/json".into()),
+                ],
+                body: ChatBody::OpenAi(OpenAiChatBody {
+                    model: cfg.model.clone(),
+                    messages: msgs_json(messages),
+                    stream,
+                    temperature: 0.7,
+                }),
+            })
+        }
+        Provider::Anthropic => {
+            let url = if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            Ok(Prepared {
+                url,
+                headers: vec![
+                    ("x-api-key".into(), cfg.api_key.clone()),
+                    ("anthropic-version".into(), "2023-06-01".into()),
+                    ("Content-Type".into(), "application/json".into()),
+                ],
+                body: ChatBody::Anthropic(AnthropicChatBody {
+                    model: cfg.model.clone(),
+                    max_tokens: 4096,
+                    system: system.to_string(),
+                    messages: anthropic_messages_json(messages),
+                    stream,
+                }),
+            })
+        }
+        Provider::Gemini => {
+            let model = cfg.model.strip_prefix("models/").unwrap_or(&cfg.model);
+            let method = if stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            let url = format!("{base}/v1beta/models/{model}:{method}");
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let url = format!("{url}{sep}key={}", cfg.api_key);
+            let sys = if system.trim().is_empty() {
+                None
+            } else {
+                Some(json!({"parts": [{"text": system}]}))
+            };
+            Ok(Prepared {
+                url,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: ChatBody::Gemini(GeminiChatBody {
+                    contents: gemini_contents_json(messages),
+                    system_instruction: sys,
+                }),
+            })
+        }
+    }
+}
+
+fn bearer_headers(api_key: &str) -> Vec<(String, String)> {
+    let mut h = vec![("Content-Type".into(), "application/json".into())];
+    if !api_key.is_empty() {
+        h.push(("Authorization".into(), format!("Bearer {api_key}")));
+    }
+    h
+}
+
+/// 流式分片取正文
+fn stream_delta(p: Provider, v: &serde_json::Value) -> Option<String> {
+    match p {
+        Provider::Ollama => v.pointer("/message/content").and_then(|c| c.as_str()).map(str::to_string),
+        Provider::OpenAi | Provider::Azure => {
+            v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(str::to_string)
+        }
+        Provider::Anthropic => {
+            if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                v.pointer("/delta/text").and_then(|c| c.as_str()).map(str::to_string)
+            } else {
+                None
+            }
+        }
+        Provider::Gemini => gemini_parts_text(v),
+    }
+}
+
+/// 非流式响应取正文
+fn full_content(p: Provider, v: &serde_json::Value) -> Option<String> {
+    match p {
+        Provider::Ollama => v
+            .pointer("/message/content")
+            .or_else(|| v.pointer("/response"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        Provider::OpenAi | Provider::Azure => v
+            .pointer("/choices/0/message/content")
+            .or_else(|| v.pointer("/choices/0/delta/content"))
+            .or_else(|| v.pointer("/choices/0/text"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        Provider::Anthropic => v.pointer("/content").and_then(|c| c.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<String>()
+        }),
+        Provider::Gemini => gemini_parts_text(v),
+    }
+}
+
+fn gemini_parts_text(v: &serde_json::Value) -> Option<String> {
+    let arr = v.pointer("/candidates/0/content/parts")?.as_array()?;
+    let s: String = arr
+        .iter()
+        .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+        .collect();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 从错误响应体提取可读信息（各 provider 结构不同）。
+fn error_message_from_body(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.get("message"))
+                .or_else(|| v.pointer("/error/status"))
+                .or_else(|| v.get("error"))
+                .and_then(|m| {
+                    m.as_str()
+                        .map(str::to_string)
+                        .or_else(|| Some(m.to_string()))
+                })
+        })
+        .unwrap_or_else(|| text.chars().take(300).collect())
+}
+
+/* ============================ 连接测试 ============================ */
+
+pub async fn test_connection(
+    provider: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    deployment: String,
+    api_version: String,
+    proxy_mode: String,
+    proxy_url: String,
+) -> Result<String, String> {
+    let p = Provider::parse(&provider);
+    let cfg = AiConfig {
+        provider: provider.clone(),
+        base_url,
+        api_key,
+        model,
+        deployment,
+        api_version,
+    };
+    let prepared = build_request(
+        p,
+        &cfg,
+        "",
+        &[("user".to_string(), "回复 OK".to_string())],
+        false,
+    )
+    .map_err(|e| format!("✗ 请求配置错误：{}", e.message))?;
+
+    let mode = if proxy_mode.is_empty() { "auto" } else { proxy_mode.as_str() };
+    let mut candidates: Vec<(String, reqwest::Client)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    match mode {
+        "custom" => {
+            let shown = normalize_proxy_url(&proxy_url).unwrap_or_else(|_| proxy_url.clone());
+            match build_client("custom", &proxy_url) {
+                Ok(c) => candidates.push((format!("自定义代理 {shown}"), c)),
+                Err(e) => notes.push(format!("自定义代理不可用：{e}")),
+            }
+        }
+        "direct" => match build_client("direct", "") {
+            Ok(c) => candidates.push(("直连".into(), c)),
+            Err(e) => notes.push(format!("直连客户端构建失败：{e}")),
+        },
+        _ => {
+            let r = resolve_auto_proxy();
+            match &r.url {
+                Some(addr) => match build_client("custom", addr) {
+                    Ok(c) => candidates.push((format!("自动代理（{}）", r.source), c)),
+                    Err(e) => notes.push(format!("自动代理（{}）不可用：{e}", r.source)),
+                },
+                None => {
+                    notes.push(r.source.clone());
+                    if let Ok(c) = build_client("direct", "") {
+                        candidates.push(("直连（自动模式未检测到代理）".into(), c));
+                    }
+                }
+            }
+            if let Some(pac) = &r.pac {
+                notes.push(format!(
+                    "检测到系统 PAC 自动配置脚本（{pac}），本程序不解析 PAC，自动模式不会使用该代理"
+                ));
+            }
+        }
+    }
+    // 非直连模式再补一条直连回退，便于诊断
+    if mode != "direct" {
+        if let Ok(c) = build_client("direct", "") {
+            candidates.push(("直连（回退）".into(), c));
+        }
+    }
+
+    let mut errs: Vec<String> = Vec::new();
+    for (name, http) in &candidates {
+        let mut req = http.clone().post(&prepared.url).timeout(Duration::from_secs(25)).json(&prepared.body);
+        for (k, v) in &prepared.headers {
+            if k.eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let outcome = async {
+            let resp = req.send().await.map_err(|e| classify_req(&e).message)?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let brief = error_message_from_body(&text);
+                return Err(format!("HTTP {status}: {brief}"));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let reply = full_content(p, &parsed).unwrap_or_default();
+            let reply = reply.trim();
+            Ok::<String, String>(if reply.is_empty() {
+                format!("✓ 连接成功（{name}｜{}）", p.label())
+            } else {
+                format!("✓ 连接成功（{name}｜{}），模型回复：{reply}", p.label())
+            })
+        }
+        .await;
+        match outcome {
+            Ok(msg) => {
+                if notes.is_empty() {
+                    return Ok(msg);
+                }
+                return Ok(format!("{msg}；诊断：{}", notes.join("；")));
+            }
+            Err(e) => errs.push(format!("【{name}】{e}")),
+        }
+    }
+    let mut all: Vec<String> = errs;
+    all.extend(notes);
+    Err(format!("✗ 全部尝试失败 → {}", all.join(" ； ")))
+}
+
+/* ============================ 流式聊天 ============================ */
 
 pub async fn stream_chat(
     app: tauri::AppHandle,
@@ -223,71 +676,53 @@ pub async fn stream_chat(
     cfg: AiConfig,
     system: String,
     messages: Vec<(String, String)>,
-) -> Result<(), String> {
-    let is_ollama = cfg.provider == "ollama";
+) -> Result<(), AiError> {
+    let p = Provider::parse(&cfg.provider);
+    let prepared = build_request(p, &cfg, &system, &messages, true)?;
 
-    let mut msgs = vec![json!({"role": "system", "content": system})];
-    for (role, content) in &messages {
-        msgs.push(json!({"role": role, "content": content}));
-    }
-
-    // “关闭思考”功能已彻底移除：请求构造恒为 auto 行为（零额外注入：不改 body 字段/query/请求头），
-    // Ollama → /api/chat，OpenAI 兼容 → /v1/chat/completions，与功能引入前一致。
-    // 保留模型ID形状守卫：防止把 JSON 片段/URL/请求头/curl 塞进 model。
-    let (final_url, body, use_auth) = if is_ollama {
-        let base = cfg.base_url.trim_end_matches('/');
-        let url = format!("{base}/api/chat");
-        let b = ChatBody::Ollama(OllamaChatBody {
-            messages: msgs,
-            model: cfg.model.clone(),
-            options: json!({"num_ctx": 8192}),
-            stream: true,
-        });
-        (url, b, false)
-    } else {
-        if !valid_model_id(&cfg.model) {
-            let msg = "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。".to_string();
-            let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": &msg, "done": true}));
-            return Err(msg);
-        }
-        let base = cfg.base_url.trim_end_matches('/');
-        let base = if base.ends_with("/v1") { base.to_string() } else { format!("{base}/v1") };
-        let url = format!("{base}/chat/completions");
-        let b = ChatBody::OpenAi(OpenAiChatBody {
-            model: cfg.model.clone(),
-            messages: msgs,
-            stream: true,
-            temperature: 0.7,
-        });
-        (url, b, !cfg.api_key.is_empty())
+    let emit_err = |app: &tauri::AppHandle, id: &str, e: &AiError| {
+        let _ = app.emit(
+            &format!("ai-token:{id}"),
+            serde_json::json!({"error": e.message, "kind": e.kind, "done": true}),
+        );
+    };
+    let emit_delta = |app: &tauri::AppHandle, id: &str, content: &str, done: bool| {
+        let _ = app.emit(
+            &format!("ai-token:{id}"),
+            serde_json::json!({"delta": content, "done": done}),
+        );
     };
 
-    let mut req = http.post(&final_url).timeout(std::time::Duration::from_secs(300));
-    if use_auth {
-        use base64::Engine;
-        let cred = format!("Bearer {}", cfg.api_key);
-        req = req.header(
-            "Authorization",
-            reqwest::header::HeaderValue::from_str(&cred).map_err(|_| "无效的 API Key")?,
-        );
+    let mut req = http
+        .post(&prepared.url)
+        .timeout(Duration::from_secs(300))
+        .json(&prepared.body);
+    for (k, v) in &prepared.headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        match reqwest::header::HeaderValue::from_str(v) {
+            Ok(hv) => {
+                req = req.header(k.as_str(), hv);
+            }
+            Err(_) => return Err(AiError::config(format!("无效的请求头值：{k}"))),
+        }
     }
 
-    let resp = req.json(&body).send().await.map_err(|e| e.to_string())?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let err = classify_req(&e);
+            emit_err(&app, &id, &err);
+            return Err(err);
+        }
+    };
     if !resp.status().is_success() {
-        let status = resp.status();
+        let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        let msg: String = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/error/message")
-                    .or_else(|| v.get("message"))
-                    .and_then(|m| m.as_str().map(|s| s.to_string()))
-            })
-            .unwrap_or_else(|| {
-                format!("HTTP {status}: {}", text.chars().take(300).collect::<String>())
-            });
-        let _ = app.emit(&format!("ai-token:{id}"), serde_json::json!({"error": msg, "done": true}));
-        return Err(msg);
+        let err = AiError::http(status, format!("HTTP {status}: {}", error_message_from_body(&text)));
+        emit_err(&app, &id, &err);
+        return Err(err);
     }
 
     let ct = resp
@@ -296,46 +731,38 @@ pub async fn stream_chat(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
+    let is_ollama = p == Provider::Ollama;
     let is_sse = ct.contains("text/event-stream") || (is_ollama && ct.contains("ndjson"));
 
-    let emit_delta = |app: &tauri::AppHandle, id: &str, content: &str, done: bool| {
-        let _ = app.emit(
-            &format!("ai-token:{id}"),
-            serde_json::json!({"delta": content, "done": done}),
-        );
-    };
-    let emit_err = |app: &tauri::AppHandle, id: &str, msg: &str| {
-        let _ = app.emit(
-            &format!("ai-token:{id}"),
-            serde_json::json!({"error": msg, "done": true}),
-        );
-    };
-
     if !is_sse {
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = resp.text().await.map_err(|e| classify_req(&e))?;
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-        let content = parsed
-            .pointer("/choices/0/message/content")
-            .or_else(|| parsed.pointer("/choices/0/delta/content"))
-            .or_else(|| parsed.pointer("/message/content"))
-            .or_else(|| parsed.pointer("/content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        if content.is_empty() {
-            let brief: String = text.chars().take(300).collect();
-            let msg = format!("响应协议不匹配：端点返回非流式响应（Content-Type: {ct}），且未包含可识别的正文字段。响应片段：{brief}");
-            emit_err(&app, &id, &msg);
-            return Err(msg);
+        if let Some(content) = full_content(p, &parsed) {
+            if !content.is_empty() {
+                emit_delta(&app, &id, &content, true);
+                return Ok(());
+            }
         }
-        emit_delta(&app, &id, content, true);
-        return Ok(());
+        let brief: String = text.chars().take(300).collect();
+        let err = AiError::protocol(format!(
+            "响应协议不匹配：端点返回非流式响应（Content-Type: {ct}），且未包含可识别的正文字段。响应片段：{brief}"
+        ));
+        emit_err(&app, &id, &err);
+        return Err(err);
     }
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut got_any = false;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let err = classify_req(&e);
+                emit_err(&app, &id, &err);
+                return Err(err);
+            }
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buf.find('\n') {
             let line: String = buf.drain(..=pos).collect();
@@ -345,56 +772,57 @@ pub async fn stream_chat(
             }
             if is_ollama {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_str()) {
+                    if let Some(content) = stream_delta(Provider::Ollama, &v) {
                         got_any = true;
                         let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                        emit_delta(&app, &id, content, done);
-                    }
-                }
-            } else if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if data == "[DONE]" {
-                    if !got_any {
-                        // 200 但全程无正文字段 → 显式报错，绝不静默完成出空白回复
-                        let msg = format!("响应协议不匹配：流结束前未找到正文字段 choices[].delta.content。响应片段：{}", buf.chars().take(200).collect::<String>());
-                        emit_err(&app, &id, &msg);
-                        return Err(msg);
-                    }
-                    emit_delta(&app, &id, "", true);
-                    return Ok(());
-                }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(content) =
-                        v.pointer("/choices/0/delta/content").and_then(|c| c.as_str())
-                    {
-                        if !content.is_empty() {
-                            got_any = true;
+                        emit_delta(&app, &id, &content, done);
+                        if done {
+                            return Ok(());
                         }
-                        emit_delta(&app, &id, content, false);
                     }
+                }
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" {
+                if !got_any {
+                    let err = AiError::protocol(format!(
+                        "响应协议不匹配：流结束前未找到正文字段。响应片段：{}",
+                        buf.chars().take(200).collect::<String>()
+                    ));
+                    emit_err(&app, &id, &err);
+                    return Err(err);
+                }
+                emit_delta(&app, &id, "", true);
+                return Ok(());
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(content) = stream_delta(p, &v) {
+                    if !content.is_empty() {
+                        got_any = true;
+                    }
+                    emit_delta(&app, &id, &content, false);
                 }
             }
         }
     }
+
     if !got_any {
         let ct2 = if ct.is_empty() { "未知" } else { &ct };
         let brief: String = buf.chars().take(300).collect();
         let parsed: serde_json::Value = serde_json::from_str(buf.trim()).unwrap_or_default();
-        let content = parsed
-            .pointer("/choices/0/message/content")
-            .or_else(|| parsed.pointer("/message/content"))
-            .or_else(|| parsed.pointer("/content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        if !content.is_empty() {
-            emit_delta(&app, &id, content, true);
-            return Ok(());
+        if let Some(content) = full_content(p, &parsed) {
+            if !content.is_empty() {
+                emit_delta(&app, &id, &content, true);
+                return Ok(());
+            }
         }
-        let msg = format!(
-            "响应协议不匹配：流式响应中未找到该协议的正文字段（chat=choices[].delta.content / completions=choices[].text），拒绝空白回复（Content-Type: {ct2}）。响应片段：{brief}"
-        );
-        emit_err(&app, &id, &msg);
-        return Err(msg);
+        let err = AiError::protocol(format!(
+            "响应协议不匹配：流式响应中未找到该协议的正文字段，拒绝空白回复（Content-Type: {ct2}）。响应片段：{brief}"
+        ));
+        emit_err(&app, &id, &err);
+        return Err(err);
     }
     emit_delta(&app, &id, "", true);
     Ok(())
@@ -417,5 +845,123 @@ mod tests {
         assert!(!valid_model_id("http://evil/v1/completions"));
         assert!(!valid_model_id("/v1/completions"));
         assert!(!valid_model_id("X-Think-Enabled: false"));
+    }
+
+    #[test]
+    fn provider_parse() {
+        assert_eq!(Provider::parse("openai"), Provider::OpenAi);
+        assert_eq!(Provider::parse("ollama"), Provider::Ollama);
+        assert_eq!(Provider::parse("anthropic"), Provider::Anthropic);
+        assert_eq!(Provider::parse("claude"), Provider::Anthropic);
+        assert_eq!(Provider::parse("gemini"), Provider::Gemini);
+        assert_eq!(Provider::parse("azure-openai"), Provider::Azure);
+        assert_eq!(Provider::parse("whatever"), Provider::OpenAi);
+    }
+
+    #[test]
+    fn proxy_server_parsing() {
+        assert_eq!(parse_proxy_server("127.0.0.1:7897"), "127.0.0.1:7897");
+        assert_eq!(
+            parse_proxy_server("http=127.0.0.1:7897;https=127.0.0.1:7898"),
+            "127.0.0.1:7898"
+        );
+        assert_eq!(
+            parse_proxy_server("http=10.0.0.1:8080;https=10.0.0.1:8443;ftp=1.1.1.1:21"),
+            "10.0.0.1:8443"
+        );
+        assert_eq!(parse_proxy_server("http=onlyhttp:3128"), "onlyhttp:3128");
+    }
+
+    #[test]
+    fn request_urls_and_bodies() {
+        let base = AiConfig {
+            provider: "openai".into(),
+            base_url: "https://api.deepseek.com".into(),
+            api_key: "k".into(),
+            model: "deepseek-chat".into(),
+            deployment: "".into(),
+            api_version: "".into(),
+        };
+        let openai = build_request(Provider::OpenAi, &base, "sys", &[("user".into(), "hi".into())], true).unwrap();
+        assert_eq!(openai.url, "https://api.deepseek.com/v1/chat/completions");
+        assert!(openai.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+
+        let anthropic_cfg = AiConfig {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key: "ak".into(),
+            model: "claude-3-5-sonnet-latest".into(),
+            deployment: "".into(),
+            api_version: "".into(),
+        };
+        let a = build_request(Provider::Anthropic, &anthropic_cfg, "sys", &[("user".into(), "hi".into())], true).unwrap();
+        assert_eq!(a.url, "https://api.anthropic.com/v1/messages");
+        assert!(a.headers.iter().any(|(k, v)| k == "x-api-key" && v == "ak"));
+        assert!(a.headers.iter().any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+
+        let gemini_cfg = AiConfig {
+            provider: "gemini".into(),
+            base_url: "https://generativelanguage.googleapis.com".into(),
+            api_key: "gk".into(),
+            model: "models/gemini-1.5-flash".into(),
+            deployment: "".into(),
+            api_version: "".into(),
+        };
+        let g = build_request(Provider::Gemini, &gemini_cfg, "", &[("user".into(), "hi".into())], true).unwrap();
+        assert_eq!(
+            g.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key=gk"
+        );
+
+        let azure_cfg = AiConfig {
+            provider: "azure-openai".into(),
+            base_url: "https://x.openai.azure.com".into(),
+            api_key: "zk".into(),
+            model: "gpt-4o".into(),
+            deployment: "my-deploy".into(),
+            api_version: "2024-06-01".into(),
+        };
+        let z = build_request(Provider::Azure, &azure_cfg, "", &[("user".into(), "hi".into())], false).unwrap();
+        assert_eq!(
+            z.url,
+            "https://x.openai.azure.com/openai/deployments/my-deploy/chat/completions?api-version=2024-06-01"
+        );
+        assert!(z.headers.iter().any(|(k, v)| k == "api-key" && v == "zk"));
+    }
+
+    #[test]
+    fn streaming_parsers() {
+        let oai: serde_json::Value =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
+        assert_eq!(stream_delta(Provider::OpenAi, &oai).as_deref(), Some("你好"));
+
+        let claude: serde_json::Value = serde_json::from_str(
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_delta(Provider::Anthropic, &claude).as_deref(), Some("Hi"));
+
+        let gem: serde_json::Value = serde_json::from_str(
+            r#"{"candidates":[{"content":{"parts":[{"text":"a"},{"text":"b"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_delta(Provider::Gemini, &gem).as_deref(), Some("ab"));
+
+        let oll: serde_json::Value =
+            serde_json::from_str(r#"{"message":{"content":"x"},"done":false}"#).unwrap();
+        assert_eq!(stream_delta(Provider::Ollama, &oll).as_deref(), Some("x"));
+
+        let claude_full: serde_json::Value =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"全"}]}"#).unwrap();
+        assert_eq!(full_content(Provider::Anthropic, &claude_full).as_deref(), Some("全"));
+    }
+
+    #[test]
+    fn error_kind_classification() {
+        assert_eq!(AiError::http(401, "x").kind, "http_4xx");
+        assert_eq!(AiError::http(429, "x").kind, "http_4xx");
+        assert_eq!(AiError::http(502, "x").kind, "http_5xx");
+        assert_eq!(AiError::model_id("x").kind, "model_id");
+        assert_eq!(AiError::protocol("x").kind, "protocol");
     }
 }

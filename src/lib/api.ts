@@ -92,10 +92,12 @@ export const api = {
   aiChat: (args: {
     id: string; provider: string; baseUrl: string; apiKey: string;
     model: string; system: string; messages: [string, string][];
+    deployment?: string; apiVersion?: string;
     proxyMode?: string; proxyUrl?: string;
   }) => invoke<void>("ai_chat", args),
   aiTest: (args: {
     provider: string; baseUrl: string; apiKey: string; model: string;
+    deployment?: string; apiVersion?: string;
     proxyMode: string; proxyUrl: string;
   }) => invoke<string>("ai_test", args),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),

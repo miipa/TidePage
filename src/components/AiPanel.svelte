@@ -5,7 +5,7 @@
   import {
     config,
     saveConfig,
-    applyConfigJson,
+    saveConfigNow,
     toast,
     ui,
     openAiWindow,
@@ -214,59 +214,137 @@
     return msgs[msgs.length - 1];
   }
 
+  function errKindLabel(kind: string): string {
+    switch (kind) {
+      case "network": return "网络错误";
+      case "timeout": return "连接超时";
+      case "http_4xx": return "鉴权/请求错误(4xx)";
+      case "http_5xx": return "服务端错误(5xx)";
+      case "protocol": return "响应协议不匹配";
+      case "model_id": return "模型ID非法";
+      case "config": return "配置不完整";
+      default: return "未知错误";
+    }
+  }
+
+  // 后端 ai_chat 失败时 reject 结构化对象 {kind,message}；此处兼容字符串/Error 兜底分类。
+  function normalizeAiError(e: unknown): { kind: string; message: string } {
+    if (e && typeof e === "object") {
+      const o = e as Record<string, unknown>;
+      if ("message" in o || "kind" in o) {
+        return {
+          kind: typeof o.kind === "string" ? o.kind : "unknown",
+          message: typeof o.message === "string" ? o.message : JSON.stringify(e),
+        };
+      }
+    }
+    const s = typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
+    const kind = /超时|timeout/i.test(s)
+      ? "timeout"
+      : /网络|connect|dns|refused|unreachable/i.test(s)
+        ? "network"
+        : /HTTP 5\d\d/.test(s)
+          ? "http_5xx"
+          : /HTTP 4\d\d/.test(s)
+            ? "http_4xx"
+            : /协议不匹配/.test(s)
+              ? "protocol"
+              : /模型ID/.test(s)
+                ? "model_id"
+                : "unknown";
+    return { kind, message: s };
+  }
+
   async function run(system: string, userText: string) {
     if (streaming) {
       toast("AI 正在回复中…");
       return;
     }
-    if (!profile || !profile.baseUrl || !profile.model) {
+    const profiles = config.ai.profiles;
+    if (!profiles.length) {
       toast("请先在设置 → AI 配置端点", "error");
       return;
     }
-    const id = `s${++sessionSeq}-${Date.now()}`;
+
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
     const reply = push("assistant", "");
     scheduleMeasure();
-    let un: (() => void) | null = null;
-    const stop = listen<{ delta: string; done: boolean; error?: string }>(`ai-token:${id}`, (e) => {
-      const p = e.payload;
-      if (p.error) {
-        reply.content += `\n\n[错误] ${p.error}`;
-        streaming = false;
-        un?.();
-        scheduleMeasure();
+
+    // 失败转移顺序：当前端点优先，其后按 profiles 列表顺序循环；最多尝试 profiles.length 次。
+    const start = Math.min(Math.max(config.ai.active, 0), profiles.length - 1);
+    const order: number[] = [];
+    for (let k = 0; k < profiles.length; k++) order.push((start + k) % profiles.length);
+    const maxTries = config.ai.failover ? order.length : 1;
+    const failures: { name: string; kind: string; message: string }[] = [];
+
+    for (let a = 0; a < maxTries; a++) {
+      const idx = order[a];
+      const p = profiles[idx];
+      if (!p || !p.baseUrl || !p.model) {
+        failures.push({ name: p?.name || `端点${idx + 1}`, kind: "config", message: "未填写地址或模型" });
+        continue;
       }
-      if (p.delta) reply.content += p.delta;
-      if (p.done) {
-        streaming = false;
-        un?.();
-        scheduleMeasure();
+      const label = p.name || `端点${idx + 1}`;
+      if (a > 0) {
+        const prev = failures[failures.length - 1];
+        // 重试前清空上一个端点可能已流式写入的内容，避免拼接错乱
+        reply.content = "";
+        toast(`端点「${prev.name}」失败（${errKindLabel(prev.kind)}），已切换至「${label}」重试`);
       }
-      tick().then(() => {
-        listEl?.scrollTo({ top: listEl.scrollHeight });
+      const id = `s${++sessionSeq}-${Date.now()}`;
+      let active = true;
+      let un: (() => void) | null = null;
+      const stop = listen<{ delta: string; done: boolean }>(`ai-token:${id}`, (e) => {
+        if (!active) return;
+        if (e.payload.delta) {
+          reply.content += e.payload.delta;
+          tick().then(() => {
+            listEl?.scrollTo({ top: listEl.scrollHeight });
+          });
+        }
       });
-    });
-    un = () => stop.then((f) => f());
-    try {
-      await api.aiChat({
-        id,
-        provider: profile.provider,
-        baseUrl: profile.baseUrl,
-        apiKey: profile.apiKey,
-        model: profile.model,
-        system,
-        messages: [["user", userText]],
-        proxyMode: profile.proxyMode,
-        proxyUrl: profile.proxyUrl,
-      });
-    } catch (e) {
-      reply.content += `\n\n[错误] ${e}`;
-    } finally {
-      streaming = false;
-      un?.();
-      scheduleMeasure();
+      un = () => stop.then((f) => f());
+      try {
+        await api.aiChat({
+          id,
+          provider: p.provider,
+          baseUrl: p.baseUrl,
+          apiKey: p.apiKey,
+          model: p.model,
+          deployment: p.deployment,
+          apiVersion: p.apiVersion,
+          system,
+          messages: [["user", userText]],
+          proxyMode: p.proxyMode,
+          proxyUrl: p.proxyUrl,
+        });
+        active = false;
+        un?.();
+        if (config.ai.active !== idx) {
+          config.ai.active = idx;
+          saveConfigNow();
+        }
+        streaming = false;
+        scheduleMeasure();
+        return;
+      } catch (e) {
+        active = false;
+        un?.();
+        const err = normalizeAiError(e);
+        failures.push({ name: label, kind: err.kind, message: err.message });
+        if (!config.ai.failover) break;
+      }
     }
+
+    reply.content = failures.length
+      ? `[全部端点均失败]\n${failures
+          .map((f) => `• 端点「${f.name}」：${errKindLabel(f.kind)}：${f.message}`)
+          .join("\n")}`
+      : "[错误] 没有可用端点";
+    streaming = false;
+    scheduleMeasure();
+    toast("全部端点均失败，详见回复内容", "error");
   }
 
   function renderPrompt(p: PromptItem, limit = 9000): string {
@@ -613,25 +691,9 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
   });
 
   /* ---------- 独立窗口：跟随主窗口设置 ---------- */
-  $effect(() => {
-    if (!standalone) return;
-    let done = false;
-    const ctrl = listen<string>("flowread-config", (e) => {
-      if (!done) applyConfigJson(e.payload);
-    });
-    const onFocus = () => {
-      try {
-        applyConfigJson(localStorage.getItem("flowread.config.v1") || "");
-      } catch { /* ignore */ }
-    };
-    window.addEventListener("focus", onFocus);
-    onFocus();
-    return () => {
-      done = true;
-      window.removeEventListener("focus", onFocus);
-      ctrl.then((fn) => fn());
-    };
-  });
+  // 跨窗同步改由 stores.svelte.ts 里的全局 flowread-config 监听统一处理
+  // （主/独立窗口双向、lastSavedJson 去重）；这里不再单独监听，避免旧配置覆盖刚切换的端点。
+  // 首次进入时 load() 已从共享 localStorage 读取最新配置。
 
   /* ---------- 导出与清空 ---------- */
   function collectExport(): { title: string; html: string }[] {
@@ -694,8 +756,8 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
-          {#each config.ai.profiles as p, i (p.name + i)}
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
+          {#each config.ai.profiles as p, i (p.id)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
         </select>
@@ -809,8 +871,8 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     <div class="ai-head">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfig}>
-          {#each config.ai.profiles as p, i (p.name + i)}
+        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
+          {#each config.ai.profiles as p, i (p.id)}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
         </select>
