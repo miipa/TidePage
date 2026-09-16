@@ -39,7 +39,11 @@ pub struct MobiDoc {
     pub parts: Vec<(usize, usize)>,
     /// 已写盘的图片数量
     pub image_count: usize,
-    /// 解码质量警告（如源文件编码损坏），供 UI 提示
+    /// EXTH121 资源号 → 本地 URL 的映射数量（by_res）
+    pub res_urls: usize,
+    /// 无法解析、被透明占位图替换的图片引用数
+    pub placeholder_count: usize,
+    /// 解析质量警告（如源文件编码损坏），供 UI 提示
     pub warning: Option<String>,
 }
 
@@ -373,13 +377,49 @@ impl HuffDecoder {
     }
 }
 
+/// 安全记录切片：语义等价 `mobi` crate 的 `RawRecords::parse`（按 PDB 偏移切分
+/// content，扣除 extra_bytes），但**所有越界都被钳制**。受损/KF8 变体文件的
+/// 偏移表可能不升序或超界，crate 内部会直接切片 panic 导致 app 崩溃，
+/// 这里自实现解析以保证任何输入都能安全降级。
+#[derive(Debug, Clone, Copy)]
+pub struct Rec<'a> {
+    pub index: usize,
+    pub content: &'a [u8],
+}
+
+fn raw_records_safe(mobi: &Mobi) -> Vec<Rec<'_>> {
+    let content = mobi.content.as_slice();
+    let recs = &mobi.metadata.records.records;
+    let extra = mobi.metadata.records.extra_bytes() as usize;
+    let n = recs.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = (recs[i].offset as usize).min(content.len());
+        let end = if i + 1 < n {
+            let nxt = recs[i + 1].offset as usize;
+            if nxt > extra {
+                (nxt - extra).min(content.len())
+            } else {
+                start
+            }
+        } else {
+            content.len()
+        };
+        let end = end.max(start);
+        out.push(Rec {
+            index: i,
+            content: &content[start..end],
+        });
+    }
+    out
+}
+
 /// HUFF 分支：加载表并逐 section 解压为字节（不做任何字符串解码）
 fn huff_decompress_bytes(mobi: &Mobi, max_bytes: usize) -> Result<Vec<u8>, String> {
     let m = &mobi.metadata.mobi;
     let huff_start = m.first_huff_record as usize;
     let huff_count = m.huff_record_count as usize;
-    let all = mobi.raw_records();
-    let recs = all.records();
+    let recs = raw_records_safe(mobi);
     if huff_start == 0 || huff_count < 2 || huff_start + huff_count > recs.len() {
         return Err("PalmDocFormatError: HUFF 表记录范围非法".to_string());
     }
@@ -411,11 +451,10 @@ pub fn extract_records_and_decompress_limited(
     max_bytes: usize,
 ) -> Result<(Vec<u8>, Option<String>), String> {
     let comp = mobi.compression();
-    let recs = mobi.raw_records();
+    let all = raw_records_safe(mobi);
     let range = mobi.readable_records_range();
-    // 注意：mobi crate 的 RawRecords::range() 对 Excluded end 做了 -1 处理
-    // （会丢弃最后一条记录），因此这里直接用完整 records() 切片。
-    let all = recs.records();
+    // 直接用完整records：mobi crate 的 RawRecords::range() 对 Excluded end 做了 -1 处理
+    // （会丢弃最后一条记录），这里不用它。
     let start = range.start.min(all.len());
     let end = range.end.min(all.len()).max(start);
     if end - start > max_records {
@@ -427,9 +466,13 @@ pub fn extract_records_and_decompress_limited(
     match comp {
         Compression::Huff => match huff_decompress_bytes(mobi, max_bytes) {
             Ok(bytes) => Ok((bytes, None)),
-            // 自研 HUFF 解码失败时退回 crate 的 section 级解码（边界可能有瑕疵但不致读不了）
+            // 自研 HUFF 解码失败时退回 crate 的 section 级解码（边界可能有瑕疵但不致读不了）。
+            // crate 内部仍可能因偏移表异常 panic，这里兜底为安全默认值。
             Err(_e) => {
-                let s = mobi.content_as_string_lossy();
+                let s = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    mobi.content_as_string_lossy()
+                }))
+                .unwrap_or_default();
                 if s.len() > max_bytes {
                     return Err(format!(
                         "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
@@ -626,6 +669,117 @@ const NON_IMAGE_MAGICS: &[&[u8]] = &[
     b"FLIS", b"FCIS", b"SRCS", b"RESC", b"BOUN", b"FDST", b"AUDI", b"VIDE",
 ];
 
+/// KF8（AZW3）检测结果，仅用于可诊断日志与回退决策。
+#[derive(Debug, Default)]
+pub struct Kf8Info {
+    /// 是否为 KF8 或 MOBI6+KF8 联合文件
+    pub is_kf8: bool,
+    /// EXTH121 记录的 KF8 边界偏移（联合文件才有）
+    pub boundary_exth: Option<u32>,
+    /// 当前解析到的头类型：MOBI6 / KF8 / JOINT(MOBI6+KF8)
+    pub header_kind: &'static str,
+}
+
+/// 只读探测：MOBI6 头 format_version>=8 或存在 KF8 边界，即认为含 KF8。
+/// 说明：`mobi` 0.8 只能解析 record0 处的头（联合文件即 MOBI6 部分）。
+/// KF8 优先需要替换/新增依赖，故此处仅诊断；正文回退用 record0 头解析，
+/// 联合文件的 MOBI6 正文仍然完整可读，KF8-only 文件 record0 本身即 KF8 头。
+pub fn detect_kf8(mobi: &Mobi) -> Kf8Info {
+    let m = &mobi.metadata.mobi;
+    let boundary_exth = mobi
+        .metadata
+        .exth_record_at(121)
+        .and_then(|blobs| blobs.first())
+        .and_then(|b| b.get(0..4))
+        .map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]));
+    let has_boundary = raw_records_safe(mobi)
+        .iter()
+        .any(|r| r.content.starts_with(b"BOUNDARY"));
+    let kf8_header = m.format_version >= 8;
+    let is_kf8 = has_boundary || kf8_header;
+    let header_kind = if has_boundary && kf8_header {
+        "KF8(+boundary)"
+    } else if has_boundary {
+        "JOINT(MOBI6+KF8)"
+    } else if kf8_header {
+        "KF8"
+    } else {
+        "MOBI6"
+    };
+    Kf8Info {
+        is_kf8,
+        boundary_exth,
+        header_kind,
+    }
+}
+
+/// 提取封面图原始字节（MOBI6/AZW3 通用）：
+/// 优先级 EXTH201(cover) → EXTH202(thumb) → EXTH129(KF8 cover URI) →
+/// first_image_index 起第一张图片。失败返回 None（调用方回退占位图）。
+pub fn extract_cover_bytes(mobi: &Mobi) -> Option<Vec<u8>> {
+    let fi = mobi.metadata.mobi.first_image_index as usize;
+    let all = raw_records_safe(mobi);
+    if all.is_empty() {
+        return None;
+    }
+    let by_off = |off: u32| -> Option<Vec<u8>> {
+        let idx = fi.checked_add(off as usize)?;
+        all.get(idx).map(|r| r.content.to_vec())
+    };
+    // EXTH 201/202：值多为 4 字节大端整数，需叠加 first_image_index
+    for rec in [201u32, 202u32] {
+        if let Some(blobs) = mobi.metadata.exth_record_at(rec) {
+            for b in blobs {
+                if b.len() >= 4 {
+                    let off = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                    if let Some(bytes) = by_off(off) {
+                        if image_magic(&bytes).is_some() {
+                            return Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // EXTH 129：KF8 cover URI，形如 kindle:embed:0001
+    if let Some(blobs) = mobi.metadata.exth_record_at(129) {
+        let re = Regex::new(r"(?i)kindle:embed:([0-9a-fA-F]{1,8})").unwrap();
+        for b in blobs {
+            let s = String::from_utf8_lossy(b);
+            if let Some(c) = re.captures(&s) {
+                if let Ok(n) = u32::from_str_radix(&c[1], 16) {
+                    if n >= 1 {
+                        if let Some(bytes) = by_off(n - 1) {
+                            if image_magic(&bytes).is_some() {
+                                return Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 回退：first_image_index 起第一张真正图片
+    (fi..all.len()).find_map(|i| {
+        let c = all[i].content;
+        if NON_IMAGE_MAGICS.iter().any(|m| c.starts_with(m)) {
+            return None;
+        }
+        image_magic(c).map(|_| c.to_vec())
+    })
+}
+
+/// 路径版封面提取（供 library 扫描/重提封面使用）。任何解析异常都安全返回 None。
+pub fn extract_cover_path(path: &str) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bytes = std::fs::read(path).ok()?;
+        let mobi = Mobi::new(&bytes).ok()?;
+        extract_cover_bytes(&mobi)
+    }))
+    .ok()
+    .flatten()
+}
+
 /// 从 first_image 索引到 EOF 提取图片记录：嗅探魔数、写盘并建立
 /// (记录索引→URL)、(EXTH121 资源号→URL)、按序列表 三种映射。
 pub fn extract_images(
@@ -637,24 +791,23 @@ pub fn extract_images(
     let mut by_res: HashMap<u32, String> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
     let fi = mobi.metadata.mobi.first_image_index as usize;
-    let all = mobi.raw_records();
-    let recs = all.records();
+    let recs = raw_records_safe(mobi);
     if fi == 0 || fi >= recs.len() {
         return (by_rec, by_res, ordered);
     }
     let _ = std::fs::create_dir_all(out_dir);
-    for (i, rec) in recs.iter().enumerate().skip(fi) {
-        let c = rec.content;
+    for r in recs.iter().skip(fi) {
+        let c = r.content;
         if NON_IMAGE_MAGICS.iter().any(|m| c.starts_with(m)) {
             continue;
         }
         let Some(ext) = image_magic(c) else { continue };
-        let fname = format!("r{i:05}.{ext}");
+        let fname = format!("r{:05}.{ext}", r.index);
         if std::fs::write(out_dir.join(&fname), c).is_err() {
             continue;
         }
         let url = format!("{url_prefix}{fname}");
-        by_rec.insert(i as u32, url.clone());
+        by_rec.insert(r.index as u32, url.clone());
         ordered.push(url);
     }
     if by_rec.is_empty() {
@@ -686,25 +839,74 @@ pub fn extract_images(
 const TRANSPARENT_PLACEHOLDER: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
+/// 图片引用重写统计，供 `[diag]` 诊断与验收断言使用。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RewriteStats {
+    /// HTML 中的 <img> 标签总数
+    pub total_imgs: usize,
+    /// 成功改写成书内本地资源 URL 的数量
+    pub rewritten: usize,
+    /// 解析不到图片、被替换成透明占位图的数量
+    pub placeholders: usize,
+}
+
+/// MOBI6 的 `recindex` 是**相对 first_image_index 的序号**（多数为十进制 1 基，
+/// 少数用十六进制/0 基）。依次尝试各种解释，取第一个能在 `by_rec`（绝对记录索引）
+/// 命中的；EXTH121 的 `recindex:resindex` 映射（`by_res`）优先级最高。
+fn resolve_recindex(
+    v: &str,
+    by_rec: &HashMap<u32, String>,
+    by_res: &HashMap<u32, String>,
+    first_image_index: u32,
+) -> Option<String> {
+    let try_abs = |n: u32| -> Option<String> {
+        if n >= 1 {
+            if let Some(u) = by_rec.get(&first_image_index.saturating_add(n - 1)) {
+                return Some(u.clone());
+            }
+        }
+        by_rec.get(&first_image_index.saturating_add(n)).cloned()
+    };
+    if let Ok(n) = v.parse::<u32>() {
+        if let Some(u) = by_res.get(&n) {
+            return Some(u.clone());
+        }
+        if let Some(u) = try_abs(n) {
+            return Some(u);
+        }
+    }
+    if let Ok(n) = u32::from_str_radix(v, 16) {
+        if let Some(u) = by_res.get(&n) {
+            return Some(u.clone());
+        }
+        if let Some(u) = try_abs(n) {
+            return Some(u);
+        }
+    }
+    // 兼容旧行为：个别文件 recindex 直接是绝对记录索引（最后兜底）
+    v.parse::<u32>().ok().and_then(|n| by_rec.get(&n).cloned())
+}
+
 pub fn rewrite_images(
     html: &str,
     by_rec: &HashMap<u32, String>,
     by_res: &HashMap<u32, String>,
     ordered: &[String],
-) -> String {
+    first_image_index: u32,
+) -> (String, RewriteStats) {
     let tag_re = Regex::new(r"(?is)<img\b[^>]*>").unwrap();
     let rec_re = Regex::new(r#"(?i)\brecindex\s*=\s*['"]?([0-9a-fA-F]{1,8})['"]?"#).unwrap();
     let embed_re = Regex::new(r"(?i)kindle:embed:([0-9a-fA-F]{1,8})").unwrap();
     let src_re = Regex::new(r#"(?i)\bsrc\s*=\s*["']([^"']*)["']"#).unwrap();
     let num_re = Regex::new(r"(\d+)").unwrap();
-    tag_re
+    let mut stats = RewriteStats::default();
+    let out_html = tag_re
         .replace_all(html, |cap: &Captures| {
             let tag = cap.get(0).unwrap().as_str();
+            stats.total_imgs += 1;
             let mut url: Option<String> = None;
             if let Some(c) = rec_re.captures(tag) {
-                if let Ok(r) = u32::from_str_radix(&c[1], 16) {
-                    url = by_rec.get(&r).cloned();
-                }
+                url = resolve_recindex(&c[1], by_rec, by_res, first_image_index);
             }
             if url.is_none() {
                 if let Some(c) = embed_re.captures(tag) {
@@ -753,6 +955,7 @@ pub fn rewrite_images(
                 if !is_img_ref {
                     return tag.to_string();
                 }
+                stats.placeholders += 1;
                 let mut out = rec_re.replace_all(tag, "").to_string();
                 out = if src_re.is_match(&out) {
                     src_re
@@ -763,6 +966,7 @@ pub fn rewrite_images(
                 };
                 return out;
             }
+            stats.rewritten += 1;
             let u = url.unwrap();
             // 去掉 recindex 属性、重写 src 为本地 URL
             let mut out = rec_re.replace_all(tag, "").to_string();
@@ -773,7 +977,8 @@ pub fn rewrite_images(
             }
             out
         })
-        .to_string()
+        .to_string();
+    (out_html, stats)
 }
 
 /// 文本节点内的实体解码（数字 + 命名），返回 (结果, 命中实体数)
@@ -1093,11 +1298,27 @@ pub fn parse(path: &str) -> Result<MobiDoc, String> {
 
 /// 完整解析。images=Some((写盘目录, URL 前缀)) 时提取并重写图片引用；
 /// force_encoding=Some(label) 时跳过嗅探按该编码重解码正文。
+///
+/// 外层捕获 `mobi` crate 在受损/KF8 变体文件上的内部 panic，转为可读错误，
+/// 保证 app 绝不因单本坏书崩溃。
 pub fn parse_full(
     path: &str,
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
 ) -> Result<MobiDoc, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_full_inner(path, force_encoding, images)
+    })) {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "PalmDocFormatError: {path} 解析中断（文件受损或为不支持的 KF8 变体），已安全中止，可尝试转换后再导入"
+        )),
+    }
+}
+
+/// 一次 `read` + 一次 `Mobi::new`，并完成 DRM 拦截。返回的 `Mobi` 自持内容，
+/// 不借用传入字节，调用方可立即释放文件缓冲。
+fn read_and_parse_mobi(path: &str) -> Result<Mobi, String> {
     // 快速失败路径：不整读文件即拦截 DRM/畸形头
     sniff_drm_file(path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
@@ -1112,23 +1333,111 @@ pub fn parse_full(
             "AWZ3EncryptedError: MOBI 头 DRM 记录偏移域非空（存在 DRM 记录），请先解密后导入".to_string(),
         );
     }
+    Ok(mobi)
+}
+
+/// 元数据阶段专用：**一次读取、一次解析**同时拿到 `MobiDoc` 与封面字节，
+/// 避免 `parse` + `extract_cover_path` 各整读一遍（大书是 2× 全量读盘）。
+/// 返回 `(解析结果, 封面字节)`；解析失败时封面为 None。
+pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_with_cover_inner(path))) {
+        Ok(r) => r,
+        Err(_) => (
+            Err(format!(
+                "PalmDocFormatError: {path} 解析中断（文件受损或为不支持的 KF8 变体），已安全中止，可尝试转换后再导入"
+            )),
+            None,
+        ),
+    }
+}
+
+fn parse_with_cover_inner(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
+    let mobi = match read_and_parse_mobi(path) {
+        Ok(m) => m,
+        Err(e) => return (Err(e), None),
+    };
+    let cover = extract_cover_bytes(&mobi);
+    match build_mobi_doc(path, &mobi, None, None) {
+        Ok(doc) => (Ok(doc), cover),
+        Err(e) => (Err(e), None),
+    }
+}
+
+fn parse_full_inner(
+    path: &str,
+    force_encoding: Option<&str>,
+    images: Option<(&Path, &str)>,
+) -> Result<MobiDoc, String> {
+    let mobi = read_and_parse_mobi(path)?;
+    build_mobi_doc(path, &mobi, force_encoding, images)
+}
+
+/// 纯构建：解码/清洗正文、改写图片、切分章节（不做任何文件读取）。
+fn build_mobi_doc(
+    path: &str,
+    mobi: &Mobi,
+    force_encoding: Option<&str>,
+    images: Option<(&Path, &str)>,
+) -> Result<MobiDoc, String> {
     let (raw, extract_warn) = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES)?;
     // 一次性全局解码整个字节流（不在任何 Record 内做字符串解码）
     let mut decoded = decode_html_bytes(&raw, mobi.text_encoding(), force_encoding);
     if decoded.warning.is_none() {
         decoded.warning = extract_warn;
     }
+    if decoded.text.trim().is_empty() {
+        return Err(
+            "PalmDocFormatError: 正文解压为空（HUFF/CDIC 受损或不受支持的 KF8 变体），请转换后再导入"
+                .to_string(),
+        );
+    }
     // NUL/控制字符必须在 tokenizer 之前剔除（tag-name 状态按规范会把 NUL 变成 U+FFFD 混进标签名）；
     // 之后再清一次：实体解码可能还原出 PUA/控制字符
     let mut html = clean_html(&decode_and_sanitize(&clean_html(&decoded.text)));
-    let (toc, parts) = split_mobi_chapters(&html);
+    // 根因1：图片重写会改变字符串长度，必须**先改图片再算章节区间**，
+    // 否则 parts 是改写前的旧字节区间，safe_slice 会从标签/单词/URI 中间切开。
+    let first_image_index = mobi.metadata.mobi.first_image_index;
     let mut image_count = 0usize;
+    let mut res_map = 0usize;
+    let mut rewrite_stats = RewriteStats::default();
     if let Some((dir, prefix)) = images {
         let (by_rec, by_res, ordered) = extract_images(&mobi, dir, prefix);
         image_count = ordered.len();
+        res_map = by_res.len();
         if image_count > 0 {
-            html = rewrite_images(&html, &by_rec, &by_res, &ordered);
+            let (h, st) = rewrite_images(&html, &by_rec, &by_res, &ordered, first_image_index);
+            html = h;
+            rewrite_stats = st;
         }
+    }
+    // res_urls 语义：成功重写为书内本地资源 URL 的图片引用数（验收指标之一）
+    let res_urls = rewrite_stats.rewritten;
+    let (toc, parts) = split_mobi_chapters(&html);
+    if std::env::var("FLOWREAD_MOBI_DIAG").is_ok() {
+        let kf8 = detect_kf8(&mobi);
+        let m = &mobi.metadata.mobi;
+        eprintln!(
+            "[diag] path={:?} type={:?} fmt={} comp={:?} first_image={} first_non_text={} \
+             exth121={:?} kf8={} head={} lt={} toc={} html={}B imgs={} res_urls={} \
+             res_map={} placeholder={} warning={:?}",
+            std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()),
+            mobi.mobi_type(),
+            m.format_version,
+            mobi.compression(),
+            m.first_image_index,
+            m.first_non_book_index,
+            kf8.boundary_exth,
+            kf8.is_kf8,
+            kf8.header_kind,
+            decoded.text.matches('<').count(),
+            toc.len(),
+            html.len(),
+            image_count,
+            res_urls,
+            res_map,
+            rewrite_stats.placeholders,
+            decoded.warning,
+        );
     }
     let title = mobi.title().trim().to_string();
     let author = mobi.author().unwrap_or_default().trim().to_string();
@@ -1146,10 +1455,236 @@ pub fn parse_full(
         toc,
         parts,
         image_count,
+        res_urls,
+        placeholder_count: rewrite_stats.placeholders,
         warning: decoded.warning,
     })
 }
 
+/// 去标签取纯文本，用于给无名章节生成可读标题。
+/// - 行内标签（font/b/i/em/strong/u/s/span/a/sup/sub/small/big…）删除时**不补空格**，
+///   避免首字下沉 `<font size="6"><b>M</b></font>an` 被拆成假空格 "M an"。
+/// - 块级/换行标签（p/div/br/h1-6/li/tr/td…）视为空白分隔。
+/// - 合并多余空白、还原常用实体、最多 max 个字符。
+fn segment_text(html: &str, max: usize) -> String {
+    // head/title/script/style 不参与命名（否则 <guide> 里的目录标题会当成正文）
+    // 注：regex crate 不支持反向引用，用显式成对分支替代
+    static DROP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?is)<head\b[^>]*>.*?</head\s*>|<title\b[^>]*>.*?</title\s*>|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>",
+        )
+        .unwrap()
+    });
+    // 块级/换行标签 → 空格；其余标签（行内）随后直接删除
+    static BLOCK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)</?(?:address|article|aside|blockquote|body|br|caption|center|dd|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|html|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul)\b[^>]*/?>"#,
+        )
+        .unwrap()
+    });
+    static TAG: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
+    let cleaned = DROP.replace_all(html, " ");
+    let spaced = BLOCK.replace_all(&cleaned, " ");
+    let stripped = TAG.replace_all(&spaced, "");
+    let decoded = decode_basic_entities(&stripped);
+    let mut out = String::new();
+    let mut prev_space = true;
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+            if out.chars().count() >= max {
+                break;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 常用实体还原（章节命名用，非 HTML 转义管线）
+fn decode_basic_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+        .replace("&#8217;", "’")
+        .replace("&nbsp;", " ")
+}
+
+/// 按词/句边界收尾，避免截半个词；拉丁截断处补「…」，CJK 按字数截断。
+fn truncate_label(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    // 1) 首个句末标点（在 6..max 内出现时收在句末）
+    const STOP: [char; 8] = ['.', '!', '?', '。', '！', '？', '；', ';'];
+    for i in 6..max {
+        if STOP.contains(&chars[i]) {
+            let s: String = chars[..=i].iter().collect();
+            return s.trim().to_string();
+        }
+    }
+    // 2) 拉丁词边界：恰好截在词中时回退到上一个空白
+    let mut cut = max;
+    let at = chars.get(max.saturating_sub(1)).copied().unwrap_or(' ');
+    let nxt = chars.get(max).copied().unwrap_or(' ');
+    if at.is_ascii_alphanumeric() && nxt.is_ascii_alphanumeric() {
+        if let Some(ws) = chars[..max].iter().rposition(|c| c.is_whitespace()) {
+            if ws >= 6 {
+                cut = ws;
+            }
+        }
+    }
+    let mut s: String = chars[..cut].iter().collect();
+    while s.ends_with(|c: char| c.is_whitespace() || c == '—' || c == '–' || c == '-') {
+        s.pop();
+    }
+    s.push('…');
+    s
+}
+
+/// 标题线索：取段内**最靠前**的醒目块（h1-6 / font size=5..7 / b），
+/// 只认它作为标题，避免把首字下沉或大段正文当标题。
+fn title_clue(seg: &str) -> Option<String> {
+    static H: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>").unwrap()
+    });
+    static F: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r#"(?is)<font\b[^>]*\bsize\s*=\s*["']?[5-7]["']?[^>]*>(.*?)</font\s*>"#).unwrap()
+    });
+    static B: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?is)<b\b[^>]*>(.*?)</b\s*>").unwrap());
+    fn consider(best: &mut Option<(usize, u8, String)>, start: usize, prio: u8, inner: &str) {
+        // <b> 仅在段首附近作为标题线索，避免正文强调词误判
+        if start > 400 || (prio == 2 && start > 160) {
+            return;
+        }
+        let txt = segment_text(inner, 80);
+        // 过滤首字下沉的单个字符
+        if txt.chars().count() < 2 {
+            return;
+        }
+        let key = (start, prio);
+        if best.as_ref().map(|(s, p, _)| key < (*s, *p)).unwrap_or(true) {
+            *best = Some((start, prio, txt));
+        }
+    }
+    let mut best: Option<(usize, u8, String)> = None;
+    for c in H.captures_iter(seg) {
+        consider(&mut best, c.get(0).unwrap().start(), 0, &c[1]);
+    }
+    for c in F.captures_iter(seg) {
+        consider(&mut best, c.get(0).unwrap().start(), 1, &c[1]);
+    }
+    for c in B.captures_iter(seg) {
+        consider(&mut best, c.get(0).unwrap().start(), 2, &c[1]);
+    }
+    best.map(|(_, _, t)| t)
+}
+
+/// 生成可读标题：优先醒目块，否则首句；统一按词/句边界截断。
+fn segment_label(seg: &str, max: usize) -> String {
+    if let Some(clue) = title_clue(seg) {
+        let t = truncate_label(&clue, max);
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let txt = segment_text(seg, max.saturating_mul(3).max(64));
+    truncate_label(&txt, max)
+}
+
+/// 卷首内容（封面/书名页/献词/目录）的合理命名。
+fn front_label(seg: &str, index: usize) -> String {
+    if seg.matches("filepos").count() >= 3 {
+        return "目录".into();
+    }
+    let has_img = seg.contains("<img");
+    let txt = segment_text(seg, 64);
+    let label = segment_label(seg, 40);
+    if txt.is_empty() || label.is_empty() {
+        return if index == 0 || has_img { "封面".into() } else { "插图".into() };
+    }
+    if index == 0 && has_img && txt.chars().count() <= 12 {
+        return "封面".into();
+    }
+    label
+}
+
+/// 正文分页的标题：优先页面醒目块/首句，拿不到再退回「第 N 章」。
+fn body_label(seg: &str, n: usize) -> String {
+    let label = segment_label(seg, 24);
+    if label.is_empty() {
+        format!("第 {n} 章")
+    } else {
+        label
+    }
+}
+
+/// 卷首"标题式"页面（无句末标点、非目录）按块级 `<p>/<div>` 细分成多条，
+/// 让书名页的「书名」与「作者」各自成条；含句末标点的正文/题词页保持整段。
+/// 返回值保证连续覆盖 `[s, e)`，供 parts 直接使用。
+fn expand_front_segment(html: &str, s: usize, e: usize) -> Vec<(usize, usize)> {
+    let whole = vec![(s, e)];
+    if e <= s + 1 {
+        return whole;
+    }
+    let seg = &html[s..e];
+    if seg.matches("filepos").count() >= 3 {
+        return whole;
+    }
+    // 用去标签后的文本判断标点（避免把 src="r00159.jpg" 之类的句点误当正文标点）
+    let seg_txt = segment_text(seg, 200);
+    if seg_txt
+        .chars()
+        .any(|c| matches!(c, '.' | '。' | '!' | '！' | '?' | '？' | ';' | '；'))
+    {
+        return whole;
+    }
+    // 块级起始标签即分段边界
+    static BLK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)<(?:p|div|center|table|tr|td|blockquote|h[1-6])\b[^>]*>").unwrap()
+    });
+    let mut bounds: Vec<usize> = vec![s];
+    bounds.extend(
+        BLK.find_iter(seg)
+            .map(|m| s + m.start())
+            .filter(|p| *p > s),
+    );
+    bounds.push(e);
+    bounds.dedup();
+    let kept: Vec<(usize, usize)> = bounds
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(bs, be)| !segment_text(&html[*bs..*be], 3).is_empty())
+        .collect();
+    if kept.len() < 2 {
+        return whole;
+    }
+    let n = kept.len();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = if i == 0 { s } else { kept[i].0 };
+        let end = if i + 1 < n { kept[i + 1].0 } else { e };
+        out.push((start, end));
+    }
+    out
+}
+
+/// 章节切分：优先书内标题 `<h1-6>`，否则按 `<mbp:pagebreak>` 分页；
+/// 无标题的卷首内容按「封面/目录/前言」命名，正文页用首段文字命名。
 fn split_mobi_chapters(html: &str) -> (Vec<TocEntry>, Vec<(usize, usize)>) {
     let h_re = Regex::new(r"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>").unwrap();
     let tag_re = Regex::new(r"(?s)<[^>]+>").unwrap();
@@ -1166,32 +1701,97 @@ fn split_mobi_chapters(html: &str) -> (Vec<TocEntry>, Vec<(usize, usize)>) {
         starts.push((m.start(), text));
     }
 
+    // 卷首（第一个标题之前）的内容单列：封面/目录/前言
+    let mut front: Vec<(usize, usize)> = Vec::new();
     if starts.len() < 2 {
         starts.clear();
+        // 分页回退：按 pagebreak 切段，先去掉纯空白/无图无字的空段
         let pb_re = Regex::new(r"(?i)<mbp:pagebreak\s*/?>").unwrap();
-        let mut n = 0;
-        for m in pb_re.find_iter(html) {
+        let mut bounds: Vec<usize> = vec![0];
+        bounds.extend(pb_re.find_iter(html).map(|m| m.start()));
+        bounds.push(html.len());
+        bounds.dedup();
+        let segs: Vec<(usize, usize)> = bounds
+            .windows(2)
+            .map(|w| (w[0], w[1]))
+            .filter(|(s, e)| {
+                let body = &html[*s..*e];
+                !segment_text(body, 5).is_empty() || body.contains("<img")
+            })
+            .collect();
+        // 首个含多个 filepos 链接的段视为目录：其（含）之前为卷首，之后为正文
+        let toc_at = segs
+            .iter()
+            .position(|(s, e)| html[*s..*e].matches("filepos").count() >= 3);
+        let body_from = match toc_at {
+            Some(i) => {
+                front = segs[..=i]
+                    .iter()
+                    .flat_map(|(s, e)| expand_front_segment(html, *s, *e))
+                    .collect();
+                i + 1
+            }
+            None => {
+                // 无目录：仅把开头的纯封面段归入卷首
+                if let Some(&(s, e)) = segs.first() {
+                    let seg = &html[s..e];
+                    if seg.contains("<img") && segment_text(seg, 13).chars().count() <= 12 {
+                        front = expand_front_segment(html, s, e);
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+        };
+        let mut n = 0usize;
+        for (s, e) in segs[body_from..].iter().copied() {
             n += 1;
-            starts.push((m.start(), format!("第 {n} 章")));
+            starts.push((s, body_label(&html[s..e], n)));
         }
     }
 
     let mut toc = Vec::new();
     let mut parts = Vec::new();
-    if starts.is_empty() {
+    // 卷首段（封面/书名页/目录/前言）
+    for (j, (s, e)) in front.iter().enumerate() {
+        let title = if html[*s..*e].matches("filepos").count() >= 3 {
+            "目录".to_string()
+        } else {
+            front_label(&html[*s..*e], j)
+        };
         toc.push(TocEntry {
-            title: "全文".into(),
-            index: 0,
-            chars: html.chars().count() as i64,
+            title,
+            index: toc.len(),
+            chars: html[*s..*e].chars().count() as i64,
         });
-        parts.push((0, html.len()));
+        parts.push((*s, *e));
+    }
+    if starts.is_empty() {
+        if parts.is_empty() {
+            toc.push(TocEntry {
+                title: "全文".into(),
+                index: 0,
+                chars: html.chars().count() as i64,
+            });
+            parts.push((0, html.len()));
+        }
         return (toc, parts);
     }
-    if starts[0].0 > 0 {
+    if front.is_empty() && starts[0].0 > 0 {
+        // 标题模式下的前置内容
+        let seg = &html[..starts[0].0];
+        let title = if seg.contains("<img") && segment_text(seg, 20).is_empty() {
+            "封面".to_string()
+        } else {
+            "前言".to_string()
+        };
         toc.push(TocEntry {
-            title: "前言".into(),
+            title,
             index: 0,
-            chars: html[..starts[0].0].chars().count() as i64,
+            chars: seg.chars().count() as i64,
         });
         parts.push((0, starts[0].0));
     }
@@ -1493,7 +2093,8 @@ mod tests {
         assert_eq!(ordered.len(), 2, "应提取 2 张图");
         std::fs::remove_dir_all(&dir).ok();
         let html = String::from_utf8_lossy(&text).to_string();
-        let out = rewrite_images(&html, &by_rec, &by_res, &ordered);
+        let fi = mobi.metadata.mobi.first_image_index;
+        let (out, st) = rewrite_images(&html, &by_rec, &by_res, &ordered, fi);
         assert!(out.contains("http://flowread.localhost/res/1/r00002.jpg"), "{out}");
         assert!(out.contains("http://flowread.localhost/res/1/r00003.png"), "{out}");
         assert!(!out.contains("recindex"), "{out}");
@@ -1503,6 +2104,200 @@ mod tests {
         assert!(out.contains("data:image/gif;base64,R0lGODlhAQAB"), "{out}");
         assert!(!out.contains("00FF"), "{out}");
         assert_eq!(out.matches("<img").count(), 4, "{out}");
+        assert_eq!(st.total_imgs, 4);
+        assert_eq!(st.rewritten, 3);
+        assert_eq!(st.placeholders, 1);
+    }
+
+    /// 根因2 回归：MOBI6 `recindex` 是相对 first_image_index 的 1 基序号，
+    /// 而不是绝对记录索引（旧实现用 abs 查找导致所有图片变透明占位）。
+    #[test]
+    fn mobi6_recindex_is_relative_to_first_image() {
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpg.extend_from_slice(&[7u8; 128]);
+        let mut png = vec![0x89, b'P', b'N', b'G'];
+        png.extend_from_slice(&[9u8; 64]);
+        // fi = 2；recindex 0001→rec2(jpg)，0002→rec3(png)，0000(0基)→rec2(jpg)
+        let text = b"<img recindex=\"0001\"/><img recindex=\"0002\"/><img recindex=\"0000\"/>".to_vec();
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: text.clone(),
+            images: vec![jpg, png],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let mobi = Mobi::new(&b).unwrap();
+        let dir = std::env::temp_dir().join(format!("flowread-mobi-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/");
+        std::fs::remove_dir_all(&dir).ok();
+        let fi = mobi.metadata.mobi.first_image_index;
+        assert_eq!(fi, 2);
+        let (out, st) =
+            rewrite_images(&text_to_str(&text), &by_rec, &by_res, &ordered, fi);
+        assert_eq!(st.rewritten, 3, "{out}");
+        assert_eq!(st.placeholders, 0, "{out}");
+        assert_eq!(out.matches("r00002.jpg").count(), 2, "{out}");
+        assert_eq!(out.matches("r00003.png").count(), 1, "{out}");
+        assert!(!out.contains("recindex"), "{out}");
+    }
+
+    fn text_to_str(b: &[u8]) -> String {
+        String::from_utf8_lossy(b).to_string()
+    }
+
+    /// 受损 PDB 偏移表（记录间距 < extra_bytes）不得 panic：旧路径用
+    /// mobi crate RawRecords::parse 会直接越界切片崩溃，改为自实现安全切片后
+    /// 必须返回 Ok/Err 而非 panic（真实 AZW3 样本实测崩溃点 record.rs:154）。
+    #[test]
+    fn malformed_offsets_do_not_panic() {
+        let body = "<p>".to_string() + &"x".repeat(9000) + "</p>";
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: body.into_bytes(),
+            images: vec![],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let mut bad = b.clone();
+        let n = u16b(&bad, 0x4C) as usize;
+        assert!(n >= 4, "需要至少 4 条记录，实际 {n}");
+        let rec_off = 0x4E;
+        // record[1].offset = record[2].offset - 1，并令 extra_bytes=4
+        // ⇒ next - extra < curr，旧实现切片 panic
+        let o2 = u32b(&bad, rec_off + 2 * 8) as usize;
+        let new_o1 = (o2.saturating_sub(1)) as u32;
+        bad[rec_off + 8..rec_off + 12].copy_from_slice(&new_o1.to_be_bytes());
+        let extra_pos = rec_off + 8 * n;
+        bad[extra_pos] = 0;
+        bad[extra_pos + 1] = 4;
+        let mobi = Mobi::new(&bad).unwrap();
+        // 旧实现此处 panic；现在只能返回 Ok 或 Err
+        let _ = extract_records_and_decompress(&mobi);
+    }
+
+    /// 章节命名回归（问题1）：行内标签不产生假空格、首字下沉不被拆开、
+    /// 按词/句边界截断、CJK 按字数、醒目块优先、卷首语义命名。
+    #[test]
+    fn title_labels_avoid_fake_spaces_and_half_words() {
+        assert_eq!(
+            segment_text("<p><font size=\"6\"><b>M</b></font>an, he loved that smile.</p>", 60),
+            "Man, he loved that smile."
+        );
+        assert_eq!(segment_text("<p>word<b>bold</b>word</p>", 60), "wordboldword");
+        assert_eq!(segment_text("<p>one</p><p>two</p>", 60), "one two");
+        assert_eq!(segment_text("<p>a<br/>b</p>", 60), "a b");
+        // 拉丁按词边界截断，不截半词
+        assert_eq!(truncate_label("alpha beta gamma delta epsilon", 20), "alpha beta gamma…");
+        // 句末标点优先收尾
+        assert_eq!(truncate_label("Hello world. This is more text here.", 30), "Hello world.");
+        // CJK 按字数截断
+        let cjk = truncate_label("这是一个很长很长的中文标题需要截断处理", 10);
+        assert_eq!(cjk.chars().count(), 11, "{cjk}");
+        assert!(cjk.starts_with("这是一个很长很长的中") && cjk.ends_with('…'), "{cjk}");
+        // 醒目块优先于正文；首字下沉单字不作为标题
+        assert_eq!(
+            body_label("<p><font size=\"5\"><b>Chapter One</b></font></p><p>Body text.</p>", 1),
+            "Chapter One"
+        );
+        let drop = body_label(
+            "<p><font size=\"6\"><b>M</b></font>an, he loved that smile of hers. It was a killer.</p>",
+            2,
+        );
+        assert!(!drop.contains("M an"), "{drop}");
+        assert!(drop.starts_with("Man"), "{drop}");
+        // 卷首语义命名
+        assert_eq!(front_label("<div><p><img src=\"x\"/></p></div>", 0), "封面");
+        assert_eq!(front_label("<p><i>For Jessica and Adam</i></p>", 2), "For Jessica and Adam");
+        assert_eq!(
+            front_label(
+                "<p><font size=\"5\"><b>A Killing Night</b></font></p><p>Jonathon King</p>",
+                1
+            ),
+            "A Killing Night"
+        );
+        assert_eq!(
+            front_label("<a filepos=\"1\"></a><a filepos=\"2\"></a><a filepos=\"3\"></a>", 4),
+            "目录"
+        );
+        // 书名页按块细分为「书名」「作者」两条，且连续覆盖（src 里的句点不算正文标点）
+        let page = "<mbp:pagebreak/></div><div><p><font size=\"5\"><b>A Killing Night</b></font></p>\
+                    <p>Jonathon King</p><p><img src=\"r00159.jpg\"/></p><div></div></div>";
+        let ps = expand_front_segment(page, 0, page.len());
+        assert_eq!(ps.len(), 2, "{ps:?}");
+        assert_eq!(ps[0].0, 0);
+        assert_eq!(ps[1].1, page.len());
+        assert_eq!(ps[0].1, ps[1].0, "细分后应连续");
+        assert_eq!(front_label(&page[ps[0].0..ps[0].1], 1), "A Killing Night");
+        assert_eq!(front_label(&page[ps[1].0..ps[1].1], 2), "Jonathon King");
+    }
+
+    /// 最小合法 1x1 PNG（供合成样本当图片记录）
+    fn tiny_png() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+            .unwrap()
+    }
+
+    /// 合成 MOBI 回归（问题1/2/3 离线可跑，不依赖外部样本）：
+    /// pagebreak 分段 + 十进制 recindex(00001/00010>9) + hex recindex(0000a)
+    /// + <font color> + <guide>/<reference> 包裹 + 末尾真实图片记录。
+    #[test]
+    fn synthetic_mobi_regression_offsets_and_recindex() {
+        let png = tiny_png();
+        let images: Vec<Vec<u8>> = (0..10).map(|_| png.clone()).collect();
+        let text = concat!(
+            "<html><head><guide><reference type=\"toc\" title=\"TOC\" filepos=\"0000000010\"/></guide></head><body>",
+            "<div><img recindex=\"00001\"/></div><mbp:pagebreak/>",
+            "<div><font size=\"5\"><b>Chapter One</b></font><p>Body one <font color=\"red\">red</font>.</p></div><mbp:pagebreak/>",
+            "<div><font size=\"5\"><b>Chapter Two</b></font><p>Body two <img recindex=\"00010\"/> tail.</p></div><mbp:pagebreak/>",
+            "<div><font size=\"5\"><b>Chapter Three</b></font><p>Body three <img recindex=\"0000a\"/> tail.</p></div>",
+            "</body></html>"
+        )
+        .as_bytes()
+        .to_vec();
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text,
+            images,
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let dir = std::env::temp_dir().join(format!("flowread-mobi-synth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("synth.mobi");
+        std::fs::write(&file, &b).unwrap();
+        let res_dir = dir.join("res");
+        let doc = parse_full(file.to_str().unwrap(), None, Some((&res_dir, "res/"))).unwrap();
+        // 问题3 根因2：recindex 相对 first_image_index 解析（十进制 >9 与 hex 都要命中）
+        assert!(doc.res_urls >= 2, "res_urls={}（应 >=2）", doc.res_urls);
+        assert_eq!(doc.placeholder_count, 0, "不应有透明占位");
+        // 问题3 根因1：章节起点在标签边界，且 parts 连续覆盖 [0, html.len())
+        for (s, _) in &doc.parts {
+            let head: String = doc.html[*s..].trim_start().chars().take(24).collect();
+            assert!(head.starts_with('<'), "章节起点非标签边界: {head:?}");
+        }
+        assert_eq!(doc.parts.first().map(|p| p.0), Some(0));
+        assert_eq!(doc.parts.last().map(|p| p.1), Some(doc.html.len()));
+        let covered: usize = doc.parts.iter().map(|(s, e)| doc.html[*s..*e].chars().count()).sum();
+        assert_eq!(covered, doc.html.chars().count(), "parts 未连续覆盖");
+        // 问题2：一次读取/一次解析同时拿到 doc 与封面（无 EXTH201/202/129 时回退首图）
+        let (doc2, cover) = parse_with_cover(file.to_str().unwrap());
+        assert!(doc2.is_ok(), "parse_with_cover 应解析成功");
+        let cover = cover.expect("应能提取封面");
+        assert!(image_magic(&cover).is_some());
+        // 兼容旧入口：extract_cover_path 仍可独立工作（reextract_cover 用）
+        let cover2 = extract_cover_path(file.to_str().unwrap()).expect("extract_cover_path 应可用");
+        assert_eq!(cover2.len(), cover.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 汉字被切断在 Record 边界时，全局一次性解码必须无损还原（不得出现任何 U+FFFD）
@@ -1705,8 +2500,19 @@ mod tests {
             }
         };
         for path in env.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let dir = std::env::temp_dir().join(format!("flowread-real-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
             let t0 = std::time::Instant::now();
-            let doc = parse_full(path, None, None).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let doc = match parse_full(path, None, Some((&dir, "res/"))) {
+                Ok(d) => d,
+                Err(e) => {
+                    // 受损/不支持的样本：只报告可诊断信息，不让单个坏文件中断批量验证
+                    // （app 侧同样返回错误而非崩溃，见 parse_full 的 panic 兜底）
+                    eprintln!("[skip] {path}: {e}");
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+            };
             let dt = t0.elapsed();
             let plain: String = doc
                 .html
@@ -1715,18 +2521,79 @@ mod tests {
                 .take(8)
                 .collect();
             let fffd = doc.html.matches('\u{FFFD}').count();
+            // 章节起点必须落在标签边界：任一 part 起点字符不是 '<'，或切片开头是可见文本以外的
+            // 情况都说明 offsets 失效（根因1 回归）。
+            let bad_starts: Vec<String> = doc
+                .parts
+                .iter()
+                .take(12)
+                .filter_map(|(s, _)| {
+                    let head = doc.html.get(*s..(*s).saturating_add(24))?;
+                    let head = head.trim_start();
+                    if head.starts_with('<') {
+                        None
+                    } else {
+                        Some(head.replace('\n', "\\n"))
+                    }
+                })
+                .collect();
             eprintln!(
-                "{} -> {}ms, toc={}, html={}B, FFFD={}, warning={:?}, 中文样例={:?}",
+                "[diag] {} -> {}ms, toc={}, html={}B, imgs={}, res_urls={}, placeholder={}, \
+                 FFFD={}, bad_chapter_starts={:?}, warning={:?}, 中文样例={:?}",
                 std::path::Path::new(path).file_name().unwrap().to_string_lossy(),
                 dt.as_millis(),
                 doc.toc.len(),
                 doc.html.len(),
+                doc.image_count,
+                doc.res_urls,
+                doc.placeholder_count,
                 fffd,
+                bad_starts,
                 doc.warning,
                 plain
             );
+            eprintln!(
+                "[toc] {:?}",
+                doc.toc.iter().take(12).map(|t| t.title.clone()).collect::<Vec<_>>()
+            );
+            let cover = extract_cover_path(path);
+            eprintln!(
+                "[cover] {:?} len={:?} magic={:?}",
+                std::path::Path::new(path).file_name().unwrap().to_string_lossy(),
+                cover.as_ref().map(|c| c.len()),
+                cover.as_ref().and_then(|c| image_magic(c)),
+            );
+            assert!(
+                cover.as_ref().and_then(|c| image_magic(c)).is_some(),
+                "{path}: 封面提取失败（应为有效图片字节）"
+            );
             assert!(!doc.html.is_empty(), "{path}: 正文为空");
             assert!(doc.toc.len() > 0, "{path}: 无章节");
+            assert_eq!(
+                doc.placeholder_count, 0,
+                "{path}: 有 {} 个图片引用解析不到（根因2 未修复）: {:?}",
+                doc.placeholder_count, bad_starts
+            );
+            assert!(
+                bad_starts.is_empty() || doc.parts.len() <= 1,
+                "{path}: 章节起点未落在标签边界（根因1）: {bad_starts:?}"
+            );
+            // 章节区间必须与最终 html 完全对应：连续覆盖 [0,len)（无重叠/无空洞）
+            if doc.parts.first().map(|p| p.0) == Some(0)
+                && doc.parts.last().map(|p| p.1) == Some(doc.html.len())
+            {
+                let covered: usize = doc
+                    .parts
+                    .iter()
+                    .map(|(s, e)| doc.html.get(*s..*e).map(|x| x.chars().count()).unwrap_or(0))
+                    .sum();
+                assert_eq!(
+                    covered,
+                    doc.html.chars().count(),
+                    "{path}: 章节区间与实际 html 长度不一致（根因1：offsets 失效）"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

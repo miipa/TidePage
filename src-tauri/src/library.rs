@@ -280,24 +280,39 @@ fn extract_meta(
                 }
             }
         }
-        "mobi" | "azw3" | "prc" => match crate::mobi::parse(path) {
-            Ok(doc) => {
-                let name = format!("{}.svg", db::path_id(path));
-                let out = covers_dir.join(&name);
-                covers::write_placeholder(&out, &doc.title, &doc.author).ok();
-                let text = crate::epub::html_to_text(&doc.html);
-                let chars = text.chars().count() as i64;
-                let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-                (
-                    if doc.title.is_empty() { fallback } else { doc.title },
-                    doc.author,
-                    Some(name),
-                    chars,
-                    text_chars,
-                )
+        "mobi" | "azw3" | "prc" => {
+            // 涓€娆¤鍙?涓€娆¤В鏋愬悓鏃舵嬁鍒版鏂囦笌灏侀潰锛岄伩鍏嶅澶т功閲嶅鏁磋涓ら亶
+            let (doc_res, cover_bytes) = crate::mobi::parse_with_cover(path);
+            match doc_res {
+                Ok(doc) => {
+                    // 浼樺厛涔﹀唴鐪熷疄灏侀潰锛圗XTH201/202/129 鎴栭鍥撅級锛屽け璐ユ墠鍥為€€鍗犱綅 SVG
+                    let cover_file = cover_bytes
+                        .and_then(|bytes| {
+                            let name = format!("{}.png", db::path_id(path));
+                            let out = covers_dir.join(&name);
+                            covers::make_thumbnail(&bytes, &out).ok()?;
+                            Some(name)
+                        })
+                        .or_else(|| {
+                            let name = format!("{}.svg", db::path_id(path));
+                            let out = covers_dir.join(&name);
+                            covers::write_placeholder(&out, &doc.title, &doc.author).ok()?;
+                            Some(name)
+                        });
+                    let text = crate::epub::html_to_text(&doc.html);
+                    let chars = text.chars().count() as i64;
+                    let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+                    (
+                        if doc.title.is_empty() { fallback } else { doc.title },
+                        doc.author,
+                        cover_file,
+                        chars,
+                        text_chars,
+                    )
+                }
+                Err(_) => (fallback, String::new(), None, 0, 0),
             }
-            Err(_) => (fallback, String::new(), None, 0, 0),
-        },
+        }
         _ => {
             let name = format!("{}.svg", db::path_id(path));
             let out = covers_dir.join(&name);
@@ -719,7 +734,14 @@ pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crat
         .join("res")
         .join(book_id.to_string());
     let prefix = format!("http://flowread.localhost/res/{book_id}/");
-    crate::mobi::parse_full(path, force.as_deref(), Some((&dir, &prefix)))
+    let doc = crate::mobi::parse_full(path, force.as_deref(), Some((&dir, &prefix)))?;
+    if std::env::var("FLOWREAD_MOBI_DIAG").is_ok() {
+        eprintln!(
+            "[mobi] {path} imgs={} res_urls={} placeholder={}",
+            doc.image_count, doc.res_urls, doc.placeholder_count
+        );
+    }
+    Ok(doc)
 }
 
 #[tauri::command]
@@ -1767,7 +1789,10 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
             None => false,
         }
     } else if ext == "mobi" || ext == "azw3" || ext == "prc" {
-        false
+        // MOBI/AZW3锛欵XTH201/202/129 鎴?first_image_index 璧烽寮犲浘
+        crate::mobi::extract_cover_path(&book.path)
+            .map(|b| covers::make_thumbnail(&b, &out).is_ok())
+            .unwrap_or(false)
     } else {
         false
     };
