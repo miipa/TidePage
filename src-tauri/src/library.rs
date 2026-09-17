@@ -440,6 +440,25 @@ pub fn list_books(state: State<'_, Arc<AppState>>) -> Vec<BookRow> {
     db::list_books(&conn)
 }
 
+/// 超大书库分页：过滤/排序下推 SQLite，单次 IPC 最多 500 行 + total。
+/// 用 spawn_blocking 放到阻塞线程池，避免长查询占用主线程（异步命令不阻塞 UI）。
+#[tauri::command]
+pub async fn list_books_page(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    sort: String,
+    offset: i64,
+    limit: i64,
+) -> Result<BookPage, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_books_page(&conn, &query, &sort, offset, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let st = state.inner().clone();
@@ -2083,6 +2102,116 @@ mod refresh_tests {
         assert!(db::get_book_by_path(&conn, &sp(&shelf.join("inroot.txt"))).is_some());
         assert!(db::get_book_by_path(&conn, &sp(&deep.join("deep.txt"))).is_none(), "二级不递归");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 分页查询：total/rows、排序白名单、LIMIT 上限、offset、LIKE 转义。
+    #[test]
+    fn list_books_page_filters_sorts_and_pages() {
+        let root = tmp_root("page");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        let data = [
+            ("a.txt", "Alpha", 100i64),
+            ("b.txt", "beta", 200),
+            ("c.txt", "Gamma", 300),
+            ("d.txt", "100%_marker", 400),
+            ("e.txt", "delta", 500),
+            ("f.txt", "Epsilon", 600),
+            ("g.txt", "zeta", 700),
+        ];
+        for (name, title, mtime) in data {
+            let p = root.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            db::upsert_book(&conn, &sp(&p), title, "txt", 1, mtime).unwrap();
+        }
+
+        let p1 = db::list_books_page(&conn, "", "recent", 0, 500);
+        assert_eq!(p1.total, 7);
+        assert_eq!(p1.rows.len(), 7);
+        assert_eq!(p1.rows[0].title, "zeta", "mtime DESC 最新在前");
+
+        let p2 = db::list_books_page(&conn, "", "recent", 2, 3);
+        assert_eq!((p2.total, p2.rows.len()), (7, 3));
+        assert_eq!(p2.rows[0].title, "delta", "offset=2 应从第三新开始");
+
+        let p3 = db::list_books_page(&conn, "", "added", 0, 9999);
+        assert_eq!(p3.rows.len(), 7, "limit 超上限被 clamp 到 500，本应有 7 行");
+
+        let p4 = db::list_books_page(&conn, "epsilon", "title", 0, 10);
+        assert_eq!((p4.total, p4.rows.len()), (1, 1), "标题搜索应大小写不敏感");
+        assert_eq!(p4.rows[0].title, "Epsilon");
+
+        let p5 = db::list_books_page(&conn, "%_marker", "title", 0, 10);
+        assert_eq!(p5.total, 1, "% 与 _ 必须按字面匹配");
+        assert_eq!(p5.rows[0].title, "100%_marker");
+
+        let p6 = db::list_books_page(&conn, "%", "title", 0, 10);
+        assert_eq!(p6.total, 1, "纯通配符不得匹配全部");
+
+        let p7 = db::list_books_page(&conn, "", "title", 0, 10);
+        assert_eq!(p7.rows[0].title, "100%_marker", "title COLLATE NOCASE 升序");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 16 万本规模的分页性能基线（默认忽略；`cargo test -- --ignored --nocapture` 运行）。
+    #[test]
+    #[ignore]
+    fn list_books_page_160k_perf() {
+        use std::time::Instant;
+        let root = tmp_root("perf160k");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..160_000i64 {
+                tx.execute(
+                    "INSERT INTO books(id,path,title,author,format,size,mtime,added_at,meta_done)
+                     VALUES(?1,?2,?3,?4,'txt',1,?5,?6,0)",
+                    rusqlite::params![
+                        i,
+                        format!("C:/fake/lib/{}.txt", i),
+                        format!("书籍标题 Book {:06}", i),
+                        format!("作者{}", i % 1000),
+                        1_700_000_000_000i64 + i,
+                        1_700_000_000_000i64 + i
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let t = Instant::now();
+        let p1 = db::list_books_page(&conn, "", "added", 0, 500);
+        println!("[perf160k] added page0: {:?} total={} rows={}", t.elapsed(), p1.total, p1.rows.len());
+
+        let t = Instant::now();
+        let p2 = db::list_books_page(&conn, "", "title", 0, 500);
+        println!("[perf160k] title page0: {:?} rows={}", t.elapsed(), p2.rows.len());
+
+        let t = Instant::now();
+        let p3 = db::list_books_page(&conn, "", "recent", 159_000, 500);
+        println!("[perf160k] recent offset=159000: {:?} rows={}", t.elapsed(), p3.rows.len());
+
+        let t = Instant::now();
+        let p3b = db::list_books_page(&conn, "", "added", 159_000, 500);
+        println!("[perf160k] added offset=159000: {:?} rows={}", t.elapsed(), p3b.rows.len());
+
+        let t = Instant::now();
+        let p3c = db::list_books_page(&conn, "", "title", 159_000, 500);
+        println!("[perf160k] title offset=159000: {:?} rows={}", t.elapsed(), p3c.rows.len());
+
+        let t = Instant::now();
+        let p3d = db::list_books_page(&conn, "", "lastread", 0, 500);
+        println!("[perf160k] lastread page0: {:?} rows={}", t.elapsed(), p3d.rows.len());
+
+        let t = Instant::now();
+        let p4 = db::list_books_page(&conn, "Book 159", "title", 0, 500);
+        println!("[perf160k] search 'Book 159': {:?} total={} rows={}", t.elapsed(), p4.total, p4.rows.len());
+
+        assert_eq!(p1.total, 160_000);
+        assert_eq!(p4.total, 1000, "Book 159000..159999 共 1000 本");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

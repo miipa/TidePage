@@ -12,6 +12,12 @@ export interface BookRow {
   last_read: number;
 }
 
+/** 分页返回：total 为过滤后总数，rows 为当前窗口。 */
+export interface BookPage {
+  total: number;
+  rows: BookRow[];
+}
+
 export interface TocEntry {
   title: string;
   index: number;

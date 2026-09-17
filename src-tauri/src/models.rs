@@ -17,6 +17,14 @@ pub struct BookRow {
     pub total_text_chars: i64,
 }
 
+/// 超大书库（16 万本）分页返回：total 为满足条件的总数（前端状态栏/虚拟滚动用），
+/// rows 为当前 LIMIT/OFFSET 窗口，避免一次性经 IPC 回传全量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookPage {
+    pub total: i64,
+    pub rows: Vec<BookRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TocEntry {
     pub title: String,

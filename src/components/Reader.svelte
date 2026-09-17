@@ -37,6 +37,14 @@
   let scrollWrap: HTMLDivElement | undefined = $state();
   let pageWrap: HTMLDivElement | undefined = $state();
   let contentEl: HTMLDivElement | undefined = $state();
+  let bodyEl: HTMLDivElement | undefined = $state();
+
+  // A−/A＋ 悬浮控件：默认完全隐藏（pointer-events:none），仅指针进入右下角热区才淡入，
+  // 避免透明热区常驻拦截正文框选/右下角翻页点击。
+  let fontCtlShow = $state(false);
+  let hoverRaf = 0;
+  let hoverX = 0;
+  let hoverY = 0;
 
   let scrollTop = $state(0);
   let maxScroll = $state(0);
@@ -507,6 +515,21 @@
       config.reader.fontSize = n;
       saveConfig();
     }
+  }
+
+  /** 指针是否位于 .body 右下角热区（约 150×130），用 rAF 节流后短算。 */
+  function onReaderMove(e: MouseEvent) {
+    hoverX = e.clientX;
+    hoverY = e.clientY;
+    if (hoverRaf) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = 0;
+      const el = bodyEl;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const inCorner = hoverX >= r.right - 150 && hoverY >= r.bottom - 130;
+      if (inCorner !== fontCtlShow) fontCtlShow = inCorner;
+    });
   }
 
   function relayout() {
@@ -984,7 +1007,7 @@ ${r.cssExtra || ""}
 
 <svelte:window onkeydown={onKeyDown} />
 
-<div class="reader" class:ovr={config.reader.overrideBookCss} style={readerVars()} onwheel={onWheel}>
+<div class="reader" class:ovr={config.reader.overrideBookCss} style={readerVars()} onwheel={onWheel} onmousemove={onReaderMove} onmouseleave={() => (fontCtlShow = false)}>
   {#if bgImageUrl}
     <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{config.reader.bgOpacity};"></div>
   {/if}
@@ -1019,7 +1042,7 @@ ${r.cssExtra || ""}
     </div>
   </div>
 
-  <div class="body">
+  <div class="body" bind:this={bodyEl}>
     {#if openError}
       <div class="empty error-box">
         <div>
@@ -1119,7 +1142,7 @@ ${r.cssExtra || ""}
     {/if}
 
     {#if book && !openError}
-      <div class="font-ctl">
+      <div class="font-ctl" class:show={fontCtlShow}>
         <button class="icon" title="减小字号" onclick={() => bumpFont(-1)}>A−</button>
         <button class="icon" title="增大字号" onclick={() => bumpFont(1)}>A＋</button>
       </div>
@@ -1238,12 +1261,24 @@ ${r.cssExtra || ""}
     display: flex;
     gap: 4px;
     z-index: 25;
-    opacity: 0.5;
-    transition: opacity 0.18s;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(4px);
+    transition: opacity 0.18s, transform 0.18s;
   }
 
-  .font-ctl:hover {
+  .font-ctl.show,
+  .font-ctl:focus-within {
     opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .font-ctl {
+      transition: none;
+      transform: none;
+    }
   }
 
   .clip {

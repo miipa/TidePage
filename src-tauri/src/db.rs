@@ -47,6 +47,15 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             total_text_chars INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+        CREATE INDEX IF NOT EXISTS idx_books_title_nocase ON books(title COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_books_author ON books(author);
+        CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_mtime ON books(mtime DESC);
+        -- 复合覆盖索引：让 ORDER BY <列> DESC, id DESC + LIMIT/OFFSET 走索引顺序，
+        -- 避免对 16 万行做临时 B-tree 排序（深 offset 场景）。
+        CREATE INDEX IF NOT EXISTS idx_books_added_id ON books(added_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_mtime_id ON books(mtime DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_title_nocase_id ON books(title COLLATE NOCASE, id);
         CREATE TABLE IF NOT EXISTS progress(
             book_id INTEGER PRIMARY KEY,
             chapter_index INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +99,8 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             chars INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_book ON reading_sessions(book_id);
+        CREATE INDEX IF NOT EXISTS idx_progress_book ON progress(book_id);
+        CREATE INDEX IF NOT EXISTS idx_progress_updated ON progress(updated_at DESC);
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
@@ -297,6 +308,81 @@ pub fn list_books(conn: &Connection) -> Vec<BookRow> {
     stmt.query_map([], book_from_row)
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+}
+
+/// 转义 LIKE 通配符，配合 SQL 的 `ESCAPE '\'` 使用，避免用户输入 `%`/`_` 被当作模式。
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// 超大书库分页查询：过滤/排序全部下推 SQLite（带索引），只返回窗口 rows + total。
+/// - query 为空不施加过滤；否则按 title/author 模糊匹配（LIKE 对 ASCII 不区分大小写）。
+/// - sort 走白名单，绝不拼接用户输入。
+/// - limit 上限保护 500，offset 非负。
+pub fn list_books_page(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    offset: i64,
+    limit: i64,
+) -> crate::models::BookPage {
+    let order = match sort {
+        "lastread" => "COALESCE(p.updated_at, 0) DESC, b.id DESC",
+        "title" => "b.title COLLATE NOCASE ASC, b.id ASC",
+        "recent" => "b.mtime DESC, b.id DESC",
+        // "added" 为默认
+        _ => "b.added_at DESC, b.id DESC",
+    };
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let q = query.trim();
+    let pat = if q.is_empty() {
+        None
+    } else {
+        Some(format!("%{}%", escape_like(q)))
+    };
+    let where_sql = if pat.is_some() {
+        " WHERE (b.title LIKE ?1 ESCAPE '\\' OR b.author LIKE ?1 ESCAPE '\\')"
+    } else {
+        ""
+    };
+
+    let total: i64 = {
+        let sql = format!("SELECT COUNT(*) FROM books b{where_sql}");
+        match &pat {
+            Some(p) => conn.query_row(&sql, params![p], |r| r.get(0)).unwrap_or(0),
+            None => conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0),
+        }
+    };
+
+    let sql = if pat.is_some() {
+        format!(
+            "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id{where_sql} ORDER BY {order} LIMIT ?2 OFFSET ?3"
+        )
+    } else {
+        format!(
+            "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id ORDER BY {order} LIMIT ?1 OFFSET ?2"
+        )
+    };
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => {
+            return crate::models::BookPage { total, rows: vec![] };
+        }
+    };
+    let rows: Vec<BookRow> = match &pat {
+        Some(p) => stmt
+            .query_map(params![p, limit, offset], book_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        None => stmt
+            .query_map(params![limit, offset], book_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+    };
+    crate::models::BookPage { total, rows }
 }
 
 pub fn get_book(conn: &Connection, id: i64) -> Option<BookRow> {

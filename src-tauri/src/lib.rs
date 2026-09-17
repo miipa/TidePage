@@ -271,6 +271,7 @@ pub fn run() {
             library::add_folder,
             library::remove_folder,
             library::list_books,
+            library::list_books_page,
             library::rescan,
             library::refresh_library,
             library::file_exists,

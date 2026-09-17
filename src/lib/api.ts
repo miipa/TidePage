@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BookRow, BookSession, BookmarkRow, ChapterData, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+import type { BookPage, BookRow, BookSession, BookmarkRow, ChapterData, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
   listFolders: () => invoke<string[]>("list_folders"),
   addFolder: (path: string) => invoke<void>("add_folder", { path }),
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
+  listBooksPage: (query: string, sort: string, offset: number, limit: number) =>
+    invoke<BookPage>("list_books_page", { query, sort, offset, limit }),
   rescan: () => invoke<void>("rescan"),
   refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
   fileExists: (path: string) => invoke<boolean>("file_exists", { path }),

@@ -5,8 +5,20 @@
   import { listen } from "@tauri-apps/api/event";
   import type { BookRow } from "../lib/types";
 
-  let books: BookRow[] = $state([]);
+  // ===== 超大书库（实测 16 万本）：前端永不全量持有书籍 =====
+  // 只保留「按需窗口 + total」：过滤/排序/分页全部下推 Rust，单次 IPC 至多 FETCH 行。
+  const FETCH = 500;        // 单次分页窗口（Rust 端 limit 上限 500）
+  const GRID_COL_MIN = 168; // 网格最小列宽
+  const ROW_H = 66;         // 列表行步长（行高 64 + 间距 2，与 .row / .list-inner CSS 一致）
+
+  let total = $state(0);
+  // $state.raw：窗口数组不递归代理（避免 16 万对象的深层响应式开销），整体替换更新。
+  let booksWindow: BookRow[] = $state.raw([]);
+  let rangeStart = $state(0);
+  let loadSeq = 0;
+
   let folders: string[] = $state([]);
+  let queryInput = $state("");
   let query = $state("");
   let sortKey = $state<"added" | "lastread" | "title" | "recent">(
     (() => {
@@ -23,6 +35,7 @@
     })()
   );
   let loading = $state(true);
+  let refreshing = $state(false);
 
   function saveSort() {
     try { localStorage.setItem("flowread.lib.sort", sortKey); } catch { /* ignore */ }
@@ -44,51 +57,144 @@
     }
   }
 
+  /** 切换视图：重置滚动，避免网格的大 scrollTop 直接套到列表。 */
   function setView(v: "grid" | "list") {
+    if (v === view) return;
     view = v;
     try { localStorage.setItem("flowread.lib.view", v); } catch { /* ignore */ }
+    resetScroll();
+  }
+
+  function resetScroll() {
+    scrollTop = 0;
+    if (gridEl) gridEl.scrollTop = 0;
   }
 
   let gridEl: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let gridH = $state(800);
   let gridW = $state(1200);
+  let gridPadX = $state(40);
   let ctxMenu = $state<{ x: number; y: number; book: BookRow } | null>(null);
 
-  const filtered = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    let arr = q
-      ? books.filter((b) => b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q))
-      : books;
-    if (sortKey === "lastread") arr = [...arr].sort((a, b) => (b.last_read || 0) - (a.last_read || 0));
-    else if (sortKey === "title") arr = [...arr].sort((a, b) => a.title.localeCompare(b.title, "zh"));
-    else if (sortKey === "recent") arr = [...arr].sort((a, b) => b.mtime - a.mtime);
-    return arr;
+  // 真实内容宽 = clientWidth - 左右 padding（用 computed style 取，不写死），
+  // 保证首列左边距与末列右边距对称，且末列不出右侧边界。
+  $effect(() => {
+    const el = gridEl;
+    if (!el) return;
+    const cs = getComputedStyle(el);
+    const l = parseFloat(cs.paddingLeft) || 0;
+    const r = parseFloat(cs.paddingRight) || 0;
+    gridPadX = l + r;
   });
 
-  const PAD = 16;
-  const cols = $derived(Math.max(2, Math.round((gridW - PAD * 2) / 168)));
-  const cellW = $derived((gridW - PAD * 2) / cols);
-  const cardW = $derived(Math.min(216, Math.max(120, cellW - 10)));
+  const contentW = $derived(Math.max(1, gridW - gridPadX));
+  const cols = $derived(Math.max(2, Math.floor(contentW / GRID_COL_MIN)));
+  const cellW = $derived(contentW / cols);
+  const cardW = $derived(Math.min(216, Math.max(120, cellW - 12)));
   const coverH = $derived((cardW - 12) * 1.5);
   const cellH = $derived(coverH + 62);
-  const rows = $derived(Math.ceil(filtered.length / cols));
-  const firstRow = $derived(Math.max(0, Math.floor(scrollTop / cellH) - 3));
-  const lastRow = $derived(Math.min(rows, Math.ceil((scrollTop + gridH) / cellH) + 3));
-  const visible = $derived(
-    Array.from({ length: Math.max(0, lastRow - firstRow) }, (_, i) => firstRow + i)
-  );
 
-  async function refresh() {
+  // 网格虚拟窗口（行）
+  const gridRows = $derived(Math.ceil(total / cols));
+  const gFirst = $derived(Math.max(0, Math.floor(scrollTop / cellH) - 3));
+  const gLast = $derived(Math.min(gridRows, Math.ceil((scrollTop + gridH) / cellH) + 3));
+  const gRows = $derived(Array.from({ length: Math.max(0, gLast - gFirst) }, (_, i) => gFirst + i));
+
+  // 列表虚拟窗口（行）
+  const lFirst = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - 8));
+  const lLast = $derived(Math.min(total, Math.ceil((scrollTop + gridH) / ROW_H) + 8));
+  const lRows = $derived(Array.from({ length: Math.max(0, lLast - lFirst) }, (_, i) => lFirst + i));
+
+  function bookAt(abs: number): BookRow | undefined {
+    return booksWindow[abs - rangeStart];
+  }
+
+  // rAF 节流滚动：回调里只更新一个标量，不做任何 O(n) 全量遍历。
+  let scrollRaf = 0;
+  let pendingTop = 0;
+  function onScroll(e: Event) {
+    pendingTop = (e.currentTarget as HTMLDivElement).scrollTop;
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (pendingTop !== scrollTop) scrollTop = pendingTop;
+    });
+  }
+
+  async function loadRange(offset: number) {
+    const seq = ++loadSeq;
     try {
-      const [b, f] = await Promise.all([api.listBooks(), api.listFolders()]);
-      books = b;
-      folders = f;
-      loading = false;
+      const r = await api.listBooksPage(query, sortKey, offset, FETCH);
+      if (seq !== loadSeq) return;
+      total = r.total;
+      rangeStart = offset;
+      booksWindow = r.rows;
     } catch (e) {
-      toast(String(e), "error");
-      loading = false;
+      if (seq === loadSeq) toast(String(e), "error");
+    } finally {
+      if (seq === loadSeq) loading = false;
     }
+  }
+
+  /** 窗口未覆盖 [start,end) 时，按 FETCH 对齐拉取一段；已覆盖则 no-op（不会循环）。 */
+  function ensureRange(start: number, end: number) {
+    if (total === 0 || end <= start) return;
+    const rangeEnd = rangeStart + booksWindow.length;
+    if (booksWindow.length && rangeStart <= start && rangeEnd >= end) return;
+    loadRange(Math.max(0, Math.floor(start / FETCH) * FETCH));
+  }
+
+  /** 全量重置：查询/排序变化或首次进入时调用（回到顶部并重拉窗口）。 */
+  function reload() {
+    loadSeq++;
+    loading = true;
+    total = 0;
+    rangeStart = 0;
+    booksWindow = [];
+    resetScroll();
+    loadRange(0);
+  }
+
+  /** 增量刷新：只重拉当前窗口与 total，不重置滚动、不拉全量（library-changed/meta 用）。 */
+  async function reloadWindow() {
+    const offset = Math.floor(Math.max(0, rangeStart) / FETCH) * FETCH;
+    await loadRange(offset);
+  }
+
+  // 可见范围变化时按需拉取窗口（effect 内只发起异步请求，不阻塞主线程）。
+  $effect(() => {
+    if (total === 0) return;
+    if (view === "grid") ensureRange(gFirst * cols, Math.min(total, gLast * cols));
+    else ensureRange(lFirst, lLast);
+  });
+
+  // 搜索 250ms 防抖后再请求（输入不触发全量过滤）。
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const q = queryInput;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      if (q !== query) {
+        query = q;
+        reload();
+      }
+    }, 250);
+    return () => clearTimeout(searchTimer);
+  });
+
+  function onSortChange() {
+    saveSort();
+    reload();
+  }
+
+  /** 就地修改窗口内某本书后，替换数组引用以触发重渲染（raw 数组不深层代理）。 */
+  function touchWindow() {
+    booksWindow = booksWindow.slice();
+  }
+
+  async function loadFolders() {
+    try { folders = await api.listFolders(); } catch { /* ignore */ }
   }
 
   async function addFolder() {
@@ -145,13 +251,20 @@
     // 无论该书是否仍在索引，都停在这里（不进入空白阅读）
   }
 
-  // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）
+  // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）。
+  // 16 万本下 IO 密集且耗时：立即给「进行中」提示并禁用按钮，完成后只增量刷新当前窗口。
   async function refreshAll() {
+    if (refreshing) return;
+    refreshing = true;
+    toast("正在刷新书库…（大书库可能耗时较久）");
     try {
       const r = await api.refreshLibrary();
       toast(`书库已刷新：移除 ${r.removed} 本、新增 ${r.added} 本`);
+      await reloadWindow();
     } catch (e) {
       toast(String(e), "error");
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -174,7 +287,7 @@
     try {
       await api.deleteBooks([b.path], fromDisk);
       toast(fromDisk ? "已删除（移入回收站）" : "已从书库移除");
-      refresh();
+      await reloadWindow();
     } catch (e) {
       toast(String(e), "error");
     }
@@ -188,6 +301,7 @@
     try {
       await api.setCustomCover(b.id, p);
       b.cover_path = `custom-${b.id}.png`;
+      touchWindow();
       toast("封面已更新");
     } catch (e) {
       toast(String(e), "error");
@@ -198,6 +312,7 @@
     try {
       const name = await api.reextractCover(b.id);
       b.cover_path = name;
+      touchWindow();
       toast("封面已重新提取");
     } catch (e) {
       toast(String(e), "error");
@@ -235,7 +350,7 @@
         toast(`添加失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
       }
     }
-    await refresh();
+    await reloadWindow();
     if (last) {
       toast(`已添加《${last.title}》到书库（原文件未移动）`);
       await tryOpenBook(last);
@@ -243,9 +358,11 @@
   }
 
   onMount(() => {
-    refresh();
-    const u1 = listen("library-changed", () => refresh());
-    const u2 = listen("library-meta", () => refresh());
+    loadFolders();
+    reload();
+    // 监听只增量刷新当前窗口与 total，不重置滚动、不拉全量。
+    const u1 = listen("library-changed", () => reloadWindow());
+    const u2 = listen("library-meta", () => reloadWindow());
     let u3: Promise<() => void> | null = null;
     import("@tauri-apps/api/webview")
       .then((m) => {
@@ -268,9 +385,9 @@
   <div class="toolbar">
     <span class="logo">FlowRead</span>
     <button onclick={addFolder}>＋ 添加文件夹</button>
-    <button onclick={refreshAll}>⟳ 刷新</button>
-    <input class="search" placeholder="搜索书名 / 作者…" bind:value={query} />
-    <select bind:value={sortKey} onchange={saveSort}>
+    <button onclick={refreshAll} disabled={refreshing}>{refreshing ? "刷新中…" : "⟳ 刷新"}</button>
+    <input class="search" placeholder="搜索书名 / 作者…" bind:value={queryInput} />
+    <select bind:value={sortKey} onchange={onSortChange}>
       <option value="lastread">按最近阅读</option>
       <option value="added">按添加时间</option>
       <option value="title">按书名</option>
@@ -301,55 +418,69 @@
     bind:this={gridEl}
     bind:clientHeight={gridH}
     bind:clientWidth={gridW}
-    onscroll={(e) => (scrollTop = (e.currentTarget as HTMLDivElement).scrollTop)}
+    onscroll={onScroll}
   >
-    {#if loading}
+    {#if loading && total === 0}
       <div class="hint">加载中…</div>
-    {:else if !filtered.length}
+    {:else if total === 0}
       <div class="hint">
-        {books.length ? "无匹配结果" : "书库为空\n点击「添加文件夹」导入本地书籍\n支持 TXT / EPUB / MOBI / AZW3"}
+        {query.trim() ? "无匹配结果" : "书库为空\n点击「添加文件夹」导入本地书籍\n支持 TXT / EPUB / MOBI / AZW3"}
       </div>
     {:else if view === "grid"}
-      <div class="grid-inner" style="height:{rows * cellH}px; position:relative;">
-        {#each visible as r (r)}
-          {#each filtered.slice(r * cols, r * cols + cols) as b, ci (b.id)}
-            <div
-              class="card"
-              style="left:{PAD + ci * cellW + (cellW - cardW) / 2}px; top:{r * cellH}px; width:{cardW}px;"
-              ondblclick={() => tryOpenBook(b)}
-              oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
-            >
-              <div class="cover" style="height:{coverH}px;">
-                <img src={coverUrl(b)} alt="" loading="lazy" draggable="false" />
-                <span class="fmt">{b.format.toUpperCase()}</span>
-              </div>
-              <div class="meta">
-                <div class="t" title={b.title}>{b.title}</div>
-                <div class="a">{b.author}</div>
-              </div>
-            </div>
+      <div class="grid-inner" style="height:{gridRows * cellH}px;">
+        {#each gRows as r (r)}
+          {#each Array(cols) as _, ci (ci)}
+            {@const abs = r * cols + ci}
+            {#if abs < total}
+              {@const b = bookAt(abs)}
+              {#if b}
+                <div
+                  class="card"
+                  style="left:{ci * cellW + (cellW - cardW) / 2}px; top:{r * cellH}px; width:{cardW}px;"
+                  ondblclick={() => tryOpenBook(b)}
+                  oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
+                >
+                  <div class="cover" style="height:{coverH}px;">
+                    <img src={coverUrl(b)} alt="" loading="lazy" decoding="async" draggable="false" />
+                    <span class="fmt">{b.format.toUpperCase()}</span>
+                  </div>
+                  <div class="meta">
+                    <div class="t" title={b.title}>{b.title}</div>
+                    <div class="a">{b.author}</div>
+                  </div>
+                </div>
+              {/if}
+            {/if}
           {/each}
         {/each}
       </div>
     {:else}
-      <div class="list-inner">
-        {#each filtered as b (b.id)}
-          <div class="row" ondblclick={() => tryOpenBook(b)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}>
-            <img class="row-cover" src={coverUrl(b)} alt="" loading="lazy" />
-            <div class="row-meta">
-              <div class="t">{b.title}</div>
-              <div class="a">{b.author}</div>
+      <div class="list-inner" style="height:{total * ROW_H}px;">
+        {#each lRows as i (i)}
+          {@const b = bookAt(i)}
+          {#if b}
+            <div
+              class="row"
+              style="top:{i * ROW_H}px"
+              ondblclick={() => tryOpenBook(b)}
+              oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
+            >
+              <img class="row-cover" src={coverUrl(b)} alt="" loading="lazy" decoding="async" />
+              <div class="row-meta">
+                <div class="t">{b.title}</div>
+                <div class="a">{b.author}</div>
+              </div>
+              <div class="row-size">{fmtSize(b.size)}</div>
+              <div class="row-date">{b.last_read ? "读于 " + fmtTime(b.last_read) : fmtTime(b.added_at)}</div>
             </div>
-            <div class="row-size">{fmtSize(b.size)}</div>
-            <div class="row-date">{b.last_read ? "读于 " + fmtTime(b.last_read) : fmtTime(b.added_at)}</div>
-          </div>
+          {/if}
         {/each}
       </div>
     {/if}
   </div>
 
   <div class="statusbar">
-    <span>{books.length} 本书</span>
+    <span>{total} 本书</span>
     <span class="build">FlowRead {APP_BUILD}</span>
     <div class="spacer"></div>
     <button class="icon" title="网格视图" onclick={() => setView("grid")}>▦</button>
@@ -443,6 +574,8 @@
 
   .grid-inner {
     position: relative;
+    width: 100%;
+    will-change: transform;
   }
 
   .card {
@@ -511,12 +644,17 @@
   }
 
   .list-inner {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+    position: relative;
+    width: 100%;
+    will-change: transform;
   }
 
   .row {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 64px;
+    box-sizing: border-box;
     display: flex;
     align-items: center;
     gap: 14px;
