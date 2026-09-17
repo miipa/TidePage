@@ -1,6 +1,6 @@
 // FlowRead 实机回归（“关闭思考”功能已彻底移除后的 auto-only 版本）。
 // 覆盖：seed 后旧键不残留、非本机端点守卫、ollama/openai 兼容发送恒 auto（无 think/reasoning 键、形状一致）、
-// 阅读 palt/字体提示、AI 分页不跳末页、发送密钥不泄露、故障注入树回收。
+// AI 分页不跳末页（切换「每行字数上限」触发重排）、发送密钥不泄露、故障注入树回收。
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
@@ -30,11 +30,8 @@ const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.
 const uiSet=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('select'),'uiSet '+labelText); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const uiInput=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('input'),'uiInput '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const labelField=(t)=>[...document.querySelectorAll('.field')].find(f=>f.querySelector('label')?.textContent.includes(t));
-const paltBox=async(want)=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); if(cb.checked!==want){ cb.click(); await sleep(500);} else { await sleep(50);} };
-const paltToggle=async()=>{ await openSettings('阅读'); const cb=await wait(()=>[...document.querySelectorAll('label')].find(x=>x.textContent.includes('压缩全角标点'))?.querySelector('input'),'palt box'); const want=!cb.checked; cb.click(); await sleep(500); return want; };
 const toastsNow=()=>[...document.querySelectorAll('.toast-card')].map(t=>t.textContent).join(' | ');
-const TXT='，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》';
-const probeEl=(el)=>{ const cs=getComputedStyle(el); const mk=(ffs)=>{const s=document.createElement('span'); s.style.cssText='position:absolute;left:-99999px;top:0;white-space:nowrap;'; for(const k of ['fontFamily','fontSize','fontWeight','fontStyle','letterSpacing','fontFeatureSettings']) s.style[k]=cs[k]; s.style.fontFeatureSettings=ffs; s.textContent=TXT; document.body.appendChild(s); const w=s.getBoundingClientRect().width; s.remove(); return Math.round(w*100)/100;}; return {ffs:cs.fontFeatureSettings, family:cs.fontFamily, off:mk('normal'), on:mk('"palt" 1')}; };
+const widthToggle=async()=>{ await openSettings('阅读'); const cur=Number(field('每行字数上限')?.querySelector('input')?.value)||0; const want=cur===0?32:0; await uiInput('每行字数上限', String(want)); await sleep(400); return want; };
 `;
 const H = (body) => `(async()=>{ ${HELPER}\n${body} })()`;
 
@@ -89,7 +86,7 @@ try {
   log("seed");
   out.seed = await main.evalJs(H(`
     const base=cfgRead();
-    const cfg={ reader: { fontFamily: "方正兰亭圆_gbk", fontSize: 27, letterSpacing: 0.05, mode: "page", punctuationCompression: false },
+    const cfg={ reader: { fontFamily: "方正兰亭圆_gbk", fontSize: 27, mode: "page" },
       ai: { enabled:true, autoOnChapter:false, system: base.ai?.system||"", active:0,
         profiles:[{name:"TEST-EP",provider:"ollama",baseUrl:"http://127.0.0.1:18081",apiKey:"sk-GUARDTEST-PLACEHOLDER-9f3k2l",model:"mock",proxyMode:"direct",proxyUrl:""}],
         prompts:[{id:1,name:"测试总结",key:"F1",text:"总结：{chapter}"}], display:"reader", style: base.ai?.style||{} },
@@ -139,39 +136,9 @@ try {
     await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); return 1`));
   }
 
-  log("F palt/字体提示");
-  {
-    await M.evalJs(H(`await paltBox(true); return 1`));
-    out.F_fangzheng_hint = await M.evalJs(H(`
-      const hint=field('压缩全角标点').textContent.includes('当前正文字体不支持比例标点');
-      closeSettings();
-      return { palt: cfgRead().reader.punctuationCompression, hint };
-    `));
-    await M.evalJs(H(`await paltBox(false); closeSettings(); return 1`));
-    await M.evalJs(H(`
-      await openSettings('阅读');
-      const fv=await wait(()=>field('字体（支持搜索')?.querySelector('.font-value'),'font input');
-      fv.value='Noto Sans SC'; fv.dispatchEvent(new Event('input',{bubbles:true})); fv.dispatchEvent(new Event('change',{bubbles:true}));
-      await sleep(200); closeSettings(); return cfgRead().reader.fontFamily;
-    `));
-    await sleep(900);
-    out.F_noto_hint = await M.evalJs(H(`
-      await paltBox(true);
-      const hintOn = field('压缩全角标点').textContent.includes('当前正文字体不支持比例标点');
-      closeSettings();
-      return { palt: cfgRead().reader.punctuationCompression, hintOnWithNoto: hintOn };
-    `));
-    await sleep(800);
-    out.F_noto_main_drawer = await M.evalJs(H(`
-      const d=document.querySelector('.ai-panel');
-      return { chapter: probeEl(document.querySelector('#chapter-content')), drawer: (d && d.querySelector('.ai-mark')) ? probeEl(d.querySelector('.ai-mark')) : "drawer-empty" };
-    `));
-    await M.evalJs(H(`await paltBox(false); closeSettings(); return 1`));
-  }
-
   log("G AI 分页不跳末页");
   {
-    await M.evalJs(H(`await paltBox(true); closeSettings(); await sleep(600); return 1`));
+    await M.evalJs(H(`await widthToggle(); closeSettings(); await sleep(600); return 1`));
     await M.evalJs(H(`await openDrawer(); return 1`));
     const hasMark = await M.evalJs(H(`return !!document.querySelector('.ai-panel .ai-mark')`));
     if (!hasMark) await sendTestPrompt(M);
@@ -184,13 +151,13 @@ try {
       return { chapter: document.querySelector('.pctinfo')?.textContent.trim(), ai: d.querySelector('.ai-pg-text')?.textContent.trim() };
     `));
     const flip = async () => {
-      const want = await M.evalJs(H(`return await paltToggle();`));
+      const want = await M.evalJs(H(`return await widthToggle();`));
       await M.evalJs(H(`closeSettings(); await sleep(1300); return 1`));
       const st8 = await M.evalJs(H(`
         const d=document.querySelector('.ai-panel');
-        return { palt: cfgRead().reader.punctuationCompression, chapter: document.querySelector('.pctinfo')?.textContent.trim(), ai: d?.querySelector('.ai-pg-text')?.textContent.trim() };
+        return { maxLineChars: cfgRead().reader.maxLineChars, chapter: document.querySelector('.pctinfo')?.textContent.trim(), ai: d?.querySelector('.ai-pg-text')?.textContent.trim() };
       `));
-      return { wantPalt: want, ...st8 };
+      return { wantMaxLineChars: want, ...st8 };
     };
     out.G_toggle1 = await flip();
     out.G_toggle2 = await flip();

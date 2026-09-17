@@ -29,7 +29,7 @@ await ensureReady(M);
 
 // ===== E: 写入带旧键的配置 → 重载 → 物理删除 =====
 out.E_seed = await M.evalJs(H(`
-  const cfg={reader:{fontFamily:'方正兰亭圆_gbk',fontSize:27,letterSpacing:0.05,mode:'page',punctuationCompression:false},
+  const cfg={reader:{fontFamily:'方正兰亭圆_gbk',fontSize:27,mode:'page'},
     ai:{enabled:true,autoOnChapter:false,system:'',active:0,reasoningMode:'off',display:'reader',style:{followReader:true},
       prompts:[{id:1,name:'probe',key:'F1',text:'请总结：{chapter}'}],
       profiles:[{name:'TEST-EP',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',proxyMode:'direct',proxyUrl:'',
