@@ -17,6 +17,10 @@
     DEFAULT_BINDINGS,
     ZONE_DEFS,
     DEFAULT_ZONES,
+    appConfirm,
+    defaultReaderConfig,
+    resetReaderConfig,
+    SCROLL_BOUNCE_PRESETS,
     type AiProvider,
     type BindAction,
     type ZoneAction,
@@ -146,33 +150,65 @@
     return q ? all.filter((f) => f.toLowerCase().includes(q)).slice(0, 60) : all.slice(0, 60);
   });
 
+  const customFontOptions = $derived.by(() => {
+    const q = fontFilter.trim().toLowerCase();
+    const list = config.reader.customFonts;
+    return q ? list.filter((f) => f.family.toLowerCase().includes(q)) : list;
+  });
+
+  const latinFontNames = $derived(
+    [...new Set([...config.reader.customFonts.map((f) => f.family), ...FALLBACK_FONTS, ...fontList])]
+  );
+
+  async function deleteCustomFont(family: string, file: string) {
+    const stem = file.replace(/\.(ttf|otf|ttc)$/i, "");
+    try {
+      await api.deleteCustomFont(stem);
+      const i = config.reader.customFonts.findIndex((f) => f.family === family && f.file === file);
+      if (i >= 0) config.reader.customFonts.splice(i, 1);
+      let fellBack = false;
+      if (config.reader.fontFamily === family) {
+        config.reader.fontFamily = defaultReaderConfig().fontFamily;
+        fellBack = true;
+      }
+      if (config.ai.style.fontFamily === family) config.ai.style.fontFamily = "";
+      saveConfig();
+      toast(fellBack ? `已删除字体「${family}」，正文字体已回退默认` : `已删除字体「${family}」`);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  async function resetReader() {
+    const ok = await appConfirm(
+      "确定恢复「阅读」设置为默认吗？字体、主题、版式、快捷键与点击区域都会重置（不含 AI / WebDAV）。"
+    );
+    if (!ok) return;
+    resetReaderConfig();
+    toast("阅读设置已恢复默认");
+  }
+
   let aiTesting = $state(false);
   let aiTestResult = $state("");
   let capPromptIdx = $state<number | null>(null);
 
-  let webviewArgs = $state("");
-  let webviewArgsCustom = $state("");
+  // 字体平滑：单个复选框（勾选=灰度抗锯齿；取消=系统 ClearType 子像素）。
+  let grayAA = $state(true);
 
   $effect(() => {
     if (tab !== "reader") return;
     api
       .getSetting("render.webviewArgs")
       .then((v) => {
-        if (!v) return;
-        if (v === "--disable-lcd-text" || v === "--disable-direct-write" || v === "--enable-lcd-text") {
-          webviewArgs = v;
-        } else {
-          webviewArgs = "__custom__";
-          webviewArgsCustom = v;
-        }
+        // 兼容旧值：含 enable-lcd-text 视为关闭灰度；空/灰度/GDI/自定义旧值一律视为开启
+        grayAA = !(v || "").includes("enable-lcd-text");
       })
       .catch(() => {});
   });
 
   async function saveWebviewArgs() {
-    const val = webviewArgs === "__custom__" ? webviewArgsCustom.trim() : webviewArgs;
     try {
-      await api.setSetting("render.webviewArgs", val);
+      await api.setSetting("render.webviewArgs", grayAA ? "--disable-lcd-text" : "--enable-lcd-text");
       toast("字体平滑已保存，重启应用后生效");
     } catch (e) {
       toast(String(e), "error");
@@ -183,41 +219,6 @@
     config.ai.profiles[Math.min(config.ai.active, config.ai.profiles.length - 1)] ?? config.ai.profiles[0]
   );
   const apMeta = $derived(aiProviderMeta(ap?.provider ?? "openai"));
-
-  // palt 能力检测：与 Reader/AiPanel 相同的 fontStack 归一化（本地副本，不动既有两处实现）
-  function rdrFontStack(): string {
-    const norm = (list: string[]) => list
-      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean)
-      .map((s) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(s) ? s : `"${s}"`))
-      .join(", ");
-    const base = norm((config.reader.fontFamily || "").split(","));
-    const latin = norm([config.reader.latinFont || ""]);
-    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
-    return base ? `${latin}, ${base}` : latin;
-  }
-  const PALT_TEXT = "，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》，。！？（）《》";
-  function paltWidthDeltaPx(): number {
-    const stack = rdrFontStack();
-    const mk = (ffs: string) => {
-      const s = document.createElement("span");
-      s.style.cssText = "position:absolute;left:-99999px;top:0;white-space:nowrap;font-size:29px;";
-      s.style.fontFamily = stack;
-      s.style.fontFeatureSettings = ffs;
-      s.textContent = PALT_TEXT;
-      document.body.appendChild(s);
-      const w = s.getBoundingClientRect().width;
-      s.remove();
-      return w;
-    };
-    return mk("normal") - mk('"palt" 1');
-  }
-  let paltDelta = $state<number | null>(null);
-  $effect(() => {
-    void config.reader.fontFamily;
-    void config.reader.latinFont;
-    paltDelta = paltWidthDeltaPx();
-  });
 
   function addProfile() {
     const provider: AiProvider = ap?.provider ?? "openai";
@@ -517,26 +518,31 @@
         </select>
       </div>
       {#if config.reader.scrollBounce}
-        <div class="grid2">
-          <div class="field">
-            <label>缓冲强度 {config.reader.scrollBounceStrength.toFixed(1)}（数值越大，切换所需滚动量越大）</label>
-            <input type="range" min="0.1" max="3" step="0.1" bind:value={config.reader.scrollBounceStrength} oninput={saveConfig} />
-          </div>
-          <div class="field">
-            <label>触发阈值 {config.reader.scrollBounceThreshold}px（触发翻页所需的滚动距离）</label>
-            <input type="range" min="40" max="1600" step="10" bind:value={config.reader.scrollBounceThreshold} oninput={saveConfig} />
-          </div>
+        <div class="field">
+          <label>缓冲强度</label>
+          <select bind:value={config.reader.scrollBounceLevel} onchange={saveConfig}>
+            {#each Object.entries(SCROLL_BOUNCE_PRESETS) as [k, p] (k)}
+              <option value={k}>{p.label}</option>
+            {/each}
+          </select>
+          <p class="tip">档位越高，切换上/下一章所需的滚动量越大；仅在「缓冲过渡」下生效。</p>
         </div>
       {/if}
+    {:else}
+      <div class="grid2">
+        <div class="field">
+          <label>栏数（固定，不随窗口宽度改变）</label>
+          <select bind:value={config.reader.duo} onchange={saveConfig}>
+            <option value={false}>单栏</option>
+            <option value={true}>双栏</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>双栏栏间距 {config.reader.colGap}px</label>
+          <input type="range" min="0" max="160" step="4" bind:value={config.reader.colGap} oninput={saveConfig} disabled={!config.reader.duo} />
+        </div>
+      </div>
     {/if}
-
-    <div class="field">
-      <label>栏数（固定，不随窗口宽度改变）</label>
-      <select bind:value={config.reader.duo} onchange={saveConfig}>
-        <option value={false}>单栏</option>
-        <option value={true}>双栏</option>
-      </select>
-    </div>
 
     <div class="grid3">
       <div class="field">
@@ -636,7 +642,6 @@
       <div class="row-inline">
         <input
           class="font-input"
-          list="font-options"
           placeholder="输入字体名筛选…"
           bind:value={fontFilter}
         />
@@ -650,6 +655,25 @@
         <button onclick={() => refreshFontNames()} title="读取字体文件中的真实名称，修复已装字体名不匹配">↻ 重读字体名</button>
       </div>
       <div class="font-list">
+        {#if customFontOptions.length}
+          <div class="font-group-title">已安装字体</div>
+          {#each customFontOptions as f, fi (f.family + fi)}
+            <span class="font-opt-wrap">
+              <button
+                class="font-opt"
+                class:active={config.reader.fontFamily === f.family}
+                style="font-family:'{f.family}'"
+                onclick={() => { config.reader.fontFamily = f.family; saveConfig(); }}
+              >★ {f.family}</button>
+              <button
+                class="font-del"
+                title="删除该字体"
+                onclick={(e) => { e.stopPropagation(); deleteCustomFont(f.family, f.file); }}
+              >×</button>
+            </span>
+          {/each}
+        {/if}
+        <div class="font-group-title">系统字体</div>
         {#each fontOptions as f (f)}
           <button
             class="font-opt"
@@ -658,25 +682,29 @@
             onclick={() => { config.reader.fontFamily = f; saveConfig(); }}
           >{f}</button>
         {/each}
-        {#each config.reader.customFonts as f, fi (f.family + fi)}
-          <button
-            class="font-opt"
-            class:active={config.reader.fontFamily === f.family}
-            style="font-family:'{f.family}'"
-            onclick={() => { config.reader.fontFamily = f.family; saveConfig(); }}
-          >★ {f.family}</button>
-        {/each}
       </div>
     </div>
 
     <div class="field">
       <label>西文字体（拉丁字母/数字优先使用，中文字形仍走上方字体）</label>
-      <select bind:value={config.reader.latinFont} onchange={saveConfig}>
-        <option value="">保持默认（跟随正文字体）</option>
-        <option value="Georgia">Georgia</option>
-        <option value="Times New Roman">Times New Roman</option>
-      </select>
-      <p class="tip">用于改善中英混排时拉丁字符字形（雅黑自带西文较平庸）；AI 窗口同步生效。</p>
+      <div class="row-inline">
+        <input
+          class="font-value"
+          list="latin-font-options"
+          placeholder="留空=跟随正文字体；可输入任意系统字体名"
+          bind:value={config.reader.latinFont}
+          onchange={saveConfig}
+        />
+        {#if config.reader.latinFont}
+          <button class="icon" title="清除" onclick={() => { config.reader.latinFont = ""; saveConfig(); }}>×</button>
+        {/if}
+      </div>
+      <datalist id="latin-font-options">
+        {#each latinFontNames as f (f)}
+          <option value={f}></option>
+        {/each}
+      </datalist>
+      <p class="tip">用于改善中英混排时拉丁字符字形（如 Georgia / Times New Roman）；AI 窗口同步生效。</p>
     </div>
 
     <div class="grid3">
@@ -696,58 +724,43 @@
 
     <hr />
     <div class="field">
-      <label>字体渲染平滑（需重启应用生效）</label>
-      <select
-        bind:value={webviewArgs}
-        onchange={() => { if (webviewArgs !== "__custom__") saveWebviewArgs(); }}
-      >
-        <option value="">灰度抗锯齿 · 柔和（新默认，已强制，根治粗体发糊/黑成一坨）</option>
-        <option value="--disable-lcd-text">灰度抗锯齿（同上，显式）</option>
-        <option value="--enable-lcd-text">系统 ClearType 子像素（显式恢复旧行为）</option>
-        <option value="--disable-direct-write">GDI 旧式渲染（更锐利，接近老式系统）</option>
-        <option value="__custom__">自定义参数…</option>
-      </select>
-      {#if webviewArgs === "__custom__"}
-        <div class="row-inline" style="margin-top:6px">
-          <input bind:value={webviewArgsCustom} placeholder="--disable-lcd-text --force-color-profile=srgb" />
-          <button onclick={saveWebviewArgs}>保存</button>
-        </div>
-      {/if}
-      <p class="tip">灰度抗锯齿可消除文字彩边、笔画更均匀柔和；GDI 模式走系统旧式文本渲染。修改后需重启生效。</p>
+      <label class="check">
+        <input type="checkbox" bind:checked={grayAA} onchange={saveWebviewArgs} />
+        灰度抗锯齿（推荐，需重启应用生效）
+      </label>
+      <p class="tip">勾选后使用灰度抗锯齿，消除文字彩边、笔画更均匀柔和；取消勾选则使用系统 ClearType 子像素渲染。修改后需重启生效。</p>
     </div>
 
     <div class="grid3">
       <div class="field">
-        <label><input type="checkbox" bind:checked={config.reader.fauxBold} onchange={saveConfig} /> 允许伪粗体（合成加粗）</label>
+        <label>正文字重</label>
+        <select bind:value={config.reader.fontWeight} onchange={saveConfig}>
+          <option value={300}>细（300）</option>
+          <option value={400}>常规（400）</option>
+          <option value={500}>中（500）</option>
+        </select>
       </div>
       <div class="field">
-        <label><input type="checkbox" bind:checked={config.reader.fauxItalic} onchange={saveConfig} /> 允许伪斜体（合成倾斜）</label>
+        <label>对齐方式</label>
+        <select bind:value={config.reader.textAlign} onchange={saveConfig}>
+          <option value="justify">两端对齐</option>
+          <option value="left">左对齐</option>
+        </select>
       </div>
       <div class="field">
-        <label>字距 {config.reader.letterSpacing.toFixed(3)}em</label>
-        <input type="range" min="0" max="0.08" step="0.005" bind:value={config.reader.letterSpacing} oninput={saveConfig} />
+        <label>每行字数上限 {config.reader.maxLineChars > 0 ? config.reader.maxLineChars + " 字" : "关闭"}</label>
+        <input type="range" min="0" max="60" step="2" bind:value={config.reader.maxLineChars} oninput={saveConfig} />
       </div>
     </div>
-    <p class="tip">关闭伪粗体/伪斜体可避免中文字体自动“假加粗/假斜”导致发糊发脏；字距微调可让正文更透气。</p>
-
-    <div class="field">
-      <label class="check">
-        <input type="checkbox" bind:checked={config.reader.punctuationCompression} onchange={saveConfig} />
-        压缩全角标点（实验性）
-      </label>
-      <p class="tip">仅影响正文与 AI 阅读窗口；可能改变总页数，不会自动跳到末页。</p>
-      {#if config.reader.punctuationCompression && paltDelta !== null && Math.abs(paltDelta) < 0.5}
-        <p class="tip" style="color:var(--danger)">当前正文字体不支持比例标点，开关不会改变主正文排版。</p>
-      {/if}
-    </div>
+    <p class="tip">「每行字数上限」大于 0 时按字号自动计算行宽并居中（忽略左右边距），适合宽屏长文；伪粗体/伪斜体已统一禁止，避免中文字体假加粗/假斜发糊。</p>
     <hr />
 
     <div class="grid3">
       <div class="field">
-        <label>左右边距 {config.reader.marginH}px</label>
+        <label>左右边距 {config.reader.maxLineChars > 0 ? "（已由每行字数上限接管）" : config.reader.marginH + "px"}</label>
         <div class="row-inline">
-          <input type="range" min="0" max="560" bind:value={config.reader.marginH} oninput={saveConfig} />
-          <input class="numbox" type="number" min="0" max="560" bind:value={config.reader.marginH} onchange={saveConfig} />
+          <input type="range" min="0" max="560" bind:value={config.reader.marginH} oninput={saveConfig} disabled={config.reader.maxLineChars > 0} />
+          <input class="numbox" type="number" min="0" max="560" bind:value={config.reader.marginH} onchange={saveConfig} disabled={config.reader.maxLineChars > 0} />
         </div>
       </div>
       <div class="field">
@@ -769,13 +782,18 @@
     </div>
 
     <div class="checks">
-      <label><input type="checkbox" bind:checked={config.reader.overrideBookCss} onchange={saveConfig} /> 忽略书籍自带样式（EPUB）</label>
+      <label><input type="checkbox" bind:checked={config.reader.overrideBookCss} onchange={saveConfig} /> 用阅读版式覆盖书籍自带排版（推荐）</label>
       <label><input type="checkbox" bind:checked={config.reader.pageTurnKeys} onchange={saveConfig} /> 键盘翻页（方向键/空格）</label>
     </div>
+    <p class="tip">开启后强制使用上方字号/字重/行距/段距/缩进/对齐与文字颜色，忽略 EPUB 自带排版；关闭后尽量保留书籍原有版式（字体始终使用上方选择）。</p>
 
     <div class="field">
-      <label>自定义 CSS（追加到正文样式之后，优先级最高）</label>
+      <label>自定义 CSS（追加到正文样式之后，优先级最高；行距/字距等可在此微调）</label>
       <textarea class="cssbox" rows="6" bind:value={config.reader.cssExtra} oninput={saveConfig} placeholder={"p { letter-spacing: 0.05em; }\nh1 { color: #a00; }"}></textarea>
+    </div>
+
+    <div class="close-row" style="margin-top:12px">
+      <button onclick={resetReader}>恢复阅读设置默认…</button>
     </div>
   {:else if tab === "split"}
     <p class="tip">
@@ -1322,6 +1340,42 @@
     border-color: var(--accent);
     color: var(--accent);
     font-weight: 600;
+  }
+
+  .font-group-title {
+    flex-basis: 100%;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--fg2);
+    letter-spacing: 0.04em;
+    margin-top: 2px;
+  }
+
+  .font-opt-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .font-del {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    line-height: 1;
+    border-radius: 50%;
+    font-size: 11px;
+    display: grid;
+    place-items: center;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--fg2);
+  }
+
+  .font-del:hover {
+    border-color: var(--danger);
+    color: var(--danger);
   }
 
   .theme-dot {

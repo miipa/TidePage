@@ -71,9 +71,9 @@ pub fn run() {
             db::migrate_book_ids(&conn);
 
             // 创建主窗口：注入 WebView2 字体渲染参数（需重启生效）。
-            // 根治粗体第三方字体（仓耳云黑等）在 ClearType 子像素渲染下"黑成一坨/发糊"：
-            // --disable-lcd-text（灰度抗锯齿）现为强制默认项，不再依赖用户手动配置；
-            // 显式写 --enable-lcd-text 可恢复子像素，--disable-direct-write（GDI 模式）原样尊重。
+            // 设置页现已简化为单个「灰度抗锯齿」复选框，只写入
+            // --disable-lcd-text（勾选）或 --enable-lcd-text（取消）；
+            // 旧版 GDI/自定义参数值仍原样尊重，保证升级用户配置不失效。
             let mut main_window_args = String::new();
             {
                 let webview_args = db::get_setting(&conn, "render.webviewArgs").unwrap_or_default();
@@ -81,8 +81,8 @@ pub fn run() {
                 let render_arg = if raw.is_empty() {
                     "--disable-lcd-text".to_string()
                 } else if raw.contains("disable-lcd-text")
-                    || raw.contains("disable-direct-write")
                     || raw.contains("enable-lcd-text")
+                    || raw.contains("disable-direct-write")
                 {
                     raw
                 } else {

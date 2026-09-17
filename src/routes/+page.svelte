@@ -9,6 +9,7 @@
   import WebdavBrowser from "../components/WebdavBrowser.svelte";
   import StandaloneBook from "../components/StandaloneBook.svelte";
   import { confirmAnswer, confirmBox, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
+  import { syncCustomFontFaces } from "../lib/fontfaces";
   import { listen } from "@tauri-apps/api/event";
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
@@ -20,6 +21,13 @@
     const bg = config.reader.bgColor || t.bg;
     const fg = config.reader.fgColor || t.fg;
     return `--rdr-bg:${bg};--rdr-fg:${fg};--panel:${bg};--fg:${fg};background:${bg};color:${fg}`;
+  });
+
+  // 自定义字体 @font-face：所有窗口（主窗口 / 独立阅读 / 独立 AI 窗口）统一注入，
+  // 独立 AI 窗口不挂载 Reader，必须在这里也能加载用户安装的字体。
+  $effect(() => {
+    void config.reader.customFonts;
+    syncCustomFontFaces();
   });
 
   $effect(() => {
@@ -153,7 +161,7 @@
   {/if}
 {/if}
 
-<div class="toast-wrap">
+<div class="fr-toast-wrap">
   {#each toasts.items as t (t.id)}
     <div class="toast-card" class:error={t.kind === "error"}>
       <div class="toast-msg">{t.msg}</div>
@@ -166,7 +174,7 @@
 </div>
 
 <style>
-  .toast-wrap {
+  .fr-toast-wrap {
     position: fixed;
     left: 16px;
     bottom: 16px;

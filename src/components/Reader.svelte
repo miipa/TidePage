@@ -17,6 +17,7 @@
     ZONE_DEFS,
     copyText,
     stripNonTextHtml,
+    SCROLL_BOUNCE_PRESETS,
     type BindAction,
     type ZoneKey,
   } from "../lib/stores.svelte";
@@ -45,6 +46,7 @@
   let colW = 0;
   let gap = 48;
   let stepPx = 0;
+  let contentW = $state(0);
 
   let scroller: SmoothScroller | null = null;
 
@@ -437,15 +439,23 @@
     page = Math.min(page, pageCount - 1);
   }
 
+  /** 有效左右边距：maxLineChars>0 时忽略 marginH，按「每行 N 字」自动居中。 */
+  function effMarginH(): number {
+    const mlc = config.reader.maxLineChars;
+    const w = contentW || contentEl?.clientWidth || 0;
+    if (mlc > 0 && w > 0) return Math.max(0, (w - mlc * config.reader.fontSize) / 2);
+    return config.reader.marginH;
+  }
+
   function measurePages() {
     if (!contentEl || !pageWrap || !chapter) return;
-    const mh = config.reader.marginH;
+    const mh = effMarginH();
     const mv = config.reader.marginV;
     const W = contentEl.clientWidth;
     const H = contentEl.clientHeight;
     const avail = Math.max(260, W - mh * 2);
     const vh = Math.max(240, H - mv * 2);
-    gap = 48;
+    gap = config.reader.colGap;
     screenCols = config.reader.duo ? 2 : 1;
     colW = Math.floor((avail - (screenCols - 1) * gap) / screenCols);
     const effAvail = screenCols * colW + (screenCols - 1) * gap;
@@ -488,6 +498,15 @@
   function prevPage() {
     if (page > 0) gotoPage(page - 1);
     else if (chapterNum > 0) prevChapter(true); // 首页回翻 → 上一章【末尾】，而非章首
+  }
+
+  /** 阅读页内快捷字号调整（免进设置）。 */
+  function bumpFont(delta: number) {
+    const n = Math.max(10, Math.min(64, config.reader.fontSize + delta));
+    if (n !== config.reader.fontSize) {
+      config.reader.fontSize = n;
+      saveConfig();
+    }
   }
 
   function relayout() {
@@ -730,9 +749,10 @@
 
   $effect(() => {
     if (scroller) {
+      const p = SCROLL_BOUNCE_PRESETS[config.reader.scrollBounceLevel] ?? SCROLL_BOUNCE_PRESETS.medium;
       scroller.bounce = config.reader.scrollBounce;
-      scroller.strength = config.reader.scrollBounceStrength;
-      scroller.threshold = config.reader.scrollBounceThreshold;
+      scroller.strength = p.strength;
+      scroller.threshold = p.threshold;
     }
   });
 
@@ -741,7 +761,9 @@
     const sw = scrollWrap;
     const c = contentEl;
     if (!w && !sw && !c) return;
-    const ro = new ResizeObserver(() => scheduleRelayout());
+    const updateW = () => { if (c) contentW = c.clientWidth; };
+    updateW();
+    const ro = new ResizeObserver(() => { updateW(); scheduleRelayout(); });
     if (c) ro.observe(c);
     if (w) ro.observe(w);
     if (sw) ro.observe(sw);
@@ -776,12 +798,11 @@
       `--rdr-fs:${config.reader.fontSize}px`,
       `--rdr-lh:${config.reader.lineHeight}`,
       `--rdr-ps:${config.reader.paraSpacing}em`,
-      `--rdr-mh:${config.reader.marginH}px`,
+      `--rdr-mh:${effMarginH()}px`,
       `--rdr-mv:${config.reader.marginV}px`,
       `--rdr-indent:${config.reader.indent}`,
-      `--rdr-ls:${config.reader.letterSpacing}em`,
-      `--rdr-fsw:${config.reader.fauxBold ? "auto" : "none"}`,
-      `--rdr-fsi:${config.reader.fauxItalic ? "auto" : "none"}`,
+      `--rdr-align:${config.reader.textAlign}`,
+      `--rdr-fw:${config.reader.fontWeight}`,
       `--rdr-sel:${t.sel}`,
       `--rdr-top:${config.reader.topbarColor || "color-mix(in srgb, " + bg + " 90%, black 10%)"}`,
       `--rdr-stat:${config.reader.statusColor || t.fg}`,
@@ -791,35 +812,20 @@
 
   function buildDynamicCss(): string {
     const r = config.reader;
-    const imp = r.overrideBookCss ? " !important" : "";
-    const fontFaces = (r.customFonts || [])
-      .map(
-        (f) =>
-          `@font-face { font-family: "${f.family}"; src: url('http://flowread.localhost/fonts/${f.file}'); }`
-      )
-      .join("\n");
     const overrideRule = r.overrideBookCss
       ? `
-#chapter-content { color: var(--rdr-fg) !important; font-family: var(--rdr-font) !important; }
-#chapter-content p { font-size: var(--rdr-fs) !important; text-indent: var(--rdr-indent) !important; margin: var(--rdr-ps) 0 !important; line-height: var(--rdr-lh) !important; }
+#chapter-content { color: var(--rdr-fg) !important; font-family: var(--rdr-font) !important; text-align: var(--rdr-align) !important; }
+#chapter-content p { font-size: var(--rdr-fs) !important; text-indent: var(--rdr-indent) !important; margin: var(--rdr-ps) 0 !important; line-height: var(--rdr-lh) !important; font-weight: var(--rdr-fw) !important; }
 #chapter-content :is(h1,h2,h3,h4,h5,h6) { font-size: 1.2em !important; font-weight: 600 !important; text-align: center !important; margin: 0.4em 0 0.8em !important; }
 #chapter-content :is(img,svg,video) { height: auto !important; max-width: 100% !important; }
 #chapter-content sup { font-size: 0.7em !important; }
 `
       : "";
     return `
-${fontFaces}
 ${overrideRule}
 ${r.cssExtra || ""}
-/* 硬编码根治发糊：置于最后确保同特异度下覆盖用户 CSS（灰度抗锯齿已在 WebView2 参数层强制） */
-/* :root 前缀提升特异度(0,2,1)，保证永远压过动态注入的旧版 #chapter-content 规则。
-   该规则只作用于 #chapter-content 元素本身；AI 面板是 .body 下 .stage 的兄弟节点，
-   与本规则无同一元素竞争，AI 字体由 readerCss 的 !important 规则独立保证 */
-:root #chapter-content {
-  font-synthesis-weight: none !important;
-  text-rendering: geometricPrecision !important;
-  letter-spacing: var(--rdr-ls, 0.05em) !important;${r.punctuationCompression ? `\n  font-feature-settings: "palt" 1 !important;` : ""}
-}
+/* 硬编码根治发糊：正文统一禁止合成加粗/斜体（与 .ai-mark 一致），避免第三方字体假粗假斜发糊 */
+:root #chapter-content { font-synthesis: none !important; }
 `;
   }
 
@@ -827,21 +833,6 @@ ${r.cssExtra || ""}
     const r = config.reader;
     void r.overrideBookCss;
     void r.cssExtra;
-    void r.customFonts;
-    void r.fontFamily;
-    void r.fontSize;
-    void r.lineHeight;
-    void r.indent;
-    void r.paraSpacing;
-    void r.marginH;
-    void r.marginV;
-    void r.theme;
-    void r.bgColor;
-    void r.fgColor;
-    void r.fauxBold;
-    void r.fauxItalic;
-    void r.letterSpacing;
-    void r.punctuationCompression;
     const css = buildDynamicCss();
     if (!styleTag) {
       styleTag = document.createElement("style");
@@ -855,21 +846,21 @@ ${r.cssExtra || ""}
     const r = config.reader;
     r.mode;
     r.duo;
+    r.colGap;
     r.fontSize;
+    r.fontWeight;
     r.lineHeight;
     r.paraSpacing;
     r.marginH;
+    r.maxLineChars;
     r.marginV;
     r.indent;
+    r.textAlign;
     r.fontFamily;
     r.latinFont;
     r.cssExtra;
     r.overrideBookCss;
     r.customFonts;
-    r.fauxBold;
-    r.fauxItalic;
-    r.letterSpacing;
-    r.punctuationCompression;
     saveConfig();
     tick().then(scheduleRelayout);
   });
@@ -993,7 +984,7 @@ ${r.cssExtra || ""}
 
 <svelte:window onkeydown={onKeyDown} />
 
-<div class="reader" style={readerVars()} onwheel={onWheel}>
+<div class="reader" class:ovr={config.reader.overrideBookCss} style={readerVars()} onwheel={onWheel}>
   {#if bgImageUrl}
     <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{config.reader.bgOpacity};"></div>
   {/if}
@@ -1126,6 +1117,13 @@ ${r.cssExtra || ""}
     {#if statsOpen && book}
       <BookStatsModal bookId={book.book.id} bookTitle={book.book.title} onclose={() => (statsOpen = false)} />
     {/if}
+
+    {#if book && !openError}
+      <div class="font-ctl">
+        <button class="icon" title="减小字号" onclick={() => bumpFont(-1)}>A−</button>
+        <button class="icon" title="增大字号" onclick={() => bumpFont(1)}>A＋</button>
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -1233,6 +1231,21 @@ ${r.cssExtra || ""}
     background: var(--rdr-sel, #e8e0cd);
   }
 
+  .font-ctl {
+    position: absolute;
+    right: 14px;
+    bottom: 46px;
+    display: flex;
+    gap: 4px;
+    z-index: 25;
+    opacity: 0.5;
+    transition: opacity 0.18s;
+  }
+
+  .font-ctl:hover {
+    opacity: 1;
+  }
+
   .clip {
     position: absolute;
     top: 0;
@@ -1266,26 +1279,30 @@ ${r.cssExtra || ""}
 
   #chapter-content {
     font-family: var(--rdr-font);
+    font-synthesis: none;
+    overflow-wrap: break-word;
+  }
+
+  /* 阅读版式覆盖仅在「覆盖书籍排版」开启时生效；关闭后由书内样式决定字号/行距/颜色等 */
+  .reader.ovr #chapter-content {
     font-size: var(--rdr-fs);
     line-height: var(--rdr-lh);
     color: var(--rdr-fg);
-    letter-spacing: var(--rdr-ls, 0em);
-    font-synthesis-weight: var(--rdr-fsw, auto);
-    font-synthesis-style: var(--rdr-fsi, auto);
-    overflow-wrap: break-word;
-    text-align: justify;
+    letter-spacing: 0.05em;
+    text-align: var(--rdr-align, justify);
     text-justify: inter-ideograph;
   }
 
-  #chapter-content :global(p) {
+  .reader.ovr #chapter-content :global(p) {
     text-indent: var(--rdr-indent, 2em);
     margin: var(--rdr-ps, 0.7em) 0;
+    font-weight: var(--rdr-fw, 400);
   }
 
-  #chapter-content :global(h1),
-  #chapter-content :global(h2),
-  #chapter-content :global(h3),
-  #chapter-content :global(h4) {
+  .reader.ovr #chapter-content :global(h1),
+  .reader.ovr #chapter-content :global(h2),
+  .reader.ovr #chapter-content :global(h3),
+  .reader.ovr #chapter-content :global(h4) {
     font-size: 1.2em;
     margin: 0.4em 0 0.8em;
     font-weight: 600;

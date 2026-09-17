@@ -89,18 +89,37 @@ export function bindKeyMatches(stored: string, combo: string): boolean {
   return normBindKey(stored) === normBindKey(combo);
 }
 
+export type TextAlign = "justify" | "left";
+export type ScrollBounceLevel = "weak" | "medium" | "strong";
+
+/// 滚动模式「章节过渡」三档预设：数值越大，切换章节所需滚动量越大。
+export const SCROLL_BOUNCE_PRESETS: Record<
+  ScrollBounceLevel,
+  { strength: number; threshold: number; label: string }
+> = {
+  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" },
+  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" },
+  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" },
+};
+
 export interface ReaderConfig {
   mode: ReadMode;
   duo: boolean;
+  colGap: number;
   anim: boolean;
   fontFamily: string;
   latinFont: string;
   fontSize: number;
+  /** 正文字重：#chapter-content p（300 细 / 400 常规 / 500 中） */
+  fontWeight: number;
   lineHeight: number;
   paraSpacing: number;
   marginH: number;
+  /** >0 时忽略 marginH，按「每行 N 字」自动居中（宽屏更友好） */
+  maxLineChars: number;
   marginV: number;
   indent: string;
+  textAlign: TextAlign;
   theme: ThemeKey;
   bgColor: string;
   fgColor: string;
@@ -115,13 +134,8 @@ export interface ReaderConfig {
   zoneHints: boolean;
   customFonts: { family: string; file: string }[];
   aiPanelWidth: number;
-  fauxBold: boolean;
-  fauxItalic: boolean;
-  letterSpacing: number;
   scrollBounce: boolean;
-  scrollBounceStrength: number;
-  scrollBounceThreshold: number;
-  punctuationCompression: boolean;
+  scrollBounceLevel: ScrollBounceLevel;
   multiWindow: boolean;
   statusPos: "left" | "center" | "right" | "none";
   statusColor: string;
@@ -374,50 +388,37 @@ const DEFAULTS: AppConfig = {
   reader: {
     mode: "page",
     duo: false,
+    colGap: 48,
     anim: true,
     fontFamily: '"Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif',
     latinFont: "",
     fontSize: 29,
+    fontWeight: 300,
     lineHeight: 1.55,
     paraSpacing: 0.5,
     marginH: 468,
+    maxLineChars: 0,
     marginV: 51,
     indent: "1em",
+    textAlign: "justify",
     theme: "paper",
     bgColor: "#FDF5E6",
     fgColor: "#2c2c2c",
     bgImage: "",
     bgOpacity: 0.35,
-    cssExtra: `#chapter-content p { color: rgba(0,0,0,0.95); font-weight: 300; }
-
-h2 {
-  color: #4682B4;
+    cssExtra: `h2 {
   font-size: 1.6rem;
   font-weight: bold;
   text-align: center;
   margin: 2rem auto 2rem;
   padding-bottom: 0.5rem;
-  border-bottom: 1px solid #dddddd;
-}
-
-p {
-  text-indent: 2em;
-  margin-top: 0;
-  margin-bottom: 1rem;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
 }
 
 @media (max-width: 480px) {
-  body {
-    padding: 1rem 0.5rem;
-  }
-
   h2 {
     font-size: 1.4rem;
     margin: 1.5rem auto;
-  }
-
-  p {
-    margin-bottom: 0.8rem;
   }
 }`,
     overrideBookCss: true,
@@ -428,13 +429,8 @@ p {
     zoneHints: false,
     customFonts: [],
     aiPanelWidth: 360,
-    fauxBold: false,
-    fauxItalic: false,
-    letterSpacing: 0.05,
     scrollBounce: true,
-    scrollBounceStrength: 0.5,
-    scrollBounceThreshold: 340,
-    punctuationCompression: false,
+    scrollBounceLevel: "medium",
     multiWindow: false,
     statusPos: "center",
     statusColor: "",
@@ -513,6 +509,98 @@ p {
   regex: "",
 };
 
+/// 旧版默认自定义 CSS（含写死的近黑字色与固定蓝标题色，破坏深色主题）。
+/// 仅当存量配置与它逐字相同时才替换为新默认，避免覆盖用户自行修改过的内容。
+const LEGACY_DEFAULT_CSS_EXTRA = `#chapter-content p { color: rgba(0,0,0,0.95); font-weight: 300; }
+
+h2 {
+  color: #4682B4;
+  font-size: 1.6rem;
+  font-weight: bold;
+  text-align: center;
+  margin: 2rem auto 2rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #dddddd;
+}
+
+p {
+  text-indent: 2em;
+  margin-top: 0;
+  margin-bottom: 1rem;
+}
+
+@media (max-width: 480px) {
+  body {
+    padding: 1rem 0.5rem;
+  }
+
+  h2 {
+    font-size: 1.4rem;
+    margin: 1.5rem auto;
+  }
+
+  p {
+    margin-bottom: 0.8rem;
+  }
+}`;
+
+const DEPRECATED_READER_KEYS = [
+  "fauxBold",
+  "fauxItalic",
+  "letterSpacing",
+  "punctuationCompression",
+  "scrollBounceStrength",
+  "scrollBounceThreshold",
+] as const;
+
+/// 归一化 reader 配置：清理已废弃键、修正非法新字段、
+/// 迁移旧默认 cssExtra 与旧滚动缓冲数值。返回是否发生了需要落盘的清理。
+function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
+  let dirty = false;
+  for (const k of DEPRECATED_READER_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(r, k)) {
+      delete r[k];
+      dirty = true;
+    }
+  }
+  const num = (v: any, min: number, max: number, def: number) => {
+    const n = typeof v === "number" ? v : Number(v);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(min, Math.min(max, Math.round(n)));
+  };
+  const cg = num(r.colGap, 0, 200, DEFAULTS.reader.colGap);
+  if (r.colGap !== cg) { r.colGap = cg; dirty = true; }
+  const fw = r.fontWeight === 400 || r.fontWeight === 500 || r.fontWeight === 300 ? r.fontWeight : DEFAULTS.reader.fontWeight;
+  if (r.fontWeight !== fw) { r.fontWeight = fw; dirty = true; }
+  const mlc = num(r.maxLineChars, 0, 120, 0);
+  if (r.maxLineChars !== mlc) { r.maxLineChars = mlc; dirty = true; }
+  const ta = r.textAlign === "left" ? "left" : "justify";
+  if (r.textAlign !== ta) { r.textAlign = ta; dirty = true; }
+  // 旧 strength/threshold → 三档 level（仅当旧字段存在且未有 level 时换算）
+  if (
+    savedRaw &&
+    savedRaw.scrollBounceLevel == null &&
+    (savedRaw.scrollBounceStrength != null || savedRaw.scrollBounceThreshold != null)
+  ) {
+    const s = Number(savedRaw.scrollBounceStrength);
+    const t = Number(savedRaw.scrollBounceThreshold);
+    const score = (Number.isFinite(s) ? s : 0.5) * 1000 + (Number.isFinite(t) ? t : 340);
+    r.scrollBounceLevel = score < 1000 ? "weak" : score > 2500 ? "strong" : "medium";
+    dirty = true;
+  }
+  const lvl = r.scrollBounceLevel;
+  if (lvl !== "weak" && lvl !== "medium" && lvl !== "strong") {
+    r.scrollBounceLevel = "medium";
+    dirty = true;
+  }
+  // 旧默认 cssExtra（写死字色/标题色）→ 新默认，仅逐字匹配时替换
+  if (savedRaw && savedRaw.cssExtra === LEGACY_DEFAULT_CSS_EXTRA) {
+    r.cssExtra = DEFAULTS.reader.cssExtra;
+    dirty = true;
+  }
+  return dirty;
+}
+
 export const THEMES: Record<ThemeKey, { bg: string; fg: string; sel: string }> = {
   paper: { bg: "#f5f1e8", fg: "#3b3630", sel: "#e8e0cd" },
   white: { bg: "#ffffff", fg: "#2b2b2b", sel: "#eef1f4" },
@@ -581,6 +669,7 @@ function migrateAi(savedAi: any): AiConfig {
 }
 
 let reasoningMigrationDirty = false;
+let readerMigrationDirty = false;
 function load(): AppConfig {
   try {
     const raw = localStorage.getItem(KEY);
@@ -635,15 +724,9 @@ function load(): AppConfig {
         merged.reader.bindings[act] = arr.map((k) => (normBindKey(k) === "esc" ? "Esc" : k));
       }
     }
-    // 一次性迁移：字距旧默认 0.045 → 0.05（v0.1.20 起 0.05 为确定默认值）。
-    // 仅当存量值【恰好等于旧默认】时上抬；用户手动调过的其他值（含 0.044/0.046）不动。
-    // flag 防重复执行。
-    try {
-      if (!localStorage.getItem("flowread.lsmig.v1")) {
-        if (merged.reader.letterSpacing === 0.045) merged.reader.letterSpacing = 0.05;
-        localStorage.setItem("flowread.lsmig.v1", "1");
-      }
-    } catch { /* ignore */ }
+    // 归一化 reader：清理已废弃键（伪粗体/伪斜体/字距/标点压缩/滚动缓冲数值），
+    // 迁移旧默认 cssExtra 与旧滚动缓冲，修正非法新字段。返回 true 时需要落盘。
+    if (normalizeReaderConfig(merged.reader, saved.reader)) readerMigrationDirty = true;
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -651,15 +734,28 @@ function load(): AppConfig {
 }
 
 export const config = $state<AppConfig>(load());
-// 迁移落盘：检测到已废弃的“关闭思考”旧键时，启动即把清理后的配置写回 localStorage。
-// 延后到模块初始化完成（saveConfig 依赖后续声明的状态），避免 TDZ。
-if (reasoningMigrationDirty) setTimeout(saveConfig, 0);
+
+/** 返回一份 reader 默认配置（深拷贝，供设置页回退字体/恢复默认使用）。 */
+export function defaultReaderConfig(): ReaderConfig {
+  return structuredClone(DEFAULTS.reader);
+}
+
+/** 仅重置「阅读」设置段（不动 AI / WebDAV / 分章正则）。 */
+export function resetReaderConfig(): void {
+  config.reader = structuredClone(DEFAULTS.reader);
+  saveConfig();
+}
+
+// 迁移落盘：检测到已废弃的旧键/需迁移的旧值（“关闭思考”、reader 废弃字段与旧默认）时，
+// 启动即把清理后的配置写回 localStorage。延后到模块初始化完成，避免 TDZ。
+if (reasoningMigrationDirty || readerMigrationDirty) setTimeout(saveConfig, 0);
 
 export function applyConfigJson(json: string) {
   try {
     if (json === JSON.stringify(config)) return;
     const obj = JSON.parse(json);
     if (!obj || typeof obj !== "object" || !obj.reader || !obj.ai) return;
+    const rawReader = obj.reader;
     obj.reader = {
       ...structuredClone(DEFAULTS.reader),
       ...obj.reader,
@@ -672,6 +768,8 @@ export function applyConfigJson(json: string) {
         ...(obj.reader.zones || {}),
       },
     };
+    // 跨窗同步/导入同样清理 reader 废弃键并迁移旧默认值
+    normalizeReaderConfig(obj.reader, rawReader);
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };

@@ -441,7 +441,7 @@
       fg: (!s.followReader && s.fgColor) || r.fgColor || t.fg,
       latin,
       indent: s.followReader ? r.indent : (s.indent || r.indent),
-      ls: r.letterSpacing,
+      align: r.textAlign,
       extra: s.cssExtra || "",
     };
   });
@@ -460,8 +460,8 @@
 
   const readerVars = $derived(
     `--ai-font:${fontStack(readerStyle.font, readerStyle.latin)};--ai-fs:${readerStyle.size}px;--ai-lh:${readerStyle.lh};` +
-    `--ai-ps:${readerStyle.ps}em;--ai-bg:${readerStyle.bg};--ai-fg:${readerStyle.fg};--ai-ls:${readerStyle.ls}em;` +
-    `--ai-indent:${readerStyle.indent}`
+    `--ai-ps:${readerStyle.ps}em;--ai-bg:${readerStyle.bg};--ai-fg:${readerStyle.fg};` +
+    `--ai-indent:${readerStyle.indent};--ai-align:${readerStyle.align}`
   );
 
   const readerCss = $derived(`
@@ -470,13 +470,13 @@
   font-family: var(--ai-font) !important;
   font-size: var(--ai-fs) !important;
   line-height: var(--ai-lh) !important;
-  letter-spacing: var(--ai-ls, 0.05em) !important;
+  letter-spacing: 0.05em !important;
 }
+.ai-panel.reader .ai-mark { text-align: var(--ai-align, justify) !important; text-justify: inter-ideograph !important; font-synthesis: none !important; }
 .ai-panel.reader .ai-mark p { margin: var(--ai-ps) 0 !important; text-indent: var(--ai-indent, 0em) !important; }
 .ai-panel.reader .ai-mark p.li { text-indent: -1.4em !important; }
 .ai-panel.reader .ai-q-title { font-family: var(--ai-font) !important; }
 ${readerStyle.extra}
-${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-feature-settings: "palt" 1 !important; }` : ""}
 `);
 
   let aiStyleTag: HTMLStyleElement | null = null;
@@ -663,7 +663,6 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
     void aiInner;
     void readerStyle;
     void panelWidth;
-    void config.reader.punctuationCompression; // 开关切换改变正文宽度 → 重新分页（不 force，不弹末页）
     if (!isReader || !aiClip) return;
     ro?.disconnect();
     ro = new ResizeObserver(() => scheduleMeasure());
@@ -1238,6 +1237,7 @@ ${config.reader.punctuationCompression ? `.ai-panel.reader .ai-mark { font-featu
   .ai-mark {
     text-align: justify;
     text-justify: inter-ideograph;
+    font-synthesis: none;
     overflow-wrap: break-word;
     cursor: default;
     /* 与 Reader 的 --rdr-font（已含 latinFont 前置）同一机制；
