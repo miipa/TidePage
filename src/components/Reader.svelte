@@ -38,6 +38,7 @@
   let pageWrap: HTMLDivElement | undefined = $state();
   let contentEl: HTMLDivElement | undefined = $state();
   let bodyEl: HTMLDivElement | undefined = $state();
+  let thumbEl: HTMLDivElement | undefined = $state();
 
   // A−/A＋ 悬浮控件：默认完全隐藏（pointer-events:none），仅指针进入右下角热区才淡入，
   // 避免透明热区常驻拦截正文框选/右下角翻页点击。
@@ -374,8 +375,8 @@
       done =
         !contentEl ||
         !scrollWrap ||
-        maxScroll - scrollTop <= 5 ||
-        scrollTop + contentEl.clientHeight >= scrollWrap.scrollHeight - 5;
+        maxScroll - scrollRender <= 5 ||
+        scrollRender + contentEl.clientHeight >= scrollWrap.scrollHeight - 5;
     } else {
       const before = pageCount;
       recheckPages();
@@ -387,16 +388,29 @@
   }
 
   let scrollBase = 0;
+  /** 每帧更新的纯 DOM 渲染位置（非响应式，供 pinToEnd/保存进度即时读取）。 */
+  let scrollRender = 0;
+  /** 响应式 UI（进度百分比等）上次同步时间，节流到 ~150ms。 */
+  let lastUiSync = 0;
 
   function applyScroll(renderPos: number) {
-    scrollTop = renderPos;
-    if (!scrollWrap) return;
+    scrollRender = renderPos;
     const p = Math.round(renderPos);
-    const d = scrollBase - p;
-    if (d === 0) {
-      scrollWrap.style.transform = "";
-    } else {
-      scrollWrap.style.transform = `translateY(${d}px)`;
+    // 每帧只做纯 DOM 写入：滚动层 transform + 滚动条 thumb transform（不改 top，避免布局）。
+    if (scrollWrap) {
+      const d = scrollBase - p;
+      scrollWrap.style.transform = d === 0 ? "" : `translateY(${d}px)`;
+    }
+    if (thumbEl) {
+      const trackH = (contentEl?.clientHeight || 0) - 28;
+      const ratio = maxScroll > 0 ? Math.max(0, Math.min(1, p / maxScroll)) : 0;
+      if (trackH > 0) thumbEl.style.transform = `translate3d(0,${(ratio * trackH * 0.92).toFixed(1)}px,0)`;
+    }
+    // 响应式 UI 节流更新；滚动 settle 时会精确同步一次。
+    const now = performance.now();
+    if (now - lastUiSync > 150) {
+      lastUiSync = now;
+      if (scrollTop !== p) scrollTop = p;
     }
   }
 
@@ -421,6 +435,7 @@
       scrollWrap.style.top = "0px";
       scrollWrap.style.transform = "";
     }
+    if (thumbEl) thumbEl.style.transform = "";
   }
 
   function handleScrollEdge(dir: number, carry: number) {
@@ -475,7 +490,6 @@
     st.height = `${vh}px`;
     st.columnWidth = `${colW}px`;
     st.columnGap = `${gap}px`;
-    st.transform = "";
     cancelAnimationFrame(measureRaf);
     measureRaf = requestAnimationFrame(() => {
       computePageCount();
@@ -483,19 +497,30 @@
     });
   }
 
-  function applyPage() {
+  function reducedMotion(): boolean {
+    return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+  }
+
+  /** 页面偏移统一由 transform 表达（GPU 合成）；animate=true 时仅用户主动翻页才启用过渡。 */
+  function applyPage(animate = false) {
     if (!pageWrap) return;
-    pageWrap.style.left = `${-Math.round(page * stepPx)}px`;
-    pageWrap.style.transform = "";
+    const x = -Math.round(page * stepPx);
+    if (animate && config.reader.anim && !reducedMotion()) {
+      pageWrap.style.transform = `translate3d(${x}px,0,0)`;
+      return;
+    }
+    // 立即跳转：临时禁用过渡 → 落位 → 强制 reflow → 恢复常驻 transition，
+    // 避免恢复进度/章节切换/relayout 复用旧动画。
+    pageWrap.style.transition = "none";
+    pageWrap.style.transform = `translate3d(${x}px,0,0)`;
+    void pageWrap.offsetWidth;
+    pageWrap.style.transition = "";
   }
 
   function gotoPage(n: number, silent = false) {
     page = Math.max(0, Math.min(n, pageCount - 1));
-    applyPage();
-    if (!silent) {
-      if (config.reader.pageTurnKeys) saveProgressDebounced();
-      else saveProgressDebounced();
-    }
+    applyPage(!silent);
+    if (!silent) saveProgressDebounced();
   }
 
   function nextPage() {
@@ -534,6 +559,8 @@
 
   function relayout() {
     if (!chapter) return;
+    // 滚动模式下先同步节流的响应式位置，保证重排后按真实位置恢复
+    if (config.reader.mode === "scroll") scrollTop = Math.round(scrollRender);
     const ratio = currentRatio();
     if (config.reader.mode === "scroll") {
       measureScroll();
@@ -743,6 +770,11 @@
   onMount(() => {
     scroller = new SmoothScroller(applyScroll);
     scroller.onSettled(() => {
+      // settle 时精确同步一次响应式位置（滚动中仅节流更新）
+      const p = Math.round(scroller!.pos);
+      lastUiSync = performance.now();
+      scrollRender = p;
+      if (scrollTop !== p) scrollTop = p;
       saveProgressDebounced();
       if (config.reader.mode === "scroll") commitScroll();
     });
@@ -1072,7 +1104,7 @@ ${r.cssExtra || ""}
               </div>
             </div>
             <div class="scrollbar">
-              <div class="thumb" style="height:8%;top:{maxScroll > 0 ? (scrollTop / maxScroll) * 92 : 0}%"></div>
+              <div class="thumb" bind:this={thumbEl} style="height:8%"></div>
             </div>
           {:else}
             <div class="clip">
@@ -1279,6 +1311,9 @@ ${r.cssExtra || ""}
       transition: none;
       transform: none;
     }
+    .col-page {
+      transition: none;
+    }
   }
 
   .clip {
@@ -1294,6 +1329,9 @@ ${r.cssExtra || ""}
     position: absolute;
     left: 0;
     column-fill: auto;
+    /* 翻页只走合成：常驻 transition，立即跳转时用内联 transition:none 短路 */
+    will-change: transform;
+    transition: transform 200ms ease;
   }
 
   .scroll-area {
@@ -1310,6 +1348,8 @@ ${r.cssExtra || ""}
     width: 100%;
     padding: var(--rdr-mv, 48px) var(--rdr-mh, 56px);
     box-sizing: border-box;
+    /* 仅滚动模式存在此元素；提升为合成层，滚动时不做布局 */
+    will-change: transform;
   }
 
   #chapter-content {
@@ -1415,9 +1455,11 @@ ${r.cssExtra || ""}
 
   .thumb {
     position: absolute;
+    top: 0;
     width: 100%;
     background: rgba(128, 128, 128, 0.35);
     border-radius: 3px;
+    will-change: transform;
   }
 
   .loading {

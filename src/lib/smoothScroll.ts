@@ -10,9 +10,16 @@ export class SmoothScroller {
   private over = 0;
   private pending = 0;
   private raf = 0;
+  /** 上一次 tick 的 performance.now()；0 表示循环未开始（用于首帧 dt 初始化）。 */
+  private last = 0;
   private apply: (renderPos: number) => void;
   private onStop?: (ratio: number) => void;
   private stopTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** 60Hz 基准：每 16.667ms 逼近目标的比例 / 回弹衰减比例。 */
+  private static readonly BASE_MS = 16.667;
+  private static readonly APPROACH = 0.22;
+  private static readonly DECAY = 0.76;
 
   bounce = true;
   strength = 0.5;
@@ -104,7 +111,11 @@ export class SmoothScroller {
   }
 
   private ensureLoop() {
-    if (!this.raf) this.raf = requestAnimationFrame(this.tick);
+    if (!this.raf) {
+      // 新一轮循环的首帧按基准 dt 初始化，避免使用上一次循环遗留的时间戳导致跳帧。
+      this.last = 0;
+      this.raf = requestAnimationFrame(this.tick);
+    }
   }
 
   private render() {
@@ -113,16 +124,28 @@ export class SmoothScroller {
 
   private tick = () => {
     this.raf = 0;
+    // 帧率无关：按两次 rAF 的真实间隔把 60Hz 基准比例换算成本帧比例。
+    // 180Hz(dt≈5.56ms) 与 60Hz(dt≈16.67ms) 在相同墙钟时间下推进量一致；
+    // dt 上限 100ms 防止后台标签页恢复/卡顿后的跳变。
+    const now = performance.now();
+    let dt = this.last ? now - this.last : SmoothScroller.BASE_MS;
+    if (dt <= 0) dt = SmoothScroller.BASE_MS;
+    if (dt > 100) dt = 100;
+    this.last = now;
+    const frames = dt / SmoothScroller.BASE_MS;
+    const kApproach = 1 - Math.pow(1 - SmoothScroller.APPROACH, frames);
+    const kDecay = Math.pow(SmoothScroller.DECAY, frames);
+
     let cont = false;
     const d = this.target - this.current;
     if (Math.abs(d) > 0.6) {
-      this.current += d * 0.22;
+      this.current += d * kApproach;
       cont = true;
     } else {
       this.current = this.target;
     }
     if (Math.abs(this.over) > 0.6) {
-      this.over *= 0.76;
+      this.over *= kDecay;
       cont = true;
     } else {
       this.over = 0;

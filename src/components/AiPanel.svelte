@@ -542,7 +542,10 @@ ${readerStyle.extra}
 
   function applyAiPage() {
     if (!aiInner || !aiClip) return;
-    aiInner.style.left = `${Math.round((aiClip.clientWidth - aiColW) / 2) - aiPage * aiStep}px`;
+    // 只用 transform 表达页偏移（合成层），避免改 left 触发布局。
+    const x = Math.round((aiClip.clientWidth - aiColW) / 2) - aiPage * aiStep;
+    aiInner.style.left = "0px";
+    aiInner.style.transform = `translate3d(${x}px,0,0)`;
   }
 
   function scheduleMeasure(forceEnd = false) {
@@ -1218,7 +1221,9 @@ ${readerStyle.extra}
 
   .ai-inner {
     position: absolute;
+    left: 0;
     column-fill: auto;
+    will-change: transform;
   }
 
   .ai-page + .ai-page {
