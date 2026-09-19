@@ -46,7 +46,7 @@
   async function buildIndex() {
     indexing = true;
     try {
-      await api.indexBookFts(bookId);
+      await api.ensureBookText(bookId);
       await run();
     } catch (e) {
       toast(String(e), "error");
@@ -90,7 +90,7 @@
       <div class="sb-empty">
         本书未找到匹配内容
         <div style="margin-top:8px">
-          <button onclick={buildIndex} disabled={indexing}>{indexing ? "建立中…" : "建立/重建索引后重试"}</button>
+          <button onclick={buildIndex} disabled={indexing}>{indexing ? "载入中…" : "重新载入全文后重试"}</button>
         </div>
       </div>
     {/if}

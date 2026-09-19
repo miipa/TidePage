@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { HIGHLIGHT_COLORS, HIGHLIGHT_STYLES, config } from "../lib/stores.svelte";
-  import { normalizeColor } from "../lib/color";
-  import ColorPicker from "./ColorPicker.svelte";
+  import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
+  import ColorPalette from "./ColorPalette.svelte";
 
   let {
     x = 0,
@@ -24,7 +23,7 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
-  let activeColor = $state(config.reader.highlightColor || HIGHLIGHT_COLORS[0]);
+  let activeColor = $state(config.reader.highlightColor || config.reader.highlightColors[0] || "#c0392b");
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -47,20 +46,13 @@
       </button>
     {/each}
   </div>
-  <div class="color-row">
-    {#each HIGHLIGHT_COLORS as c (c)}
-      <button
-        class="csw"
-        class:active={normalizeColor(activeColor) === normalizeColor(c)}
-        style="background:{c};"
-        title={c}
-        onclick={() => (activeColor = c)}
-      ></button>
-    {/each}
-    <ColorPicker
-      bind:value={activeColor}
-      title="自定义划线颜色"
-      onchange={() => { /* 仅选定，点样式或「划线」应用 */ }}
+  <div class="color-row" title="点击色点设置颜色；＋ 可新增，设置框内可删除">
+    <ColorPalette
+      bind:colors={config.reader.highlightColors}
+      value={activeColor}
+      applyLabel="选用"
+      onapply={(c) => (activeColor = c)}
+      onpalette={saveConfig}
     />
   </div>
   <div class="act-row">

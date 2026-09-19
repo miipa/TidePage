@@ -313,6 +313,7 @@ pub fn run() {
             library::ai_test,
             library::search_all,
             library::search_in_book,
+            library::ensure_book_text_cmd,
             library::add_highlight,
             library::list_highlights,
             library::search_highlights,

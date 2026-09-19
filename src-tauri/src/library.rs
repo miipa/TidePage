@@ -1680,40 +1680,200 @@ pub fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Vec<SearchH
     .unwrap_or_default()
 }
 
-/// 在单本书内快速全文检索：走 FTS5(trigram) 索引，按 book_id 过滤。
-/// 选中文本通常是一段连续原文，这里强制按「短语」匹配，命中即原样出现。
-#[tauri::command]
-pub fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: String) -> Vec<BookSearchHit> {
-    let conn = state.db.0.lock().unwrap();
-    let q = query.trim();
-    if !db::has_fts(&conn) || q.chars().count() < 2 {
-        return vec![];
-    }
-    // 过长选区只取前 64 字，避免生成超大 FTS 短语；去掉会破坏语法的控制字符。
-    let trimmed: String = q.chars().take(64).collect();
-    let phrase = format!("\"{}\"", trimmed.replace('"', "\"\""));
-    let sql = "SELECT chapter_index, title, snippet(fts, 3, '<mark>', '</mark>', '…', 12) FROM fts WHERE book_id=?1 AND body MATCH ?2 LIMIT 200";
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
+/// 提取整本书每章的纯文本（章节号、标题、正文文本）。
+/// txt/mobi 先剥离 HTML 标签，保证与阅读界面渲染出的文字一致，选区匹配更可靠。
+fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64, String, String)>, String> {
+    let book = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?
     };
-    stmt.query_map(rusqlite::params![book_id, phrase], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })
-    .map(|rows| {
-        rows.filter_map(|r| r.ok())
-            .map(|(chapter_index, chapter_title, snippet)| BookSearchHit {
-                chapter_index,
-                chapter_title,
-                snippet,
+    let ext = ext_of(&book.path).unwrap_or_default();
+    let chapters: Vec<(i64, String, String)> = if ext == "txt" {
+        let plain = {
+            let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
+            let (t, _) = txt::decode_bytes(&data);
+            t.replace("\r\n", "\n").replace('\r', "\n")
+        };
+        let pattern = {
+            let conn = state.db.0.lock().unwrap();
+            db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
+        };
+        let doc = txt::split_custom(&plain, &pattern)?;
+        doc.toc
+            .iter()
+            .zip(&doc.ranges)
+            .map(|(t, (s, e))| (t.index as i64, t.title.clone(), safe_slice(&plain, *s, *e)))
+            .collect()
+    } else if ext == "epub" {
+        let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
+        let doc = crate::epub::parse(data.clone())?;
+        let spine_len = doc.spine.len();
+        let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
+        for (i, t) in doc.toc.iter().enumerate() {
+            if t.index < spine_len && toc_pos_by_spine[t.index].is_none() {
+                toc_pos_by_spine[t.index] = Some(i as i64);
+            }
+        }
+        doc.spine
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let ti = toc_pos_by_spine[i].unwrap_or(i as i64);
+                let title = doc
+                    .toc
+                    .iter()
+                    .find(|t| t.index == i)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default();
+                (ti, title, crate::epub::doc_text(&data, d))
             })
             .collect()
-    })
-    .unwrap_or_default()
+    } else {
+        let doc = mobi_doc_for(state, &book.path, book_id)?;
+        doc.toc
+            .iter()
+            .zip(&doc.parts)
+            .map(|(t, (s, e))| {
+                let raw = safe_slice(&doc.html, *s, *e);
+                (t.index as i64, t.title.clone(), crate::epub::html_to_text(&raw))
+            })
+            .collect()
+    };
+    Ok(chapters)
+}
+
+/// 确保某本书的纯文本章节已缓存到 chapter_text（划词全文搜索用）。
+fn ensure_book_text(state: &Arc<AppState>, book_id: i64) -> Result<usize, String> {
+    {
+        let conn = state.db.0.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chapter_text WHERE book_id=?1",
+                [book_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            return Ok(n as usize);
+        }
+    }
+    let chapters = collect_book_chapters(state, book_id)?;
+    let mut conn = state.db.0.lock().unwrap();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (idx, title, body) in &chapters {
+        tx.execute(
+            "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![book_id, idx, title, body],
+        )
+        .ok();
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(chapters.len())
+}
+
+#[tauri::command]
+pub fn ensure_book_text_cmd(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
+    ensure_book_text(state.inner(), book_id).map(|n| n as i64)
+}
+
+/// 生成带 <mark> 高亮的片段（HTML 转义正文，只保留命中两侧少量上下文）。
+fn highlight_snippet(chars: &[char], bs: usize, be: usize) -> String {
+    let ctx = 24usize;
+    let from = bs.saturating_sub(ctx);
+    let to = (be + 1 + ctx).min(chars.len());
+    let mut s = String::new();
+    if from > 0 {
+        s.push('…');
+    }
+    for (k, ch) in chars[from..to].iter().enumerate() {
+        let idx = from + k;
+        if idx == bs {
+            s.push_str("<mark>");
+        }
+        match ch {
+            '&' => s.push_str("&amp;"),
+            '<' => s.push_str("&lt;"),
+            '>' => s.push_str("&gt;"),
+            c => s.push(*c),
+        }
+        if idx == be {
+            s.push_str("</mark>");
+        }
+    }
+    if to < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// 单本书内全文检索：不依赖 FTS5，直接扫描缓存的纯文本章节。
+/// 忽略所有空白并做 ASCII 不区分大小写匹配，避免选区换行/空格与索引原文不一致导致漏命中。
+#[tauri::command]
+pub fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: String) -> Vec<BookSearchHit> {
+    let compact_q: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if compact_q.is_empty() {
+        return vec![];
+    }
+    if ensure_book_text(state.inner(), book_id).is_err() {
+        return vec![];
+    }
+    let rows: Vec<(i64, String, String)> = {
+        let conn = state.db.0.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT chapter_index, title, body FROM chapter_text WHERE book_id=?1 ORDER BY chapter_index",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([book_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|rs| rs.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+
+    const MAX_HITS: usize = 200;
+    const PER_CHAPTER: usize = 5;
+    let qlen = compact_q.len();
+    let mut out: Vec<BookSearchHit> = Vec::new();
+
+    for (idx, title, body) in rows {
+        if out.len() >= MAX_HITS {
+            break;
+        }
+        let chars: Vec<char> = body.chars().collect();
+        let mut compact: Vec<char> = Vec::with_capacity(chars.len());
+        let mut map: Vec<usize> = Vec::with_capacity(chars.len());
+        for (i, ch) in chars.iter().enumerate() {
+            if !ch.is_whitespace() {
+                compact.push(ch.to_ascii_lowercase());
+                map.push(i);
+            }
+        }
+        let mut i = 0usize;
+        let mut per = 0usize;
+        while i + qlen <= compact.len() {
+            if compact[i..i + qlen] == compact_q[..] {
+                let bs = map[i];
+                let be = map[i + qlen - 1];
+                out.push(BookSearchHit {
+                    chapter_index: idx,
+                    chapter_title: title.clone(),
+                    snippet: highlight_snippet(&chars, bs, be),
+                });
+                per += 1;
+                i += qlen.max(1);
+                if out.len() >= MAX_HITS || per >= PER_CHAPTER {
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1805,7 +1965,7 @@ pub fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
 
 #[tauri::command]
 pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
-    let book = {
+    let needs_index = {
         let conn = state.db.0.lock().unwrap();
         if !db::has_fts(&conn) {
             return Ok(0);
@@ -1818,60 +1978,25 @@ pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        if existing > 0 {
-            return Ok(0);
-        }
-        db::get_book(&conn, book_id).ok_or("书籍不存在")?
+        existing == 0
     };
+    if !needs_index {
+        // 已建过 FTS：顺手确保纯文本缓存存在（划词全文搜索不依赖 FTS）
+        let _ = ensure_book_text(state.inner(), book_id);
+        return Ok(0);
+    }
 
-    let ext = ext_of(&book.path).unwrap_or_default();
-    let chapters: Vec<(i64, String, String)> = if ext == "txt" {
-        let plain = {
-            let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
-            let (t, _) = txt::decode_bytes(&data);
-            t.replace("\r\n", "\n").replace('\r', "\n")
-        };
-        let pattern = {
-            let conn = state.db.0.lock().unwrap();
-            db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
-        };
-        let doc = txt::split_custom(&plain, &pattern)?;
-        doc.toc
-            .iter()
-            .zip(&doc.ranges)
-            .map(|(t, (s, e))| (t.index as i64, t.title.clone(), safe_slice(&plain, *s, *e)))
-            .collect()
-    } else if ext == "epub" {
-        let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
-        let doc = crate::epub::parse(data.clone())?;
-        let spine_len = doc.spine.len();
-        let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
-        for (i, t) in doc.toc.iter().enumerate() {
-            if t.index < spine_len && toc_pos_by_spine[t.index].is_none() {
-                toc_pos_by_spine[t.index] = Some(i as i64);
-            }
-        }
-        doc.spine
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let ti = toc_pos_by_spine[i].unwrap_or(i as i64);
-                let title = doc
-                    .toc
-                    .iter()
-                    .find(|t| t.index == i)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default();
-                (ti, title, crate::epub::doc_text(&data, d))
-            })
-            .collect()
-    } else {
-        let doc = mobi_doc_for(state.inner(), &book.path, book_id)?;
-        doc.toc
-            .iter()
-            .zip(&doc.parts)
-            .map(|(t, (s, e))| (t.index as i64, t.title.clone(), safe_slice(&doc.html, *s, *e)))
-            .collect()
+    let chapters = collect_book_chapters(state.inner(), book_id)?;
+    let text_empty = {
+        let conn = state.db.0.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chapter_text WHERE book_id=?1",
+                [book_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        n == 0
     };
 
     let mut conn = state.db.0.lock().unwrap();
@@ -1882,6 +2007,13 @@ pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i
             rusqlite::params![book_id, idx, title, body],
         )
         .ok();
+        if text_empty {
+            tx.execute(
+                "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![book_id, idx, title, body],
+            )
+            .ok();
+        }
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(chapters.len() as i64)

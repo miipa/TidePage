@@ -106,6 +106,7 @@ export const api = {
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   searchInBook: (bookId: number, query: string) =>
     invoke<BookSearchHit[]>("search_in_book", { bookId, query }),
+  ensureBookText: (bookId: number) => invoke<number>("ensure_book_text_cmd", { bookId }),
   addHighlight: (args: {
     bookId: number; chapterIndex: number; chapterTitle: string;
     start: number; end: number; text: string; style: string; color: string; note: string;

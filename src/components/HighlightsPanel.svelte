@@ -1,8 +1,8 @@
 <script lang="ts">
   import { api } from "../lib/api";
-  import { HIGHLIGHT_STYLES, toast } from "../lib/stores.svelte";
+  import { HIGHLIGHT_STYLES, config, saveConfig, toast } from "../lib/stores.svelte";
   import type { HighlightRow } from "../lib/types";
-  import ColorPicker from "./ColorPicker.svelte";
+  import ColorPalette from "./ColorPalette.svelte";
 
   let {
     bookId,
@@ -117,12 +117,12 @@
               <option value={s.id}>{s.name}</option>
             {/each}
           </select>
-          <ColorPicker
-            title="修改划线颜色"
-            allowEmpty
-            emptyLabel="默认色"
-            bind:value={h.color}
-            onchange={() => changeColor(h, h.color)}
+          <ColorPalette
+            bind:colors={config.reader.highlightColors}
+            value={h.color}
+            applyLabel="应用"
+            onapply={(c) => changeColor(h, c)}
+            onpalette={saveConfig}
           />
           <span class="flex1"></span>
           <button class="icon" title="删除划线" onclick={() => del(h)}>×</button>

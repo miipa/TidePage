@@ -144,6 +144,8 @@ export interface ReaderConfig {
   highlightStyle: string;
   /** 划词划线默认颜色（空=跟随主题强调色） */
   highlightColor: string;
+  /** 划词菜单可用的颜色调色板（可增删） */
+  highlightColors: string[];
   /** 划词「浏览器搜索」的链接模板，%s 会被替换为选中文字 */
   browserSearchUrl: string;
   conv: { title: string; author: string; css: string; coverPath: string };
@@ -467,6 +469,7 @@ const DEFAULTS: AppConfig = {
     topbarColor: "",
     highlightStyle: "underline",
     highlightColor: "",
+    highlightColors: structuredClone(HIGHLIGHT_COLORS),
     browserSearchUrl: "https://www.baidu.com/s?wd=%s",
     conv: { title: "", author: "", css: `body {
   max-width: 680px;
@@ -739,6 +742,10 @@ function load(): AppConfig {
           ...structuredClone(DEFAULT_ZONES),
           ...(saved.reader?.zones || {}),
         },
+        highlightColors:
+          Array.isArray(saved.reader?.highlightColors) && saved.reader.highlightColors.length
+            ? [...saved.reader.highlightColors]
+            : structuredClone(HIGHLIGHT_COLORS),
       },
       webdav: { ...DEFAULTS.webdav, ...saved.webdav },
       ai: migrateAi(saved.ai),
@@ -803,6 +810,10 @@ export function applyConfigJson(json: string) {
         ...structuredClone(DEFAULT_ZONES),
         ...(obj.reader.zones || {}),
       },
+      highlightColors:
+        Array.isArray(obj.reader.highlightColors) && obj.reader.highlightColors.length
+          ? [...obj.reader.highlightColors]
+          : structuredClone(HIGHLIGHT_COLORS),
     };
     // 跨窗同步/导入同样清理 reader 废弃键并迁移旧默认值
     normalizeReaderConfig(obj.reader, rawReader);

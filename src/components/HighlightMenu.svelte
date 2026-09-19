@@ -1,8 +1,7 @@
 <script lang="ts">
-  import { HIGHLIGHT_COLORS, HIGHLIGHT_STYLES } from "../lib/stores.svelte";
-  import { normalizeColor } from "../lib/color";
+  import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
   import type { HighlightRow } from "../lib/types";
-  import ColorPicker from "./ColorPicker.svelte";
+  import ColorPalette from "./ColorPalette.svelte";
 
   let {
     highlight,
@@ -25,7 +24,6 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
-  let customColor = $state(highlight.color || "");
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -43,21 +41,12 @@
 <div class="hl-menu" bind:this={menuEl} style={pos}>
   <div class="hm-text" title={highlight.text}>{highlight.text}</div>
   <div class="hm-colors">
-    {#each HIGHLIGHT_COLORS as c (c)}
-      <button
-        class="csw"
-        class:active={normalizeColor(highlight.color || "") === normalizeColor(c)}
-        style="background:{c};"
-        title={c}
-        onclick={() => oncolor(c)}
-      ></button>
-    {/each}
-    <ColorPicker
-      bind:value={customColor}
-      title="自定义颜色"
-      allowEmpty
-      emptyLabel="默认色"
-      onchange={() => oncolor(customColor)}
+    <ColorPalette
+      bind:colors={config.reader.highlightColors}
+      value={highlight.color}
+      applyLabel="应用"
+      onapply={oncolor}
+      onpalette={saveConfig}
     />
   </div>
   <div class="hm-row">

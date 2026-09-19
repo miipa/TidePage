@@ -114,7 +114,13 @@
       chapterNum = restore && restore.chapter_index < book.toc.length ? restore.chapter_index : 0;
       await loadChapter(chapterNum, restore ?? undefined);
       refreshHighlights();
-      api.indexBookFts(book.book.id).catch(() => {});
+      {
+        const openedBookId = book.book.id;
+        api
+          .indexBookFts(openedBookId)
+          .catch(() => {})
+          .finally(() => { api.ensureBookText(openedBookId).catch(() => {}); });
+      }
       if (pendingHighlightJump && pendingHighlightJump.book_id === book.book.id) {
         const ph = pendingHighlightJump;
         pendingHighlightJump = null;
@@ -973,6 +979,9 @@ ${r.cssExtra || ""}
     r.cssExtra;
     r.overrideBookCss;
     r.customFonts;
+    r.highlightColors;
+    r.highlightColor;
+    r.highlightStyle;
     saveConfig();
     tick().then(scheduleRelayout);
   });
