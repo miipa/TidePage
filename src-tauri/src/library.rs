@@ -1727,6 +1727,7 @@ pub fn add_highlight(
     end: i64,
     text: String,
     style: String,
+    color: String,
     note: String,
 ) -> Result<i64, String> {
     let conn = state.db.0.lock().unwrap();
@@ -1739,6 +1740,7 @@ pub fn add_highlight(
         end,
         &text,
         &style,
+        &color,
         &note,
     )
 }
@@ -1766,10 +1768,26 @@ pub fn update_highlight(
     state: State<'_, Arc<AppState>>,
     id: i64,
     style: String,
+    color: String,
     note: String,
 ) -> Result<(), String> {
     let conn = state.db.0.lock().unwrap();
-    db::update_highlight(&conn, id, &style, &note)
+    db::update_highlight(&conn, id, &style, &color, &note)
+}
+
+#[tauri::command]
+pub fn update_book_meta(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    title: String,
+    author: String,
+) -> Result<(), String> {
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::update_book_title_author(&conn, book_id, &title, &author)?;
+    }
+    state.app.emit("library-changed", ()).ok();
+    Ok(())
 }
 
 #[tauri::command]

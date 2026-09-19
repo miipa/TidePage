@@ -76,6 +76,7 @@ export interface HighlightRow {
   pos_end: number;
   text: string;
   style: string;
+  color: string;
   note: string;
   created_at: number;
 }

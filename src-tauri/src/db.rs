@@ -81,6 +81,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             pos_end INTEGER NOT NULL DEFAULT 0,
             text TEXT NOT NULL DEFAULT '',
             style TEXT NOT NULL DEFAULT 'underline',
+            color TEXT NOT NULL DEFAULT '',
             note TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0
         );
@@ -136,6 +137,19 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             conn.execute(&format!("ALTER TABLE books ADD COLUMN {col}"), [])
                 .ok();
         }
+    }
+    // highlights.color：旧库补列（新库建表时已含）
+    let has_hl_color: bool = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('highlights') WHERE name='color'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if !has_hl_color {
+        conn.execute("ALTER TABLE highlights ADD COLUMN color TEXT NOT NULL DEFAULT ''", [])
+            .ok();
     }
     Ok(conn)
 }
@@ -570,12 +584,13 @@ pub fn add_highlight(
     pos_end: i64,
     text: &str,
     style: &str,
+    color: &str,
     note: &str,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, note, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, note, now_ms()],
+        "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -592,12 +607,13 @@ fn highlight_from_row(r: &Row) -> rusqlite::Result<crate::models::HighlightRow> 
         pos_end: r.get(6)?,
         text: r.get(7)?,
         style: r.get(8)?,
-        note: r.get(9)?,
-        created_at: r.get(10)?,
+        color: r.get(9)?,
+        note: r.get(10)?,
+        created_at: r.get(11)?,
     })
 }
 
-const HIGHLIGHT_COLS: &str = "h.id, h.book_id, COALESCE(b.title,''), h.chapter_index, h.chapter_title, h.pos_start, h.pos_end, h.text, h.style, h.note, h.created_at";
+const HIGHLIGHT_COLS: &str = "h.id, h.book_id, COALESCE(b.title,''), h.chapter_index, h.chapter_title, h.pos_start, h.pos_end, h.text, h.style, h.color, h.note, h.created_at";
 
 pub fn list_highlights(conn: &Connection, book_id: i64) -> Vec<crate::models::HighlightRow> {
     let sql = format!(
@@ -642,10 +658,30 @@ pub fn delete_highlight(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_highlight(conn: &Connection, id: i64, style: &str, note: &str) -> Result<(), String> {
+pub fn update_highlight(
+    conn: &Connection,
+    id: i64,
+    style: &str,
+    color: &str,
+    note: &str,
+) -> Result<(), String> {
     conn.execute(
-        "UPDATE highlights SET style=?2, note=?3 WHERE id=?1",
-        params![id, style, note],
+        "UPDATE highlights SET style=?2, color=?3, note=?4 WHERE id=?1",
+        params![id, style, color, note],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_book_title_author(
+    conn: &Connection,
+    book_id: i64,
+    title: &str,
+    author: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE books SET title=?2, author=?3 WHERE id=?1",
+        params![book_id, title, author],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

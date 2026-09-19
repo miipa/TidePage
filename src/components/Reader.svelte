@@ -31,6 +31,7 @@
   import BookSearchPopup from "./BookSearchPopup.svelte";
   import QuickAiPopup from "./QuickAiPopup.svelte";
   import HighlightsPanel from "./HighlightsPanel.svelte";
+  import HighlightMenu from "./HighlightMenu.svelte";
   import type { ChapterData, HighlightRow, OpenResult, Progress } from "../lib/types";
 
   let { standalone = false }: { standalone?: boolean } = $props();
@@ -77,6 +78,7 @@
 
   type SelMenuState = { text: string; start: number; end: number; x: number; y: number; below: boolean };
   let selMenu: SelMenuState | null = $state(null);
+  let hlMenu: { h: HighlightRow; x: number; y: number; below: boolean } | null = $state(null);
   let searchPopup: { query: string; x: number; y: number; below: boolean } | null = $state(null);
   let quickAiPopup: { text: string; x: number; y: number; below: boolean } | null = $state(null);
 
@@ -689,7 +691,7 @@
         ui.settingsOpen = true;
         break;
       case "close":
-        if (tocOpen || bookmarksOpen || statsOpen || highlightsOpen || selMenu || searchPopup || quickAiPopup) {
+        if (tocOpen || bookmarksOpen || statsOpen || highlightsOpen || selMenu || searchPopup || quickAiPopup || hlMenu) {
           tocOpen = false;
           bookmarksOpen = false;
           statsOpen = false;
@@ -697,6 +699,7 @@
           selMenu = null;
           searchPopup = null;
           quickAiPopup = null;
+          hlMenu = null;
         } else {
           goBack();
         }
@@ -758,6 +761,16 @@
             return;
           }
         }
+      }
+    }
+    // 点击已有划线 → 打开划线设置（改颜色 / 改样式 / 删除）
+    const markEl = (e.target as HTMLElement | null)?.closest?.("mark.fr-hl") as HTMLElement | null;
+    if (markEl && contentEl && contentEl.contains(markEl)) {
+      const id = Number(markEl.dataset.hlid);
+      const h = highlights.find((x) => x.id === id);
+      if (h) {
+        hlMenu = { h, ...hlMenuAnchor(markEl.getBoundingClientRect()) };
+        return;
       }
     }
     if (moved > 10 || !quick || !contentEl) return;
@@ -985,6 +998,17 @@ ${r.cssExtra || ""}
     const sel = window.getSelection()?.toString().slice(0, 80) ?? "";
     await api.addBookmark(book.book.id, chapterNum, chapter.title, sel);
     toast("书签已添加");
+    if (bookmarksOpen) bookmarks = await api.listBookmarks(book.book.id);
+  }
+
+  async function deleteBookmark(id: number) {
+    try {
+      await api.deleteBookmark(id);
+      bookmarks = bookmarks.filter((b) => b.id !== id);
+      toast("书签已删除");
+    } catch (e) {
+      toast(String(e), "error");
+    }
   }
 
   /* ================= 划线 / 划词菜单 / 检索 ================= */
@@ -995,6 +1019,7 @@ ${r.cssExtra || ""}
     void chapter;
     void chapterNum;
     void highlights;
+    void hlVersion;
     tick().then(() => paintNow());
   });
 
@@ -1027,7 +1052,7 @@ ${r.cssExtra || ""}
     selMenu = { text, start: offs.start, end: offs.end, x, y, below };
   }
 
-  async function onHighlight(style: string) {
+  async function onHighlight(style: string, color: string) {
     const s = selMenu;
     selMenu = null;
     if (!s || !book || !chapter) return;
@@ -1040,6 +1065,7 @@ ${r.cssExtra || ""}
         end: s.end,
         text: s.text,
         style,
+        color,
         note: "",
       });
       highlights.push({
@@ -1052,12 +1078,67 @@ ${r.cssExtra || ""}
         pos_end: s.end,
         text: s.text,
         style,
+        color,
         note: "",
         created_at: Date.now(),
       });
       hlVersion++;
       window.getSelection()?.removeAllRanges();
+      await tick();
+      paintNow();
       toast("已划线");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  function closeHlMenu() {
+    hlMenu = null;
+  }
+
+  function hlMenuAnchor(rect: DOMRect) {
+    const x = Math.max(90, Math.min(window.innerWidth - 90, rect.left + rect.width / 2));
+    const below = rect.top < 140;
+    const y = below ? rect.bottom + 8 : rect.top - 8;
+    return { x, y, below };
+  }
+
+  async function hlSetColor(h: HighlightRow, color: string) {
+    try {
+      await api.updateHighlight(h.id, h.style, color, h.note);
+      h.color = color;
+      hlVersion++;
+      await tick();
+      paintNow();
+      if (hlMenu) hlMenu = { ...hlMenu, h };
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  async function hlSetStyle(h: HighlightRow, style: string) {
+    try {
+      await api.updateHighlight(h.id, style, h.color, h.note);
+      h.style = style;
+      hlVersion++;
+      await tick();
+      paintNow();
+      if (hlMenu) hlMenu = { ...hlMenu, h };
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  async function hlDelete(h: HighlightRow) {
+    try {
+      await api.deleteHighlight(h.id);
+      const i = highlights.findIndex((x) => x.id === h.id);
+      if (i >= 0) highlights.splice(i, 1);
+      hlMenu = null;
+      hlVersion++;
+      await tick();
+      paintNow();
+      toast("已删除划线");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1368,9 +1449,12 @@ ${r.cssExtra || ""}
         <div class="sp-head"><span>书签</span><button class="icon" onclick={() => (bookmarksOpen = false)}>×</button></div>
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
-            <div class="sp-item" onclick={() => { loadChapter(bm.chapter_index); bookmarksOpen = false; }}>
-              <div class="bm-title">{bm.title || "未命名"}</div>
-              {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
+            <div class="sp-item bm-item">
+              <div class="bm-main" onclick={() => { loadChapter(bm.chapter_index); bookmarksOpen = false; }}>
+                <div class="bm-title">{bm.title || "未命名"}</div>
+                {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
+              </div>
+              <button class="icon bm-del" title="删除书签" onclick={() => deleteBookmark(bm.id)}>×</button>
             </div>
           {:else}
             <div class="sp-empty">暂无书签，点 🔖 添加</div>
@@ -1421,6 +1505,19 @@ ${r.cssExtra || ""}
         y={quickAiPopup.y}
         below={quickAiPopup.below}
         onclose={() => (quickAiPopup = null)}
+      />
+    {/if}
+
+    {#if hlMenu}
+      <HighlightMenu
+        highlight={hlMenu.h}
+        x={hlMenu.x}
+        y={hlMenu.y}
+        below={hlMenu.below}
+        oncolor={(c) => hlSetColor(hlMenu!.h, c)}
+        onstyle={(s) => hlSetStyle(hlMenu!.h, s)}
+        ondelete={() => hlDelete(hlMenu!.h)}
+        onclose={closeHlMenu}
       />
     {/if}
 
@@ -1924,6 +2021,11 @@ ${r.cssExtra || ""}
   }
 
   .sp-item:hover { background: rgba(128, 128, 128, 0.1); }
+
+  .bm-item { display: flex; align-items: flex-start; gap: 8px; }
+  .bm-main { flex: 1; min-width: 0; cursor: pointer; }
+  .bm-del { opacity: 0; flex-shrink: 0; transition: opacity 0.15s; }
+  .bm-item:hover .bm-del { opacity: 1; }
 
   .bm-title { font-size: 13px; font-weight: 500; }
   .bm-excerpt { font-size: 12px; opacity: 0.6; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

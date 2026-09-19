@@ -27,6 +27,7 @@
     type ZoneAction,
     type ThemeKey,
   } from "../lib/stores.svelte";
+  import ColorPicker from "./ColorPicker.svelte";
   import type { TocEntry } from "../lib/types";
 
   type SettingsTab = "reader" | "split" | "keys" | "webdav" | "ai" | "other";
@@ -594,11 +595,7 @@
             bind:value={config.reader.bgColor}
             oninput={saveConfig}
           />
-          <input type="color" class="picker" value={config.reader.bgColor || "#f5f1e8"}
-            oninput={(e) => { config.reader.bgColor = e.currentTarget.value; saveConfig(); }} />
-          {#if config.reader.bgColor}
-            <button class="icon" title="清除" onclick={() => { config.reader.bgColor = ""; saveConfig(); }}>×</button>
-          {/if}
+          <ColorPicker bind:value={config.reader.bgColor} allowEmpty emptyLabel="跟随预设" title="背景颜色" onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
@@ -609,11 +606,7 @@
             bind:value={config.reader.fgColor}
             oninput={saveConfig}
           />
-          <input type="color" class="picker" value={config.reader.fgColor || "#3b3630"}
-            oninput={(e) => { config.reader.fgColor = e.currentTarget.value; saveConfig(); }} />
-          {#if config.reader.fgColor}
-            <button class="icon" title="清除" onclick={() => { config.reader.fgColor = ""; saveConfig(); }}>×</button>
-          {/if}
+          <ColorPicker bind:value={config.reader.fgColor} allowEmpty emptyLabel="跟随预设" title="文字颜色" onchange={saveConfig} />
         </div>
       </div>
     </div>
@@ -801,12 +794,8 @@
       <div class="field">
         <label>划线颜色（空=默认红棕）</label>
         <div class="color-row">
-          <input placeholder="如 #c0392b，留空用默认" bind:value={config.reader.highlightColor} oninput={saveConfig} />
-          <input type="color" class="picker" value={config.reader.highlightColor || "#c0392b"}
-            oninput={(e) => { config.reader.highlightColor = e.currentTarget.value; saveConfig(); }} />
-          {#if config.reader.highlightColor}
-            <button class="icon" title="清除" onclick={() => { config.reader.highlightColor = ""; saveConfig(); }}>×</button>
-          {/if}
+          <input placeholder="如 #c0392b / rgb(192,57,43)，留空用默认" bind:value={config.reader.highlightColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.highlightColor} allowEmpty emptyLabel="默认红棕" title="划线默认颜色" onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
@@ -1016,23 +1005,15 @@
           <div class="field">
             <label>背景颜色（空=跟随阅读配色）</label>
             <div class="color-row">
-              <input placeholder="如 #f5f1e8" bind:value={config.ai.style.bgColor} oninput={saveConfig} />
-              <input type="color" class="picker" value={config.ai.style.bgColor || "#f5f1e8"}
-                oninput={(e) => { config.ai.style.bgColor = e.currentTarget.value; saveConfig(); }} />
-              {#if config.ai.style.bgColor}
-                <button class="icon" title="清除" onclick={() => { config.ai.style.bgColor = ""; saveConfig(); }}>×</button>
-              {/if}
+              <input placeholder="如 #f5f1e8 / rgb(245,241,232)" bind:value={config.ai.style.bgColor} oninput={saveConfig} />
+              <ColorPicker bind:value={config.ai.style.bgColor} allowEmpty emptyLabel="跟随阅读" title="AI 背景颜色" onchange={saveConfig} />
             </div>
           </div>
           <div class="field">
             <label>文字颜色（空=跟随阅读配色）</label>
             <div class="color-row">
-              <input placeholder="如 #3b3630" bind:value={config.ai.style.fgColor} oninput={saveConfig} />
-              <input type="color" class="picker" value={config.ai.style.fgColor || "#3b3630"}
-                oninput={(e) => { config.ai.style.fgColor = e.currentTarget.value; saveConfig(); }} />
-              {#if config.ai.style.fgColor}
-                <button class="icon" title="清除" onclick={() => { config.ai.style.fgColor = ""; saveConfig(); }}>×</button>
-              {/if}
+              <input placeholder="如 #3b3630 / rgb(59,54,48)" bind:value={config.ai.style.fgColor} oninput={saveConfig} />
+              <ColorPicker bind:value={config.ai.style.fgColor} allowEmpty emptyLabel="跟随阅读" title="AI 文字颜色" onchange={saveConfig} />
             </div>
           </div>
         </div>

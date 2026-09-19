@@ -159,6 +159,18 @@ export const HIGHLIGHT_STYLES: { id: string; name: string }[] = [
   { id: "box", name: "方框" },
 ];
 
+/** 划词菜单与划线设置里的预设颜色。 */
+export const HIGHLIGHT_COLORS: string[] = [
+  "#c0392b",
+  "#e67e22",
+  "#f1c40f",
+  "#27ae60",
+  "#2980b9",
+  "#8e44ad",
+  "#d3549e",
+  "#7f8c8d",
+];
+
 export interface WebdavConfig {
   enabled: boolean;
   base: string;

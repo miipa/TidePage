@@ -3,6 +3,7 @@
   import { api, coverUrl } from "../lib/api";
   import { appConfirm, config, convertState, openBookInNewWindow, pendingOpen, toast, ui, APP_BUILD } from "../lib/stores.svelte";
   import { listen } from "@tauri-apps/api/event";
+  import BookDetailModal from "./BookDetailModal.svelte";
   import type { BookRow } from "../lib/types";
 
   // ===== 超大书库（实测 16 万本）：前端永不全量持有书籍 =====
@@ -76,6 +77,27 @@
   let gridW = $state(1200);
   let gridPadX = $state(40);
   let ctxMenu = $state<{ x: number; y: number; book: BookRow } | null>(null);
+  let ctxEl: HTMLDivElement | undefined = $state();
+  let ctxPos = $state({ left: 0, top: 0 });
+  let detailBook: BookRow | null = $state(null);
+
+  /** 右键菜单：先按鼠标位置显示，渲染后按菜单实际尺寸夹取到视口内（避免贴近底部/右侧被遮住）。 */
+  function openCtx(e: MouseEvent, b: BookRow) {
+    e.preventDefault();
+    ctxMenu = { x: e.clientX, y: e.clientY, book: b };
+    ctxPos = { left: e.clientX, top: e.clientY };
+  }
+
+  $effect(() => {
+    if (!ctxMenu || !ctxEl) return;
+    const r = ctxEl.getBoundingClientRect();
+    const maxX = window.innerWidth - r.width - 8;
+    const maxY = window.innerHeight - r.height - 8;
+    ctxPos = {
+      left: Math.max(8, Math.min(ctxMenu.x, maxX)),
+      top: Math.max(8, Math.min(ctxMenu.y, maxY)),
+    };
+  });
 
   // 真实内容宽 = clientWidth - 左右 padding（用 computed style 取，不写死），
   // 保证首列左边距与末列右边距对称，且末列不出右侧边界。
@@ -438,7 +460,7 @@
                   class="card"
                   style="left:{ci * cellW + (cellW - cardW) / 2}px; top:{r * cellH}px; width:{cardW}px;"
                   ondblclick={() => tryOpenBook(b)}
-                  oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
+                  oncontextmenu={(e) => openCtx(e, b)}
                 >
                   <div class="cover" style="height:{coverH}px;">
                     <img src={coverUrl(b)} alt="" loading="lazy" decoding="async" draggable="false" />
@@ -463,7 +485,7 @@
               class="row"
               style="top:{i * ROW_H}px"
               ondblclick={() => tryOpenBook(b)}
-              oncontextmenu={(e) => { e.preventDefault(); ctxMenu = { x: e.clientX, y: e.clientY, book: b }; }}
+              oncontextmenu={(e) => openCtx(e, b)}
             >
               <img class="row-cover" src={coverUrl(b)} alt="" loading="lazy" decoding="async" />
               <div class="row-meta">
@@ -489,8 +511,9 @@
 
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
-      <div class="ctx" style="left:{Math.min(ctxMenu.x, gridW - 200)}px; top:{ctxMenu.y}px;">
+      <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
         <button onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}>📖 打开</button>
+        <button onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}>ℹ️ 详细信息</button>
         {#if ctxMenu.book.format === "txt"}
           <button onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}>⇄ 转换为 EPUB</button>
         {/if}
@@ -501,6 +524,10 @@
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除（含本地文件）</button>
       </div>
     </div>
+  {/if}
+
+  {#if detailBook}
+    <BookDetailModal book={detailBook} onclose={() => { detailBook = null; touchWindow(); }} />
   {/if}
 </div>
 

@@ -99,6 +99,8 @@ pub struct HighlightRow {
     pub pos_end: i64,
     pub text: String,
     pub style: String,
+    /// 划线颜色（CSS 颜色，空=跟随主题默认）
+    pub color: String,
     pub note: String,
     pub created_at: i64,
 }

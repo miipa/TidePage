@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { HIGHLIGHT_STYLES, config } from "../lib/stores.svelte";
+  import { HIGHLIGHT_COLORS, HIGHLIGHT_STYLES, config } from "../lib/stores.svelte";
+  import { normalizeColor } from "../lib/color";
+  import ColorPicker from "./ColorPicker.svelte";
 
   let {
     x = 0,
@@ -14,7 +16,7 @@
     x?: number;
     y?: number;
     below?: boolean;
-    onhighlight: (style: string) => void;
+    onhighlight: (style: string, color: string) => void;
     onsearch: () => void;
     onbrowser: () => void;
     onai: () => void;
@@ -22,6 +24,7 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
+  let activeColor = $state(config.reader.highlightColor || HIGHLIGHT_COLORS[0]);
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -37,15 +40,31 @@
 </script>
 
 <div class="sel-menu" bind:this={menuEl} style={pos} oncontextmenu={(e) => e.preventDefault()}>
-  <div class="hl-row">
+  <div class="hl-row" title="点击样式即按当前颜色划线">
     {#each HIGHLIGHT_STYLES as s (s.id)}
-      <button class="sw sw-{s.id}" title={s.name} onclick={() => onhighlight(s.id)}>
-        <span class="sw-line">文</span>
+      <button class="sw sw-{s.id}" title={s.name} onclick={() => onhighlight(s.id, activeColor)}>
+        <span class="sw-line" style="color:{activeColor};">文</span>
       </button>
     {/each}
   </div>
+  <div class="color-row">
+    {#each HIGHLIGHT_COLORS as c (c)}
+      <button
+        class="csw"
+        class:active={normalizeColor(activeColor) === normalizeColor(c)}
+        style="background:{c};"
+        title={c}
+        onclick={() => (activeColor = c)}
+      ></button>
+    {/each}
+    <ColorPicker
+      bind:value={activeColor}
+      title="自定义划线颜色"
+      onchange={() => { /* 仅选定，点样式或「划线」应用 */ }}
+    />
+  </div>
   <div class="act-row">
-    <button class="hl-main" onclick={() => onhighlight(config.reader.highlightStyle || "underline")} title="按默认样式划线">划线</button>
+    <button class="hl-main" onclick={() => onhighlight(config.reader.highlightStyle || "underline", activeColor)} title="按默认样式与当前颜色划线">划线</button>
     <button onclick={onsearch} title="在本书中搜索选中文字">全文</button>
     <button onclick={onbrowser} title="用浏览器搜索选中文字">浏览器</button>
     <button onclick={onai} title="AI 翻译 / 释义">AI 释义</button>
@@ -110,6 +129,27 @@
   .sw-strike .sw-line { text-decoration: line-through 2px currentColor; }
   .sw-box .sw-line { box-shadow: 0 0 0 1.5px currentColor; border-radius: 3px; }
   .sw-background .sw-line { background: color-mix(in srgb, currentColor 42%, transparent); border-radius: 3px; }
+
+  .color-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .csw {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    padding: 0;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .csw.active {
+    outline: 2px solid var(--accent, #4a6b8a);
+    outline-offset: 1px;
+  }
 
   .act-row {
     display: flex;

@@ -128,6 +128,7 @@ export function paintHighlights(root: HTMLElement, highlights: HighlightRow[]): 
     const mark = document.createElement("mark");
     mark.className = `fr-hl fr-hl-${h.style || "underline"}`;
     mark.dataset.hlid = String(h.id);
+    if (h.color) mark.style.setProperty("--hl-color", h.color);
     try {
       const frag = range.extractContents();
       mark.appendChild(frag);

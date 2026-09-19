@@ -108,13 +108,15 @@ export const api = {
     invoke<BookSearchHit[]>("search_in_book", { bookId, query }),
   addHighlight: (args: {
     bookId: number; chapterIndex: number; chapterTitle: string;
-    start: number; end: number; text: string; style: string; note: string;
+    start: number; end: number; text: string; style: string; color: string; note: string;
   }) => invoke<number>("add_highlight", args),
   listHighlights: (bookId: number) => invoke<HighlightRow[]>("list_highlights", { bookId }),
   searchHighlights: (query: string) => invoke<HighlightRow[]>("search_highlights", { query }),
   deleteHighlight: (id: number) => invoke<void>("delete_highlight", { id }),
-  updateHighlight: (id: number, style: string, note: string) =>
-    invoke<void>("update_highlight", { id, style, note }),
+  updateHighlight: (id: number, style: string, color: string, note: string) =>
+    invoke<void>("update_highlight", { id, style, color, note }),
+  updateBookMeta: (bookId: number, title: string, author: string) =>
+    invoke<void>("update_book_meta", { bookId, title, author }),
   suggestMeta: (path: string) =>
     invoke<{ title: string; author: string }>("suggest_meta", { path }),
   rebuildFts: () => invoke<number>("rebuild_fts"),

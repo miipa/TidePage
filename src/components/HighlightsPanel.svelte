@@ -2,6 +2,7 @@
   import { api } from "../lib/api";
   import { HIGHLIGHT_STYLES, toast } from "../lib/stores.svelte";
   import type { HighlightRow } from "../lib/types";
+  import ColorPicker from "./ColorPicker.svelte";
 
   let {
     bookId,
@@ -53,8 +54,18 @@
 
   async function changeStyle(h: HighlightRow, style: string) {
     try {
-      await api.updateHighlight(h.id, style, h.note);
+      await api.updateHighlight(h.id, style, h.color, h.note);
       h.style = style;
+      onchanged();
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  async function changeColor(h: HighlightRow, color: string) {
+    try {
+      await api.updateHighlight(h.id, h.style, color, h.note);
+      h.color = color;
       onchanged();
     } catch (e) {
       toast(String(e), "error");
@@ -106,6 +117,14 @@
               <option value={s.id}>{s.name}</option>
             {/each}
           </select>
+          <ColorPicker
+            title="修改划线颜色"
+            allowEmpty
+            emptyLabel="默认色"
+            bind:value={h.color}
+            onchange={() => changeColor(h, h.color)}
+          />
+          <span class="flex1"></span>
           <button class="icon" title="删除划线" onclick={() => del(h)}>×</button>
         </div>
       </div>
@@ -186,6 +205,8 @@
     margin-top: 6px;
   }
 
+  .hl-acts { flex-wrap: wrap; }
   .hl-acts select { font-size: 12px; padding: 2px 6px; }
+  .flex1 { flex: 1; }
   .sp-empty { padding: 24px; text-align: center; opacity: 0.5; font-size: 13px; }
 </style>
