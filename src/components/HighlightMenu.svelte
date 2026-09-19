@@ -1,22 +1,19 @@
 <script lang="ts">
   import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
+  import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
 
   let {
     highlight,
-    x = 0,
-    y = 0,
-    below = false,
+    anchor,
     oncolor,
     onstyle,
     ondelete,
     onclose,
   }: {
     highlight: HighlightRow;
-    x?: number;
-    y?: number;
-    below?: boolean;
+    anchor: PopupAnchor;
     oncolor: (color: string) => void;
     onstyle: (style: string) => void;
     ondelete: () => void;
@@ -24,6 +21,7 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
+  let posStyle = $state("visibility:hidden;");
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -33,12 +31,20 @@
     return () => window.removeEventListener("pointerdown", h, true);
   });
 
-  const pos = $derived(
-    `left:${x}px; top:${y}px; transform:translate(-50%, ${below ? "0" : "-100%"});`,
-  );
+  $effect(() => {
+    void anchor.top;
+    void anchor.bottom;
+    void anchor.cx;
+    if (!menuEl) return;
+    requestAnimationFrame(() => {
+      if (!menuEl) return;
+      const p = placePopup(anchor, menuEl.offsetWidth, menuEl.offsetHeight);
+      posStyle = `left:${p.left}px; top:${p.top}px;`;
+    });
+  });
 </script>
 
-<div class="hl-menu" bind:this={menuEl} style={pos}>
+<div class="hl-menu" bind:this={menuEl} style={posStyle}>
   <div class="hm-text" title={highlight.text}>{highlight.text}</div>
   <div class="hm-colors">
     <ColorPalette

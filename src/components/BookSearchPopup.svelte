@@ -2,23 +2,24 @@
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { toast } from "../lib/stores.svelte";
+  import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import type { BookSearchHit } from "../lib/types";
 
   let {
     bookId,
     initialQuery = "",
-    x = 0,
-    y = 0,
-    below = false,
+    anchor,
+    canBack = false,
     onpick,
+    onback,
     onclose,
   }: {
     bookId: number;
     initialQuery?: string;
-    x?: number;
-    y?: number;
-    below?: boolean;
+    anchor: PopupAnchor;
+    canBack?: boolean;
     onpick: (chapterIndex: number, query: string) => void;
+    onback: () => void;
     onclose: () => void;
   } = $props();
 
@@ -55,6 +56,9 @@
     }
   }
 
+  let activeIdx = $state(-1);
+  let posStyle = $state("visibility:hidden;");
+
   $effect(() => {
     const h = (e: PointerEvent) => {
       if (popEl && !popEl.contains(e.target as Node)) onclose();
@@ -63,19 +67,41 @@
     return () => window.removeEventListener("pointerdown", h, true);
   });
 
+  // 内容高度随结果变化，需重新测量摆放（顶部/底部自动翻转并夹取到视口内）
+  $effect(() => {
+    void anchor.top;
+    void anchor.bottom;
+    void anchor.cx;
+    void hits;
+    void searching;
+    void searched;
+    if (!popEl) return;
+    requestAnimationFrame(() => {
+      if (!popEl) return;
+      const p = placePopup(anchor, popEl.offsetWidth, popEl.offsetHeight);
+      posStyle = `left:${p.left}px; top:${p.top}px;`;
+    });
+  });
+
   onMount(() => {
     run();
   });
 
-  const pos = $derived(
-    `left:${x}px; top:${y}px; transform:translate(-50%, ${below ? "0" : "-100%"});`,
-  );
+  function pick(i: number, h: BookSearchHit) {
+    activeIdx = i;
+    onpick(h.chapter_index, query.trim());
+  }
 </script>
 
-<div class="sb-pop" bind:this={popEl} style={pos}>
+<div class="sb-pop" bind:this={popEl} style={posStyle}>
   <div class="sb-head">
     <span>全书搜索</span>
-    <button class="x" onclick={onclose} title="关闭">×</button>
+    <div class="sb-head-acts">
+      {#if canBack}
+        <button class="mini" onclick={onback} title="返回跳转前的位置">↩ 返回</button>
+      {/if}
+      <button class="x" onclick={onclose} title="关闭">×</button>
+    </div>
   </div>
   <div class="sb-row">
     <input
@@ -94,8 +120,8 @@
         </div>
       </div>
     {/if}
-    {#each hits as h (h.chapter_index + ":" + h.snippet)}
-      <div class="sb-hit" onclick={() => onpick(h.chapter_index, query.trim())}>
+    {#each hits as h, i (i)}
+      <div class="sb-hit" class:active={activeIdx === i} onclick={() => pick(i, h)}>
         <div class="sb-ch">{h.chapter_title || `第 ${h.chapter_index + 1} 节`}</div>
         <div class="sb-sn">{@html h.snippet.replaceAll("<mark>", '<mark class="mk">')}</div>
       </div>
@@ -129,8 +155,20 @@
     border-bottom: 1px solid rgba(128, 128, 128, 0.16);
   }
 
+  .sb-head-acts {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
   .sb-head .x {
     padding: 1px 8px;
+    border-radius: 6px;
+  }
+
+  .sb-head .mini {
+    font-size: 12px;
+    padding: 2px 8px;
     border-radius: 6px;
   }
 
@@ -156,6 +194,7 @@
   }
 
   .sb-hit:hover { background: rgba(128, 128, 128, 0.14); }
+  .sb-hit.active { background: color-mix(in srgb, var(--accent, #4a6b8a) 22%, transparent); }
 
   .sb-ch { font-size: 12.5px; font-weight: 600; }
 

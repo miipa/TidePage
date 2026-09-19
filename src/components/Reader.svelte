@@ -24,6 +24,7 @@
   } from "../lib/stores.svelte";
   import { SmoothScroller } from "../lib/smoothScroll";
   import { charRangeToRange, findTextRange, paintHighlights, selectionOffsets } from "../lib/highlights";
+  import type { PopupAnchor } from "../lib/placePopup";
   import AiPanel from "./AiPanel.svelte";
   import TocPanel from "./TocPanel.svelte";
   import BookStatsModal from "./BookStatsModal.svelte";
@@ -76,11 +77,16 @@
   let hlVersion = $state(0);
   let pendingHighlightJump: HighlightRow | null = null;
 
-  type SelMenuState = { text: string; start: number; end: number; x: number; y: number; below: boolean };
+  type SelMenuState = { text: string; start: number; end: number; anchor: PopupAnchor };
   let selMenu: SelMenuState | null = $state(null);
-  let hlMenu: { h: HighlightRow; x: number; y: number; below: boolean } | null = $state(null);
-  let searchPopup: { query: string; x: number; y: number; below: boolean } | null = $state(null);
-  let quickAiPopup: { text: string; x: number; y: number; below: boolean } | null = $state(null);
+  let hlMenu: { h: HighlightRow; anchor: PopupAnchor } | null = $state(null);
+  let searchPopup: { query: string; anchor: PopupAnchor } | null = $state(null);
+  let quickAiPopup: { text: string; anchor: PopupAnchor } | null = $state(null);
+
+  // 搜索结果跳转历史：可逐步/一键返回跳转前的位置
+  type NavPos = { chapter_index: number; ratio: number };
+  let searchNavStack: NavPos[] = $state([]);
+  let searchOrigin: NavPos | null = null;
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -775,7 +781,7 @@
       const id = Number(markEl.dataset.hlid);
       const h = highlights.find((x) => x.id === id);
       if (h) {
-        hlMenu = { h, ...hlMenuAnchor(markEl.getBoundingClientRect()) };
+        hlMenu = { h, anchor: rectAnchor(markEl.getBoundingClientRect()) };
         return;
       }
     }
@@ -1054,11 +1060,12 @@ ${r.cssExtra || ""}
     selMenu = null;
   }
 
+  function rectAnchor(rect: DOMRect): PopupAnchor {
+    return { top: rect.top, bottom: rect.bottom, cx: rect.left + rect.width / 2 };
+  }
+
   function showSelectionMenu(text: string, offs: { start: number; end: number }, rect: DOMRect) {
-    const x = Math.max(80, Math.min(window.innerWidth - 80, rect.left + rect.width / 2));
-    const below = rect.top < 96;
-    const y = below ? rect.bottom + 8 : rect.top - 8;
-    selMenu = { text, start: offs.start, end: offs.end, x, y, below };
+    selMenu = { text, start: offs.start, end: offs.end, anchor: rectAnchor(rect) };
   }
 
   async function onHighlight(style: string, color: string) {
@@ -1105,12 +1112,7 @@ ${r.cssExtra || ""}
     hlMenu = null;
   }
 
-  function hlMenuAnchor(rect: DOMRect) {
-    const x = Math.max(90, Math.min(window.innerWidth - 90, rect.left + rect.width / 2));
-    const below = rect.top < 140;
-    const y = below ? rect.bottom + 8 : rect.top - 8;
-    return { x, y, below };
-  }
+
 
   async function hlSetColor(h: HighlightRow, color: string) {
     try {
@@ -1157,7 +1159,9 @@ ${r.cssExtra || ""}
     const s = selMenu;
     selMenu = null;
     if (!s) return;
-    searchPopup = { query: s.text, x: s.x, y: s.y, below: s.below };
+    searchOrigin = { chapter_index: chapterNum, ratio: currentRatio() };
+    searchNavStack = [];
+    searchPopup = { query: s.text, anchor: s.anchor };
   }
 
   async function onBrowserSelection() {
@@ -1180,7 +1184,7 @@ ${r.cssExtra || ""}
     const s = selMenu;
     selMenu = null;
     if (!s) return;
-    quickAiPopup = { text: s.text, x: s.x, y: s.y, below: s.below };
+    quickAiPopup = { text: s.text, anchor: s.anchor };
   }
 
   function scrollRangeIntoView(range: Range) {
@@ -1207,8 +1211,9 @@ ${r.cssExtra || ""}
   }
 
   async function jumpToChapterText(chapterIndex: number, needle: string) {
-    searchPopup = null;
     if (!book) return;
+    // 记录跳转前位置，便于返回；搜索框保持打开
+    searchNavStack = [...searchNavStack, { chapter_index: chapterNum, ratio: currentRatio() }];
     if (chapterIndex !== chapterNum || !chapter) {
       await loadChapter(chapterIndex);
     }
@@ -1222,6 +1227,24 @@ ${r.cssExtra || ""}
       return;
     }
     scrollRangeIntoView(range);
+  }
+
+  async function gotoNavPos(p: NavPos) {
+    if (p.chapter_index !== chapterNum || !chapter) {
+      await loadChapter(p.chapter_index);
+      await tick();
+    }
+    applyRatio(p.ratio);
+  }
+
+  /** 返回上一次跳转前的位置；已在最初位置则返回搜索开始前的位置。 */
+  async function searchGoBack() {
+    const prev = searchNavStack.length
+      ? searchNavStack[searchNavStack.length - 1]
+      : searchOrigin;
+    if (!prev) return;
+    if (searchNavStack.length) searchNavStack = searchNavStack.slice(0, -1);
+    await gotoNavPos(prev);
   }
 
   async function jumpToHighlight(h: HighlightRow) {
@@ -1484,9 +1507,7 @@ ${r.cssExtra || ""}
 
     {#if selMenu}
       <SelectionMenu
-        x={selMenu.x}
-        y={selMenu.y}
-        below={selMenu.below}
+        anchor={selMenu.anchor}
         onhighlight={onHighlight}
         onsearch={onSearchSelection}
         onbrowser={onBrowserSelection}
@@ -1499,30 +1520,22 @@ ${r.cssExtra || ""}
       <BookSearchPopup
         bookId={book.book.id}
         initialQuery={searchPopup.query}
-        x={searchPopup.x}
-        y={searchPopup.y}
-        below={searchPopup.below}
+        anchor={searchPopup.anchor}
+        canBack={searchNavStack.length > 0 || !!searchOrigin}
         onpick={jumpToChapterText}
-        onclose={() => (searchPopup = null)}
+        onback={searchGoBack}
+        onclose={() => { searchPopup = null; searchNavStack = []; searchOrigin = null; }}
       />
     {/if}
 
     {#if quickAiPopup}
-      <QuickAiPopup
-        text={quickAiPopup.text}
-        x={quickAiPopup.x}
-        y={quickAiPopup.y}
-        below={quickAiPopup.below}
-        onclose={() => (quickAiPopup = null)}
-      />
+      <QuickAiPopup text={quickAiPopup.text} anchor={quickAiPopup.anchor} onclose={() => (quickAiPopup = null)} />
     {/if}
 
     {#if hlMenu}
       <HighlightMenu
         highlight={hlMenu.h}
-        x={hlMenu.x}
-        y={hlMenu.y}
-        below={hlMenu.below}
+        anchor={hlMenu.anchor}
         oncolor={(c) => hlSetColor(hlMenu!.h, c)}
         onstyle={(s) => hlSetStyle(hlMenu!.h, s)}
         ondelete={() => hlDelete(hlMenu!.h)}

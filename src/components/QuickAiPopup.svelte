@@ -4,18 +4,15 @@
   import { config, copyText, saveConfigNow, toast } from "../lib/stores.svelte";
   import { api } from "../lib/api";
   import { mdToHtml } from "../lib/md";
+  import { placePopup, type PopupAnchor } from "../lib/placePopup";
 
   let {
     text,
-    x = 0,
-    y = 0,
-    below = false,
+    anchor,
     onclose,
   }: {
     text: string;
-    x?: number;
-    y?: number;
-    below?: boolean;
+    anchor: PopupAnchor;
     onclose: () => void;
   } = $props();
 
@@ -162,12 +159,22 @@
     run();
   });
 
-  const pos = $derived(
-    `left:${x}px; top:${y}px; transform:translate(-50%, ${below ? "0" : "-100%"});`,
-  );
+  let posStyle = $state("visibility:hidden;");
+  $effect(() => {
+    void anchor.top;
+    void anchor.bottom;
+    void anchor.cx;
+    void output;
+    if (!popEl) return;
+    requestAnimationFrame(() => {
+      if (!popEl) return;
+      const p = placePopup(anchor, popEl.offsetWidth, popEl.offsetHeight);
+      posStyle = `left:${p.left}px; top:${p.top}px;`;
+    });
+  });
 </script>
 
-<div class="qa-pop" bind:this={popEl} style={pos}>
+<div class="qa-pop" bind:this={popEl} style={posStyle}>
   <div class="qa-head">
     <span>AI 翻译 / 释义</span>
     <div class="qa-acts">

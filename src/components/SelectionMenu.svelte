@@ -1,20 +1,17 @@
 <script lang="ts">
   import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
+  import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import ColorPalette from "./ColorPalette.svelte";
 
   let {
-    x = 0,
-    y = 0,
-    below = false,
+    anchor,
     onhighlight,
     onsearch,
     onbrowser,
     onai,
     onclose,
   }: {
-    x?: number;
-    y?: number;
-    below?: boolean;
+    anchor: PopupAnchor;
     onhighlight: (style: string, color: string) => void;
     onsearch: () => void;
     onbrowser: () => void;
@@ -24,6 +21,7 @@
 
   let menuEl: HTMLDivElement | undefined = $state();
   let activeColor = $state(config.reader.highlightColor || config.reader.highlightColors[0] || "#c0392b");
+  let posStyle = $state("visibility:hidden;");
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -33,12 +31,20 @@
     return () => window.removeEventListener("pointerdown", h, true);
   });
 
-  const pos = $derived(
-    `left:${x}px; top:${y}px; transform:translate(-50%, ${below ? "0" : "-100%"});`,
-  );
+  $effect(() => {
+    void anchor.top;
+    void anchor.bottom;
+    void anchor.cx;
+    if (!menuEl) return;
+    requestAnimationFrame(() => {
+      if (!menuEl) return;
+      const p = placePopup(anchor, menuEl.offsetWidth, menuEl.offsetHeight);
+      posStyle = `left:${p.left}px; top:${p.top}px;`;
+    });
+  });
 </script>
 
-<div class="sel-menu" bind:this={menuEl} style={pos} oncontextmenu={(e) => e.preventDefault()}>
+<div class="sel-menu" bind:this={menuEl} style={posStyle} oncontextmenu={(e) => e.preventDefault()}>
   <div class="hl-row" title="点击样式即按当前颜色划线">
     {#each HIGHLIGHT_STYLES as s (s.id)}
       <button class="sw sw-{s.id}" title={s.name} onclick={() => onhighlight(s.id, activeColor)}>
