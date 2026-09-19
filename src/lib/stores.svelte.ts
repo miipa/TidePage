@@ -140,8 +140,24 @@ export interface ReaderConfig {
   statusPos: "left" | "center" | "right" | "none";
   statusColor: string;
   topbarColor: string;
+  /** 划词划线默认样式（见 HIGHLIGHT_STYLES） */
+  highlightStyle: string;
+  /** 划词划线默认颜色（空=跟随主题强调色） */
+  highlightColor: string;
+  /** 划词「浏览器搜索」的链接模板，%s 会被替换为选中文字 */
+  browserSearchUrl: string;
   conv: { title: string; author: string; css: string; coverPath: string };
 }
+
+export const HIGHLIGHT_STYLES: { id: string; name: string }[] = [
+  { id: "underline", name: "下划线" },
+  { id: "wavy", name: "波浪线" },
+  { id: "dotted", name: "点线" },
+  { id: "double", name: "双下划线" },
+  { id: "background", name: "荧光笔" },
+  { id: "strike", name: "删除线" },
+  { id: "box", name: "方框" },
+];
 
 export interface WebdavConfig {
   enabled: boolean;
@@ -239,6 +255,8 @@ export interface AiConfig {
   style: AiStyleConfig;
   /** 端点失败时自动切换并重跑上一次操作（默认开） */
   failover: boolean;
+  /** 划词翻译/释义小窗提示词，{selection} 为选中文字 */
+  quickPrompt: string;
 }
 
 // “关闭思考”功能已于 v0.1.24 后彻底移除（UI/发送链/存储三层都无残留）：
@@ -435,6 +453,9 @@ const DEFAULTS: AppConfig = {
     statusPos: "center",
     statusColor: "",
     topbarColor: "",
+    highlightStyle: "underline",
+    highlightColor: "",
+    browserSearchUrl: "https://www.baidu.com/s?wd=%s",
     conv: { title: "", author: "", css: `body {
   max-width: 680px;
   margin: 0 auto;
@@ -505,6 +526,8 @@ p {
       cssExtra: "",
     },
     failover: true,
+    quickPrompt:
+      "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
   },
   regex: "",
 };
@@ -665,6 +688,7 @@ function migrateAi(savedAi: any): AiConfig {
     display: "reader",
     style: structuredClone(DEFAULTS.ai.style),
     failover: savedAi?.failover ?? true,
+    quickPrompt: savedAi?.quickPrompt ?? DEFAULTS.ai.quickPrompt,
   };
 }
 

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BookPage, BookRow, BookSession, BookmarkRow, ChapterData, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+import type { BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
   listFolders: () => invoke<string[]>("list_folders"),
@@ -104,6 +104,17 @@ export const api = {
   }) => invoke<string>("ai_test", args),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
+  searchInBook: (bookId: number, query: string) =>
+    invoke<BookSearchHit[]>("search_in_book", { bookId, query }),
+  addHighlight: (args: {
+    bookId: number; chapterIndex: number; chapterTitle: string;
+    start: number; end: number; text: string; style: string; note: string;
+  }) => invoke<number>("add_highlight", args),
+  listHighlights: (bookId: number) => invoke<HighlightRow[]>("list_highlights", { bookId }),
+  searchHighlights: (query: string) => invoke<HighlightRow[]>("search_highlights", { query }),
+  deleteHighlight: (id: number) => invoke<void>("delete_highlight", { id }),
+  updateHighlight: (id: number, style: string, note: string) =>
+    invoke<void>("update_highlight", { id, style, note }),
   suggestMeta: (path: string) =>
     invoke<{ title: string; author: string }>("suggest_meta", { path }),
   rebuildFts: () => invoke<number>("rebuild_fts"),

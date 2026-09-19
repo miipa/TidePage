@@ -82,6 +82,28 @@ pub struct SearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookSearchHit {
+    pub chapter_index: i64,
+    pub chapter_title: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighlightRow {
+    pub id: i64,
+    pub book_id: i64,
+    pub book_title: String,
+    pub chapter_index: i64,
+    pub chapter_title: String,
+    pub pos_start: i64,
+    pub pos_end: i64,
+    pub text: String,
+    pub style: String,
+    pub note: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoonProgress {
     pub file: String,
     pub title: String,

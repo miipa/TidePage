@@ -60,6 +60,26 @@ export interface SearchHit {
   snippet: string;
 }
 
+export interface BookSearchHit {
+  chapter_index: number;
+  chapter_title: string;
+  snippet: string;
+}
+
+export interface HighlightRow {
+  id: number;
+  book_id: number;
+  book_title: string;
+  chapter_index: number;
+  chapter_title: string;
+  pos_start: number;
+  pos_end: number;
+  text: string;
+  style: string;
+  note: string;
+  created_at: number;
+}
+
 export interface BookmarkRow {
   id: number;
   chapter_index: number;

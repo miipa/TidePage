@@ -72,6 +72,20 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             excerpt TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS highlights(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER NOT NULL,
+            chapter_index INTEGER NOT NULL DEFAULT 0,
+            chapter_title TEXT NOT NULL DEFAULT '',
+            pos_start INTEGER NOT NULL DEFAULT 0,
+            pos_end INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL DEFAULT '',
+            style TEXT NOT NULL DEFAULT 'underline',
+            note TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_highlights_book ON highlights(book_id);
+        CREATE INDEX IF NOT EXISTS idx_highlights_created ON highlights(created_at DESC);
         CREATE TABLE IF NOT EXISTS txt_cache(
             book_id INTEGER PRIMARY KEY,
             offsets TEXT NOT NULL,
@@ -155,7 +169,7 @@ pub fn migrate_book_ids(conn: &Connection) {
                 .execute("UPDATE books SET id=?1 WHERE id=?2", params![new_id, old_id])
                 .is_ok()
             {
-                for table in ["progress", "txt_cache", "bookmarks", "reading_sessions"] {
+                for table in ["progress", "txt_cache", "bookmarks", "reading_sessions", "highlights"] {
                     conn.execute(
                         &format!("UPDATE {table} SET book_id=?1 WHERE book_id=?2"),
                         params![new_id, old_id],
@@ -453,6 +467,8 @@ pub fn delete_books(conn: &Connection, paths: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM bookmarks WHERE book_id=?1", params![id])
             .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM highlights WHERE book_id=?1", params![id])
+            .map_err(|e| e.to_string())?;
         if has_fts(conn) {
             conn.execute("DELETE FROM fts WHERE book_id=?1", params![id])
                 .ok();
@@ -541,6 +557,97 @@ pub fn list_bookmarks(conn: &Connection, book_id: i64) -> Vec<(i64, i64, String,
 pub fn delete_bookmark(conn: &Connection, id: i64) -> Result<(), String> {
     conn.execute("DELETE FROM bookmarks WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_highlight(
+    conn: &Connection,
+    book_id: i64,
+    chapter_index: i64,
+    chapter_title: &str,
+    pos_start: i64,
+    pos_end: i64,
+    text: &str,
+    style: &str,
+    note: &str,
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, note, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, note, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn highlight_from_row(r: &Row) -> rusqlite::Result<crate::models::HighlightRow> {
+    Ok(crate::models::HighlightRow {
+        id: r.get(0)?,
+        book_id: r.get(1)?,
+        book_title: r.get(2)?,
+        chapter_index: r.get(3)?,
+        chapter_title: r.get(4)?,
+        pos_start: r.get(5)?,
+        pos_end: r.get(6)?,
+        text: r.get(7)?,
+        style: r.get(8)?,
+        note: r.get(9)?,
+        created_at: r.get(10)?,
+    })
+}
+
+const HIGHLIGHT_COLS: &str = "h.id, h.book_id, COALESCE(b.title,''), h.chapter_index, h.chapter_title, h.pos_start, h.pos_end, h.text, h.style, h.note, h.created_at";
+
+pub fn list_highlights(conn: &Connection, book_id: i64) -> Vec<crate::models::HighlightRow> {
+    let sql = format!(
+        "SELECT {HIGHLIGHT_COLS} FROM highlights h LEFT JOIN books b ON b.id=h.book_id WHERE h.book_id=?1 ORDER BY h.chapter_index, h.pos_start"
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![book_id], highlight_from_row)
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 全库划线索引查询：按正文/书名/章节名模糊匹配，供「划线」面板检索。
+pub fn search_highlights(conn: &Connection, query: &str) -> Vec<crate::models::HighlightRow> {
+    let q = query.trim();
+    let sql = if q.is_empty() {
+        format!("SELECT {HIGHLIGHT_COLS} FROM highlights h LEFT JOIN books b ON b.id=h.book_id ORDER BY h.created_at DESC LIMIT 500")
+    } else {
+        format!("SELECT {HIGHLIGHT_COLS} FROM highlights h LEFT JOIN books b ON b.id=h.book_id WHERE h.text LIKE ?1 ESCAPE '\\' OR b.title LIKE ?1 ESCAPE '\\' OR h.chapter_title LIKE ?1 ESCAPE '\\' OR h.note LIKE ?1 ESCAPE '\\' ORDER BY h.created_at DESC LIMIT 500")
+    };
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    if q.is_empty() {
+        stmt.query_map([], highlight_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        let pat = format!("%{}%", escape_like(q));
+        stmt.query_map(params![pat], highlight_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+}
+
+pub fn delete_highlight(conn: &Connection, id: i64) -> Result<(), String> {
+    conn.execute("DELETE FROM highlights WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_highlight(conn: &Connection, id: i64, style: &str, note: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE highlights SET style=?2, note=?3 WHERE id=?1",
+        params![id, style, note],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

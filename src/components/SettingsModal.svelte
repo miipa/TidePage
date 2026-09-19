@@ -21,6 +21,7 @@
     defaultReaderConfig,
     resetReaderConfig,
     SCROLL_BOUNCE_PRESETS,
+    HIGHLIGHT_STYLES,
     type AiProvider,
     type BindAction,
     type ZoneAction,
@@ -787,6 +788,34 @@
     </div>
     <p class="tip">开启后强制使用上方字号/字重/行距/段距/缩进/对齐与文字颜色，忽略 EPUB 自带排版；关闭后尽量保留书籍原有版式（字体始终使用上方选择）。</p>
 
+    <hr />
+    <div class="grid3">
+      <div class="field">
+        <label>划线默认样式（选中文字后仍可临时选择其它样式）</label>
+        <select bind:value={config.reader.highlightStyle} onchange={saveConfig}>
+          {#each HIGHLIGHT_STYLES as s (s.id)}
+            <option value={s.id}>{s.name}</option>
+          {/each}
+        </select>
+      </div>
+      <div class="field">
+        <label>划线颜色（空=默认红棕）</label>
+        <div class="color-row">
+          <input placeholder="如 #c0392b，留空用默认" bind:value={config.reader.highlightColor} oninput={saveConfig} />
+          <input type="color" class="picker" value={config.reader.highlightColor || "#c0392b"}
+            oninput={(e) => { config.reader.highlightColor = e.currentTarget.value; saveConfig(); }} />
+          {#if config.reader.highlightColor}
+            <button class="icon" title="清除" onclick={() => { config.reader.highlightColor = ""; saveConfig(); }}>×</button>
+          {/if}
+        </div>
+      </div>
+      <div class="field">
+        <label>浏览器搜索链接（%s 为选中文字）</label>
+        <input placeholder="https://www.baidu.com/s?wd=%s" bind:value={config.reader.browserSearchUrl} oninput={saveConfig} />
+      </div>
+    </div>
+    <p class="tip">选中正文文字后会弹出划词菜单：可直接划线（多种样式）、在本书内全文搜索、用浏览器搜索、AI 翻译释义。</p>
+
     <div class="field">
       <label>自定义 CSS（追加到正文样式之后，优先级最高；行距/字距等可在此微调）</label>
       <textarea class="cssbox" rows="6" bind:value={config.reader.cssExtra} oninput={saveConfig} placeholder={"p { letter-spacing: 0.05em; }\nh1 { color: #a00; }"}></textarea>
@@ -1124,6 +1153,12 @@
     <div class="field" style="margin-top:12px">
       <label>System 提示词（全局）</label>
       <input bind:value={config.ai.system} onchange={saveConfig} />
+    </div>
+
+    <div class="field">
+      <label>划词翻译 / 释义提示词（阅读界面选中文字点「AI 释义」小窗执行；{"{selection}"} 为选中文字）</label>
+      <textarea rows="3" bind:value={config.ai.quickPrompt} oninput={saveConfig}></textarea>
+      <p class="tip">独立于下方「我的提示词」，不会影响 AI 面板的按钮与快捷键。</p>
     </div>
 
     <div class="field">

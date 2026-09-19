@@ -1680,6 +1680,98 @@ pub fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Vec<SearchH
     .unwrap_or_default()
 }
 
+/// 在单本书内快速全文检索：走 FTS5(trigram) 索引，按 book_id 过滤。
+/// 选中文本通常是一段连续原文，这里强制按「短语」匹配，命中即原样出现。
+#[tauri::command]
+pub fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: String) -> Vec<BookSearchHit> {
+    let conn = state.db.0.lock().unwrap();
+    let q = query.trim();
+    if !db::has_fts(&conn) || q.chars().count() < 2 {
+        return vec![];
+    }
+    // 过长选区只取前 64 字，避免生成超大 FTS 短语；去掉会破坏语法的控制字符。
+    let trimmed: String = q.chars().take(64).collect();
+    let phrase = format!("\"{}\"", trimmed.replace('"', "\"\""));
+    let sql = "SELECT chapter_index, title, snippet(fts, 3, '<mark>', '</mark>', '…', 12) FROM fts WHERE book_id=?1 AND body MATCH ?2 LIMIT 200";
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(rusqlite::params![book_id, phrase], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })
+    .map(|rows| {
+        rows.filter_map(|r| r.ok())
+            .map(|(chapter_index, chapter_title, snippet)| BookSearchHit {
+                chapter_index,
+                chapter_title,
+                snippet,
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn add_highlight(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    chapter_index: i64,
+    chapter_title: String,
+    start: i64,
+    end: i64,
+    text: String,
+    style: String,
+    note: String,
+) -> Result<i64, String> {
+    let conn = state.db.0.lock().unwrap();
+    db::add_highlight(
+        &conn,
+        book_id,
+        chapter_index,
+        &chapter_title,
+        start,
+        end,
+        &text,
+        &style,
+        &note,
+    )
+}
+
+#[tauri::command]
+pub fn list_highlights(state: State<'_, Arc<AppState>>, book_id: i64) -> Vec<HighlightRow> {
+    let conn = state.db.0.lock().unwrap();
+    db::list_highlights(&conn, book_id)
+}
+
+#[tauri::command]
+pub fn search_highlights(state: State<'_, Arc<AppState>>, query: String) -> Vec<HighlightRow> {
+    let conn = state.db.0.lock().unwrap();
+    db::search_highlights(&conn, &query)
+}
+
+#[tauri::command]
+pub fn delete_highlight(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    db::delete_highlight(&conn, id)
+}
+
+#[tauri::command]
+pub fn update_highlight(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    style: String,
+    note: String,
+) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    db::update_highlight(&conn, id, &style, &note)
+}
+
 #[tauri::command]
 pub fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
     let conn = state.db.0.lock().unwrap();

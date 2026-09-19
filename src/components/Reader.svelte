@@ -17,15 +17,21 @@
     ZONE_DEFS,
     copyText,
     stripNonTextHtml,
+    requestOpenBook,
     SCROLL_BOUNCE_PRESETS,
     type BindAction,
     type ZoneKey,
   } from "../lib/stores.svelte";
   import { SmoothScroller } from "../lib/smoothScroll";
+  import { charRangeToRange, findTextRange, paintHighlights, selectionOffsets } from "../lib/highlights";
   import AiPanel from "./AiPanel.svelte";
   import TocPanel from "./TocPanel.svelte";
   import BookStatsModal from "./BookStatsModal.svelte";
-  import type { ChapterData, OpenResult, Progress } from "../lib/types";
+  import SelectionMenu from "./SelectionMenu.svelte";
+  import BookSearchPopup from "./BookSearchPopup.svelte";
+  import QuickAiPopup from "./QuickAiPopup.svelte";
+  import HighlightsPanel from "./HighlightsPanel.svelte";
+  import type { ChapterData, HighlightRow, OpenResult, Progress } from "../lib/types";
 
   let { standalone = false }: { standalone?: boolean } = $props();
 
@@ -64,6 +70,16 @@
   let statsOpen = $state(false);
   let bookmarks: { id: number; chapter_index: number; title: string; excerpt: string }[] = $state([]);
 
+  let highlights: HighlightRow[] = $state([]);
+  let highlightsOpen = $state(false);
+  let hlVersion = $state(0);
+  let pendingHighlightJump: HighlightRow | null = null;
+
+  type SelMenuState = { text: string; start: number; end: number; x: number; y: number; below: boolean };
+  let selMenu: SelMenuState | null = $state(null);
+  let searchPopup: { query: string; x: number; y: number; below: boolean } | null = $state(null);
+  let quickAiPopup: { text: string; x: number; y: number; below: boolean } | null = $state(null);
+
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
   let measureRaf = 0;
@@ -95,6 +111,13 @@
       } catch { /* ignore */ }
       chapterNum = restore && restore.chapter_index < book.toc.length ? restore.chapter_index : 0;
       await loadChapter(chapterNum, restore ?? undefined);
+      refreshHighlights();
+      api.indexBookFts(book.book.id).catch(() => {});
+      if (pendingHighlightJump && pendingHighlightJump.book_id === book.book.id) {
+        const ph = pendingHighlightJump;
+        pendingHighlightJump = null;
+        jumpToHighlight(ph);
+      }
       if (statsTimer) clearInterval(statsTimer);
       const bid = bookId;
       try {
@@ -666,10 +689,14 @@
         ui.settingsOpen = true;
         break;
       case "close":
-        if (tocOpen || bookmarksOpen || statsOpen) {
+        if (tocOpen || bookmarksOpen || statsOpen || highlightsOpen || selMenu || searchPopup || quickAiPopup) {
           tocOpen = false;
           bookmarksOpen = false;
           statsOpen = false;
+          highlightsOpen = false;
+          selMenu = null;
+          searchPopup = null;
+          quickAiPopup = null;
         } else {
           goBack();
         }
@@ -717,6 +744,22 @@
     const moved = Math.hypot(e.clientX - ptr.x, e.clientY - ptr.y);
     const quick = Date.now() - ptr.t < 450;
     ptr = null;
+    // 有选区时优先弹划词菜单（划线 / 全文 / 浏览器 / AI），不触发点击区域动作
+    if (contentEl) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.rangeCount) {
+        const root = contentRoot();
+        const range = sel.getRangeAt(0);
+        if (root && root.contains(range.commonAncestorContainer)) {
+          const text = sel.toString().replace(/\s+/g, " ").trim();
+          const offs = selectionOffsets(root, range);
+          if (text && offs && offs.end > offs.start) {
+            showSelectionMenu(text, offs, range.getBoundingClientRect());
+            return;
+          }
+        }
+      }
+    }
     if (moved > 10 || !quick || !contentEl) return;
     const rect = contentEl.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
@@ -859,6 +902,7 @@
       `--rdr-align:${config.reader.textAlign}`,
       `--rdr-fw:${config.reader.fontWeight}`,
       `--rdr-sel:${t.sel}`,
+      `--hl-color:${config.reader.highlightColor || "#c0392b"}`,
       `--rdr-top:${config.reader.topbarColor || "color-mix(in srgb, " + bg + " 90%, black 10%)"}`,
       `--rdr-stat:${config.reader.statusColor || t.fg}`,
       `--rdr-stat-align:${config.reader.statusPos === "none" ? "center" : config.reader.statusPos}`,
@@ -941,6 +985,175 @@ ${r.cssExtra || ""}
     const sel = window.getSelection()?.toString().slice(0, 80) ?? "";
     await api.addBookmark(book.book.id, chapterNum, chapter.title, sel);
     toast("书签已添加");
+  }
+
+  /* ================= 划线 / 划词菜单 / 检索 ================= */
+
+  const chapterHighlights = $derived(highlights.filter((h) => h.chapter_index === chapterNum));
+
+  $effect(() => {
+    void chapter;
+    void chapterNum;
+    void highlights;
+    tick().then(() => paintNow());
+  });
+
+  function contentRoot(): HTMLElement | null {
+    return (contentEl?.querySelector("#chapter-content") as HTMLElement | null) ?? null;
+  }
+
+  function paintNow() {
+    const root = contentRoot();
+    if (!root) return;
+    paintHighlights(root, chapterHighlights);
+  }
+
+  async function refreshHighlights() {
+    if (!book) return;
+    try {
+      highlights = await api.listHighlights(book.book.id);
+      hlVersion++;
+    } catch { /* ignore */ }
+  }
+
+  function closeSelectionMenu() {
+    selMenu = null;
+  }
+
+  function showSelectionMenu(text: string, offs: { start: number; end: number }, rect: DOMRect) {
+    const x = Math.max(80, Math.min(window.innerWidth - 80, rect.left + rect.width / 2));
+    const below = rect.top < 96;
+    const y = below ? rect.bottom + 8 : rect.top - 8;
+    selMenu = { text, start: offs.start, end: offs.end, x, y, below };
+  }
+
+  async function onHighlight(style: string) {
+    const s = selMenu;
+    selMenu = null;
+    if (!s || !book || !chapter) return;
+    try {
+      const id = await api.addHighlight({
+        bookId: book.book.id,
+        chapterIndex: chapterNum,
+        chapterTitle: chapter.title,
+        start: s.start,
+        end: s.end,
+        text: s.text,
+        style,
+        note: "",
+      });
+      highlights.push({
+        id,
+        book_id: book.book.id,
+        book_title: book.book.title,
+        chapter_index: chapterNum,
+        chapter_title: chapter.title,
+        pos_start: s.start,
+        pos_end: s.end,
+        text: s.text,
+        style,
+        note: "",
+        created_at: Date.now(),
+      });
+      hlVersion++;
+      window.getSelection()?.removeAllRanges();
+      toast("已划线");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  function onSearchSelection() {
+    const s = selMenu;
+    selMenu = null;
+    if (!s) return;
+    searchPopup = { query: s.text, x: s.x, y: s.y, below: s.below };
+  }
+
+  async function onBrowserSelection() {
+    const s = selMenu;
+    selMenu = null;
+    if (!s) return;
+    const tpl = config.reader.browserSearchUrl || "https://www.baidu.com/s?wd=%s";
+    const url = tpl.includes("%s")
+      ? tpl.replace("%s", encodeURIComponent(s.text))
+      : tpl + encodeURIComponent(s.text);
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } catch {
+      try { window.open(url, "_blank"); } catch { /* ignore */ }
+    }
+  }
+
+  function onAiSelection() {
+    const s = selMenu;
+    selMenu = null;
+    if (!s) return;
+    quickAiPopup = { text: s.text, x: s.x, y: s.y, below: s.below };
+  }
+
+  function scrollRangeIntoView(range: Range) {
+    const sel = window.getSelection();
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    if (config.reader.mode === "scroll") {
+      if (!contentEl || !scroller) return;
+      const contentRect = contentEl.getBoundingClientRect();
+      const r = range.getBoundingClientRect();
+      const target = scrollRender + (r.top - contentRect.top) - contentRect.height * 0.3;
+      scroller.jumpTo(Math.max(0, Math.min(target, maxScroll)), true);
+      scheduleCommit();
+    } else {
+      if (!pageWrap) return;
+      const wrapRect = pageWrap.getBoundingClientRect();
+      const r = range.getBoundingClientRect();
+      const left = r.left - wrapRect.left;
+      const pg = Math.max(0, Math.min(pageCount - 1, Math.floor(left / (stepPx || 1))));
+      gotoPage(pg, true);
+    }
+  }
+
+  async function jumpToChapterText(chapterIndex: number, needle: string) {
+    searchPopup = null;
+    if (!book) return;
+    if (chapterIndex !== chapterNum || !chapter) {
+      await loadChapter(chapterIndex);
+    }
+    await tick();
+    paintNow();
+    const root = contentRoot();
+    if (!root) return;
+    const range = findTextRange(root, needle);
+    if (!range) {
+      toast("已跳转到章节（未精确定位到文字）");
+      return;
+    }
+    scrollRangeIntoView(range);
+  }
+
+  async function jumpToHighlight(h: HighlightRow) {
+    highlightsOpen = false;
+    if (!book) return;
+    if (h.book_id !== book.book.id) {
+      pendingHighlightJump = h;
+      requestOpenBook(h.book_id);
+      return;
+    }
+    if (h.chapter_index !== chapterNum) {
+      await loadChapter(h.chapter_index);
+      await tick();
+    } else {
+      await tick();
+    }
+    paintNow();
+    const root = contentRoot();
+    if (!root) return;
+    const range = charRangeToRange(root, h.pos_start, h.pos_end);
+    if (range) scrollRangeIntoView(range);
+    else toast("未定位到划线位置");
   }
 
   function speak() {
@@ -1067,6 +1280,7 @@ ${r.cssExtra || ""}
       <button class="icon" title="书签列表" onclick={loadBookmarks}>≡</button>
       <button class="icon" title="朗读本章" onclick={speak}>▶</button>
       <button class="icon" title="停止朗读" onclick={() => speechSynthesis.cancel()}>■</button>
+      <button class="icon" title="划线 / 批注" onclick={() => (highlightsOpen = !highlightsOpen)}>✎</button>
       <button class="icon" title="AI 助手" onclick={toggleAi}>AI</button>
       <button class="icon" title="本书统计" onclick={() => (statsOpen = !statsOpen)}>📊</button>
       <button class="icon" title="目录 (F3)" onclick={() => (tocOpen = !tocOpen)}>☰</button>
@@ -1163,6 +1377,51 @@ ${r.cssExtra || ""}
           {/each}
         </div>
       </div>
+    {/if}
+
+    {#if highlightsOpen && book}
+      <HighlightsPanel
+        bookId={book.book.id}
+        version={hlVersion}
+        onjump={jumpToHighlight}
+        onclose={() => (highlightsOpen = false)}
+        onchanged={refreshHighlights}
+      />
+    {/if}
+
+    {#if selMenu}
+      <SelectionMenu
+        x={selMenu.x}
+        y={selMenu.y}
+        below={selMenu.below}
+        onhighlight={onHighlight}
+        onsearch={onSearchSelection}
+        onbrowser={onBrowserSelection}
+        onai={onAiSelection}
+        onclose={closeSelectionMenu}
+      />
+    {/if}
+
+    {#if searchPopup && book}
+      <BookSearchPopup
+        bookId={book.book.id}
+        initialQuery={searchPopup.query}
+        x={searchPopup.x}
+        y={searchPopup.y}
+        below={searchPopup.below}
+        onpick={jumpToChapterText}
+        onclose={() => (searchPopup = null)}
+      />
+    {/if}
+
+    {#if quickAiPopup}
+      <QuickAiPopup
+        text={quickAiPopup.text}
+        x={quickAiPopup.x}
+        y={quickAiPopup.y}
+        below={quickAiPopup.below}
+        onclose={() => (quickAiPopup = null)}
+      />
     {/if}
 
     {#if ui.aiOpen}
@@ -1411,6 +1670,60 @@ ${r.cssExtra || ""}
   #chapter-content :global(th) {
     border: 1px solid rgba(128, 128, 128, 0.3);
     padding: 4px 8px;
+  }
+
+  #chapter-content :global(mark.fr-hl) {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  #chapter-content :global(mark.fr-hl-underline) {
+    text-decoration-line: underline;
+    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  #chapter-content :global(mark.fr-hl-wavy) {
+    text-decoration-line: underline;
+    text-decoration-style: wavy;
+    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+  }
+
+  #chapter-content :global(mark.fr-hl-dotted) {
+    text-decoration-line: underline;
+    text-decoration-style: dotted;
+    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  #chapter-content :global(mark.fr-hl-double) {
+    text-decoration-line: underline;
+    text-decoration-style: double;
+    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  #chapter-content :global(mark.fr-hl-strike) {
+    text-decoration-line: line-through;
+    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-thickness: 2px;
+  }
+
+  #chapter-content :global(mark.fr-hl-background) {
+    background: color-mix(in srgb, var(--hl-color, #c0392b) 38%, transparent);
+    border-radius: 3px;
+  }
+
+  #chapter-content :global(mark.fr-hl-box) {
+    box-shadow: 0 0 0 1.5px var(--hl-color, #c0392b);
+    border-radius: 3px;
   }
 
   .zone-hints {
