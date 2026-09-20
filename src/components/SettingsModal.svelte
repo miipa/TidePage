@@ -28,9 +28,10 @@
     type ThemeKey,
   } from "../lib/stores.svelte";
   import ColorPicker from "./ColorPicker.svelte";
+  import { refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { TocEntry } from "../lib/types";
 
-  type SettingsTab = "reader" | "split" | "keys" | "webdav" | "ai" | "other";
+  type SettingsTab = "reader" | "split" | "keys" | "tts" | "webdav" | "ai" | "other";
   let { initialTab = "reader" as SettingsTab }: { initialTab?: SettingsTab } = $props();
   let tab = $state<SettingsTab>(initialTab);
   let webdavTesting = $state(false);
@@ -497,6 +498,7 @@
     <button class:active={tab === "reader"} onclick={() => (tab = "reader")}>阅读</button>
     <button class:active={tab === "split"} onclick={() => (tab = "split")}>分章</button>
     <button class:active={tab === "keys"} onclick={() => (tab = "keys")}>按键</button>
+    <button class:active={tab === "tts"} onclick={() => { tab = "tts"; refreshVoices(); }}>朗读</button>
     <button class:active={tab === "webdav"} onclick={() => (tab = "webdav")}>WebDAV</button>
     <button class:active={tab === "ai"} onclick={() => (tab = "ai")}>AI</button>
     <button class:active={tab === "other"} onclick={() => (tab = "other")}>其他</button>
@@ -903,6 +905,68 @@
     <div class="close-row">
       <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast("已恢复默认"); }}>恢复默认</button>
     </div>
+  {:else if tab === "tts"}
+    <p class="tip">
+      语音朗读使用系统内置语音（Windows 的 SAPI/OneCore，WebView2 提供）。安装更多中文语音包后，可在下方选择。
+    </p>
+
+    {#if !ttsState.supported}
+      <p class="tip" style="color:var(--danger)">当前环境不支持系统语音朗读。</p>
+    {:else}
+      <div class="field">
+        <label>语音（空=按语言自动选择）</label>
+        <select bind:value={config.tts.voice} onchange={saveConfig}>
+          <option value="">自动（按语言）</option>
+          {#each ttsState.voices as v (v.voiceURI)}
+            <option value={v.name}>{v.name} · {v.lang}{v.default ? " · 默认" : ""}</option>
+          {/each}
+        </select>
+        {#if !ttsState.voices.length}
+          <p class="tip">未检测到语音，请确认系统已安装语音包（设置 → 时间和语言 → 语音）。</p>
+        {/if}
+      </div>
+
+      <div class="grid2">
+        <div class="field">
+          <label>自动选择语言</label>
+          <input bind:value={config.tts.lang} onchange={saveConfig} placeholder="zh-CN" />
+        </div>
+        <div class="field">
+          <label>定时停止默认值</label>
+          <select bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
+            <option value={0}>关闭</option>
+            <option value={5}>5 分钟</option>
+            <option value={10}>10 分钟</option>
+            <option value={15}>15 分钟</option>
+            <option value={30}>30 分钟</option>
+            <option value={60}>60 分钟</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div class="field">
+          <label>语速 {config.tts.rate.toFixed(2)}</label>
+          <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
+        </div>
+        <div class="field">
+          <label>音调 {config.tts.pitch.toFixed(2)}</label>
+          <input type="range" min="0" max="2" step="0.05" bind:value={config.tts.pitch} oninput={saveConfig} />
+        </div>
+        <div class="field">
+          <label>音量 {Math.round(config.tts.volume * 100)}%</label>
+          <input type="range" min="0" max="1" step="0.05" bind:value={config.tts.volume} oninput={saveConfig} />
+        </div>
+      </div>
+
+      <div class="checks">
+        <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
+        <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
+      </div>
+      <p class="tip">
+        在阅读界面点「▶」开始朗读：优先从选中文字开始，否则从当前屏幕顶部开始；播放条可暂停/继续、上一句/下一句、停止，并可设置定时停止与语速。
+      </p>
+    {/if}
   {:else if tab === "webdav"}
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>

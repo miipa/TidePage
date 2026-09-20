@@ -31,6 +31,10 @@ export type BindAction =
   | "bookmarkList"
   | "ai"
   | "bookStats"
+  | "ttsPlayPause"
+  | "ttsStop"
+  | "ttsNext"
+  | "ttsPrev"
   | "settings"
   | "close";
 
@@ -46,6 +50,10 @@ export const BIND_DEFS: { id: BindAction; name: string }[] = [
   { id: "bookmarkList", name: "书签列表" },
   { id: "ai", name: "AI 面板" },
   { id: "bookStats", name: "本书统计" },
+  { id: "ttsPlayPause", name: "朗读：播放/暂停" },
+  { id: "ttsStop", name: "朗读：停止" },
+  { id: "ttsNext", name: "朗读：下一句" },
+  { id: "ttsPrev", name: "朗读：上一句" },
   { id: "settings", name: "设置" },
   { id: "close", name: "返回书库" },
 ];
@@ -62,6 +70,10 @@ export const DEFAULT_BINDINGS: Record<BindAction, string[]> = {
   bookmarkList: [],
   ai: [],
   bookStats: [],
+  ttsPlayPause: [],
+  ttsStop: [],
+  ttsNext: [],
+  ttsPrev: [],
   settings: [],
   close: ["Esc"],
 };
@@ -409,10 +421,27 @@ export const DEFAULT_PROMPTS: PromptItem[] = [
   },
 ];
 
+export interface TtsConfig {
+  /** 指定语音（voice.name 或 voiceURI），空=按语言自动选择 */
+  voice: string;
+  /** 自动选择语音时的语言 */
+  lang: string;
+  rate: number;
+  pitch: number;
+  volume: number;
+  /** 一章读完自动续读下一章 */
+  autoNextChapter: boolean;
+  /** 朗读时高亮当前句并自动滚动跟随 */
+  highlight: boolean;
+  /** 定时停止（分钟，0=关闭） */
+  sleepMinutes: number;
+}
+
 export interface AppConfig {
   reader: ReaderConfig;
   webdav: WebdavConfig;
   ai: AiConfig;
+  tts: TtsConfig;
   regex: string;
 }
 
@@ -543,6 +572,16 @@ p {
     failover: true,
     quickPrompt:
       "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
+  },
+  tts: {
+    voice: "",
+    lang: "zh-CN",
+    rate: 1,
+    pitch: 1,
+    volume: 1,
+    autoNextChapter: true,
+    highlight: true,
+    sleepMinutes: 0,
   },
   regex: "",
 };
@@ -749,6 +788,7 @@ function load(): AppConfig {
       },
       webdav: { ...DEFAULTS.webdav, ...saved.webdav },
       ai: migrateAi(saved.ai),
+      tts: { ...DEFAULTS.tts, ...(saved.tts || {}) },
       regex: saved.regex ?? "",
     };
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
@@ -824,6 +864,7 @@ export function applyConfigJson(json: string) {
     obj.ai.active = Math.min(Math.max((obj.ai.active as number) | 0, 0), obj.ai.profiles.length - 1);
     stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
+    obj.tts = { ...structuredClone(DEFAULTS.tts), ...(obj.tts || {}) };
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }

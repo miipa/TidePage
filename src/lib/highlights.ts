@@ -114,6 +114,34 @@ function unwrapMarks(root: ParentNode): void {
   });
 }
 
+/** 清除朗读高亮标记。 */
+export function clearTtsMark(root: ParentNode): void {
+  root.querySelectorAll("mark.fr-tts").forEach((m) => {
+    const parent = m.parentNode;
+    if (!parent) return;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+  });
+}
+
+/** 高亮当前朗读的文本区间（start<0 表示清除）。 */
+export function paintTtsMark(root: HTMLElement, start: number, end: number): void {
+  clearTtsMark(root);
+  root.normalize();
+  if (start < 0 || end <= start) return;
+  const range = charRangeToRange(root, start, end);
+  if (!range) return;
+  const mark = document.createElement("mark");
+  mark.className = "fr-tts";
+  try {
+    const frag = range.extractContents();
+    mark.appendChild(frag);
+    range.insertNode(mark);
+  } catch {
+    /* ignore */
+  }
+}
+
 /** 把当前章节的划线绘制到 root（先清除旧标记再重绘）。 */
 export function paintHighlights(root: HTMLElement, highlights: HighlightRow[]): void {
   unwrapMarks(root);

@@ -24,7 +24,27 @@
   } from "../lib/stores.svelte";
   import { SmoothScroller } from "../lib/smoothScroll";
   import { preloadReaderFonts } from "../lib/fontfaces";
-  import { charRangeToRange, findTextRange, paintHighlights, selectionOffsets } from "../lib/highlights";
+  import {
+    charRangeToRange,
+    clearTtsMark,
+    findTextRange,
+    paintHighlights,
+    paintTtsMark,
+    selectionOffsets,
+  } from "../lib/highlights";
+  import {
+    segIndexAt,
+    splitSegments,
+    ttsNext,
+    ttsPauseResume,
+    ttsPrev,
+    ttsSetCallbacks,
+    ttsSetSegments,
+    ttsStart,
+    ttsState,
+    ttsStop,
+  } from "../lib/tts.svelte";
+  import type { FlatSegment } from "../lib/tts.svelte";
   import type { PopupAnchor } from "../lib/placePopup";
   import AiPanel from "./AiPanel.svelte";
   import TocPanel from "./TocPanel.svelte";
@@ -34,6 +54,7 @@
   import QuickAiPopup from "./QuickAiPopup.svelte";
   import HighlightsPanel from "./HighlightsPanel.svelte";
   import HighlightMenu from "./HighlightMenu.svelte";
+  import TtsBar from "./TtsBar.svelte";
   import type { ChapterData, HighlightRow, OpenResult, Progress } from "../lib/types";
 
   let { standalone = false }: { standalone?: boolean } = $props();
@@ -88,6 +109,9 @@
   type NavPos = { chapter_index: number; ratio: number };
   let searchNavStack: NavPos[] = $state([]);
   let searchOrigin: NavPos | null = null;
+
+  // 朗读（TTS）
+  let ttsCurrent: FlatSegment | null = $state(null);
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -159,6 +183,7 @@
   }
 
   export async function close() {
+    stopTts();
     webdavPush();
     await doSaveProgress();
     await flushSession(true);
@@ -213,6 +238,7 @@
     entry?: { at: "head" | "tail"; extra?: number }
   ) {
     if (!book) return;
+    if (ttsState.playing) stopTts(); // 手动切换章节时停止朗读（自动续读在 onTtsChapterEnd 中处理）
     loadingChapter = true;
     try {
       // 章节首次绘制前先确保设定字体已就绪，避免回退字体闪烁
@@ -702,6 +728,18 @@
       case "bookStats":
         statsOpen = !statsOpen;
         break;
+      case "ttsPlayPause":
+        toggleTts();
+        break;
+      case "ttsStop":
+        stopTts();
+        break;
+      case "ttsNext":
+        ttsNext();
+        break;
+      case "ttsPrev":
+        ttsPrev();
+        break;
       case "settings":
         ui.settingsOpen = true;
         break;
@@ -826,7 +864,7 @@
   }
 
   function goBack() {
-    speechSynthesis.cancel();
+    stopTts();
     if (standalone) {
       try {
         doSaveProgress();
@@ -839,6 +877,10 @@
   }
 
   onMount(() => {
+    ttsSetCallbacks({
+      onSegment: (seg) => onTtsSegment(seg),
+      onEnd: () => { void onTtsChapterEnd(); },
+    });
     scroller = new SmoothScroller(applyScroll);
     scroller.onSettled(() => {
       // settle 时精确同步一次响应式位置（滚动中仅节流更新）
@@ -860,6 +902,7 @@
     window.addEventListener("flowread-jump", onJump);
     window.addEventListener("pagehide", onUnload);
     return () => {
+      ttsStop();
       scroller?.destroy();
       if (statsTimer) clearInterval(statsTimer);
       window.removeEventListener("flowread-jump", onJump);
@@ -1196,6 +1239,11 @@ ${r.cssExtra || ""}
       sel.removeAllRanges();
       sel.addRange(range);
     }
+    scrollToRange(range);
+  }
+
+  /** 仅滚动到指定 Range（不改动当前选区），供朗读跟随使用。 */
+  function scrollToRange(range: Range) {
     if (config.reader.mode === "scroll") {
       if (!contentEl || !scroller) return;
       const contentRect = contentEl.getBoundingClientRect();
@@ -1272,13 +1320,97 @@ ${r.cssExtra || ""}
     else toast("未定位到划线位置");
   }
 
-  function speak() {
-    if (!chapter) return;
-    const text = chapter.html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 6000);
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "zh-CN";
-    speechSynthesis.cancel();
-    speechSynthesis.speak(u);
+  /* ================= 语音朗读（TTS） ================= */
+
+  /** 朗读跟随：高亮当前句并滚动到可见位置。 */
+  function onTtsSegment(seg: FlatSegment | null) {
+    ttsCurrent = seg;
+    const root = contentRoot();
+    if (!root) return;
+    if (!seg || !config.tts.highlight) {
+      clearTtsMark(root);
+      return;
+    }
+    paintTtsMark(root, seg.start, seg.end);
+    const range = charRangeToRange(root, seg.start, seg.end);
+    if (range) scrollToRange(range);
+  }
+
+  /** 光标点（视口顶部中央）对应的章节文本偏移，用于「从当前屏开始朗读」。 */
+  function offsetAtViewportTop(root: HTMLElement): number | null {
+    const r = root.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = Math.min(r.bottom - 2, Math.max(r.top + 2, (contentEl?.getBoundingClientRect().top ?? r.top) + 6));
+    let range: Range | null = null;
+    const doc = document as Document & {
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+    };
+    if (doc.caretRangeFromPoint) {
+      range = doc.caretRangeFromPoint(x, y);
+    } else if (doc.caretPositionFromPoint) {
+      const p = doc.caretPositionFromPoint(x, y);
+      if (p) {
+        range = document.createRange();
+        range.setStart(p.offsetNode, p.offset);
+      }
+    }
+    if (!range) return null;
+    const offs = selectionOffsets(root, range);
+    return offs ? offs.start : null;
+  }
+
+  /** 开始朗读：优先从当前选区开始，否则从当前屏幕顶部开始，否则从头。 */
+  function startTts() {
+    if (!ttsState.supported) {
+      toast("当前环境不支持系统语音朗读", "error");
+      return;
+    }
+    const root = contentRoot();
+    if (!root || !chapter) return;
+    const text = root.textContent ?? "";
+    const segs = splitSegments(text);
+    if (!segs.length) {
+      toast("本章没有可朗读的文字");
+      return;
+    }
+    let idx = 0;
+    const sel = window.getSelection();
+    let off: number | null = null;
+    if (sel && !sel.isCollapsed && sel.rangeCount) {
+      const o = selectionOffsets(root, sel.getRangeAt(0));
+      if (o) off = o.start;
+    }
+    if (off == null) off = offsetAtViewportTop(root);
+    if (off != null) idx = segIndexAt(segs, off);
+    ttsSetSegments(segs);
+    ttsStart(idx);
+  }
+
+  /** 停止朗读并清除高亮。 */
+  function stopTts() {
+    ttsStop();
+    const root = contentRoot();
+    if (root) clearTtsMark(root);
+    ttsCurrent = null;
+  }
+
+  /** 本章读完：按设置自动续读下一章。 */
+  async function onTtsChapterEnd() {
+    if (!config.tts.autoNextChapter || !book) return;
+    if (chapterNum >= book.toc.length - 1) {
+      toast("已朗读到最后一章");
+      return;
+    }
+    // 此时 ttsState.playing 已为 false，loadChapter 不会误杀朗读
+    await loadChapter(chapterNum + 1);
+    await tick();
+    startTts();
+  }
+
+  function toggleTts() {
+    if (ttsState.playing) ttsPauseResume();
+    else startTts();
   }
 
   function convertThis() {
@@ -1394,8 +1526,10 @@ ${r.cssExtra || ""}
       {/if}
       <button class="icon" title="添加书签" onclick={addBookmark}>🔖</button>
       <button class="icon" title="书签列表" onclick={loadBookmarks}>≡</button>
-      <button class="icon" title="朗读本章" onclick={speak}>▶</button>
-      <button class="icon" title="停止朗读" onclick={() => speechSynthesis.cancel()}>■</button>
+      <button class="icon" title={ttsState.playing ? "朗读：暂停/继续" : "朗读（从当前屏幕/选中处开始）"} onclick={toggleTts}>
+        {ttsState.playing ? "⏸" : "▶"}
+      </button>
+      <button class="icon" title="停止朗读" onclick={stopTts}>■</button>
       <button class="icon" title="划线 / 批注" onclick={() => (highlightsOpen = !highlightsOpen)}>✎</button>
       <button class="icon" title="AI 助手" onclick={toggleAi}>AI</button>
       <button class="icon" title="本书统计" onclick={() => (statsOpen = !statsOpen)}>📊</button>
@@ -1544,6 +1678,10 @@ ${r.cssExtra || ""}
         ondelete={() => hlDelete(hlMenu!.h)}
         onclose={closeHlMenu}
       />
+    {/if}
+
+    {#if ttsState.playing || ttsState.paused}
+      <TtsBar current={ttsCurrent} />
     {/if}
 
     {#if ui.aiOpen}
@@ -1799,6 +1937,13 @@ ${r.cssExtra || ""}
     color: inherit;
     padding: 0;
     cursor: pointer;
+  }
+
+  #chapter-content :global(mark.fr-tts) {
+    background: color-mix(in srgb, var(--accent, #4a6b8a) 32%, transparent);
+    color: inherit;
+    border-radius: 3px;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #4a6b8a) 45%, transparent);
   }
 
   #chapter-content :global(mark.fr-hl-underline) {
