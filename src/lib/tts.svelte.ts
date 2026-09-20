@@ -1,4 +1,5 @@
-import { config } from "./stores.svelte";
+import { config, toast } from "./stores.svelte";
+import { api } from "./api";
 
 export interface FlatSegment {
   /** 用于朗读的文本（已去首尾空白） */
@@ -27,7 +28,6 @@ export function splitSegments(text: string, maxLen = 160): FlatSegment[] {
     const lead = raw.length - raw.trimStart().length;
     const s2 = s + lead;
     const e2 = s2 + trimmed.length;
-    // 过长片段按软标点再切
     if (trimmed.length <= maxLen) {
       out.push({ text: trimmed, start: s2, end: e2 });
       return;
@@ -83,10 +83,16 @@ export const ttsState = $state({
 /** 非响应式：片段数组较大，避免深层代理开销 */
 let segments: FlatSegment[] = [];
 let utter: SpeechSynthesisUtterance | null = null;
+let audioEl: HTMLAudioElement | null = null;
+let usingAudio = false;
 let gen = 0;
 
 let onSegmentCb: ((seg: FlatSegment | null, index: number) => void) | null = null;
 let onEndCb: (() => void) | null = null;
+
+const audioCache = new Map<string, string>();
+const AUDIO_CACHE_MAX = 60;
+let onlineWarned = false;
 
 export function ttsSetCallbacks(cb: {
   onSegment?: (seg: FlatSegment | null, index: number) => void;
@@ -99,11 +105,18 @@ export function ttsSetCallbacks(cb: {
 export function ttsSetSegments(segs: FlatSegment[]) {
   segments = segs;
   ttsState.total = segs.length;
+  clearAudioCache();
 }
 
 export function ttsSegments(): FlatSegment[] {
   return segments;
 }
+
+export function isOnlineEngine(): boolean {
+  return config.tts.engine === "online";
+}
+
+/* ---------------- 系统语音 ---------------- */
 
 function resolveVoice(): SpeechSynthesisVoice | null {
   const list = ttsState.voices;
@@ -122,9 +135,169 @@ function resolveVoice(): SpeechSynthesisVoice | null {
   );
 }
 
-function playAt(i: number) {
-  if (!supported) return;
+function speakSystem(seg: FlatSegment, i: number, g: number) {
+  if (!supported) {
+    playAt(i + 1);
+    return;
+  }
+  usingAudio = false;
   const synth = window.speechSynthesis;
+  const u = new SpeechSynthesisUtterance(seg.text);
+  const v = resolveVoice();
+  if (v) {
+    u.voice = v;
+    u.lang = v.lang;
+  } else {
+    u.lang = config.tts.lang || "zh-CN";
+  }
+  u.rate = Math.max(0.5, Math.min(2, config.tts.rate || 1));
+  u.pitch = Math.max(0, Math.min(2, config.tts.pitch ?? 1));
+  u.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
+  u.onend = () => {
+    if (g !== gen) return;
+    playAt(i + 1);
+  };
+  u.onerror = () => {
+    if (g !== gen) return;
+    playAt(i + 1);
+  };
+  utter = u;
+  synth.speak(u);
+}
+
+/* ---------------- 在线语音 ---------------- */
+
+function onlineProfile() {
+  const list = config.ai.profiles;
+  if (!list.length) return null;
+  const byId = list.find((p) => p.id === config.tts.onlineProfileId);
+  if (byId) return byId;
+  return list[Math.min(Math.max(config.ai.active, 0), list.length - 1)] ?? list[0];
+}
+
+function cacheKey(text: string): string {
+  const p = onlineProfile();
+  return [
+    p?.id ?? 0,
+    config.tts.onlineModel,
+    config.tts.onlineVoice,
+    config.tts.onlineFormat,
+    text,
+  ].join("\u0001");
+}
+
+function base64ToObjectUrl(b64: string, fmt: string): string {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const mime =
+    fmt === "wav" ? "audio/wav"
+      : fmt === "opus" ? "audio/ogg"
+        : fmt === "aac" ? "audio/aac"
+          : fmt === "flac" ? "audio/flac"
+            : "audio/mpeg";
+  return URL.createObjectURL(new Blob([bytes], { type: mime }));
+}
+
+function putCache(key: string, url: string) {
+  if (audioCache.size >= AUDIO_CACHE_MAX) {
+    const first = audioCache.keys().next().value;
+    if (first !== undefined) {
+      const old = audioCache.get(first);
+      if (old) URL.revokeObjectURL(old);
+      audioCache.delete(first);
+    }
+  }
+  audioCache.set(key, url);
+}
+
+function clearAudioCache() {
+  for (const u of audioCache.values()) URL.revokeObjectURL(u);
+  audioCache.clear();
+}
+
+async function loadAudio(text: string): Promise<string> {
+  const key = cacheKey(text);
+  const hit = audioCache.get(key);
+  if (hit) return hit;
+  const p = onlineProfile();
+  if (!p) throw new Error("未配置 AI 端点");
+  const fmt = config.tts.onlineFormat || "mp3";
+  const b64 = await api.ttsSynth({
+    provider: p.provider,
+    baseUrl: p.baseUrl,
+    apiKey: p.apiKey,
+    model: config.tts.onlineModel || p.model,
+    deployment: p.deployment,
+    apiVersion: p.apiVersion,
+    proxyMode: p.proxyMode,
+    proxyUrl: p.proxyUrl,
+    voice: config.tts.onlineVoice || "alloy",
+    format: fmt,
+    text,
+  });
+  const url = base64ToObjectUrl(b64, fmt);
+  putCache(key, url);
+  return url;
+}
+
+function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number) {
+  if (!audioEl) audioEl = new Audio();
+  usingAudio = true;
+  audioEl.onended = () => {
+    if (g !== gen) return;
+    playAt(i + 1);
+  };
+  audioEl.onerror = () => {
+    if (g !== gen) return;
+    playAt(i + 1);
+  };
+  audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
+  audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
+  audioEl.src = url;
+  audioEl
+    .play()
+    .catch(() => {
+      if (g !== gen) return;
+      // 自动播放被拦截或解码失败：回退系统语音，保证连续朗读
+      speakSystem(seg, i, g);
+    });
+}
+
+async function playOnline(seg: FlatSegment, i: number, g: number) {
+  try {
+    const url = await loadAudio(seg.text);
+    if (g !== gen) return;
+    playAudioUrl(url, seg, i, g);
+    void prefetch(i + 1, g);
+  } catch (e) {
+    if (g !== gen) return;
+    if (!onlineWarned) {
+      onlineWarned = true;
+      const msg = e && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e);
+      toast(`在线语音失败，已回退系统语音：${msg}`, "error");
+    }
+    speakSystem(seg, i, g);
+  }
+}
+
+async function prefetch(from: number, g: number) {
+  for (let k = 0; k < 2; k++) {
+    const j = from + k;
+    if (g !== gen || j >= segments.length) return;
+    const text = segments[j].text;
+    if (audioCache.has(cacheKey(text))) continue;
+    try {
+      await loadAudio(text);
+    } catch {
+      return;
+    }
+  }
+}
+
+/* ---------------- 播放控制 ---------------- */
+
+function playAt(i: number) {
   if (i < 0) {
     stopState();
     return;
@@ -141,35 +314,9 @@ function playAt(i: number) {
   ttsState.paused = false;
   const seg = segments[i];
   onSegmentCb?.(seg, i);
-
-  const u = new SpeechSynthesisUtterance(seg.text);
-  const v = resolveVoice();
-  if (v) {
-    u.voice = v;
-    u.lang = v.lang;
-  } else {
-    u.lang = config.tts.lang || "zh-CN";
-  }
-  u.rate = Math.max(0.5, Math.min(2, config.tts.rate || 1));
-  u.pitch = Math.max(0, Math.min(2, config.tts.pitch ?? 1));
-  u.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
   const g = gen;
-  u.onend = () => {
-    if (g !== gen) return;
-    playAt(i + 1);
-  };
-  u.onerror = () => {
-    if (g !== gen) return;
-    pageAdvanceGuard();
-    playAt(i + 1);
-  };
-  utter = u;
-  synth.speak(u);
-}
-
-// 播放中途若浏览器报错（如语音不支持），仍然继续下一句，避免卡死
-function pageAdvanceGuard() {
-  /* no-op hook，保留给未来错误统计 */
+  if (config.tts.engine === "online") void playOnline(seg, i, g);
+  else speakSystem(seg, i, g);
 }
 
 function stopState() {
@@ -180,25 +327,53 @@ function stopState() {
   onSegmentCb?.(null, -1);
 }
 
+function haltAudio() {
+  if (!audioEl) return;
+  try {
+    audioEl.onended = null;
+    audioEl.onerror = null;
+    audioEl.pause();
+    audioEl.removeAttribute("src");
+    audioEl.load();
+  } catch {
+    /* ignore */
+  }
+  usingAudio = false;
+}
+
 export function ttsStart(index = 0) {
-  if (!supported || !segments.length) return;
-  window.speechSynthesis.cancel();
+  if (!segments.length) return;
+  if (config.tts.engine === "system" && !supported) return;
+  window.speechSynthesis?.cancel();
+  haltAudio();
   gen++;
+  onlineWarned = false;
   ttsState.playing = true;
   ttsState.paused = false;
   playAt(Math.max(0, Math.min(index, segments.length - 1)));
 }
 
 export function ttsStop() {
-  if (!supported) return;
   gen++;
-  window.speechSynthesis.cancel();
+  window.speechSynthesis?.cancel();
+  haltAudio();
   stopState();
 }
 
 export function ttsPauseResume() {
-  if (!supported || !ttsState.playing) return;
+  if (!ttsState.playing) return;
+  if (config.tts.engine === "online" && usingAudio && audioEl) {
+    if (ttsState.paused) {
+      audioEl.play().catch(() => undefined);
+      ttsState.paused = false;
+    } else {
+      audioEl.pause();
+      ttsState.paused = true;
+    }
+    return;
+  }
   const synth = window.speechSynthesis;
+  if (!synth) return;
   if (ttsState.paused) {
     synth.resume();
     ttsState.paused = false;
@@ -209,23 +384,25 @@ export function ttsPauseResume() {
 }
 
 export function ttsNext() {
-  if (!supported || !ttsState.playing) return;
+  if (!ttsState.playing) return;
   gen++;
-  window.speechSynthesis.cancel();
+  window.speechSynthesis?.cancel();
+  haltAudio();
   playAt(ttsState.index + 1);
 }
 
 export function ttsPrev() {
-  if (!supported || !ttsState.playing) return;
+  if (!ttsState.playing) return;
   gen++;
-  window.speechSynthesis.cancel();
+  window.speechSynthesis?.cancel();
+  haltAudio();
   playAt(ttsState.index - 1);
 }
 
 export function ttsPlayIndex(i: number) {
-  if (!supported) return;
   gen++;
-  window.speechSynthesis.cancel();
+  window.speechSynthesis?.cancel();
+  haltAudio();
   ttsState.playing = true;
   ttsState.paused = false;
   playAt(i);

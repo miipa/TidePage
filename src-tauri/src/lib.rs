@@ -311,6 +311,7 @@ pub fn run() {
             library::get_stats,
             library::ai_chat,
             library::ai_test,
+            library::tts_synth,
             library::search_all,
             library::search_in_book,
             library::ensure_book_text_cmd,

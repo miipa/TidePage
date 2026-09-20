@@ -828,6 +828,86 @@ pub async fn stream_chat(
     Ok(())
 }
 
+/* ============================ 在线语音合成（TTS） ============================ */
+
+#[derive(serde::Serialize)]
+struct TtsBody {
+    model: String,
+    input: String,
+    voice: String,
+    response_format: String,
+}
+
+/// 调用 OpenAI 兼容 / Azure OpenAI 的语音合成接口，返回音频字节（如 mp3）。
+pub async fn synthesize(
+    http: reqwest::Client,
+    cfg: AiConfig,
+    voice: &str,
+    format: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    let p = Provider::parse(&cfg.provider);
+    let base = strip_trailing_slash(&cfg.base_url);
+    if base.is_empty() {
+        return Err(AiError::config("未配置语音端点地址"));
+    }
+    let (url, headers) = match p {
+        Provider::OpenAi | Provider::Ollama => {
+            // Ollama 无 /audio/speech，最终会返回 4xx，这里统一按 OpenAI 兼容路径尝试
+            let b = ensure_v1(base);
+            (format!("{b}/audio/speech"), bearer_headers(&cfg.api_key))
+        }
+        Provider::Azure => {
+            let dep = cfg.deployment.trim();
+            if dep.is_empty() {
+                return Err(AiError::config("Azure OpenAI 语音需要填写部署名（deployment）"));
+            }
+            let ver = if cfg.api_version.trim().is_empty() {
+                "2024-06-01"
+            } else {
+                cfg.api_version.trim()
+            };
+            let mut h: Vec<(String, String)> = Vec::new();
+            if !cfg.api_key.trim().is_empty() {
+                h.push(("api-key".into(), cfg.api_key.clone()));
+            }
+            (
+                format!("{base}/openai/deployments/{dep}/audio/speech?api-version={ver}"),
+                h,
+            )
+        }
+        _ => {
+            return Err(AiError::config(
+                "在线语音仅支持 OpenAI 兼容或 Azure OpenAI 端点；请改用系统语音",
+            ))
+        }
+    };
+    let fmt = if format.trim().is_empty() { "mp3" } else { format.trim() };
+    let voice = if voice.trim().is_empty() { "alloy" } else { voice.trim() };
+    let body = TtsBody {
+        model: cfg.model.clone(),
+        input: text.to_string(),
+        voice: voice.to_string(),
+        response_format: fmt.to_string(),
+    };
+    let mut req = http.post(&url).json(&body);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    if bytes.is_empty() {
+        return Err(AiError::protocol("语音接口返回空音频"));
+    }
+    Ok(bytes.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

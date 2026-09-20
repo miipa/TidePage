@@ -102,6 +102,12 @@ export const api = {
     deployment?: string; apiVersion?: string;
     proxyMode: string; proxyUrl: string;
   }) => invoke<string>("ai_test", args),
+  ttsSynth: (args: {
+    provider: string; baseUrl: string; apiKey: string; model: string;
+    deployment?: string; apiVersion?: string;
+    proxyMode?: string; proxyUrl?: string;
+    voice: string; format: string; text: string;
+  }) => invoke<string>("tts_synth", args),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   searchInBook: (bookId: number, query: string) =>

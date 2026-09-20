@@ -910,7 +910,61 @@
       语音朗读使用系统内置语音（Windows 的 SAPI/OneCore，WebView2 提供）。安装更多中文语音包后，可在下方选择。
     </p>
 
-    {#if !ttsState.supported}
+    <div class="field">
+      <label>朗读引擎</label>
+      <select bind:value={config.tts.engine} onchange={saveConfig}>
+        <option value="system">系统语音（离线，使用 Windows 语音）</option>
+        <option value="online">在线神经语音（更自然，复用 AI 端点，消耗额度）</option>
+      </select>
+    </div>
+
+    {#if config.tts.engine === "online"}
+      <div class="grid2">
+        <div class="field">
+          <label>使用端点</label>
+          <select bind:value={config.tts.onlineProfileId} onchange={saveConfig}>
+            <option value={0}>当前 AI 端点</option>
+            {#each config.ai.profiles as p (p.id)}
+              <option value={p.id}>{p.name || `端点 ${p.id}`}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="field">
+          <label>音频格式</label>
+          <select bind:value={config.tts.onlineFormat} onchange={saveConfig}>
+            <option value="mp3">mp3</option>
+            <option value="wav">wav</option>
+            <option value="opus">opus</option>
+            <option value="aac">aac</option>
+            <option value="flac">flac</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label>语音模型（如 tts-1 / gpt-4o-mini-tts）</label>
+          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" />
+        </div>
+        <div class="field">
+          <label>音色（如 alloy / nova / shimmer）</label>
+          <input list="tts-online-voice-list" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
+        </div>
+      </div>
+      <datalist id="tts-online-voice-list">
+        <option value="alloy"></option>
+        <option value="echo"></option>
+        <option value="fable"></option>
+        <option value="onyx"></option>
+        <option value="nova"></option>
+        <option value="shimmer"></option>
+        <option value="coral"></option>
+        <option value="sage"></option>
+      </datalist>
+      <p class="tip">
+        仅支持 OpenAI 兼容（<code>/v1/audio/speech</code>）或 Azure OpenAI 端点；失败的句子会自动回退系统语音。
+        语速映射为播放速度，音调对在线语音无效。
+      </p>
+    {:else if !ttsState.supported}
       <p class="tip" style="color:var(--danger)">当前环境不支持系统语音朗读。</p>
     {:else}
       <div class="field">
@@ -925,48 +979,49 @@
           <p class="tip">未检测到语音，请确认系统已安装语音包（设置 → 时间和语言 → 语音）。</p>
         {/if}
       </div>
-
-      <div class="grid2">
-        <div class="field">
-          <label>自动选择语言</label>
-          <input bind:value={config.tts.lang} onchange={saveConfig} placeholder="zh-CN" />
-        </div>
-        <div class="field">
-          <label>定时停止默认值</label>
-          <select bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
-            <option value={0}>关闭</option>
-            <option value={5}>5 分钟</option>
-            <option value={10}>10 分钟</option>
-            <option value={15}>15 分钟</option>
-            <option value={30}>30 分钟</option>
-            <option value={60}>60 分钟</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="grid3">
-        <div class="field">
-          <label>语速 {config.tts.rate.toFixed(2)}</label>
-          <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
-        </div>
-        <div class="field">
-          <label>音调 {config.tts.pitch.toFixed(2)}</label>
-          <input type="range" min="0" max="2" step="0.05" bind:value={config.tts.pitch} oninput={saveConfig} />
-        </div>
-        <div class="field">
-          <label>音量 {Math.round(config.tts.volume * 100)}%</label>
-          <input type="range" min="0" max="1" step="0.05" bind:value={config.tts.volume} oninput={saveConfig} />
-        </div>
-      </div>
-
-      <div class="checks">
-        <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
-        <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
-      </div>
-      <p class="tip">
-        在阅读界面点「▶」开始朗读：优先从选中文字开始，否则从当前屏幕顶部开始；播放条可暂停/继续、上一句/下一句、停止，并可设置定时停止与语速。
-      </p>
     {/if}
+
+    {#if config.tts.engine === "system"}
+      <div class="field">
+        <label>自动选择语言（未指定语音时按此语言挑系统语音）</label>
+        <input bind:value={config.tts.lang} onchange={saveConfig} placeholder="zh-CN" />
+      </div>
+    {/if}
+
+    <div class="grid3">
+      <div class="field">
+        <label>语速 {config.tts.rate.toFixed(2)}</label>
+        <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
+      </div>
+      <div class="field">
+        <label>音调 {config.tts.pitch.toFixed(2)}{config.tts.engine === "online" ? "（在线无效）" : ""}</label>
+        <input type="range" min="0" max="2" step="0.05" bind:value={config.tts.pitch} oninput={saveConfig} disabled={config.tts.engine === "online"} />
+      </div>
+      <div class="field">
+        <label>音量 {Math.round(config.tts.volume * 100)}%</label>
+        <input type="range" min="0" max="1" step="0.05" bind:value={config.tts.volume} oninput={saveConfig} />
+      </div>
+    </div>
+
+    <div class="field">
+      <label>定时停止默认值</label>
+      <select bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
+        <option value={0}>关闭</option>
+        <option value={5}>5 分钟</option>
+        <option value={10}>10 分钟</option>
+        <option value={15}>15 分钟</option>
+        <option value={30}>30 分钟</option>
+        <option value={60}>60 分钟</option>
+      </select>
+    </div>
+
+    <div class="checks">
+      <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
+      <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
+    </div>
+    <p class="tip">
+      在阅读界面点「▶」开始朗读：优先从选中文字开始，否则从当前屏幕顶部开始；播放条可暂停/继续、上一句/下一句、停止，并可设置定时停止与语速。
+    </p>
   {:else if tab === "webdav"}
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>

@@ -1644,6 +1644,36 @@ pub async fn ai_test(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn tts_synth(
+    provider: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    deployment: Option<String>,
+    api_version: Option<String>,
+    proxy_mode: Option<String>,
+    proxy_url: Option<String>,
+    voice: String,
+    format: String,
+    text: String,
+) -> Result<String, crate::ai::AiError> {
+    let cfg = crate::ai::AiConfig {
+        provider,
+        base_url,
+        api_key,
+        model,
+        deployment: deployment.unwrap_or_default(),
+        api_version: api_version.unwrap_or_default(),
+    };
+    let http = crate::ai::build_client(proxy_mode.as_deref().unwrap_or("auto"), proxy_url.as_deref().unwrap_or(""))
+        .map_err(crate::ai::AiError::config)?;
+    let bytes = crate::ai::synthesize(http, cfg, &voice, &format, &text).await?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+#[tauri::command]
 pub fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Vec<SearchHit> {
     let conn = state.db.0.lock().unwrap();
     if !db::has_fts(&conn) || query.chars().count() < 2 {

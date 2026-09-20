@@ -421,7 +421,19 @@ export const DEFAULT_PROMPTS: PromptItem[] = [
   },
 ];
 
+export type TtsEngine = "system" | "online";
+
 export interface TtsConfig {
+  /** 朗读引擎：system=系统离线语音；online=在线神经语音（复用 AI 端点） */
+  engine: TtsEngine;
+  /** 在线语音使用的 AI 端点 id（0=使用当前端点） */
+  onlineProfileId: number;
+  /** 在线语音模型（如 tts-1 / gpt-4o-mini-tts） */
+  onlineModel: string;
+  /** 在线语音音色（如 alloy/nova/…） */
+  onlineVoice: string;
+  /** 在线语音音频格式 */
+  onlineFormat: string;
   /** 指定语音（voice.name 或 voiceURI），空=按语言自动选择 */
   voice: string;
   /** 自动选择语音时的语言 */
@@ -574,6 +586,11 @@ p {
       "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
   },
   tts: {
+    engine: "system",
+    onlineProfileId: 0,
+    onlineModel: "tts-1",
+    onlineVoice: "alloy",
+    onlineFormat: "mp3",
     voice: "",
     lang: "zh-CN",
     rate: 1,

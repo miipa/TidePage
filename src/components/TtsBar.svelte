@@ -12,6 +12,8 @@
 
   let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
 
+  const ONLINE_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage"];
+
   let expanded = $state(false);
   let sleepLeft = $state(0);
   let sleepEnd = 0;
@@ -77,24 +79,33 @@
   {#if expanded}
     <div class="tb-panel">
       <div class="tb-row">
-        <label>语音</label>
-        <select bind:value={config.tts.voice} onchange={saveConfig}>
-          <option value="">自动（按语言）</option>
-          {#if zhVoices.length}
-            <optgroup label="中文">
-              {#each zhVoices as v (v.voiceURI)}
-                <option value={v.name}>{v.name} · {v.lang}</option>
-              {/each}
-            </optgroup>
-          {/if}
-          {#if otherVoices.length}
-            <optgroup label="其它语言">
-              {#each otherVoices as v (v.voiceURI)}
-                <option value={v.name}>{v.name} · {v.lang}</option>
-              {/each}
-            </optgroup>
-          {/if}
-        </select>
+        <label>{config.tts.engine === "online" ? "音色" : "语音"}</label>
+        {#if config.tts.engine === "online"}
+          <input list="tts-online-voices" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
+          <datalist id="tts-online-voices">
+            {#each ONLINE_VOICES as v (v)}
+              <option value={v}></option>
+            {/each}
+          </datalist>
+        {:else}
+          <select bind:value={config.tts.voice} onchange={saveConfig}>
+            <option value="">自动（按语言）</option>
+            {#if zhVoices.length}
+              <optgroup label="中文">
+                {#each zhVoices as v (v.voiceURI)}
+                  <option value={v.name}>{v.name} · {v.lang}</option>
+                {/each}
+              </optgroup>
+            {/if}
+            {#if otherVoices.length}
+              <optgroup label="其它语言">
+                {#each otherVoices as v (v.voiceURI)}
+                  <option value={v.name}>{v.name} · {v.lang}</option>
+                {/each}
+              </optgroup>
+            {/if}
+          </select>
+        {/if}
       </div>
       <div class="tb-grid">
         <label>语速 {config.tts.rate.toFixed(2)}</label>
