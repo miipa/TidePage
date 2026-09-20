@@ -167,18 +167,59 @@ function speakSystem(seg: FlatSegment, i: number, g: number) {
 
 /* ---------------- 在线语音 ---------------- */
 
-function onlineProfile() {
+interface TtsEndpoint {
+  provider: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  deployment: string;
+  apiVersion: string;
+  proxyMode: string;
+  proxyUrl: string;
+  tag: string;
+}
+
+/** 解析在线语音要用的端点：自定义地址，或某个 AI 端点。 */
+function resolveEndpoint(): TtsEndpoint | null {
+  if (config.tts.onlineSource === "custom") {
+    const base = (config.tts.customBaseUrl || "").trim();
+    if (!base) return null;
+    return {
+      provider: "openai",
+      baseUrl: base,
+      apiKey: config.tts.customApiKey || "",
+      model: config.tts.onlineModel || "tts-1",
+      deployment: "",
+      apiVersion: "",
+      proxyMode: "auto",
+      proxyUrl: "",
+      tag: `custom:${base}`,
+    };
+  }
   const list = config.ai.profiles;
   if (!list.length) return null;
-  const byId = list.find((p) => p.id === config.tts.onlineProfileId);
-  if (byId) return byId;
-  return list[Math.min(Math.max(config.ai.active, 0), list.length - 1)] ?? list[0];
+  const p =
+    list.find((x) => x.id === config.tts.onlineProfileId) ??
+    list[Math.min(Math.max(config.ai.active, 0), list.length - 1)] ??
+    list[0];
+  if (!p) return null;
+  return {
+    provider: p.provider,
+    baseUrl: p.baseUrl,
+    apiKey: p.apiKey,
+    model: config.tts.onlineModel || p.model,
+    deployment: p.deployment,
+    apiVersion: p.apiVersion,
+    proxyMode: p.proxyMode,
+    proxyUrl: p.proxyUrl,
+    tag: `profile:${p.id}`,
+  };
 }
 
 function cacheKey(text: string): string {
-  const p = onlineProfile();
+  const ep = resolveEndpoint();
   return [
-    p?.id ?? 0,
+    ep?.tag ?? "none",
     config.tts.onlineModel,
     config.tts.onlineVoice,
     config.tts.onlineFormat,
@@ -220,18 +261,18 @@ async function loadAudio(text: string): Promise<string> {
   const key = cacheKey(text);
   const hit = audioCache.get(key);
   if (hit) return hit;
-  const p = onlineProfile();
-  if (!p) throw new Error("未配置 AI 端点");
+  const ep = resolveEndpoint();
+  if (!ep) throw new Error("未配置在线语音端点");
   const fmt = config.tts.onlineFormat || "mp3";
   const b64 = await api.ttsSynth({
-    provider: p.provider,
-    baseUrl: p.baseUrl,
-    apiKey: p.apiKey,
-    model: config.tts.onlineModel || p.model,
-    deployment: p.deployment,
-    apiVersion: p.apiVersion,
-    proxyMode: p.proxyMode,
-    proxyUrl: p.proxyUrl,
+    provider: ep.provider,
+    baseUrl: ep.baseUrl,
+    apiKey: ep.apiKey,
+    model: ep.model,
+    deployment: ep.deployment,
+    apiVersion: ep.apiVersion,
+    proxyMode: ep.proxyMode,
+    proxyUrl: ep.proxyUrl,
     voice: config.tts.onlineVoice || "alloy",
     format: fmt,
     text,

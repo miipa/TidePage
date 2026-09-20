@@ -424,8 +424,14 @@ export const DEFAULT_PROMPTS: PromptItem[] = [
 export type TtsEngine = "system" | "online";
 
 export interface TtsConfig {
-  /** 朗读引擎：system=系统离线语音；online=在线神经语音（复用 AI 端点） */
+  /** 朗读引擎：system=系统离线语音；online=在线神经语音 */
   engine: TtsEngine;
+  /** 在线语音来源：profile=复用 AI 端点；custom=自定义本地/远程 TTS 服务地址 */
+  onlineSource: "profile" | "custom";
+  /** 自定义 TTS 服务地址（OpenAI 兼容 /v1/audio/speech） */
+  customBaseUrl: string;
+  /** 自定义 TTS 服务密钥（本地服务可留空） */
+  customApiKey: string;
   /** 在线语音使用的 AI 端点 id（0=使用当前端点） */
   onlineProfileId: number;
   /** 在线语音模型（如 tts-1 / gpt-4o-mini-tts） */
@@ -587,6 +593,9 @@ p {
   },
   tts: {
     engine: "system",
+    onlineSource: "profile",
+    customBaseUrl: "http://127.0.0.1:8000",
+    customApiKey: "",
     onlineProfileId: 0,
     onlineModel: "tts-1",
     onlineVoice: "alloy",

@@ -496,9 +496,9 @@
 <div class="modal-body settings">
   <div class="tabs">
     <button class:active={tab === "reader"} onclick={() => (tab = "reader")}>阅读</button>
+    <button class:active={tab === "tts"} onclick={() => { tab = "tts"; refreshVoices(); }}>语音朗读</button>
     <button class:active={tab === "split"} onclick={() => (tab = "split")}>分章</button>
     <button class:active={tab === "keys"} onclick={() => (tab = "keys")}>按键</button>
-    <button class:active={tab === "tts"} onclick={() => { tab = "tts"; refreshVoices(); }}>朗读</button>
     <button class:active={tab === "webdav"} onclick={() => (tab = "webdav")}>WebDAV</button>
     <button class:active={tab === "ai"} onclick={() => (tab = "ai")}>AI</button>
     <button class:active={tab === "other"} onclick={() => (tab = "other")}>其他</button>
@@ -907,19 +907,38 @@
     </div>
   {:else if tab === "tts"}
     <p class="tip">
-      语音朗读使用系统内置语音（Windows 的 SAPI/OneCore，WebView2 提供）。安装更多中文语音包后，可在下方选择。
+      这里集中管理「语音朗读」的全部设置，与 AI 助手设置相互独立。系统语音离线可用；在线神经语音更自然（可接本地 VoxCPM、GPT-SoVITS、CosyVoice 等 OpenAI 兼容服务）。
     </p>
 
     <div class="field">
       <label>朗读引擎</label>
       <select bind:value={config.tts.engine} onchange={saveConfig}>
         <option value="system">系统语音（离线，使用 Windows 语音）</option>
-        <option value="online">在线神经语音（更自然，复用 AI 端点，消耗额度）</option>
+        <option value="online">在线神经语音（更自然，需一个 OpenAI 兼容 TTS 服务）</option>
       </select>
     </div>
 
     {#if config.tts.engine === "online"}
-      <div class="grid2">
+      <div class="field">
+        <label>语音服务来源</label>
+        <select bind:value={config.tts.onlineSource} onchange={saveConfig}>
+          <option value="custom">自定义服务地址（本地/远程，推荐接本地 VoxCPM）</option>
+          <option value="profile">复用「AI 设置」里的某个端点</option>
+        </select>
+      </div>
+
+      {#if config.tts.onlineSource === "custom"}
+        <div class="grid2">
+          <div class="field">
+            <label>服务地址（OpenAI 兼容 /v1/audio/speech）</label>
+            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder="http://127.0.0.1:8000" />
+          </div>
+          <div class="field">
+            <label>密钥（本地服务留空）</label>
+            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder="可留空" />
+          </div>
+        </div>
+      {:else}
         <div class="field">
           <label>使用端点</label>
           <select bind:value={config.tts.onlineProfileId} onchange={saveConfig}>
@@ -929,26 +948,27 @@
             {/each}
           </select>
         </div>
-        <div class="field">
-          <label>音频格式</label>
-          <select bind:value={config.tts.onlineFormat} onchange={saveConfig}>
-            <option value="mp3">mp3</option>
-            <option value="wav">wav</option>
-            <option value="opus">opus</option>
-            <option value="aac">aac</option>
-            <option value="flac">flac</option>
-          </select>
-        </div>
-      </div>
+      {/if}
+
       <div class="grid2">
         <div class="field">
-          <label>语音模型（如 tts-1 / gpt-4o-mini-tts）</label>
+          <label>语音模型（本地 VoxCPM 可填 voxcpm；OpenAI 用 tts-1）</label>
           <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" />
         </div>
         <div class="field">
-          <label>音色（如 alloy / nova / shimmer）</label>
+          <label>音色（如 alloy / nova / shimmer；VoxCPM 填 default 或参考音频 .wav 路径）</label>
           <input list="tts-online-voice-list" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
         </div>
+      </div>
+      <div class="field">
+        <label>音频格式（本地 VoxCPM 服务请选 wav）</label>
+        <select bind:value={config.tts.onlineFormat} onchange={saveConfig}>
+          <option value="wav">wav</option>
+          <option value="mp3">mp3</option>
+          <option value="opus">opus</option>
+          <option value="aac">aac</option>
+          <option value="flac">flac</option>
+        </select>
       </div>
       <datalist id="tts-online-voice-list">
         <option value="alloy"></option>
@@ -961,14 +981,14 @@
         <option value="sage"></option>
       </datalist>
       <p class="tip">
-        仅支持 OpenAI 兼容（<code>/v1/audio/speech</code>）或 Azure OpenAI 端点；失败的句子会自动回退系统语音。
-        语速映射为播放速度，音调对在线语音无效。
+        需目标服务提供 OpenAI 兼容的 <code>/v1/audio/speech</code>（OpenAI、Azure OpenAI、vLLM-Omni 的 VoxCPM、GPT-SoVITS 封装等）。
+        某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
       </p>
     {:else if !ttsState.supported}
       <p class="tip" style="color:var(--danger)">当前环境不支持系统语音朗读。</p>
     {:else}
       <div class="field">
-        <label>语音（空=按语言自动选择）</label>
+        <label>系统语音（空=按语言自动选择）</label>
         <select bind:value={config.tts.voice} onchange={saveConfig}>
           <option value="">自动（按语言）</option>
           {#each ttsState.voices as v (v.voiceURI)}
