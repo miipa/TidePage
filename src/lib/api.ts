@@ -108,6 +108,8 @@ export const api = {
     proxyMode?: string; proxyUrl?: string;
     voice: string; format: string; text: string;
   }) => invoke<string>("tts_synth", args),
+  ttsVoices: (baseUrl: string, apiKey: string) =>
+    invoke<string[]>("tts_voices", { baseUrl, apiKey }),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   searchInBook: (bookId: number, query: string) =>

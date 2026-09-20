@@ -1673,6 +1673,41 @@ pub async fn tts_synth(
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
+/// 读取自定义 TTS 服务（如本地 VoxCPM）提供的音色列表：GET {base}/v1/voices。
+#[tauri::command]
+pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("未填写服务地址".into());
+    }
+    let url = if base.ends_with("/v1") {
+        format!("{base}/voices")
+    } else {
+        format!("{base}/v1/voices")
+    };
+    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let mut req = client.get(&url);
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    let resp = req.send().await.map_err(|e| format!("请求失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("服务返回 HTTP {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out: Vec<String> = Vec::new();
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        for it in arr {
+            if let Some(id) = it.get("id").and_then(|x| x.as_str()) {
+                out.push(id.to_string());
+            } else if let Some(s) = it.as_str() {
+                out.push(s.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 pub fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Vec<SearchHit> {
     let conn = state.db.0.lock().unwrap();

@@ -41,6 +41,34 @@
   let dataDir = $state("");
   let mobiEnc = $state("auto");
 
+  let ttsVoiceList = $state<string[]>([]);
+  let ttsVoiceLoading = $state(false);
+  let ttsVoiceMsg = $state("");
+
+  async function loadTtsVoices() {
+    if (config.tts.onlineSource !== "custom") return;
+    ttsVoiceLoading = true;
+    ttsVoiceMsg = "";
+    try {
+      ttsVoiceList = await api.ttsVoices(config.tts.customBaseUrl, config.tts.customApiKey);
+      ttsVoiceMsg = ttsVoiceList.length
+        ? `共 ${ttsVoiceList.length} 个音色（来自服务）`
+        : "服务未返回音色列表（需支持 /v1/voices）";
+      if (ttsVoiceList.length && !config.tts.onlineVoice) {
+        config.tts.onlineVoice = ttsVoiceList[0];
+        saveConfig();
+      }
+    } catch (e) {
+      ttsVoiceMsg = `读取失败：${e}`;
+    } finally {
+      ttsVoiceLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (tab === "tts") loadTtsVoices();
+  });
+
   $effect(() => {
     if (tab !== "other") return;
     api
@@ -956,10 +984,29 @@
           <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" />
         </div>
         <div class="field">
-          <label>音色（如 alloy / nova / shimmer；VoxCPM 填 default 或参考音频 .wav 路径）</label>
-          <input list="tts-online-voice-list" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
+          <label>音色</label>
+          {#if config.tts.onlineSource === "custom"}
+            <div class="row-inline">
+              <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
+                <option value="">默认（服务端参考音色）</option>
+                {#each ttsVoiceList as v (v)}
+                  <option value={v}>{v}</option>
+                {/each}
+              </select>
+              <button onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
+            </div>
+          {:else}
+            <input list="tts-online-voice-list" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
+          {/if}
         </div>
       </div>
+      {#if config.tts.onlineSource === "custom"}
+        <div class="field">
+          <label>或直接填参考音频 .wav 完整路径（音色会固定用该音频）</label>
+          <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="D:\VoxCPM\voices\ref_male.wav" />
+        </div>
+        {#if ttsVoiceMsg}<p class="tip">{ttsVoiceMsg}</p>{/if}
+      {/if}
       <div class="field">
         <label>音频格式（本地 VoxCPM 服务请选 wav）</label>
         <select bind:value={config.tts.onlineFormat} onchange={saveConfig}>

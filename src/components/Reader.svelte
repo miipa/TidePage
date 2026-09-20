@@ -1372,10 +1372,38 @@ ${r.cssExtra || ""}
     return offsetOfRange(root, range);
   }
 
-  /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。
-   *  注意：翻页模式下 #chapter-content 的包围盒包含所有栏（宽达屏幕外），
-   *  必须按“可见区域”取点，否则中心点落在屏幕外导致定位失败、退回章节开头。 */
+  /** 第一个「可见」文本节点对应的章节文本偏移（按元素真实可见矩形判断，
+   *  翻页模式只算当前页的栏，滚动模式只算视口内，均不受包围盒影响）。 */
+  function firstVisibleOffset(root: HTMLElement): number | null {
+    const vr = (contentEl ?? root).getBoundingClientRect();
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let acc = 0;
+    let n = walker.nextNode() as Text | null;
+    while (n) {
+      const val = n.nodeValue ?? "";
+      const len = val.length;
+      if (len && val.trim()) {
+        const r = document.createRange();
+        r.selectNodeContents(n);
+        const rects = r.getClientRects();
+        for (let i = 0; i < rects.length; i++) {
+          const rc = rects[i];
+          const visX = rc.right > vr.left + 2 && rc.left < vr.right - 2;
+          const visY = rc.bottom > vr.top + 2 && rc.top < vr.bottom - 2;
+          if (visX && visY) return acc;
+        }
+      }
+      acc += len;
+      n = walker.nextNode() as Text | null;
+    }
+    return null;
+  }
+
+  /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。 */
   function offsetAtViewportTop(root: HTMLElement): number | null {
+    const vis = firstVisibleOffset(root);
+    if (vis != null) return vis;
+    // 兜底：按可见区域取光标点
     const vr = (contentEl ?? root).getBoundingClientRect();
     const xs = [0.5, 0.3, 0.7, 0.15, 0.85];
     const ys = [8, 20, 36, 56, 80, 120];

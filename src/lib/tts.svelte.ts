@@ -302,30 +302,44 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number) {
   audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
   audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
   audioEl.src = url;
-  audioEl
-    .play()
-    .catch(() => {
-      if (g !== gen) return;
-      // 自动播放被拦截或解码失败：回退系统语音，保证连续朗读
-      speakSystem(seg, i, g);
-    });
+  audioEl.play().catch(() => {
+    if (g !== gen) return;
+    // 重试一次，仍失败才回退系统语音（避免偶发失败导致音色/音量突变）
+    setTimeout(() => {
+      if (g !== gen || !audioEl) return;
+      audioEl.play().catch(() => {
+        if (g !== gen) return;
+        speakSystem(seg, i, g);
+      });
+    }, 300);
+  });
 }
 
 async function playOnline(seg: FlatSegment, i: number, g: number) {
-  try {
-    const url = await loadAudio(seg.text);
-    if (g !== gen) return;
-    playAudioUrl(url, seg, i, g);
-    void prefetch(i + 1, g);
-  } catch (e) {
-    if (g !== gen) return;
-    if (!onlineWarned) {
-      onlineWarned = true;
-      const msg = e && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e);
-      toast(`在线语音失败，已回退系统语音：${msg}`, "error");
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const url = await loadAudio(seg.text);
+      if (g !== gen) return;
+      playAudioUrl(url, seg, i, g);
+      void prefetch(i + 1, g);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (g !== gen) return;
+      await new Promise((r) => setTimeout(r, 400));
     }
-    speakSystem(seg, i, g);
   }
+  if (g !== gen) return;
+  if (!onlineWarned) {
+    onlineWarned = true;
+    const msg =
+      lastErr && typeof lastErr === "object" && "message" in lastErr
+        ? String((lastErr as { message: unknown }).message)
+        : String(lastErr);
+    toast(`在线语音连续失败，本句回退系统语音：${msg}`, "error");
+  }
+  speakSystem(seg, i, g);
 }
 
 async function prefetch(from: number, g: number) {
