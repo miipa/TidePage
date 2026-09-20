@@ -16,7 +16,7 @@ const CLOSERS = "」』”\"'）)】》〉」";
 const SOFT_BREAK = "，,、；;：:";
 
 /** 把章节纯文本切成适合朗读的句子片段（保留原文偏移）。 */
-export function splitSegments(text: string, maxLen = 160): FlatSegment[] {
+export function splitSegments(text: string, maxLen = 100): FlatSegment[] {
   const out: FlatSegment[] = [];
   const n = text.length;
   let start = 0;
@@ -323,7 +323,9 @@ async function playOnline(seg: FlatSegment, i: number, g: number) {
 }
 
 async function prefetch(from: number, g: number) {
-  for (let k = 0; k < 2; k++) {
+  // 在线语音较慢：多预取几句，保证播放不断档（RTF<1 时可持续领先）
+  const depth = config.tts.engine === "online" ? 4 : 1;
+  for (let k = 0; k < depth; k++) {
     const j = from + k;
     if (g !== gen || j >= segments.length) return;
     const text = segments[j].text;
