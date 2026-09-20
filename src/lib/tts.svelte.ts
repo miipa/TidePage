@@ -227,17 +227,22 @@ function cacheKey(text: string): string {
   ].join("\u0001");
 }
 
-function base64ToObjectUrl(b64: string, fmt: string): string {
+/** 按音频字节魔数判断真实格式，避免服务返回格式与设置不一致导致无法解码。 */
+function sniffAudioMime(b: Uint8Array): string {
+  if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46) return "audio/wav"; // RIFF
+  if (b.length >= 4 && b[0] === 0x4f && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return "audio/ogg"; // OggS
+  if (b.length >= 4 && b[0] === 0x66 && b[1] === 0x4c && b[2] === 0x61 && b[3] === 0x43) return "audio/flac"; // fLaC
+  if (b.length >= 3 && b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) return "audio/mpeg"; // ID3
+  if (b.length >= 2 && b[0] === 0xff && (b[1] & 0xe0) === 0xe0) return "audio/mpeg"; // MP3 frame
+  if (b.length >= 2 && b[0] === 0xff && (b[1] & 0xf6) === 0xf0) return "audio/aac"; // ADTS
+  return "audio/mpeg";
+}
+
+function base64ToObjectUrl(b64: string): string {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const mime =
-    fmt === "wav" ? "audio/wav"
-      : fmt === "opus" ? "audio/ogg"
-        : fmt === "aac" ? "audio/aac"
-          : fmt === "flac" ? "audio/flac"
-            : "audio/mpeg";
-  return URL.createObjectURL(new Blob([bytes], { type: mime }));
+  return URL.createObjectURL(new Blob([bytes], { type: sniffAudioMime(bytes) }));
 }
 
 function putCache(key: string, url: string) {
@@ -277,7 +282,7 @@ async function loadAudio(text: string): Promise<string> {
     format: fmt,
     text,
   });
-  const url = base64ToObjectUrl(b64, fmt);
+  const url = base64ToObjectUrl(b64);
   putCache(key, url);
   return url;
 }
@@ -291,7 +296,8 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number) {
   };
   audioEl.onerror = () => {
     if (g !== gen) return;
-    playAt(i + 1);
+    // 音频解码/加载失败：回退系统语音读完这句，避免静默跳句
+    speakSystem(seg, i, g);
   };
   audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
   audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
@@ -324,7 +330,7 @@ async function playOnline(seg: FlatSegment, i: number, g: number) {
 
 async function prefetch(from: number, g: number) {
   // 在线语音较慢：多预取几句，保证播放不断档（RTF<1 时可持续领先）
-  const depth = config.tts.engine === "online" ? 6 : 1;
+  const depth = config.tts.engine === "online" ? 3 : 1;
   for (let k = 0; k < depth; k++) {
     const j = from + k;
     if (g !== gen || j >= segments.length) return;

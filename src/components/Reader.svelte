@@ -1336,16 +1336,25 @@ ${r.cssExtra || ""}
     if (range) scrollToRange(range);
   }
 
-  /** 光标点（视口顶部中央）对应的章节文本偏移，用于「从当前屏开始朗读」。 */
-  function offsetAtViewportTop(root: HTMLElement): number | null {
-    const r = root.getBoundingClientRect();
-    const x = r.left + r.width / 2;
-    const y = Math.min(r.bottom - 2, Math.max(r.top + 2, (contentEl?.getBoundingClientRect().top ?? r.top) + 6));
-    let range: Range | null = null;
+  /** 任意 Range 起点在 root 纯文本中的字符偏移（对元素/文本节点都稳健）。 */
+  function offsetOfRange(root: Node, range: Range): number | null {
+    try {
+      const r = document.createRange();
+      r.selectNodeContents(root);
+      r.setEnd(range.startContainer, range.startOffset);
+      return r.toString().length;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 视口内某点对应的章节文本偏移。 */
+  function offsetAtPoint(root: HTMLElement, x: number, y: number): number | null {
     const doc = document as Document & {
       caretRangeFromPoint?: (x: number, y: number) => Range | null;
       caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
     };
+    let range: Range | null = null;
     if (doc.caretRangeFromPoint) {
       range = doc.caretRangeFromPoint(x, y);
     } else if (doc.caretPositionFromPoint) {
@@ -1355,13 +1364,28 @@ ${r.cssExtra || ""}
         range.setStart(p.offsetNode, p.offset);
       }
     }
-    if (!range) return null;
-    const offs = selectionOffsets(root, range);
-    return offs ? offs.start : null;
+    if (!range || !root.contains(range.startContainer)) return null;
+    return offsetOfRange(root, range);
   }
 
-  /** 开始朗读：优先从当前选区开始，否则从当前屏幕顶部开始，否则从头。 */
-  function startTts() {
+  /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。 */
+  function offsetAtViewportTop(root: HTMLElement): number | null {
+    const r = root.getBoundingClientRect();
+    const contTop = contentEl?.getBoundingClientRect().top ?? r.top;
+    const top = Math.max(r.top + 1, contTop + 1);
+    const xs = [0.5, 0.3, 0.7, 0.15, 0.85];
+    const ys = [top + 6, top + 16, top + 30, top + 48];
+    for (const dy of ys) {
+      for (const fx of xs) {
+        const off = offsetAtPoint(root, r.left + r.width * fx, Math.min(r.bottom - 2, dy));
+        if (off != null && off > 0) return off;
+      }
+    }
+    return 0;
+  }
+
+  /** 开始朗读：fromSelection=true 时优先从选中处开始；否则一律从当前页顶部开始。 */
+  function startTts(fromSelection = true) {
     if (!ttsState.supported) {
       toast("当前环境不支持系统语音朗读", "error");
       return;
@@ -1375,16 +1399,23 @@ ${r.cssExtra || ""}
       return;
     }
     let idx = 0;
-    const sel = window.getSelection();
     let off: number | null = null;
-    if (sel && !sel.isCollapsed && sel.rangeCount) {
-      const o = selectionOffsets(root, sel.getRangeAt(0));
-      if (o) off = o.start;
+    if (fromSelection) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.rangeCount) {
+        const o = selectionOffsets(root, sel.getRangeAt(0));
+        if (o) off = o.start;
+      }
     }
     if (off == null) off = offsetAtViewportTop(root);
     if (off != null) idx = segIndexAt(segs, off);
     ttsSetSegments(segs);
     ttsStart(idx);
+  }
+
+  /** 从当前页顶部开始朗读（忽略选区）。 */
+  function startTtsFromPage() {
+    startTts(false);
   }
 
   /** 停止朗读并清除高亮。 */
@@ -1526,9 +1557,10 @@ ${r.cssExtra || ""}
       {/if}
       <button class="icon" title="添加书签" onclick={addBookmark}>🔖</button>
       <button class="icon" title="书签列表" onclick={loadBookmarks}>≡</button>
-      <button class="icon" title={ttsState.playing ? "朗读：暂停/继续" : "朗读（从当前屏幕/选中处开始）"} onclick={toggleTts}>
+      <button class="icon" title={ttsState.playing ? "朗读：暂停/继续" : "朗读（优先从选中处，否则从本页开始）"} onclick={toggleTts}>
         {ttsState.playing ? "⏸" : "▶"}
       </button>
+      <button class="icon" title="从本页顶部开始朗读" onclick={startTtsFromPage}>页▶</button>
       <button class="icon" title="停止朗读" onclick={stopTts}>■</button>
       <button class="icon" title="划线 / 批注" onclick={() => (highlightsOpen = !highlightsOpen)}>✎</button>
       <button class="icon" title="AI 助手" onclick={toggleAi}>AI</button>

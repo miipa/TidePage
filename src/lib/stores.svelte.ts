@@ -599,7 +599,7 @@ p {
     onlineProfileId: 0,
     onlineModel: "tts-1",
     onlineVoice: "alloy",
-    onlineFormat: "mp3",
+    onlineFormat: "wav",
     voice: "",
     lang: "zh-CN",
     rate: 1,
