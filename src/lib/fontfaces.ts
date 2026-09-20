@@ -14,9 +14,38 @@ export function customFontFaceCss(fonts?: CustomFontItem[]): string {
     .filter((f) => f && f.family && f.file)
     .map(
       (f) =>
-        `@font-face { font-family: "${f.family}"; src: url('http://flowread.localhost/fonts/${f.file}'); }`,
+        // font-display:block：字体未就绪时先不显示回退字体，避免「先别字体再变」的闪烁
+        `@font-face { font-family: "${f.family}"; src: url('http://flowread.localhost/fonts/${f.file}'); font-display: block; }`,
     )
     .join("\n");
+}
+
+/** 把 font-family 列表拆成单个字体名（去掉引号）。 */
+function splitFamilies(raw: string): string[] {
+  return (raw || "")
+    .split(",")
+    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean);
+}
+
+/**
+ * 预加载阅读界面常用的字体（正文字体 + 西文字体）。
+ * 在渲染章节正文之前 await，可保证首次打开书籍时直接以设定字体呈现，不出现回退字体闪烁。
+ * 系统字体没有 @font-face，load() 会立即完成；用户安装的字体则会真正拉取并缓存。
+ */
+export async function preloadReaderFonts(timeoutMs = 3000): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return;
+  const families = [
+    ...splitFamilies(config.reader.fontFamily),
+    ...splitFamilies(config.reader.latinFont),
+  ];
+  if (!families.length) return;
+  const size = Math.max(12, Math.min(64, config.reader.fontSize || 16));
+  const jobs = families.map((f) =>
+    document.fonts.load(`${size}px "${f}"`).catch(() => undefined),
+  );
+  const timeout = new Promise<void>((r) => setTimeout(r, timeoutMs));
+  await Promise.race([Promise.all(jobs).then(() => undefined), timeout]);
 }
 
 /**

@@ -9,7 +9,7 @@
   import WebdavBrowser from "../components/WebdavBrowser.svelte";
   import StandaloneBook from "../components/StandaloneBook.svelte";
   import { confirmAnswer, confirmBox, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
-  import { syncCustomFontFaces } from "../lib/fontfaces";
+  import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { listen } from "@tauri-apps/api/event";
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
@@ -28,6 +28,15 @@
   $effect(() => {
     void config.reader.customFonts;
     syncCustomFontFaces();
+  });
+
+  // 启动即预加载设定字体，首次打开书籍时可直接以正确字体呈现（消除字体闪烁）
+  $effect(() => {
+    void config.reader.customFonts;
+    void config.reader.fontFamily;
+    void config.reader.latinFont;
+    void config.reader.fontSize;
+    preloadReaderFonts();
   });
 
   $effect(() => {

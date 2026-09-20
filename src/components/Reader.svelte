@@ -23,6 +23,7 @@
     type ZoneKey,
   } from "../lib/stores.svelte";
   import { SmoothScroller } from "../lib/smoothScroll";
+  import { preloadReaderFonts } from "../lib/fontfaces";
   import { charRangeToRange, findTextRange, paintHighlights, selectionOffsets } from "../lib/highlights";
   import type { PopupAnchor } from "../lib/placePopup";
   import AiPanel from "./AiPanel.svelte";
@@ -214,6 +215,8 @@
     if (!book) return;
     loadingChapter = true;
     try {
+      // 章节首次绘制前先确保设定字体已就绪，避免回退字体闪烁
+      await preloadReaderFonts();
       let ch = chapterCache.get(idx);
       if (!ch) {
         ch = await api.getChapter(book.book.id, idx);
