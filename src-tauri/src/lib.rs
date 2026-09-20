@@ -320,6 +320,7 @@ pub fn run() {
             library::delete_highlight,
             library::update_highlight,
             library::update_book_meta,
+            library::write_book_meta,
             library::rebuild_fts,
             library::index_book_fts,
             library::reveal_in_explorer,

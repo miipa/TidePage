@@ -2,7 +2,7 @@ use crate::models::TocEntry;
 use crate::txt::escape_html;
 use regex::Regex;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub struct EpubDoc {
@@ -671,6 +671,98 @@ pub fn find_cover_fallback(zip_bytes: &[u8], spine: &[String]) -> Option<Vec<u8>
         }
     }
     big.map(|(_, b)| b)
+}
+
+/// 用正则把某个标签的文本内容替换为新值（保留开标签属性）。
+fn set_tag_text(xml: &str, tag: &str, value: &str) -> Option<String> {
+    let esc = escape_html(value);
+    let pat = format!(r"(?s)(<{tag}[^>]*>).*?(</{tag}>)");
+    let re = Regex::new(&pat).ok()?;
+    if re.is_match(xml) {
+        Some(
+            re.replace(xml, |c: &regex::Captures| format!("{}{}{}", &c[1], esc, &c[2]))
+                .into_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+/// 直接覆盖写回 EPUB 的 OPF 元数据（dc:title / dc:creator），不生成备份。
+pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let cursor = std::io::Cursor::new(&data);
+    let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("EPUB 打开失败: {e}"))?;
+    let ci = build_ci(&mut zip);
+
+    let container = zip_read(&mut zip, &ci, "META-INF/container.xml")
+        .ok_or("缺少 META-INF/container.xml")?;
+    let container_str = String::from_utf8_lossy(&container).into_owned();
+    let opf_path = Regex::new(r#"full-path\s*=\s*"([^"]+)""#)
+        .ok()
+        .and_then(|re| re.captures(&container_str))
+        .map(|c| c[1].to_string())
+        .ok_or("container.xml 中未找到 OPF")?;
+
+    let opf_bytes = zip_read(&mut zip, &ci, &opf_path).ok_or("OPF 文件缺失")?;
+    let opf = String::from_utf8_lossy(&opf_bytes).into_owned();
+
+    let mut new_opf = set_tag_text(&opf, "dc:title", title);
+    new_opf = new_opf.and_then(|x| set_tag_text(&x, "dc:creator", author).or_else(|| {
+        // 没有 dc:creator 时，在 dc:title 之后插入一个
+        let esc = escape_html(author);
+        let re = Regex::new(r"(?s)(</dc:title>)").ok()?;
+        Some(
+            re.replace(&x, |c: &regex::Captures| {
+                format!("{c1}<dc:creator>{esc}</dc:creator>", c1 = &c[1])
+            })
+            .into_owned(),
+        )
+    }));
+    let new_opf = new_opf.ok_or("OPF 中未找到 dc:title 标签，无法写回")?;
+
+    // 读入所有条目
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = f.name().to_string();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        entries.push((name, buf));
+    }
+    drop(zip);
+
+    let opf_key = opf_path.replace('\\', "/").to_lowercase();
+    let tmp = format!("{path}.flowread-tmp");
+    {
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut zw = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        // 按 EPUB 规范：mimetype 首个且不压缩
+        if entries.iter().any(|(n, _)| n.eq_ignore_ascii_case("mimetype")) {
+            zw.start_file("mimetype", stored).map_err(|e| e.to_string())?;
+            zw.write_all(b"application/epub+zip").map_err(|e| e.to_string())?;
+        }
+        for (name, buf) in &entries {
+            if name.eq_ignore_ascii_case("mimetype") || name.ends_with('/') {
+                continue;
+            }
+            zw.start_file(name.clone(), deflated).map_err(|e| e.to_string())?;
+            if name.replace('\\', "/").to_lowercase() == opf_key {
+                zw.write_all(new_opf.as_bytes()).map_err(|e| e.to_string())?;
+            } else {
+                zw.write_all(buf).map_err(|e| e.to_string())?;
+            }
+        }
+        zw.finish().map_err(|e| e.to_string())?;
+    }
+    std::fs::copy(&tmp, path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
 }
 
 pub fn spine_docs_with_titles(zip_bytes: &[u8], spine: &[String]) -> Vec<(String, String)> {

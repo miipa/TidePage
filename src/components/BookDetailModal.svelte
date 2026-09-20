@@ -55,11 +55,26 @@
       await api.updateBookMeta(book.id, title.trim(), author.trim());
       book.title = title.trim();
       book.author = author.trim();
-      toast("书籍信息已保存");
+      toast("书籍信息已保存（仅软件内显示）");
     } catch (e) {
       toast(String(e), "error");
     } finally {
       saving = false;
+    }
+  }
+
+  let writing = $state(false);
+  async function saveToFile() {
+    writing = true;
+    try {
+      await api.writeBookMeta(book.id, title.trim(), author.trim());
+      book.title = title.trim();
+      book.author = author.trim();
+      toast("已写入原始 EPUB 文件（直接覆盖）");
+    } catch (e) {
+      toast(String(e), "error");
+    } finally {
+      writing = false;
     }
   }
 
@@ -186,7 +201,10 @@
       <button onclick={copyAll}>复制全部信息</button>
       <div class="flex1"></div>
       <button onclick={onclose}>关闭</button>
-      <button class="primary" onclick={save} disabled={saving}>{saving ? "保存中…" : "保存信息"}</button>
+      <button onclick={save} disabled={saving}>{saving ? "保存中…" : "保存信息"}</button>
+      <button class="primary" onclick={saveToFile} disabled={writing} title="把书名/作者直接写回原始 EPUB 文件（覆盖，不备份）">
+        {writing ? "写入中…" : "保存到书籍"}
+      </button>
     </div>
   </div>
 </div>

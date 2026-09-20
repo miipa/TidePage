@@ -57,15 +57,15 @@
   }
 
   let activeIdx = $state(-1);
-  let posStyle = $state("visibility:hidden;");
+  let autoPos = $state({ left: 0, top: 0 });
+  let userPos = $state<{ left: number; top: number } | null>(null);
 
-  $effect(() => {
-    const h = (e: PointerEvent) => {
-      if (popEl && !popEl.contains(e.target as Node)) onclose();
-    };
-    window.addEventListener("pointerdown", h, true);
-    return () => window.removeEventListener("pointerdown", h, true);
-  });
+  // 用户拖动后固定位置；未拖动时按锚点自适应摆放
+  const posStyle = $derived(
+    userPos
+      ? `left:${userPos.left}px; top:${userPos.top}px;`
+      : `left:${autoPos.left}px; top:${autoPos.top}px;`,
+  );
 
   // 内容高度随结果变化，需重新测量摆放（顶部/底部自动翻转并夹取到视口内）
   $effect(() => {
@@ -75,11 +75,11 @@
     void hits;
     void searching;
     void searched;
-    if (!popEl) return;
+    if (!popEl || userPos) return;
     requestAnimationFrame(() => {
-      if (!popEl) return;
+      if (!popEl || userPos) return;
       const p = placePopup(anchor, popEl.offsetWidth, popEl.offsetHeight);
-      posStyle = `left:${p.left}px; top:${p.top}px;`;
+      autoPos = p;
     });
   });
 
@@ -91,11 +91,35 @@
     activeIdx = i;
     onpick(h.chapter_index, query.trim());
   }
+
+  function startDrag(e: PointerEvent) {
+    if ((e.target as HTMLElement)?.closest("button")) return;
+    if (!popEl) return;
+    const rect = popEl.getBoundingClientRect();
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const ox = rect.left;
+    const oy = rect.top;
+    const w = rect.width;
+    const h = rect.height;
+    const move = (ev: PointerEvent) => {
+      const left = Math.max(4, Math.min(ox + ev.clientX - sx, window.innerWidth - w - 4));
+      const top = Math.max(4, Math.min(oy + ev.clientY - sy, window.innerHeight - h - 4));
+      userPos = { left, top };
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    e.preventDefault();
+  }
 </script>
 
 <div class="sb-pop" bind:this={popEl} style={posStyle}>
-  <div class="sb-head">
-    <span>全书搜索</span>
+  <div class="sb-head" onpointerdown={startDrag} title="按住拖动可移动此框">
+    <span class="sb-drag">⠿ 全书搜索</span>
     <div class="sb-head-acts">
       {#if canBack}
         <button class="mini" onclick={onback} title="返回跳转前的位置">↩ 返回</button>
@@ -153,7 +177,12 @@
     font-size: 13px;
     font-weight: 600;
     border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+    cursor: move;
+    user-select: none;
+    touch-action: none;
   }
+
+  .sb-drag { cursor: move; }
 
   .sb-head-acts {
     display: flex;

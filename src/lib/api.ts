@@ -118,6 +118,8 @@ export const api = {
     invoke<void>("update_highlight", { id, style, color, note }),
   updateBookMeta: (bookId: number, title: string, author: string) =>
     invoke<void>("update_book_meta", { bookId, title, author }),
+  writeBookMeta: (bookId: number, title: string, author: string) =>
+    invoke<void>("write_book_meta", { bookId, title, author }),
   suggestMeta: (path: string) =>
     invoke<{ title: string; author: string }>("suggest_meta", { path }),
   rebuildFts: () => invoke<number>("rebuild_fts"),

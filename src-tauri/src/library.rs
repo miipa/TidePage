@@ -1950,6 +1950,32 @@ pub fn update_book_meta(
     Ok(())
 }
 
+/// 把书名/作者直接写回原始电子书文件（当前支持 EPUB，直接覆盖，不生成备份），
+/// 同时更新数据库显示。
+#[tauri::command]
+pub fn write_book_meta(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    title: String,
+    author: String,
+) -> Result<(), String> {
+    let book = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?
+    };
+    let ext = ext_of(&book.path).unwrap_or_default();
+    if ext != "epub" {
+        return Err("写回原文件目前仅支持 EPUB；其他格式请先用「转换格式」转为 EPUB".into());
+    }
+    crate::epub::write_meta(&book.path, &title, &author)?;
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::update_book_title_author(&conn, book_id, &title, &author)?;
+    }
+    state.app.emit("library-changed", ()).ok();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
     let conn = state.db.0.lock().unwrap();
@@ -2455,5 +2481,41 @@ mod refresh_tests {
         assert_eq!(p1.total, 160_000);
         assert_eq!(p4.total, 1000, "Book 159000..159999 共 1000 本");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod epub_meta_tests {
+    use std::io::Write;
+
+    fn write_min_epub(path: &std::path::Path) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let stored =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("mimetype", stored).unwrap();
+        zw.write_all(b"application/epub+zip").unwrap();
+        zw.start_file("META-INF/container.xml", deflated).unwrap();
+        zw.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        zw.start_file("OEBPS/content.opf", deflated).unwrap();
+        zw.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title id="t">Old Title</dc:title><dc:creator id="c">Old Author</dc:creator></metadata><manifest/><spine/></package>"#).unwrap();
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn write_meta_overwrites_title_and_author() {
+        let dir = std::env::temp_dir().join(format!("fr_epub_meta_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("b.epub");
+        write_min_epub(&p);
+        let ps = p.to_string_lossy().into_owned();
+        crate::epub::write_meta(&ps, "新标题 & <tag>", "新作者").unwrap();
+        let data = std::fs::read(&p).unwrap();
+        let doc = crate::epub::parse(data).unwrap();
+        assert_eq!(doc.title, "新标题 & <tag>");
+        assert_eq!(doc.author, "新作者");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
