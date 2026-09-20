@@ -55,6 +55,7 @@
   import HighlightsPanel from "./HighlightsPanel.svelte";
   import HighlightMenu from "./HighlightMenu.svelte";
   import TtsBar from "./TtsBar.svelte";
+  import TtsStartMenu from "./TtsStartMenu.svelte";
   import type { ChapterData, HighlightRow, OpenResult, Progress } from "../lib/types";
 
   let { standalone = false }: { standalone?: boolean } = $props();
@@ -112,6 +113,7 @@
 
   // 朗读（TTS）
   let ttsCurrent: FlatSegment | null = $state(null);
+  let ttsStartChoice: { anchor: PopupAnchor } | null = $state(null);
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1334,6 +1336,8 @@ ${r.cssExtra || ""}
     paintTtsMark(root, seg.start, seg.end);
     const range = charRangeToRange(root, seg.start, seg.end);
     if (range) scrollToRange(range);
+    // 跟随朗读时同步保存阅读进度，重开时能回到朗读到的位置
+    saveProgressDebounced();
   }
 
   /** 任意 Range 起点在 root 纯文本中的字符偏移（对元素/文本节点都稳健）。 */
@@ -1368,24 +1372,31 @@ ${r.cssExtra || ""}
     return offsetOfRange(root, range);
   }
 
-  /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。 */
+  /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。
+   *  注意：翻页模式下 #chapter-content 的包围盒包含所有栏（宽达屏幕外），
+   *  必须按“可见区域”取点，否则中心点落在屏幕外导致定位失败、退回章节开头。 */
   function offsetAtViewportTop(root: HTMLElement): number | null {
-    const r = root.getBoundingClientRect();
-    const contTop = contentEl?.getBoundingClientRect().top ?? r.top;
-    const top = Math.max(r.top + 1, contTop + 1);
+    const vr = (contentEl ?? root).getBoundingClientRect();
     const xs = [0.5, 0.3, 0.7, 0.15, 0.85];
-    const ys = [top + 6, top + 16, top + 30, top + 48];
+    const ys = [8, 20, 36, 56, 80, 120];
     for (const dy of ys) {
+      const y = Math.min(vr.bottom - 2, vr.top + dy);
+      if (y <= vr.top) continue;
       for (const fx of xs) {
-        const off = offsetAtPoint(root, r.left + r.width * fx, Math.min(r.bottom - 2, dy));
-        if (off != null && off > 0) return off;
+        const off = offsetAtPoint(root, vr.left + vr.width * fx, y);
+        if (off != null) return off;
       }
     }
     return 0;
   }
 
-  /** 开始朗读：fromSelection=true 时优先从选中处开始；否则一律从当前页顶部开始。 */
-  function startTts(fromSelection = true) {
+  type TtsStartMode = "auto" | "page" | "chapter";
+
+  /**
+   * 开始朗读。
+   * auto=优先选中处，其次本页顶部；page=本页顶部；chapter=章节开头。
+   */
+  function startTts(mode: TtsStartMode = "auto") {
     if (!ttsState.supported) {
       toast("当前环境不支持系统语音朗读", "error");
       return;
@@ -1398,24 +1409,51 @@ ${r.cssExtra || ""}
       toast("本章没有可朗读的文字");
       return;
     }
-    let idx = 0;
     let off: number | null = null;
-    if (fromSelection) {
+    if (mode === "auto") {
       const sel = window.getSelection();
       if (sel && !sel.isCollapsed && sel.rangeCount) {
         const o = selectionOffsets(root, sel.getRangeAt(0));
         if (o) off = o.start;
       }
     }
-    if (off == null) off = offsetAtViewportTop(root);
-    if (off != null) idx = segIndexAt(segs, off);
+    if (mode !== "chapter" && off == null) off = offsetAtViewportTop(root);
+    const idx = off != null ? segIndexAt(segs, off) : 0;
     ttsSetSegments(segs);
     ttsStart(idx);
   }
 
-  /** 从当前页顶部开始朗读（忽略选区）。 */
-  function startTtsFromPage() {
-    startTts(false);
+  /** 当前是否处于本章第一页/顶部。 */
+  function atChapterStart(): boolean {
+    if (config.reader.mode === "scroll") return scrollRender <= 24;
+    return page <= 0;
+  }
+
+  /** 点朗读时：不在章节开头则先问从本页还是从章节开头。 */
+  function beginTts() {
+    if (ttsState.playing) {
+      ttsPauseResume();
+      return;
+    }
+    if (atChapterStart()) {
+      startTts("auto");
+      return;
+    }
+    const r = (contentEl ?? bodyEl)?.getBoundingClientRect();
+    const anchor: PopupAnchor = r
+      ? { top: r.top, bottom: r.top + 1, cx: r.left + r.width / 2 }
+      : { top: 80, bottom: 81, cx: window.innerWidth / 2 };
+    ttsStartChoice = { anchor };
+  }
+
+  function ttsStartFromPage() {
+    ttsStartChoice = null;
+    startTts("page");
+  }
+
+  function ttsStartFromChapter() {
+    ttsStartChoice = null;
+    startTts("chapter");
   }
 
   /** 停止朗读并清除高亮。 */
@@ -1436,12 +1474,11 @@ ${r.cssExtra || ""}
     // 此时 ttsState.playing 已为 false，loadChapter 不会误杀朗读
     await loadChapter(chapterNum + 1);
     await tick();
-    startTts();
+    startTts("chapter");
   }
 
   function toggleTts() {
-    if (ttsState.playing) ttsPauseResume();
-    else startTts();
+    beginTts();
   }
 
   function convertThis() {
@@ -1557,10 +1594,9 @@ ${r.cssExtra || ""}
       {/if}
       <button class="icon" title="添加书签" onclick={addBookmark}>🔖</button>
       <button class="icon" title="书签列表" onclick={loadBookmarks}>≡</button>
-      <button class="icon" title={ttsState.playing ? "朗读：暂停/继续" : "朗读（优先从选中处，否则从本页开始）"} onclick={toggleTts}>
+      <button class="icon" title={ttsState.playing ? "朗读：暂停/继续" : "朗读（可选中文字或从本页/本章开始）"} onclick={toggleTts}>
         {ttsState.playing ? "⏸" : "▶"}
       </button>
-      <button class="icon" title="从本页顶部开始朗读" onclick={startTtsFromPage}>页▶</button>
       <button class="icon" title="停止朗读" onclick={stopTts}>■</button>
       <button class="icon" title="划线 / 批注" onclick={() => (highlightsOpen = !highlightsOpen)}>✎</button>
       <button class="icon" title="AI 助手" onclick={toggleAi}>AI</button>
@@ -1714,6 +1750,15 @@ ${r.cssExtra || ""}
 
     {#if ttsState.playing || ttsState.paused}
       <TtsBar current={ttsCurrent} />
+    {/if}
+
+    {#if ttsStartChoice}
+      <TtsStartMenu
+        anchor={ttsStartChoice.anchor}
+        onpage={ttsStartFromPage}
+        onchapter={ttsStartFromChapter}
+        onclose={() => (ttsStartChoice = null)}
+      />
     {/if}
 
     {#if ui.aiOpen}
