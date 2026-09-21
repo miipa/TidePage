@@ -28,7 +28,7 @@
     type ThemeKey,
   } from "../lib/stores.svelte";
   import ColorPicker from "./ColorPicker.svelte";
-  import { refreshVoices, ttsState } from "../lib/tts.svelte";
+  import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { TocEntry } from "../lib/types";
 
   type SettingsTab = "reader" | "split" | "keys" | "tts" | "webdav" | "ai" | "other";
@@ -50,7 +50,8 @@
     ttsVoiceLoading = true;
     ttsVoiceMsg = "";
     try {
-      ttsVoiceList = await api.ttsVoices(config.tts.customBaseUrl, config.tts.customApiKey);
+      // 同时写入 ttsState.onlineVoices，供阅读界面播放条的音色下拉复用。
+      ttsVoiceList = await refreshOnlineVoices();
       ttsVoiceMsg = ttsVoiceList.length
         ? `共 ${ttsVoiceList.length} 个音色（来自服务）`
         : "服务未返回音色列表（需支持 /v1/voices）";

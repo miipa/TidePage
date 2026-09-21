@@ -1680,32 +1680,64 @@ pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>
     if base.is_empty() {
         return Err("未填写服务地址".into());
     }
-    let url = if base.ends_with("/v1") {
-        format!("{base}/voices")
-    } else {
-        format!("{base}/v1/voices")
-    };
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    // 兼容常见写法：VoiceStudio 用 /v1/audio/voices，其它服务用 /v1/voices
+    let candidates = [
+        format!("{root}/v1/audio/voices"),
+        format!("{root}/v1/voices"),
+    ];
     let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
-    let mut req = client.get(&url);
-    if !api_key.trim().is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
-    }
-    let resp = req.send().await.map_err(|e| format!("请求失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("服务返回 HTTP {}", resp.status()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut out: Vec<String> = Vec::new();
-    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-        for it in arr {
-            if let Some(id) = it.get("id").and_then(|x| x.as_str()) {
-                out.push(id.to_string());
-            } else if let Some(s) = it.as_str() {
-                out.push(s.to_string());
+    let mut last_err = String::from("未找到音色接口");
+    for url in candidates {
+        let mut req = client.get(&url);
+        if !api_key.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("请求失败：{e}");
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = format!("HTTP {}", resp.status());
+            continue;
+        }
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        let mut out: Vec<String> = Vec::new();
+        // data: [...]  或  voices: [...]
+        let arr = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .or_else(|| v.get("voices").and_then(|d| d.as_array()));
+        if let Some(arr) = arr {
+            for it in arr {
+                let id = it
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| it.get("voice_id").and_then(|x| x.as_str()))
+                    .or_else(|| it.get("name").and_then(|x| x.as_str()))
+                    .or_else(|| it.as_str());
+                if let Some(id) = id {
+                    if !out.iter().any(|x| x == id) {
+                        out.push(id.to_string());
+                    }
+                }
             }
         }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        last_err = "服务未返回音色列表".into();
     }
-    Ok(out)
+    Err(last_err)
 }
 
 #[tauri::command]

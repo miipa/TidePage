@@ -78,6 +78,11 @@ export const ttsState = $state({
   index: -1,
   total: 0,
   voices: [] as SpeechSynthesisVoice[],
+  /** 在线语音：从服务 /v1/voices 读取到的音色列表 */
+  onlineVoices: [] as string[],
+  onlineVoiceLoading: false,
+  /** 在线语音：当前句音频尚未就绪（缓冲中） */
+  buffering: false,
 });
 
 /** 非响应式：片段数组较大，避免深层代理开销 */
@@ -86,6 +91,7 @@ let utter: SpeechSynthesisUtterance | null = null;
 let audioEl: HTMLAudioElement | null = null;
 let usingAudio = false;
 let gen = 0;
+let prefetchGen = 0;
 
 let onSegmentCb: ((seg: FlatSegment | null, index: number) => void) | null = null;
 let onEndCb: (() => void) | null = null;
@@ -262,10 +268,10 @@ function clearAudioCache() {
   audioCache.clear();
 }
 
-async function loadAudio(text: string): Promise<string> {
-  const key = cacheKey(text);
-  const hit = audioCache.get(key);
-  if (hit) return hit;
+/** 同一文本同一参数只发一次请求；并发调用共享同一个 Promise，避免重复合成。 */
+const loading = new Map<string, Promise<string>>();
+
+async function fetchAudio(text: string): Promise<string> {
   const ep = resolveEndpoint();
   if (!ep) throw new Error("未配置在线语音端点");
   const fmt = config.tts.onlineFormat || "mp3";
@@ -282,80 +288,172 @@ async function loadAudio(text: string): Promise<string> {
     format: fmt,
     text,
   });
-  const url = base64ToObjectUrl(b64);
-  putCache(key, url);
-  return url;
+  return base64ToObjectUrl(b64);
 }
 
-function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number) {
-  if (!audioEl) audioEl = new Audio();
-  usingAudio = true;
-  audioEl.onended = () => {
-    if (g !== gen) return;
-    playAt(i + 1);
-  };
-  audioEl.onerror = () => {
-    if (g !== gen) return;
-    // 音频解码/加载失败：回退系统语音读完这句，避免静默跳句
-    speakSystem(seg, i, g);
-  };
-  audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
-  audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
-  audioEl.src = url;
-  audioEl.play().catch(() => {
-    if (g !== gen) return;
-    // 重试一次，仍失败才回退系统语音（避免偶发失败导致音色/音量突变）
-    setTimeout(() => {
-      if (g !== gen || !audioEl) return;
-      audioEl.play().catch(() => {
-        if (g !== gen) return;
-        speakSystem(seg, i, g);
+function getAudio(text: string): Promise<string> {
+  const key = cacheKey(text);
+  const hit = audioCache.get(key);
+  if (hit) return Promise.resolve(hit);
+  let p = loading.get(key);
+  if (!p) {
+    p = fetchAudio(text)
+      .then((url) => {
+        putCache(key, url);
+        return url;
+      })
+      .finally(() => {
+        loading.delete(key);
       });
-    }, 300);
+    loading.set(key, p);
+  }
+  return p;
+}
+
+/** 在线语音预取：拉起后续若干句，尽量缩短句间空档。用 generation 标记忽略旧会话结果。 */
+const PREFETCH_DEPTH = 6;
+
+function prefetchFrom(from: number, g: number) {
+  if (config.tts.engine !== "online") return;
+  prefetchGen = g;
+  for (let k = 0; k < PREFETCH_DEPTH; k++) {
+    const j = from + k;
+    if (j >= segments.length) break;
+    getAudio(segments[j].text).catch(() => {});
+  }
+}
+
+/** 释放当前 Audio 元素，防止 WebView2 中连续复用导致增益衰减/状态异常。 */
+function disposeAudio() {
+  if (!audioEl) return;
+  try {
+    audioEl.onended = null;
+    audioEl.onerror = null;
+    audioEl.onloadedmetadata = null;
+    audioEl.pause();
+    audioEl.removeAttribute("src");
+    audioEl.load();
+  } catch {
+    /* ignore */
+  }
+  audioEl = null;
+  usingAudio = false;
+}
+
+/** 播放单个 ObjectURL。每句都新建 Audio 元素，并在元数据加载时校验时长。 */
+function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    disposeAudio();
+    audioEl = new Audio();
+    usingAudio = true;
+    ttsState.buffering = false;
+
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      disposeAudio();
+    };
+
+    audioEl.onloadedmetadata = () => {
+      if (g !== gen) {
+        cleanup();
+        resolve();
+        return;
+      }
+      const dur = audioEl?.duration ?? 0;
+      if (!audioEl || !isFinite(dur) || dur <= 0.05) {
+        cleanup();
+        reject(new Error("音频无效（时长为 0）"));
+      }
+    };
+
+    audioEl.onended = () => {
+      if (g !== gen) {
+        cleanup();
+        resolve();
+        return;
+      }
+      cleanup();
+      playAt(i + 1);
+      resolve();
+    };
+
+    audioEl.onerror = () => {
+      if (g !== gen) {
+        cleanup();
+        resolve();
+        return;
+      }
+      cleanup();
+      // 在线语音解码失败：绝不回退系统语音（会让音色/音量突变），提示并停止。
+      reject(new Error("音频解码失败"));
+    };
+
+    audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
+    audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
+    audioEl.src = url;
+    audioEl.play().catch((e) => {
+      if (g !== gen) {
+        cleanup();
+        resolve();
+        return;
+      }
+      cleanup();
+      reject(e);
+    });
   });
 }
 
-async function playOnline(seg: FlatSegment, i: number, g: number) {
+/** 拉取并缓存单句音频，失败自动重试（最多 3 次）。 */
+async function retryAudio(text: string, g: number): Promise<string | null> {
   let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (g !== gen) return null;
     try {
-      const url = await loadAudio(seg.text);
-      if (g !== gen) return;
-      playAudioUrl(url, seg, i, g);
-      void prefetch(i + 1, g);
+      return await getAudio(text);
+    } catch (e) {
+      lastErr = e;
+      if (g !== gen) return null;
+      await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+    }
+  }
+  if (g !== gen) return null;
+  throw lastErr;
+}
+
+function failOnline(err: unknown) {
+  const msg =
+    err && typeof err === "object" && "message" in err
+      ? String((err as { message: unknown }).message)
+      : String(err);
+  if (!onlineWarned) {
+    onlineWarned = true;
+    toast(`在线语音失败，已停止朗读：${msg}`, "error");
+  }
+  ttsStop();
+}
+
+async function playOnline(seg: FlatSegment, i: number, g: number) {
+  ttsState.buffering = true;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (g !== gen) return;
+    try {
+      const url = await retryAudio(seg.text, g);
+      if (g !== gen || !url) return;
+      await playAudioUrl(url, seg, i, g);
+      prefetchFrom(i + 1, g);
       return;
     } catch (e) {
       lastErr = e;
       if (g !== gen) return;
-      await new Promise((r) => setTimeout(r, 400));
+      disposeAudio();
+      await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
     }
   }
   if (g !== gen) return;
-  if (!onlineWarned) {
-    onlineWarned = true;
-    const msg =
-      lastErr && typeof lastErr === "object" && "message" in lastErr
-        ? String((lastErr as { message: unknown }).message)
-        : String(lastErr);
-    toast(`在线语音连续失败，本句回退系统语音：${msg}`, "error");
-  }
-  speakSystem(seg, i, g);
-}
-
-async function prefetch(from: number, g: number) {
-  // 在线语音较慢：多预取几句，保证播放不断档（RTF<1 时可持续领先）
-  const depth = config.tts.engine === "online" ? 3 : 1;
-  for (let k = 0; k < depth; k++) {
-    const j = from + k;
-    if (g !== gen || j >= segments.length) return;
-    const text = segments[j].text;
-    if (audioCache.has(cacheKey(text))) continue;
-    try {
-      await loadAudio(text);
-    } catch {
-      return;
-    }
-  }
+  failOnline(lastErr);
 }
 
 /* ---------------- 播放控制 ---------------- */
@@ -386,22 +484,13 @@ function stopState() {
   ttsState.playing = false;
   ttsState.paused = false;
   ttsState.index = -1;
+  ttsState.buffering = false;
   utter = null;
   onSegmentCb?.(null, -1);
 }
 
 function haltAudio() {
-  if (!audioEl) return;
-  try {
-    audioEl.onended = null;
-    audioEl.onerror = null;
-    audioEl.pause();
-    audioEl.removeAttribute("src");
-    audioEl.load();
-  } catch {
-    /* ignore */
-  }
-  usingAudio = false;
+  disposeAudio();
 }
 
 export function ttsStart(index = 0) {
@@ -425,7 +514,9 @@ export function ttsStop() {
 
 export function ttsPauseResume() {
   if (!ttsState.playing) return;
-  if (config.tts.engine === "online" && usingAudio && audioEl) {
+  if (config.tts.engine === "online") {
+    // 缓冲中（当前句音频还没就绪）无法暂停，等音频开始后再操作。
+    if (!usingAudio || !audioEl) return;
     if (ttsState.paused) {
       audioEl.play().catch(() => undefined);
       ttsState.paused = false;
@@ -477,6 +568,33 @@ export function refreshVoices() {
     ttsState.voices = window.speechSynthesis.getVoices();
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * 从自定义在线 TTS 服务的 /v1/voices 读取可用音色。
+ * 返回列表（失败返回空数组），并写入 ttsState.onlineVoices 供播放条使用。
+ */
+export async function refreshOnlineVoices(): Promise<string[]> {
+  if (config.tts.onlineSource !== "custom") {
+    ttsState.onlineVoices = [];
+    return [];
+  }
+  const base = (config.tts.customBaseUrl || "").trim();
+  if (!base) {
+    ttsState.onlineVoices = [];
+    return [];
+  }
+  ttsState.onlineVoiceLoading = true;
+  try {
+    const list = await api.ttsVoices(base, config.tts.customApiKey || "");
+    ttsState.onlineVoices = list;
+    return list;
+  } catch {
+    ttsState.onlineVoices = [];
+    return [];
+  } finally {
+    ttsState.onlineVoiceLoading = false;
   }
 }
 

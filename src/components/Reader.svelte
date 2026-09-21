@@ -114,6 +114,10 @@
   // 朗读（TTS）
   let ttsCurrent: FlatSegment | null = $state(null);
   let ttsStartChoice: { anchor: PopupAnchor } | null = $state(null);
+  /** 本章可朗读文本总长 / 当前朗读到的比例（用于精确保存朗读进度） */
+  let ttsTextLen = 0;
+  let ttsRatio = 0;
+  let ttsSavedAt = 0;
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -287,6 +291,7 @@
         measurePages();
         let pg = restore ? Math.round(restore.chapter_ratio * Math.max(1, pageCount - 1)) : 0;
         if (entry) pg = entry.at === "tail" ? Math.max(0, pageCount - 1) : 0;
+        pendingPageRatio = restore && !entry ? restore.chapter_ratio : null;
         gotoPage(Math.max(0, Math.min(pg, Math.max(0, pageCount - 1))), true);
         setTimeout(recheckPages, 350);
         if (entry?.at === "tail") {
@@ -324,7 +329,17 @@
     if (!pageWrap || config.reader.mode === "scroll") return;
     const before = pageCount;
     computePageCount();
-    if (pageCount !== before) applyPage();
+    if (pageCount !== before) {
+      // 字体/图片等延迟加载后页数变化：若在恢复进度，按原比例重新落到正确页，
+      // 否则保持当前页（避免恢复章节时被夹到第 0 页）。
+      if (pendingPageRatio != null) {
+        const target = Math.round(pendingPageRatio * Math.max(1, pageCount - 1));
+        gotoPage(Math.max(0, Math.min(target, pageCount - 1)), true);
+      } else {
+        applyPage();
+      }
+    }
+    pendingPageRatio = null;
   }
 
   function nextChapter(fromEnd = false) {
@@ -379,18 +394,19 @@
     return pageCount > 1 ? Math.min(1, page / (pageCount - 1)) : 0;
   }
 
-  function totalPct(): number {
+  function totalPct(ratio = currentRatio()): number {
     if (!book) return 0;
     const n = book.toc.length || 1;
-    return Math.min(100, ((chapterNum + currentRatio()) / n) * 100);
+    return Math.min(100, ((chapterNum + ratio) / n) * 100);
   }
 
-  async function doSaveProgress() {
+  async function doSaveProgress(ratioOverride?: number) {
     if (!book) return;
+    const ratio = Math.max(0, Math.min(1, ratioOverride ?? currentRatio()));
     const p: Progress = {
       chapter_index: chapterNum,
-      chapter_ratio: currentRatio(),
-      pct: totalPct(),
+      chapter_ratio: ratio,
+      pct: totalPct(ratio),
       updated_at: Date.now(),
       device: "pc",
     };
@@ -522,6 +538,8 @@
 
   /* ================= page mode ================= */
   let screenCols = 1;
+  /** 待恢复的阅读比例：页数在首次测量后仍可能变化，用它把目标页重新落位。 */
+  let pendingPageRatio: number | null = null;
 
   function computePageCount() {
     if (!pageWrap) return;
@@ -559,6 +577,10 @@
     st.columnWidth = `${colW}px`;
     st.columnGap = `${gap}px`;
     cancelAnimationFrame(measureRaf);
+    // 先同步算一次页数（读取 scrollWidth 会触发一次布局），保证恢复进度时
+    // gotoPage 的夹取使用的是真实页数，而不是上一章的旧值/初始值 1。
+    computePageCount();
+    applyPage();
     measureRaf = requestAnimationFrame(() => {
       computePageCount();
       applyPage();
@@ -1328,16 +1350,26 @@ ${r.cssExtra || ""}
   function onTtsSegment(seg: FlatSegment | null) {
     ttsCurrent = seg;
     const root = contentRoot();
-    if (!root) return;
-    if (!seg || !config.tts.highlight) {
-      clearTtsMark(root);
-      return;
+    if (seg && ttsTextLen > 0) {
+      ttsRatio = Math.max(0, Math.min(1, seg.start / ttsTextLen));
     }
-    paintTtsMark(root, seg.start, seg.end);
-    const range = charRangeToRange(root, seg.start, seg.end);
-    if (range) scrollToRange(range);
-    // 跟随朗读时同步保存阅读进度，重开时能回到朗读到的位置
-    saveProgressDebounced();
+    if (root) {
+      if (!seg || !config.tts.highlight) {
+        clearTtsMark(root);
+      } else {
+        paintTtsMark(root, seg.start, seg.end);
+        const range = charRangeToRange(root, seg.start, seg.end);
+        if (range) scrollToRange(range);
+      }
+    }
+    // 朗读时按「读到的字符位置」保存进度（节流），关掉软件重开可回到朗读处。
+    if (seg) {
+      const now = Date.now();
+      if (now - ttsSavedAt > 1500) {
+        ttsSavedAt = now;
+        void doSaveProgress(ttsRatio);
+      }
+    }
   }
 
   /** 任意 Range 起点在 root 纯文本中的字符偏移（对元素/文本节点都稳健）。 */
@@ -1372,10 +1404,31 @@ ${r.cssExtra || ""}
     return offsetOfRange(root, range);
   }
 
-  /** 第一个「可见」文本节点对应的章节文本偏移（按元素真实可见矩形判断，
-   *  翻页模式只算当前页的栏，滚动模式只算视口内，均不受包围盒影响）。 */
+  /** 朗读定位用的「可见文本框」：翻页模式是 .clip（左右已除外边距的正文窗口），
+   *  滚动模式是整个 .content。注意不能用 .content 作为翻页模式的判定框：它包含
+   *  两侧留白，会把被裁掉的相邻栏也判为“可见”，导致从本页开始时定位到更靠前的页。
+   */
+  function visibleTextBox(): DOMRect | null {
+    if (config.reader.mode === "page") {
+      const clip = contentEl?.querySelector(".clip") as HTMLElement | null;
+      if (clip) return clip.getBoundingClientRect();
+    }
+    return contentEl ? contentEl.getBoundingClientRect() : null;
+  }
+
+  /** 偏移对应的实际渲染矩形是否落在可见文本框内。 */
+  function offsetVisibleInBox(root: HTMLElement, off: number, vr: DOMRect): boolean {
+    const r = charRangeToRange(root, off, off + 1);
+    if (!r) return false;
+    const rc = r.getBoundingClientRect();
+    return rc.bottom > vr.top + 1 && rc.top < vr.bottom - 1 && rc.right > vr.left + 1 && rc.left < vr.right - 1;
+  }
+
+  /** 第一个「可见」文本节点对应的章节文本偏移。以真实可见文本框判定，
+   *  并返回可见片段起始字符的精确偏移（文本节点可能跨栏/跨页）。 */
   function firstVisibleOffset(root: HTMLElement): number | null {
-    const vr = (contentEl ?? root).getBoundingClientRect();
+    const vr = visibleTextBox();
+    if (!vr) return null;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let acc = 0;
     let n = walker.nextNode() as Text | null;
@@ -1390,7 +1443,13 @@ ${r.cssExtra || ""}
           const rc = rects[i];
           const visX = rc.right > vr.left + 2 && rc.left < vr.right - 2;
           const visY = rc.bottom > vr.top + 2 && rc.top < vr.bottom - 2;
-          if (visX && visY) return acc;
+          if (visX && visY) {
+            const px = Math.max(rc.left + 2, vr.left + 2);
+            const py = Math.min(Math.max(rc.top + 2, vr.top + 2), vr.bottom - 2, rc.bottom - 2);
+            const exact = offsetAtPoint(root, px, py);
+            if (exact != null && offsetVisibleInBox(root, exact, vr)) return exact;
+            return acc;
+          }
         }
       }
       acc += len;
@@ -1401,18 +1460,19 @@ ${r.cssExtra || ""}
 
   /** 当前屏幕顶部（可见页）起始处的章节文本偏移，用于「从本页开始朗读」。 */
   function offsetAtViewportTop(root: HTMLElement): number | null {
-    const vis = firstVisibleOffset(root);
-    if (vis != null) return vis;
-    // 兜底：按可见区域取光标点
-    const vr = (contentEl ?? root).getBoundingClientRect();
-    const xs = [0.5, 0.3, 0.7, 0.15, 0.85];
-    const ys = [8, 20, 36, 56, 80, 120];
+    const walkerHit = firstVisibleOffset(root);
+    if (walkerHit != null) return walkerHit;
+    // 兜底：在真实可见文本框内按光标点取偏移（并校验该偏移确实可见）。
+    const vr = visibleTextBox();
+    if (!vr) return null;
+    const xs = [0.02, 0.05, 0.15, 0.3, 0.5, 0.7, 0.85];
+    const ys = [4, 10, 18, 28, 40, 56, 78, 104, 140];
     for (const dy of ys) {
       const y = Math.min(vr.bottom - 2, vr.top + dy);
-      if (y <= vr.top) continue;
+      if (y <= vr.top + 1) continue;
       for (const fx of xs) {
         const off = offsetAtPoint(root, vr.left + vr.width * fx, y);
-        if (off != null) return off;
+        if (off != null && offsetVisibleInBox(root, off, vr)) return off;
       }
     }
     return 0;
@@ -1447,6 +1507,9 @@ ${r.cssExtra || ""}
     }
     if (mode !== "chapter" && off == null) off = offsetAtViewportTop(root);
     const idx = off != null ? segIndexAt(segs, off) : 0;
+    ttsTextLen = text.length;
+    ttsRatio = ttsTextLen > 0 ? Math.max(0, Math.min(1, segs[idx].start / ttsTextLen)) : 0;
+    ttsSavedAt = Date.now();
     ttsSetSegments(segs);
     ttsStart(idx);
   }
@@ -1486,15 +1549,21 @@ ${r.cssExtra || ""}
 
   /** 停止朗读并清除高亮。 */
   function stopTts() {
+    const wasActive = ttsState.playing || ttsState.paused;
+    const ratio = ttsRatio;
     ttsStop();
     const root = contentRoot();
     if (root) clearTtsMark(root);
     ttsCurrent = null;
+    // 仅当确实在朗读时才落盘，避免“未朗读点停止”把已有阅读进度覆盖成 0。
+    if (wasActive && book) void doSaveProgress(ratio);
   }
 
   /** 本章读完：按设置自动续读下一章。 */
   async function onTtsChapterEnd() {
     if (!config.tts.autoNextChapter || !book) return;
+    // 本章已读完，先把进度记到章末，重开时不会退回本章开头。
+    void doSaveProgress(1);
     if (chapterNum >= book.toc.length - 1) {
       toast("已朗读到最后一章");
       return;

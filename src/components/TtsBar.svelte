@@ -1,6 +1,7 @@
 <script lang="ts">
   import { config, saveConfig, toast } from "../lib/stores.svelte";
   import {
+    refreshOnlineVoices,
     refreshVoices,
     ttsNext,
     ttsPauseResume,
@@ -12,13 +13,23 @@
 
   let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
 
-  const ONLINE_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage"];
+  const FALLBACK_ONLINE_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage"];
 
   let expanded = $state(false);
   let sleepLeft = $state(0);
   let sleepEnd = 0;
 
   refreshVoices();
+
+  const onlineVoices = $derived(
+    ttsState.onlineVoices.length ? ttsState.onlineVoices : FALLBACK_ONLINE_VOICES
+  );
+
+  $effect(() => {
+    if (expanded && config.tts.engine === "online" && config.tts.onlineSource === "custom") {
+      void refreshOnlineVoices();
+    }
+  });
 
   $effect(() => {
     const min = config.tts.sleepMinutes;
@@ -68,6 +79,9 @@
       {ttsState.index >= 0 ? ttsState.index + 1 : 0}/{ttsState.total}
     </span>
     <span class="tb-text">{current?.text || "…"}</span>
+    {#if ttsState.buffering}
+      <span class="tb-buffering" title="正在生成音频">缓冲中…</span>
+    {/if}
   </div>
 
   {#if sleepLeft > 0}
@@ -81,12 +95,20 @@
       <div class="tb-row">
         <label>{config.tts.engine === "online" ? "音色" : "语音"}</label>
         {#if config.tts.engine === "online"}
-          <input list="tts-online-voices" bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="alloy" />
-          <datalist id="tts-online-voices">
-            {#each ONLINE_VOICES as v (v)}
-              <option value={v}></option>
+          <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
+            <option value="">默认（服务端参考音色）</option>
+            {#each onlineVoices as v (v)}
+              <option value={v}>{v}</option>
             {/each}
-          </datalist>
+          </select>
+          {#if config.tts.onlineSource === "custom"}
+            <button
+              class="tb-mini"
+              title="从服务读取音色"
+              onclick={() => refreshOnlineVoices()}
+              disabled={ttsState.onlineVoiceLoading}
+            >{ttsState.onlineVoiceLoading ? "…" : "↻"}</button>
+          {/if}
         {:else}
           <select bind:value={config.tts.voice} onchange={saveConfig}>
             <option value="">自动（按语言）</option>
@@ -203,6 +225,31 @@
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
   }
+
+  .tb-buffering {
+    font-size: 11px;
+    opacity: 0.7;
+    flex-shrink: 0;
+    animation: tb-pulse 1s ease-in-out infinite;
+  }
+
+  @keyframes tb-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 0.85; }
+  }
+
+  .tb-mini {
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 13px;
+    padding: 3px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .tb-mini:hover { background: rgba(128, 128, 128, 0.18); }
 
   .tb-panel {
     flex-basis: 100%;
