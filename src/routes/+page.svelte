@@ -8,7 +8,8 @@
   import AiPanel from "../components/AiPanel.svelte";
   import WebdavBrowser from "../components/WebdavBrowser.svelte";
   import StandaloneBook from "../components/StandaloneBook.svelte";
-  import { confirmAnswer, confirmBox, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
+  import NotesPanel from "../components/NotesPanel.svelte";
+  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { listen } from "@tauri-apps/api/event";
 
@@ -52,7 +53,7 @@
     // 否则同一次 Esc 会在关闭弹窗后又触发阅读界面的“返回/关闭”快捷键
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (!ui.settingsOpen && !ui.searchOpen && !ui.statsOpen && !ui.webdavOpen && !convertState.open && !confirmBox.active) return;
+      if (!ui.settingsOpen && !ui.searchOpen && !ui.statsOpen && !ui.webdavOpen && !convertState.open && !confirmBox.active && !choiceBox.active) return;
       e.stopPropagation();
       if (ui.settingsOpen) ui.settingsOpen = false;
       if (ui.searchOpen) ui.searchOpen = false;
@@ -60,6 +61,7 @@
       if (ui.webdavOpen) ui.webdavOpen = false;
       if (convertState.open) { convertState.open = false; convertState.book = null; }
       if (confirmBox.active) confirmAnswer(false);
+      if (choiceBox.active) choiceAnswer(null);
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
@@ -154,6 +156,24 @@
         <ConvertModal />
       {/if}
     </dialog>
+  {/if}
+
+  {#if choiceBox.active}
+    <div class="overlay" onpointerdown={(e) => { if (e.target === e.currentTarget) choiceAnswer(null); }}></div>
+    <dialog open onclick={(e) => { if (e.target === e.currentTarget) choiceAnswer(null); }}>
+      <div class="modal-body choice-body">
+        <p class="confirm-msg">{choiceBox.msg}</p>
+        <div class="choice-row">
+          {#each choiceBox.actions as a (a.id)}
+            <button class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
+          {/each}
+        </div>
+      </div>
+    </dialog>
+  {/if}
+
+  {#if ui.notesOpen}
+    <NotesPanel />
   {/if}
 
   {#if confirmBox.active}
@@ -300,5 +320,15 @@
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+  }
+
+  .choice-body { min-width: 420px; max-width: 560px; }
+
+  .choice-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 6px;
   }
 </style>

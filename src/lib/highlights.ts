@@ -154,7 +154,7 @@ export function paintHighlights(root: HTMLElement, highlights: HighlightRow[]): 
     const range = charRangeToRange(root, h.pos_start, h.pos_end);
     if (!range) continue;
     const mark = document.createElement("mark");
-    mark.className = `fr-hl fr-hl-${h.style || "underline"}`;
+    mark.className = `fr-hl fr-hl-${h.style || "underline"}${h.note && h.note.trim() ? " fr-has-note" : ""}`;
     mark.dataset.hlid = String(h.id);
     if (h.color) mark.style.setProperty("--hl-color", h.color);
     try {

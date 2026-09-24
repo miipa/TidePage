@@ -78,7 +78,7 @@
 <div class="sidepanel">
   <div class="sp-head">
     <span>本书统计</span>
-    <button class="icon" onclick={onclose}>×</button>
+    <button class="icon" title="关闭" onclick={onclose}>×</button>
   </div>
   <div class="stats-body">
     {#if !loaded}
@@ -201,13 +201,13 @@
   }
 
   .sum-item .v {
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 700;
     color: var(--accent);
   }
 
   .sum-item .k {
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.65;
     margin-top: 3px;
   }
@@ -230,7 +230,7 @@
   }
 
   .day-sum {
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.6;
   }
 
@@ -238,7 +238,7 @@
     display: flex;
     gap: 10px;
     padding: 5px 2px;
-    font-size: 12.5px;
+    font-size: 13px;
   }
 
   .s-time { width: 44px; opacity: 0.7; }

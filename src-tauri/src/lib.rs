@@ -12,7 +12,24 @@ mod models;
 mod txt;
 
 use library::AppState;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// 应用数据目录（数据库/封面/字体/提取资源）。
+/// 默认使用系统的 app_data_dir；当设置了 `FLOWREAD_DATA_DIR` 时改为该目录，
+/// 用于「便携模式」以及测试时的数据隔离（默认不设置 → 行为完全不变）。
+pub fn data_dir(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(p) = std::env::var("FLOWREAD_DATA_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    use tauri::Manager;
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
 
 pub fn default_pattern() -> &'static str {
     r"第\s*[0-9〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,10}\s*[章节卷回部篇]"
@@ -59,10 +76,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             use tauri::Manager;
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("无法获取数据目录");
+            let data_dir = data_dir(app.handle());
             std::fs::create_dir_all(&data_dir).ok();
             let conn = db::init(&data_dir.join("flowread.db"))?;
             if db::has_fts(&conn) {
@@ -145,9 +159,29 @@ pub fn run() {
                 rules_ver: std::sync::atomic::AtomicU64::new(1),
                 txt_cache: Mutex::new(std::collections::HashMap::new()),
                 epub_cache: Mutex::new(std::collections::HashMap::new()),
+                chapter_cache: Mutex::new(library::ChapterCache::new(80)),
+                image_cache: Mutex::new(std::collections::HashMap::new()),
                 http,
+                scan_running: std::sync::atomic::AtomicBool::new(false),
+                scan_stop: std::sync::atomic::AtomicBool::new(false),
+                scan_start_count: std::sync::atomic::AtomicU64::new(0),
+                cover_scan: Mutex::new(library::CoverScanQueue::default()),
+                cover_scan_done: std::sync::atomic::AtomicU64::new(0),
+                cover_scan_total: std::sync::atomic::AtomicU64::new(0),
+                cover_style_ver: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
+
+            // 启动续扫：只捞 `meta_done=0`（未处理/上次中断）的书入队；
+            // 已扫完的（meta_done=1）与可重试失败的（meta_done=2）都不会被重新捞出来。
+            // 队列为空则 worker 立即退出（扫完即停、不驻留、不轮询）。
+            {
+                let pending: Vec<i64> = {
+                    let conn = state.db.0.lock().unwrap();
+                    db::ids_needing_meta(&conn)
+                };
+                library::enqueue_cover_scan(&state, pending);
+            }
 
             {
                 let st = state.clone();
@@ -184,10 +218,90 @@ pub fn run() {
             Ok(())
         })
         .register_uri_scheme_protocol("flowread", |ctx, request| {
+            use tauri::Manager;
             let path = request.uri().path().trim_start_matches('/');
             let dir = covers::covers_dir(ctx.app_handle());
 
-            let (mime, bytes) = if let Some(raw) = path.strip_prefix("covers/") {
+            let (mime, bytes) = if let Some(raw) = path.strip_prefix("epubimg/") {
+                // EPUB 正文插图按需读取：epubimg/<book_id>/<b64url(zip内路径)>
+                let (bid_s, enc) = raw.split_once('/').unwrap_or((raw, ""));
+                let bid: i64 = bid_s.parse().unwrap_or(0);
+                let target = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(enc.as_bytes())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_default()
+                };
+                if bid <= 0 || target.is_empty() || target.contains("..") {
+                    ("image/png".to_string(), Vec::new())
+                } else {
+                    match ctx
+                        .app_handle()
+                        .try_state::<std::sync::Arc<library::AppState>>()
+                        .and_then(|st| library::read_epub_image(&st, bid, &target))
+                    {
+                        Some((m, b)) => (m, b),
+                        None => ("image/png".to_string(), Vec::new()),
+                    }
+                }
+            } else if let Some(raw) = path.strip_prefix("cover-default/") {
+                // F2 共享默认封面：底图 + 实时叠字（书名/作者从 DB 取，不缓存每本封面）。
+                let bid: i64 = raw.trim_end_matches('/').parse().unwrap_or(0);
+                match ctx
+                    .app_handle()
+                    .try_state::<std::sync::Arc<library::AppState>>()
+                {
+                    Some(st) => {
+                        let svg = library::render_default_cover(&st, bid);
+                        ("image/svg+xml".to_string(), svg.into_bytes())
+                    }
+                    None => (
+                        "image/svg+xml".to_string(),
+                        covers::placeholder_svg("未命名", "").into_bytes(),
+                    ),
+                }
+            } else if let Some(raw) = path.strip_prefix("book-cover/") {
+                // per-book 封面端点：/book-cover/<id>?v=<cover_style_ver>-<cover_ver>
+                // id → DB cover_path → 文件；无内嵌封面时回落共享默认封面（底图+实时叠字）。
+                // URL 含 per-book 分量（cover_ver），提取出新封面后立即替换底图、不吃缓存。
+                let bid: i64 = raw.trim_end_matches('/').parse().unwrap_or(0);
+                match ctx
+                    .app_handle()
+                    .try_state::<std::sync::Arc<library::AppState>>()
+                {
+                    Some(st) => {
+                        let name = {
+                            let conn = st.db.0.lock().unwrap();
+                            db::get_book(&conn, bid).and_then(|b| b.cover_path)
+                        };
+                        let safe = name.unwrap_or_default();
+                        let valid = !safe.is_empty()
+                            && !safe.contains("..")
+                            && !safe.contains('/')
+                            && !safe.contains('\\');
+                        let served = if valid {
+                            std::fs::read(covers::covers_dir(ctx.app_handle()).join(&safe))
+                                .ok()
+                                .map(|b| (sniff_mime(&b).to_string(), b))
+                        } else {
+                            None
+                        };
+                        match served {
+                            Some(v) => v,
+                            None => {
+                                let svg = library::render_default_cover(&st, bid);
+                                ("image/svg+xml".to_string(), svg.into_bytes())
+                            }
+                        }
+                    }
+                    None => (
+                        "image/svg+xml".to_string(),
+                        covers::placeholder_svg("未命名", "").into_bytes(),
+                    ),
+                }
+            } else if let Some(raw) = path.strip_prefix("covers/") {
                 let name = percent_decode(raw);
                 let safe = name.replace('\\', "/");
                 let file = covers::covers_dir(ctx.app_handle()).join(&safe);
@@ -277,6 +391,7 @@ pub fn run() {
             library::file_exists,
             library::open_book,
             library::get_chapter,
+            library::list_book_images,
             library::save_progress,
             library::load_progress,
             library::delete_books,
@@ -304,6 +419,13 @@ pub fn run() {
             library::set_setting_kv,
             library::get_setting_kv,
             library::app_data_dir,
+            library::storage_stats,
+            library::clear_cache,
+            library::refresh_covers,
+            library::meta_debug_stats,
+            library::set_default_cover,
+            library::clear_default_cover,
+            library::has_default_cover,
             library::add_bookmark,
             library::list_bookmarks,
             library::delete_bookmark,
@@ -313,10 +435,16 @@ pub fn run() {
             library::ai_test,
             library::tts_synth,
             library::tts_voices,
+            library::tts_ensure_fixed_voice,
             library::search_all,
             library::search_in_book,
             library::ensure_book_text_cmd,
             library::add_highlight,
+            library::book_note_info,
+            library::list_note_books,
+            library::list_notes_of_book,
+            library::set_highlight_note,
+            library::append_highlight_note,
             library::list_highlights,
             library::search_highlights,
             library::delete_highlight,

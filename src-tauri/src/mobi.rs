@@ -300,79 +300,77 @@ impl HuffDecoder {
         if depth > 32 {
             return Err("ParseTimeoutOrCorrupted: HUFF 递归过深（畸形文件）".to_string());
         }
-        struct BitR<'a> {
-            d: &'a [u8],
-            byte_pos: usize,
-            buf: u64,
-            bits: u32,
-        }
-        impl<'a> BitR<'a> {
-            fn fill(&mut self) {
-                while self.bits <= 56 {
-                    let b = if self.byte_pos < self.d.len() {
-                        let v = self.d[self.byte_pos];
-                        self.byte_pos += 1;
-                        v
-                    } else {
-                        0
-                    };
-                    self.buf = (self.buf << 8) | b as u64;
-                    self.bits += 8;
-                }
+        // bit 读取器：与 calibre/MobileRead 参考实现一致的 64 位滑动窗口。
+        // 不能用「左对齐缓冲 + 逐字节 fill」的近似实现（跳位后与参考实现错位，
+        // 会把正文解码成错误索引甚至自引用循环）。
+        let mut padded = data.to_vec();
+        padded.extend_from_slice(&[0u8; 8]);
+        let read_u64 = |p: &[u8], pos: usize| -> u64 {
+            if pos + 8 <= p.len() {
+                u64::from_be_bytes([
+                    p[pos], p[pos + 1], p[pos + 2], p[pos + 3],
+                    p[pos + 4], p[pos + 5], p[pos + 6], p[pos + 7],
+                ])
+            } else {
+                0
             }
-            fn peek32(&mut self) -> u32 {
-                self.fill();
-                (self.buf >> (self.bits - 32)) as u32
-            }
-            fn skip(&mut self, n: u32) {
-                self.buf <<= n;
-                self.bits -= n;
-            }
-            fn left(&self) -> usize {
-                self.byte_pos.saturating_mul(8).saturating_sub(self.bits as usize)
-            }
-        }
-        let mut br = BitR { d: data, byte_pos: 0, buf: 0, bits: 0 };
-        let total_bits = data.len() * 8;
+        };
+        let total_bits = data.len() as i64 * 8;
+        let mut bits_remaining = total_bits;
+        let mut pos = 0usize;
+        let mut x = read_u64(&padded, pos);
+        let mut n: i32 = 32;
         let mut out: Vec<u8> = Vec::new();
-        let mut consumed = 0usize;
-        loop {
-            if consumed >= total_bits {
-                break;
+        while bits_remaining > 0 {
+            if n <= 0 {
+                pos += 4;
+                x = read_u64(&padded, pos);
+                n += 32;
             }
-            let code = br.peek32();
+            let code = ((x >> n) & 0xFFFF_FFFF) as u32;
             let (code_len, term, mut max_code) = self.code_dict[(code >> 24) as usize];
             if code_len == 0 {
                 return Err("ParseTimeoutOrCorrupted: HUFF 码表空槽".to_string());
             }
             let mut cl = code_len as usize;
             if !term {
-                match self.min_codes[cl..33].iter().position(|&m| code >= m) {
-                    Some(off) => cl += off,
-                    None => return Err("ParseTimeoutOrCorrupted: HUFF 码定位失败".to_string()),
+                while cl < 32 && code < self.min_codes[cl] {
+                    cl += 1;
                 }
                 max_code = self.max_codes[cl.min(32)];
             }
+            n -= cl as i32;
+            bits_remaining -= cl as i64;
+            if bits_remaining < 0 {
+                break;
+            }
             let index = ((max_code.wrapping_sub(code)) >> (32 - cl)) as usize;
+            // 取出条目并**立即置空**：既做缓存失效，又用于检测循环引用
+            // （合法 CDIC 不会自引用；循环说明表/区间异常，直接报错而不是无限递归）。
             let entry = self
                 .dictionary
-                .get(index)
-                .and_then(|e| e.clone())
-                .ok_or("ParseTimeoutOrCorrupted: HUFF 字典索引越界")?;
+                .get_mut(index)
+                .ok_or("ParseTimeoutOrCorrupted: HUFF 字典索引越界")?
+                .take()
+                .ok_or("PalmDocFormatError: HUFF 字典存在循环引用（表或正文区间异常）")?;
             let (mut slice, is_raw) = entry;
             if !is_raw {
-                slice = self.unpack(&slice, depth + 1, budget)?;
-                self.dictionary[index] = Some((slice.clone(), true));
+                match self.unpack(&slice, depth + 1, budget) {
+                    Ok(expanded) => slice = expanded,
+                    Err(e) => {
+                        // 失败也要放回原条目，避免污染字典（下次可重新尝试/回退）
+                        self.dictionary[index] = Some((slice, false));
+                        return Err(e);
+                    }
+                }
             }
             if *budget < slice.len() {
                 return Err("ParseTimeoutOrCorrupted: HUFF 解压输出超上限".to_string());
             }
             *budget -= slice.len();
+            self.dictionary[index] = Some((slice.clone(), true));
             out.extend_from_slice(&slice);
-            br.skip(cl as u32);
-            consumed += cl;
         }
-        let _ = br.left();
         Ok(out)
     }
 }
@@ -388,7 +386,13 @@ pub struct Rec<'a> {
 }
 
 fn raw_records_safe(mobi: &Mobi) -> Vec<Rec<'_>> {
-    let content = mobi.content.as_slice();
+    raw_records_safe_data(mobi, mobi.content.as_slice())
+}
+
+/// 用**原始文件字节**按 PDB 偏移切分记录。`mobi.content` 会把解析元数据用到的
+/// 前导区置零（crate 内部 `vec![0; position]` + `read_to_end` 的副作用），
+/// 若用它切分会把 record0 的内容当成全零，进而误判为正文；因此有原文件字节时一律传入。
+fn raw_records_safe_data<'a>(mobi: &Mobi, content: &'a [u8]) -> Vec<Rec<'a>> {
     let recs = &mobi.metadata.records.records;
     let extra = mobi.metadata.records.extra_bytes() as usize;
     let n = recs.len();
@@ -414,6 +418,44 @@ fn raw_records_safe(mobi: &Mobi) -> Vec<Rec<'_>> {
     out
 }
 
+/// 判断记录内容是否像 PalmDOC/MOBI 文本块（而非头/索引/图片/媒体）。
+/// 部分 AZW3 的 `first_content_record` 为 0（把 record0 头也算进正文区间），
+/// 必须跳过；同时跳过 FCIS/FLIS/IDXT/RESC/RESC 等索引与媒体记录。
+fn looks_like_text_record(content: &[u8]) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    const NON_TEXT: &[&[u8]] = &[
+        b"FCIS", b"FLIS", b"FDST", b"IDXT", b"RESC", b"BOUN", b"SRCS", b"AUDI", b"VIDE",
+        b"INDX", b"TAGX", b"HUFF", b"CDIC",
+    ];
+    if NON_TEXT.iter().any(|t| content.starts_with(t)) {
+        return false;
+    }
+    // PalmDOC/MOBI 头（record0）：前 4 字节为压缩算法（0x0001/0x0002/0x4448）+ 后续文本长度
+    if content.len() >= 4 {
+        let c = u16::from_be_bytes([content[0], content[1]]);
+        if matches!(c, 1 | 2 | 17480) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 正文记录区间：以 crate 的 `readable_records_range` 为起点，
+/// 跳过开头的 record0 头与 FCIS/FLIS/IDXT 等非文本记录（部分 AZW3 会把它们算进去，
+/// 导致把 MOBI 头当作正文解码，产出空正文或乱码）。
+fn content_records_range(mobi: &Mobi, recs: &[Rec<'_>]) -> std::ops::Range<usize> {
+    let rng = mobi.readable_records_range();
+    let mut start = rng.start.min(recs.len());
+    let end = rng.end.min(recs.len()).max(start);
+    // 只跳过区间开头连续的非文本记录（正文中途的图片/索引不应跳，交由上层处理）。
+    while start < end && !looks_like_text_record(recs[start].content) {
+        start += 1;
+    }
+    start..end
+}
+
 /// HUFF 分支：加载表并逐 section 解压为字节（不做任何字符串解码）
 fn huff_decompress_bytes(mobi: &Mobi, max_bytes: usize) -> Result<Vec<u8>, String> {
     let m = &mobi.metadata.mobi;
@@ -428,12 +470,10 @@ fn huff_decompress_bytes(mobi: &Mobi, max_bytes: usize) -> Result<Vec<u8>, Strin
     for r in &recs[huff_start + 1..huff_start + huff_count] {
         dec.load_cdic(r.content)?;
     }
-    let rng = mobi.readable_records_range();
-    let s0 = rng.start.min(recs.len());
-    let e0 = rng.end.min(recs.len()).max(s0);
+    let rng = content_records_range(mobi, &recs);
     let mut budget = max_bytes;
     let mut out = Vec::new();
-    for r in &recs[s0..e0] {
+    for r in &recs[rng.clone()] {
         out.extend(dec.unpack(r.content, 0, &mut budget)?);
     }
     Ok(out)
@@ -452,7 +492,7 @@ pub fn extract_records_and_decompress_limited(
 ) -> Result<(Vec<u8>, Option<String>), String> {
     let comp = mobi.compression();
     let all = raw_records_safe(mobi);
-    let range = mobi.readable_records_range();
+    let range = content_records_range(mobi, &all);
     // 直接用完整records：mobi crate 的 RawRecords::range() 对 Excluded end 做了 -1 处理
     // （会丢弃最后一条记录），这里不用它。
     let start = range.start.min(all.len());
@@ -465,21 +505,38 @@ pub fn extract_records_and_decompress_limited(
     }
     match comp {
         Compression::Huff => match huff_decompress_bytes(mobi, max_bytes) {
-            Ok(bytes) => Ok((bytes, None)),
-            // 自研 HUFF 解码失败时退回 crate 的 section 级解码（边界可能有瑕疵但不致读不了）。
-            // crate 内部仍可能因偏移表异常 panic，这里兜底为安全默认值。
-            Err(_e) => {
+            Ok(bytes) if !bytes.is_empty() => Ok((bytes, None)),
+            first => {
+                let first_err = match first {
+                    Ok(_) => "HUFF 解压结果为空".to_string(),
+                    Err(e) => e,
+                };
+                // 自研 HUFF 解码失败/为空时，退回 crate 的 section 级解码。
+                // crate 内部可能因偏移表异常 panic，这里兜底为安全默认值。
                 let s = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     mobi.content_as_string_lossy()
                 }))
                 .unwrap_or_default();
-                if s.len() > max_bytes {
-                    return Err(format!(
-                        "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
-                        s.len()
+                if !s.trim().is_empty() {
+                    if s.len() > max_bytes {
+                        return Err(format!(
+                            "ParseTimeoutOrCorrupted: HUFF 解压输出 {} 字节超过上限",
+                            s.len()
+                        ));
+                    }
+                    return Ok((
+                        s.into_bytes(),
+                        Some(format!(
+                            "HUFF/CDIC 表异常（{first_err}），已按 section 回退解码，个别字可能有乱码"
+                        )),
                     ));
                 }
-                Ok((s.into_bytes(), Some("HUFF/CDIC 表异常，已按 section 回退解码，个别字可能有乱码".to_string())))
+                // 两条解码路径都拿不到正文：明确、可操作地报错（含诊断开关提示）。
+                Err(format!(
+                    "PalmDocFormatError: HUFF/CDIC 正文解码失败（{first_err}）。\
+                     该书可能为不支持的 KF8 变体或压缩表受损，请在书库中「转换为 EPUB」后再阅读\
+                     （设 FLOWREAD_MOBI_DIAG=1 可输出诊断信息）"
+                ))
             }
         },
         Compression::PalmDoc => {
@@ -1319,11 +1376,16 @@ pub fn parse_full(
 /// 一次 `read` + 一次 `Mobi::new`，并完成 DRM 拦截。返回的 `Mobi` 自持内容，
 /// 不借用传入字节，调用方可立即释放文件缓冲。
 fn read_and_parse_mobi(path: &str) -> Result<Mobi, String> {
+    read_and_parse_mobi_bytes(path).map(|(m, _)| m)
+}
+
+/// 一次读取 + 一次解析，同时返回**原始文件字节**（用于正确切分记录）。
+fn read_and_parse_mobi_bytes(path: &str) -> Result<(Mobi, Vec<u8>), String> {
     // 快速失败路径：不整读文件即拦截 DRM/畸形头
     sniff_drm_file(path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
     detect_drm(&bytes)?;
-    let mobi = Mobi::new(&bytes).map_err(|e| format!("MOBI/AZW3 解析失败: {e:?}"))?;
+    let mut mobi = Mobi::new(&bytes).map_err(|e| format!("MOBI/AZW3 解析失败: {e:?}"))?;
     // 双保险：crate 解析后的头字段再查一次（覆盖新式 DRM 的 MOBI 头 DRM 域）
     if mobi.encryption() != Encryption::No {
         return Err("AWZ3EncryptedError: PalmDOC 头标记为已加密，请先解密后导入".to_string());
@@ -1333,7 +1395,13 @@ fn read_and_parse_mobi(path: &str) -> Result<Mobi, String> {
             "AWZ3EncryptedError: MOBI 头 DRM 记录偏移域非空（存在 DRM 记录），请先解密后导入".to_string(),
         );
     }
-    Ok(mobi)
+    // 修复 crate 的 content 前导置零：`Mobi::from_reader` 用 `vec![0; position]` 再
+    // `read_to_end` 追加，导致元数据区被置零，而 PDB 记录偏移是**绝对文件偏移**，
+    // 若不修复则 record0 内容全零、正文切分会错位（KF8/AZW3 尤其明显）。
+    if mobi.content.len() == bytes.len() {
+        mobi.content.copy_from_slice(&bytes);
+    }
+    Ok((mobi, bytes))
 }
 
 /// 元数据阶段专用：**一次读取、一次解析**同时拿到 `MobiDoc` 与封面字节，
@@ -1352,7 +1420,7 @@ pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>
 }
 
 fn parse_with_cover_inner(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
-    let mobi = match read_and_parse_mobi(path) {
+    let (mobi, _data) = match read_and_parse_mobi_bytes(path) {
         Ok(m) => m,
         Err(e) => return (Err(e), None),
     };
@@ -1368,7 +1436,7 @@ fn parse_full_inner(
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
 ) -> Result<MobiDoc, String> {
-    let mobi = read_and_parse_mobi(path)?;
+    let (mobi, _data) = read_and_parse_mobi_bytes(path)?;
     build_mobi_doc(path, &mobi, force_encoding, images)
 }
 
@@ -1416,16 +1484,22 @@ fn build_mobi_doc(
     if std::env::var("FLOWREAD_MOBI_DIAG").is_ok() {
         let kf8 = detect_kf8(&mobi);
         let m = &mobi.metadata.mobi;
+        let recs = raw_records_safe(&mobi);
+        let txt_rng = content_records_range(&mobi, &recs);
         eprintln!(
-            "[diag] path={:?} type={:?} fmt={} comp={:?} first_image={} first_non_text={} \
-             exth121={:?} kf8={} head={} lt={} toc={} html={}B imgs={} res_urls={} \
-             res_map={} placeholder={} warning={:?}",
+            "[diag] path={:?} type={:?} fmt={} comp={:?} first_content={} first_image={} \
+             first_non_text={} huff={}+{} text_rng={:?} exth121={:?} kf8={} head={} lt={} \
+             toc={} html={}B imgs={} res_urls={} res_map={} placeholder={} raw={}B warning={:?}",
             std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()),
             mobi.mobi_type(),
             m.format_version,
             mobi.compression(),
+            m.first_content_record,
             m.first_image_index,
             m.first_non_book_index,
+            m.first_huff_record,
+            m.huff_record_count,
+            txt_rng,
             kf8.boundary_exth,
             kf8.is_kf8,
             kf8.header_kind,
@@ -1436,6 +1510,7 @@ fn build_mobi_doc(
             res_urls,
             res_map,
             rewrite_stats.placeholders,
+            raw.len(),
             decoded.warning,
         );
     }
@@ -2067,6 +2142,24 @@ mod tests {
         raw2.extend_from_slice(&gbk);
         let html2 = decode_html_bytes(&raw2, TextEncoding::UTF8, None).text;
         assert!(html2.contains("简体中文"), "{html2}");
+    }
+
+    /// 正文记录判定：MOBI 头（record0）、FCIS/FLIS/IDXT/HUFF/CDIC 等非文本记录必须被排除，
+    /// 否则会把头当正文解码，产出空正文或乱码（AZW3 回归根因）。
+    #[test]
+    fn text_record_detection_skips_headers_and_indices() {
+        // PalmDOC/MOBI 头：压缩算法 0x4448(HUFF)/0x0002(PalmDoc)
+        assert!(!looks_like_text_record(&[0x44, 0x48, 0x00, 0x00, 0x11]));
+        assert!(!looks_like_text_record(&[0x00, 0x02, 0x00, 0x00]));
+        assert!(!looks_like_text_record(b"FCIS\x00\x00"));
+        assert!(!looks_like_text_record(b"FLIS\x00\x00"));
+        assert!(!looks_like_text_record(b"IDXT\x00\x00"));
+        assert!(!looks_like_text_record(b"HUFF\x00\x00"));
+        assert!(!looks_like_text_record(b"CDIC\x00\x00"));
+        assert!(!looks_like_text_record(b""));
+        // 真实 XHTML/HTML 文本块
+        assert!(looks_like_text_record(b"<?xml version=\"1.0\"?>"));
+        assert!(looks_like_text_record(b"<html><body>hi</body></html>"));
     }
 
     #[test]

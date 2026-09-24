@@ -10,6 +10,8 @@ export interface BookRow {
   cover_path: string | null;
   meta_done: number;
   last_read: number;
+  /** 该书自己的封面版本：提取/更换封面时 +1，令 per-book 封面 URL 缓存失效。 */
+  cover_ver: number;
 }
 
 /** 分页返回：total 为过滤后总数，rows 为当前窗口。 */
@@ -28,6 +30,13 @@ export interface ChapterData {
   title: string;
   html: string;
   chars: number;
+}
+
+/** 全书图片查看器：一张图片的引用。 */
+export interface BookImage {
+  url: string;
+  chapter_index: number;
+  chapter_title: string;
 }
 
 export interface BookSession {
@@ -50,6 +59,9 @@ export interface OpenResult {
   toc: TocEntry[];
   docs: string[];
   encoding_warning?: string | null;
+  images?: BookImage[];
+  /** 是否检测为漫画书籍（图片远多于文本；用于漫画图片大小默认值与首次引导） */
+  is_manga?: boolean;
 }
 
 export interface SearchHit {

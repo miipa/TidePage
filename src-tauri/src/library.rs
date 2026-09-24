@@ -4,7 +4,7 @@ use crate::models::*;
 use crate::txt;
 use futures_util::StreamExt;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,15 +31,27 @@ pub struct AppState {
     /// 全书图片列表缓存：key = book_id。
     pub image_cache: Mutex<HashMap<i64, Arc<Vec<BookImage>>>>,
     pub http: reqwest::Client,
-    /// 元数据 worker 是否正在运行（进程内标记，天然不会跨崩溃残留，修掉
-    /// 旧实现把 `meta_busy` 持久化到 DB 导致被强杀后永久卡死、封面再也不生成的问题）。
-    pub meta_running: std::sync::atomic::AtomicBool,
-    /// worker 被请求停止（清缓存前会置位，worker 每轮检查后尽快退出，避免删/写并发）。
-    pub meta_stop: std::sync::atomic::AtomicBool,
-    /// worker 累计启动次数（用于验证互斥：连点刷新封面应仍为 1）。仅诊断用。
-    pub meta_start_count: AtomicU64,
+    /// 封面增量扫描 worker 是否在跑（进程内标记，天然不会跨崩溃残留）。
+    /// 队列驱动：只有队列非空时才拉起；空队列 worker 立即退出（扫完即停、不驻留、不轮询）。
+    pub scan_running: std::sync::atomic::AtomicBool,
+    /// 清缓存前请求 worker 尽快退出（避免删封面目录与写封面并发）。
+    pub scan_stop: std::sync::atomic::AtomicBool,
+    /// worker 累计启动次数（仅诊断用）。
+    pub scan_start_count: AtomicU64,
+    /// 待扫封面队列（VecDeque）+ 去重集合（HashSet），保证同一本书不重复入队。
+    pub cover_scan: Mutex<CoverScanQueue>,
+    /// 本次扫描已处理数 / 入队总数（进度条分子分母）。
+    pub cover_scan_done: AtomicU64,
+    pub cover_scan_total: AtomicU64,
     /// 封面默认底图 id 与解析规则版本，参与缓存失效（F5）。
     pub cover_style_ver: AtomicU64,
+}
+
+/// 封面增量扫描队列：VecDeque 保序 + HashSet 去重（同 id 不重复入队）。
+#[derive(Default)]
+pub struct CoverScanQueue {
+    pub queue: VecDeque<i64>,
+    pub queued: HashSet<i64>,
 }
 
 /// 简单的按书维度 LRU 章节缓存：容量按条数限制，随书切换/规则变化整体失效。
@@ -259,24 +271,22 @@ pub async fn scan_folders(state: &AppState) {
     }
 
     if to_insert.is_empty() {
-        let needs_meta = {
-            let conn = state.db.0.lock().unwrap();
-            db::has_books_needing_meta(&conn)
-        };
-        if needs_meta {
-            spawn_meta_worker(state.app.clone());
-        }
         return;
     }
 
-    {
+    let new_ids: Vec<i64> = {
         let conn = state.db.0.lock().unwrap();
+        let mut ids = Vec::with_capacity(to_insert.len());
         for (path, size, mtime, title, ext) in &to_insert {
-            db::upsert_book(&conn, path, title, ext, *size, *mtime).ok();
+            if let Ok(id) = db::upsert_book(&conn, path, title, ext, *size, *mtime) {
+                ids.push(id);
+            }
         }
-    }
+        ids
+    };
     state.app.emit("library-changed", ()).ok();
-    spawn_meta_worker(state.app.clone());
+    // 导入目录落库后：新书 meta_done=0，入队做增量扫封面（只处理这批新 id）。
+    enqueue_cover_scan(state, new_ids);
 }
 
 pub fn install_watcher(state: &Arc<AppState>) {
@@ -319,139 +329,192 @@ pub fn spawn_watcher_loop(app: AppHandle) {
 }
 
 /// worker 运行标记的 RAII 守卫：无论正常返回、`?` 提前返回，还是线程 panic 展开，
-/// `Drop` 都会复位 `meta_running`，避免「一次失败后永远拉不起来」。
-struct MetaGuard(Arc<AppState>);
-impl Drop for MetaGuard {
+/// `Drop` 都会复位 `scan_running`，避免「一次失败后永远拉不起来」。
+struct ScanGuard(Arc<AppState>);
+impl Drop for ScanGuard {
     fn drop(&mut self) {
         self.0
-            .meta_running
+            .scan_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// 启动元数据/封面 worker。全局互斥：已在运行时不重复拉起。
-/// `refresh_covers` 与 `clear_cache('covers')` 都经此入口，保证同一时刻至多一个 worker。
-pub fn spawn_meta_worker(app: AppHandle) {
+/// 发一次进度事件（`meta-progress`，phase=meta）。前端底部进度条据此显示 `done/total`。
+fn emit_scan_progress(app: &AppHandle, done: u64, total: u64) {
+    app.emit(
+        "meta-progress",
+        serde_json::json!({ "phase": "meta", "done": done, "total": total }),
+    )
+    .ok();
+}
+
+/// 入队待扫封面（VecDeque 保序 + HashSet 去重）。队列非空即：
+/// ① 立即发一次进度（进度条马上出现）；② 确保 worker 在跑。
+/// 只处理 `meta_done=0` 的书；调用点只有三处：导入书籍、导入目录、启动续扫（+显式刷新）。
+pub fn enqueue_cover_scan(state: &AppState, ids: Vec<i64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut added: u64 = 0;
+    {
+        let mut q = state.cover_scan.lock().unwrap();
+        // 队列空 = 上一批已结束：新一批从 0 重新计数（进度条显示 0/N）。
+        // 在锁内完成，避免与 worker 的退出/复位竞态。
+        if q.queue.is_empty() {
+            state.cover_scan_done.store(0, Ordering::SeqCst);
+            state.cover_scan_total.store(0, Ordering::SeqCst);
+        }
+        for id in ids {
+            if q.queued.insert(id) {
+                q.queue.push_back(id);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            state.cover_scan_total.fetch_add(added, Ordering::SeqCst);
+        }
+    }
+    if added == 0 {
+        return;
+    }
+    let done = state.cover_scan_done.load(Ordering::SeqCst);
+    let total = state.cover_scan_total.load(Ordering::SeqCst);
+    emit_scan_progress(&state.app, done, total);
+    spawn_cover_worker(state.app.clone());
+}
+
+/// 清空队列并复位计数（清缓存前调用；之后重新入队 `meta_done=0` 的书）。
+pub fn reset_cover_scan(state: &AppState) {
+    let mut q = state.cover_scan.lock().unwrap();
+    q.queue.clear();
+    q.queued.clear();
+    state.cover_scan_done.store(0, Ordering::SeqCst);
+    state.cover_scan_total.store(0, Ordering::SeqCst);
+}
+
+/// 拉起封面扫描 worker：全局互斥（`scan_running`）。队列空则线程立即退出（扫完即停、不驻留、不轮询）。
+pub fn spawn_cover_worker(app: AppHandle) {
     std::thread::spawn(move || {
         let state = match app.try_state::<Arc<AppState>>() {
             Some(s) => s.inner().clone(),
             None => return,
         };
-        // 全局互斥：已在跑则不重复拉起。
         if state
-            .meta_running
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
+            .scan_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return;
+            return; // 已有 worker 在消费同一个队列
         }
-        // RAII：任何退出路径（含 panic）都会复位 meta_running。
-        let _guard = MetaGuard(state.clone());
-        state.meta_start_count.fetch_add(1, Ordering::SeqCst);
-        // 本次运行不再响应旧的停止请求。
-        state.meta_stop.store(false, Ordering::SeqCst);
-        // 清理历史遗留的 DB 标志（旧版本被强杀后会永久卡死封面生成）。
-        {
-            let conn = state.db.0.lock().unwrap();
-            let _ = db::set_setting(&conn, "meta_busy", "");
-        }
-        let covers_dir = covers::covers_dir(&app);
-        let chunk = 12;
-        // 后台元数据扫描只占用一半 CPU：避免把 async 运行时 / WebView 主线程
-        // 的调度挤掉，导致打开书籍等 IPC 被延迟数秒（表现为长时间空白）。
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads((threads / 2).max(1))
-            .build()
-            .ok();
-        // library-meta 事件按时间合并，避免逐块刷新把前端主线程刷爆。
-        let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
-        // 进度条分母：本次启动时的待生成总数（动态变化的剩余量作为分子）。
-        let total0 = {
-            let conn = state.db.0.lock().unwrap();
-            db::count_books_needing_meta(&conn)
-        };
-        let mut done0: i64 = 0;
-        let emit_progress = |state: &Arc<AppState>, done: i64, total: i64, phase: &str| {
-            state
-                .app
-                .emit(
-                    "meta-progress",
-                    serde_json::json!({ "phase": phase, "done": done, "total": total }),
-                )
-                .ok();
-        };
-        if total0 > 0 {
-            emit_progress(&state, 0, total0, "meta");
-        }
-        // 分批拉取（每批 BATCH 本），避免一次性物化 16 万行、以及反复全表扫描。
-        const BATCH: i64 = 240;
-        'outer: loop {
-            // 收到停止请求（清缓存前会置位）：尽快退出，保证删文件与写封面不并发。
-            if state.meta_stop.load(Ordering::SeqCst) {
-                break;
-            }
-            let batch = {
-                let conn = state.db.0.lock().unwrap();
-                db::books_needing_meta_batch(&conn, BATCH)
-            };
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len() as i64;
-            for slice in batch.chunks(chunk) {
-                if state.meta_stop.load(Ordering::SeqCst) {
-                    break 'outer;
-                }
-                let app_ref = &app;
-                let covers_ref = &covers_dir;
-                let map_slice = move || {
-                    slice
-                        .par_iter()
-                        .map(|(id, path, format)| {
-                            let (title, author, cover, chars, text_chars) =
-                                extract_meta(app_ref, path, format, covers_ref);
-                            (*id, title, author, cover, chars, text_chars)
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let results: Vec<(i64, String, String, Option<String>, i64, i64)> =
-                    match &pool {
-                        Some(p) => p.install(map_slice),
-                        None => map_slice(),
-                    };
-                {
-                    let conn = state.db.0.lock().unwrap();
-                    for (id, title, author, cover, chars, text_chars) in results {
-                        db::set_book_meta(&conn, id, &title, &author, cover.as_deref(), chars, text_chars)
-                            .ok();
-                    }
-                }
-                if last_emit.elapsed() >= std::time::Duration::from_millis(900) {
-                    last_emit = std::time::Instant::now();
-                    state.app.emit("library-meta", ()).ok();
-                    emit_progress(&state, done0, total0.max(1), "meta");
-                }
-            }
-            done0 += batch_len;
-        }
-        state.app.emit("library-meta", ()).ok();
-        emit_progress(&state, total0.max(1), total0.max(1), "done");
+        let _guard = ScanGuard(state.clone());
+        state.scan_start_count.fetch_add(1, Ordering::SeqCst);
+        state.scan_stop.store(false, Ordering::SeqCst);
+        run_cover_scan(state, app);
     });
 }
 
-/// 停止 worker 并等待其退出（最多等约 3 秒），用于清缓存前避免删/写并发。
-fn stop_meta_worker_and_wait(state: &Arc<AppState>) {
-    state.meta_stop.store(true, Ordering::SeqCst);
+/// 队列消费主循环（队列驱动：只从 VecDeque 取，空队列即退）。
+/// 进度节流：每处理 >=16 本发一次；`done == total` 时必发；结束发 `scan-finished`。
+fn run_cover_scan(state: Arc<AppState>, app: AppHandle) {
+    let covers_dir = covers::covers_dir(&app);
+    // 只占一半 CPU：避免把 async 运行时 / WebView 主线程的调度挤掉。
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads((threads / 2).max(1))
+        .build()
+        .ok();
+    const CHUNK: usize = 8;
+    const EMIT_EVERY: u64 = 16;
+    let mut since_emit: u64 = 0;
+    loop {
+        if state.scan_stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // 一次取一小批；从去重集合移除（并发再入队可重新加入）。
+        let ids: Vec<i64> = {
+            let mut q = state.cover_scan.lock().unwrap();
+            let mut v = Vec::with_capacity(CHUNK);
+            while v.len() < CHUNK {
+                match q.queue.pop_front() {
+                    Some(id) => {
+                        q.queued.remove(&id);
+                        v.push(id);
+                    }
+                    None => break,
+                }
+            }
+            v
+        };
+        if ids.is_empty() {
+            // 队列空：持锁确认并**原子**把 scan_running 置 false。
+            // 若此刻有并发入队（enqueue 持同一把锁 push），则 queue 非空 → 继续消费；
+            // 否则置 false 后退出，enqueue 的 spawn CAS 能成功拉起新 worker，绝不丢任务。
+            let exiting = {
+                let q = state.cover_scan.lock().unwrap();
+                if q.queue.is_empty() {
+                    state.scan_running.store(false, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !exiting {
+                continue;
+            }
+            break; // 空队列即退（扫完即停、不驻留、不轮询）
+        }
+        let briefs = {
+            let conn = state.db.0.lock().unwrap();
+            db::books_brief_by_ids(&conn, &ids)
+        };
+        // 并行提取；每本都会把 meta_done 落定为 1 或 2（绝不留 0）。
+        let st_ref = &state;
+        let covers_ref = &covers_dir;
+        let map = move || {
+            briefs
+                .par_iter()
+                .map(|(id, path, format)| {
+                    let r = extract_and_store_cover(st_ref, *id, path, format, covers_ref);
+                    (*id, r)
+                })
+                .collect::<Vec<_>>()
+        };
+        let results: Vec<(i64, Result<bool, String>)> = match &pool {
+            Some(p) => p.install(map),
+            None => map(),
+        };
+        let any_cover = results.iter().any(|(_, r)| matches!(r, Ok(true)));
+        let processed = ids.len() as u64;
+        let done = state.cover_scan_done.fetch_add(processed, Ordering::SeqCst) + processed;
+        since_emit += processed;
+        let total = state.cover_scan_total.load(Ordering::SeqCst);
+        if since_emit >= EMIT_EVERY || done >= total {
+            since_emit = 0;
+            emit_scan_progress(&state.app, done, total);
+            state.app.emit("library-meta", ()).ok();
+            if any_cover {
+                state.app.emit("book-updated", ()).ok();
+            }
+        }
+    }
+    // 扫完：发最终进度 + scan-finished。
+    // 计数**不在此复位**：新一批入队时（队列为空）才从 0 开始，避免与并发入队竞态。
+    let done = state.cover_scan_done.load(Ordering::SeqCst);
+    let total = state.cover_scan_total.load(Ordering::SeqCst);
+    emit_scan_progress(&state.app, done, total);
+    state.app.emit("library-meta", ()).ok();
+    state.app
+        .emit("scan-finished", serde_json::json!({ "done": done, "total": total }))
+        .ok();
+}
+
+/// 停止封面扫描 worker 并等待其退出（最多约 3 秒），用于清缓存前避免删/写并发。
+fn stop_cover_worker_and_wait(state: &Arc<AppState>) {
+    state.scan_stop.store(true, Ordering::SeqCst);
     for _ in 0..60 {
-        if !state.meta_running.load(Ordering::SeqCst) {
+        if !state.scan_running.load(Ordering::SeqCst) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -494,82 +557,116 @@ pub fn render_default_cover(state: &Arc<AppState>, book_id: i64) -> String {
     covers::default_cover_svg(&title, &author, base.as_deref())
 }
 
-/// 提取元数据。
-///
-/// F2 架构：**不再为无内嵌封面的书生成/落盘封面文件**。
-/// - 有内嵌封面 → 落盘一张 PNG（书内真实封面），返回其文件名；
-/// - 无内嵌封面 → 返回 `None`（封面 URL 由前端指向共享底图端点，书名作者渲染时实时叠）。
-fn extract_meta(
-    _app: &AppHandle,
-    path: &str,
-    format: &str,
-    covers_dir: &Path,
-) -> (String, String, Option<String>, i64, i64) {
+/// 单本书的提取结果（封面文件可选）。
+struct MetaOut {
+    title: String,
+    author: String,
+    cover: Option<String>,
+    chars: i64,
+    text_chars: i64,
+}
+
+/// 提取一本书的元数据 + 落盘内嵌封面。
+/// **只有文件读取/解析失败才返回 `Err`**；解析成功但无内嵌封面（或封面解码失败）返回 `Ok`（cover=None）。
+/// F2 架构：**不为无内嵌封面的书生成/落盘封面文件**（走共享底图 + 实时叠字）。
+fn extract_meta_out(path: &str, format: &str, covers_dir: &Path) -> Result<MetaOut, String> {
     let (fn_title, fn_author) = parse_filename(path);
     match format {
         "epub" => {
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => return (fn_title, fn_author, None, 0, 0),
-            };
-            match crate::epub::parse_with_chars(data.clone()) {
-                Ok(doc) => {
-                    let title = if doc.title.is_empty() { fn_title } else { doc.title };
-                    let author = if doc.author.is_empty() { fn_author } else { doc.author };
-                    let cover_file = doc
-                        .cover_href
-                        .as_ref()
-                        .and_then(|href| {
-                            crate::epub::read_cover(&data, href).and_then(|bytes| {
-                                let name = format!("{}.png", db::path_id(path));
-                                let out = covers_dir.join(&name);
-                                covers::make_thumbnail(&bytes, &out).ok()?;
-                                Some(name)
-                            })
-                        })
-                        .or_else(|| {
-                            crate::epub::find_cover_fallback(&data, &doc.spine).and_then(|bytes| {
-                                let name = format!("{}.png", db::path_id(path));
-                                let out = covers_dir.join(&name);
-                                covers::make_thumbnail(&bytes, &out).ok()?;
-                                Some(name)
-                            })
-                        });
-                    (title, author, cover_file, doc.total_chars, doc.total_text_chars)
-                }
-                Err(_) => (fn_title, fn_author, None, 0, 0),
-            }
+            let data = std::fs::read(path).map_err(|e| e.to_string())?;
+            let doc = crate::epub::parse_with_chars(data.clone()).map_err(|e| e.to_string())?;
+            let title = if doc.title.is_empty() { fn_title } else { doc.title };
+            let author = if doc.author.is_empty() { fn_author } else { doc.author };
+            let cover = doc
+                .cover_href
+                .as_ref()
+                .and_then(|href| crate::epub::read_cover(&data, href))
+                .or_else(|| crate::epub::find_cover_fallback(&data, &doc.spine))
+                .and_then(|bytes| {
+                    let name = format!("{}.png", db::path_id(path));
+                    let out = covers_dir.join(&name);
+                    covers::make_thumbnail(&bytes, &out).ok()?;
+                    Some(name)
+                });
+            Ok(MetaOut {
+                title,
+                author,
+                cover,
+                chars: doc.total_chars,
+                text_chars: doc.total_text_chars,
+            })
         }
         "mobi" | "azw3" | "prc" => {
             let (doc_res, cover_bytes) = crate::mobi::parse_with_cover(path);
-            match doc_res {
-                Ok(doc) => {
-                    let title = if doc.title.is_empty() { fn_title } else { doc.title };
-                    let author = if doc.author.is_empty() { fn_author } else { doc.author };
-                    let cover_file = cover_bytes.and_then(|bytes| {
-                        let name = format!("{}.png", db::path_id(path));
-                        let out = covers_dir.join(&name);
-                        covers::make_thumbnail(&bytes, &out).ok()?;
-                        Some(name)
-                    });
-                    let text = crate::epub::html_to_text(&doc.html);
-                    let chars = text.chars().count() as i64;
-                    let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-                    (title, author, cover_file, chars, text_chars)
-                }
-                Err(_) => (fn_title, fn_author, None, 0, 0),
-            }
+            let doc = doc_res.map_err(|e| e.to_string())?;
+            let title = if doc.title.is_empty() { fn_title } else { doc.title };
+            let author = if doc.author.is_empty() { fn_author } else { doc.author };
+            let cover = cover_bytes.and_then(|bytes| {
+                let name = format!("{}.png", db::path_id(path));
+                let out = covers_dir.join(&name);
+                covers::make_thumbnail(&bytes, &out).ok()?;
+                Some(name)
+            });
+            let text = crate::epub::html_to_text(&doc.html);
+            let chars = text.chars().count() as i64;
+            let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+            Ok(MetaOut { title, author, cover, chars, text_chars })
         }
         _ => {
             // TXT 等：只解析文件名得到书名/作者；封面留空 → 走共享底图端点。
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => return (fn_title, fn_author, None, 0, 0),
-            };
+            let data = std::fs::read(path).map_err(|e| e.to_string())?;
             let (text, _) = crate::txt::decode_bytes(&data);
             let chars = text.chars().count() as i64;
             let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-            (fn_title, fn_author, None, chars, text_chars)
+            Ok(MetaOut { title: fn_title, author: fn_author, cover: None, chars, text_chars })
+        }
+    }
+}
+
+/// 提取并落盘封面，同时把结果写入 DB：**保证该书 `meta_done` 不再是 0**
+/// （否则每次启动都会被重新捞出来重扫）。三态与 meta_done 的对应关系：
+///   `Ok(true)`  —— 对应 **Some**：有内嵌封面并已落盘 → `meta_done=1`，且 `cover_ver+1`；
+///   `Ok(false)` —— 对应 **None**：确定无封面 / 封面解码失败 → `meta_done=1`；
+///   `Err(e)`    —— 对应 **Err**：文件读取/解析失败（可重试）→ `meta_done=2`
+///                  （启动只捞 `meta_done=0`，因此不会自动重扫）。
+fn extract_and_store_cover(
+    state: &Arc<AppState>,
+    id: i64,
+    path: &str,
+    format: &str,
+    covers_dir: &Path,
+) -> Result<bool, String> {
+    let (fn_title, fn_author) = parse_filename(path);
+    match extract_meta_out(path, format, covers_dir) {
+        // Some：有内嵌封面 → meta_done=1，cover_ver+1
+        Ok(m) if m.cover.is_some() => {
+            let conn = state.db.0.lock().unwrap();
+            db::set_book_meta_ex(
+                &conn,
+                id,
+                &m.title,
+                &m.author,
+                m.cover.as_deref(),
+                m.chars,
+                m.text_chars,
+                1,
+                true,
+            )
+            .ok();
+            Ok(true)
+        }
+        // None：确定无封面 → meta_done=1
+        Ok(m) => {
+            let conn = state.db.0.lock().unwrap();
+            db::set_book_meta_ex(&conn, id, &m.title, &m.author, None, m.chars, m.text_chars, 1, false)
+                .ok();
+            Ok(false)
+        }
+        // Err：失败（可重试）→ meta_done=2（绝不留 0）
+        Err(e) => {
+            let conn = state.db.0.lock().unwrap();
+            db::set_book_meta_ex(&conn, id, &fn_title, &fn_author, None, 0, 0, 2, false).ok();
+            Err(e)
         }
     }
 }
@@ -995,11 +1092,13 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
     }
 
     let mut added = 0usize;
+    let mut new_ids: Vec<i64> = Vec::new();
     if !new_books.is_empty() {
         let conn = st.db.0.lock().unwrap();
         for (path, title, ext, size, mtime) in &new_books {
-            if db::upsert_book(&conn, path, title, ext, *size, *mtime).is_ok() {
+            if let Ok(id) = db::upsert_book(&conn, path, title, ext, *size, *mtime) {
                 added += 1;
+                new_ids.push(id);
             }
         }
     }
@@ -1007,7 +1106,8 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
         st.app.emit("library-changed", ()).ok();
     }
     emit("done", 1, 1);
-    // A：刷新只做索引对账，不触发任何元数据/AI 任务；新入书 meta_done 保持未生成（=0）。
+    // 导入目录落库后：只把新入库的书入队做增量扫封面（不重扫已扫完的）。
+    enqueue_cover_scan(&st, new_ids);
     Ok(RefreshResult { removed: missing.len(), added })
 }
 
@@ -1564,12 +1664,16 @@ pub fn set_custom_cover(
     let out = dir.join(&name);
     covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
     let rel = name;
-    let conn = state.db.0.lock().unwrap();
-    conn.execute(
-        "UPDATE books SET cover_path=?2 WHERE id=?1",
-        rusqlite::params![book_id, rel],
-    )
-    .map_err(|e| e.to_string())?;
+    {
+        let conn = state.db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
+            rusqlite::params![book_id, rel],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // 该本封面已变：通知前端刷新，per-book URL 因 cover_ver+1 而失效重取。
+    state.app.emit("book-updated", ()).ok();
     Ok(())
 }
 
@@ -2279,29 +2383,28 @@ pub fn storage_stats(state: State<'_, Arc<AppState>>) -> StorageStats {
     }
 }
 
-/// 只重算封面/元数据（不重新扫描目录）：把 meta_done 复位并拉起 worker。
-/// 用于「长按刷新 → 刷新封面」。与 clear_cache('covers') 共用同一全局互斥入口。
+/// 只重算封面/元数据（不重新扫描目录）：把 meta_done 复位，再按 `meta_done=0` 入队。
+/// 用于「长按刷新 → 刷新封面」。这是**显式**全量刷新，不是自动增量路径。
 #[tauri::command]
 pub fn refresh_covers(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    // 全局互斥是硬要求：已在跑就视为同一次任务，直接返回，不重复拉起。
-    if state.meta_running.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    {
+    let ids: Vec<i64> = {
         let conn = state.db.0.lock().unwrap();
         conn.execute("UPDATE books SET meta_done=0", [])
             .map_err(|e| e.to_string())?;
-    }
-    spawn_meta_worker(state.app.clone());
+        db::ids_needing_meta(&conn)
+    };
+    enqueue_cover_scan(state.inner(), ids);
     Ok(())
 }
 
-/// 诊断：worker 启动次数 / 是否在跑（仅用于验证互斥）。
+/// 诊断：worker 启动次数 / 是否在跑 / 队列长度（仅用于验证）。
 #[tauri::command]
 pub fn meta_debug_stats(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let queued = state.cover_scan.lock().unwrap().queue.len();
     serde_json::json!({
-        "startCount": state.meta_start_count.load(Ordering::SeqCst),
-        "running": state.meta_running.load(Ordering::SeqCst),
+        "startCount": state.scan_start_count.load(Ordering::SeqCst),
+        "running": state.scan_running.load(Ordering::SeqCst),
+        "queued": queued,
     })
 }
 
@@ -2318,7 +2421,7 @@ pub fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Result<u64,
     };
     // 含封面清理时：先停 worker 并等其退出，避免删文件与写封面并发（半成品残留）。
     if targets.contains(&"covers") {
-        stop_meta_worker_and_wait(state.inner());
+        stop_cover_worker_and_wait(state.inner());
     }
     let mut freed: u64 = 0;
     for name in &targets {
@@ -2334,13 +2437,15 @@ pub fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Result<u64,
     if targets.contains(&"covers") {
         // 换底图/清缓存让旧封面缓存整体失效（F5）：规则版本 +1 参与缓存 key。
         state.cover_style_ver.fetch_add(1, Ordering::SeqCst);
-        {
+        reset_cover_scan(state.inner());
+        let ids: Vec<i64> = {
             let conn = state.db.0.lock().unwrap();
             conn.execute("UPDATE books SET cover_path=NULL, meta_done=0", [])
                 .map_err(|e| e.to_string())?;
-        }
-        // worker 已停止，这里重新拉起（全局互斥：若已在跑则自动 no-op）。
-        spawn_meta_worker(state.app.clone());
+            db::ids_needing_meta(&conn)
+        };
+        // worker 已停止，重新入队并拉起（全局互斥：若已在跑则自动 no-op）。
+        enqueue_cover_scan(state.inner(), ids);
     }
     if targets.contains(&"res") {
         // 提取资源清空后，已缓存的章节/图片需要失效。
@@ -3200,12 +3305,15 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
 
     if ok {
         let rel = name;
-        let conn = state.db.0.lock().unwrap();
-        conn.execute(
-            "UPDATE books SET cover_path=?2 WHERE id=?1",
-            rusqlite::params![book_id, rel],
-        )
-        .map_err(|e| e.to_string())?;
+        {
+            let conn = state.db.0.lock().unwrap();
+            conn.execute(
+                "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
+                rusqlite::params![book_id, rel],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        state.app.emit("book-updated", ()).ok();
         Ok(rel)
     } else {
         Err("该书未能自动提取封面，请右键「设置封面」手动指定图片".into())
@@ -3284,7 +3392,7 @@ pub fn add_dropped_book(state: State<'_, Arc<AppState>>, path: String) -> Result
         &p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
     );
     let size = std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
-    let book = {
+    let (id, book) = {
         let conn = state.db.0.lock().unwrap();
         let id = db::upsert_book(&conn, &path, &m.title, &ext, size, file_mtime(p))?;
         if !m.author.is_empty() {
@@ -3294,9 +3402,11 @@ pub fn add_dropped_book(state: State<'_, Arc<AppState>>, path: String) -> Result
             )
             .ok();
         }
-        db::get_book(&conn, id)
+        (id, db::get_book(&conn, id))
     };
     state.app.emit("library-changed", ()).ok();
+    // 导入书籍落库后：新书 meta_done=0，入队做增量扫封面。
+    enqueue_cover_scan(state.inner(), vec![id]);
     book.ok_or_else(|| "添加失败".to_string())
 }
 

@@ -102,12 +102,7 @@ pub fn font_family_from_bytes(data: &[u8]) -> Option<String> {
 }
 
 fn fonts_dir(app: &tauri::AppHandle) -> PathBuf {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("fonts");
+    let dir = crate::data_dir(app).join("fonts");
     std::fs::create_dir_all(&dir).ok();
     dir
 }

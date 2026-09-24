@@ -328,6 +328,140 @@ struct Prepared {
     body: ChatBody,
 }
 
+/// 判定整行是否为「budget/token 预算」注入行（v5 收紧版）。
+/// 只在**整行**呈"字段名/占位符形态"时命中；正文自然语句一律保留。
+fn is_budget_line(line: &str) -> bool {
+    let l = line.trim();
+    if l.is_empty() {
+        return false;
+    }
+    let low = l.to_ascii_lowercase();
+    // 分词：同时按 `_`、`:`、`=`、空白切分（关键：token_budget 需能被切开）。
+    let words: Vec<&str> = low
+        .split(|c: char| c.is_whitespace() || matches!(c, '_' | ':' | '=' | ',' | ';' | '\t' | '|'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let all_noise = |s: &str| -> bool {
+        // 仅由数字或 o/O（形近 0）组成 → 计数字噪声
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == 'o' || c == 'O')
+    };
+    let is_kw = |w: &str| w == "budget" || w == "token" || w == "tokens";
+
+    // 逐词判断：任一词以 token_budget / budget / token / tokens 开头，
+    // 且其后紧接的剩余部分全是数字/形近 0 → 元数据（token_budget200000、budget200000 等）。
+    // 注意 `_` 已被切分，故 `token_budget200000` 会变成 `token` + `budget200000` 两个词。
+    for w in &words {
+        for base in ["token_budget", "tokens_budget", "budget", "tokens", "token"] {
+            if let Some(rest) = w.strip_prefix(base) {
+                if all_noise(rest) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 独立字段名行：整行由「关键词（可两词 token budget）+ 计数字/纯数字」构成。
+    // 覆盖 `budget 200000` / `tokens: 20oooo` / `token budget:999` 等。
+    {
+        let mut rest = words.as_slice();
+        let mut consumed = 0usize;
+        while consumed < 2 && !rest.is_empty() && is_kw(rest[0]) {
+            rest = &rest[1..];
+            consumed += 1;
+        }
+        if consumed >= 1 && !rest.is_empty() && rest.iter().all(|w| all_noise(w)) {
+            return true;
+        }
+    }
+
+    // `budget:` / `budget=` 前缀，且其后非英文字母（数字/符号/空）→ 元数据
+    for pfx in ["budget:", "budget =", "budget="] {
+        if let Some(rest) = low.strip_prefix(pfx) {
+            let rest = rest.trim();
+            if rest.is_empty() || rest.chars().all(|c| !c.is_ascii_alphabetic()) {
+                return true;
+            }
+        }
+    }
+
+    // 标签包裹：<...> / [...] 内部含独立 token/budget 词
+    let tag = (l.starts_with('<') && l.ends_with('>'))
+        || (l.starts_with('[') && l.ends_with(']'));
+    if tag {
+        let inner = &low[1..low.len().saturating_sub(1)];
+        let inner_words: Vec<&str> = inner
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty())
+            .collect();
+        if inner_words.iter().any(|w| is_kw(w) || w.starts_with("token_budget")) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 清洗 messages（v5）：
+///   - 不误杀正文（分词版判定）；
+///   - 相邻完全重复的消息并成 1 条；
+///   - 清洗后为空的消息给非空兜底（保证请求仍能发出）。
+pub fn sanitize_messages(messages: &[(String, String)]) -> Vec<(String, String)> {
+    const FALLBACK: &str = ".";
+    let mut cleaned: Vec<(String, String)> = messages
+        .iter()
+        .map(|(role, content)| {
+            let kept: Vec<&str> = content
+                .split('\n')
+                .filter(|line| !is_budget_line(line))
+                .collect();
+            let joined = kept.join("\n");
+            let joined = joined.trim_matches('\n').to_string();
+            let body = if joined.trim().is_empty() {
+                FALLBACK.to_string()
+            } else {
+                joined
+            };
+            (role.clone(), body)
+        })
+        .collect();
+
+    let mut deduped: Vec<(String, String)> = Vec::with_capacity(cleaned.len());
+    for item in cleaned.drain(..) {
+        if deduped
+            .last()
+            .map(|(r, c)| *r == item.0 && *c == item.1)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        deduped.push(item);
+    }
+    deduped
+}
+
+/// 溯源（独立宽松版）：**不复用 is_budget_line**，用子串宽松匹配捕捉任何漏删残留。
+/// `FLOWREAD_AI_TRACE=1` 时逐条打印 idx/role/len；命中打印 head= 残留原文。
+pub fn trace_budget(messages: &[(String, String)]) {
+    if std::env::var("FLOWREAD_AI_TRACE").as_deref() != Ok("1") {
+        return;
+    }
+    let total: usize = messages.iter().map(|(_, c)| c.chars().count()).sum();
+    eprintln!("[ai-trace] total={} messages={}", total, messages.len());
+    let mut hits = 0usize;
+    for (i, (role, content)) in messages.iter().enumerate() {
+        let low = content.to_ascii_lowercase();
+        let hit = low.contains("budget") || low.contains("token_budget");
+        if hit {
+            hits += 1;
+            let head: String = content.chars().take(120).collect();
+            eprintln!("[ai-trace] idx={} role={} len={} HIT head={:?}", i, role, content.chars().count(), head);
+        } else {
+            eprintln!("[ai-trace] idx={} role={} len={}", i, role, content.chars().count());
+        }
+    }
+    eprintln!("[ai-trace] hits={} (0 = 干净)", hits);
+}
+
 fn msgs_json(messages: &[(String, String)]) -> Vec<serde_json::Value> {
     messages
         .iter()
@@ -372,6 +506,10 @@ fn build_request(
             "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。",
         ));
     }
+    // 出站前清洗：摘除客户端/网关/代理拼接的 budget/token 元数据行（含相邻去重）。
+    let cleaned: Vec<(String, String)> = sanitize_messages(messages);
+    trace_budget(&cleaned);
+    let messages: &[(String, String)] = &cleaned;
     match p {
         Provider::Ollama => Ok(Prepared {
             url: format!("{base}/api/chat"),
@@ -677,6 +815,10 @@ pub async fn stream_chat(
     system: String,
     messages: Vec<(String, String)>,
 ) -> Result<(), AiError> {
+    // 溯源（清洗前）：显示进入本层的原始 messages 是否已含 budget 残留。
+    // FLOWREAD_AI_TRACE=1 时，先打印一块 [ai-trace]（pre），再由 build_request 打印清洗后的（post）。
+    // 若 pre hits>0 而 post hits=0 → 注入来自上游（客户端配置/网关/代理），清洗已摘除。
+    trace_budget(&messages);
     let p = Provider::parse(&cfg.provider);
     let prepared = build_request(p, &cfg, &system, &messages, true)?;
 
@@ -1043,5 +1185,185 @@ mod tests {
         assert_eq!(AiError::http(502, "x").kind, "http_5xx");
         assert_eq!(AiError::model_id("x").kind, "model_id");
         assert_eq!(AiError::protocol("x").kind, "protocol");
+    }
+}
+
+#[cfg(test)]
+mod budget_sanitize {
+    use super::*;
+
+    #[test]
+    fn strips_all_budget_variants() {
+        let msgs = vec![("user".to_string(), "正文第一段\nbudget:token_budget200000\n正文结尾".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "正文第一段\n正文结尾");
+        assert!(!out[0].1.to_ascii_lowercase().contains("budget"));
+    }
+
+    #[test]
+    fn strips_spaced_and_noisy_variant() {
+        let msgs = vec![("user".to_string(), "开头\nbudget:token budget2o0000\n尾部".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out[0].1, "开头\n尾部");
+    }
+
+    #[test]
+    fn strips_xml_tag_variant() {
+        let msgs = vec![("user".to_string(), "A\n<budget:token_budget>20oooo</budget:token_budget>\nB".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out[0].1, "A\nB");
+    }
+
+    #[test]
+    fn strips_bare_count_line() {
+        let msgs = vec![("user".to_string(), "X\nbudget: 200000\nY".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out[0].1, "X\nY");
+    }
+
+    #[test]
+    fn keeps_prose_with_budget_word() {
+        let msgs = vec![("user".to_string(),
+            "The quarterly budget review is scheduled.\nWe discussed the token budget for Q3.\nEnd.".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out[0].1,
+            "The quarterly budget review is scheduled.\nWe discussed the token budget for Q3.\nEnd.");
+    }
+
+    #[test]
+    fn keeps_budget_followed_by_year() {
+        let msgs = vec![("user".to_string(), "Our budget 2024 plan\n正文".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out[0].1, "Our budget 2024 plan\n正文");
+    }
+
+    #[test]
+    fn never_empty_on_all_budget() {
+        let msgs = vec![("user".to_string(), "budget:token_budget200000\ntoken budget:999".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].1.trim().is_empty());
+    }
+
+    #[test]
+    fn wraps_are_not_empty_either() {
+        let msgs = vec![("user".to_string(), "<budget:token_budget>20oooo</budget:token_budget>".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert!(!out[0].1.trim().is_empty());
+    }
+
+    #[test]
+    fn dedupes_adjacent_identical_messages() {
+        let m = ("user".to_string(), "重复正文".to_string());
+        let msgs = vec![m.clone(), m.clone(), ("assistant".to_string(), "ok".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1, "重复正文");
+        assert_eq!(out[1].1, "ok");
+    }
+
+    #[test]
+    fn strips_two_word_colon_count() {
+        let msgs = vec![("user".to_string(), "token budget:999".to_string())];
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].1.to_ascii_lowercase().contains("budget"),
+            "budget 字样未清除: {:?}",
+            out[0].1
+        );
+    }
+
+    /// 走真实出站构造路径（build_request → sanitize_messages → trace_budget）。
+    /// 外部以 `FLOWREAD_AI_TRACE=1 cargo test trace_real_path -- --nocapture` 运行时，
+    /// 会打印 `[ai-trace] total=/hits=`。断言：出站 body 不含 budget 字样。
+    #[test]
+    fn trace_real_path() {
+        let cfg = AiConfig {
+            provider: "openai".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: "k".to_string(),
+            model: "m".to_string(),
+            deployment: String::new(),
+            api_version: String::new(),
+        };
+        // 一条被污染的（第2行是注入元数据）+ 一条干净正文。
+        let msgs: Vec<(String, String)> = vec![
+            ("user".to_string(), "请总结这一章。\nbudget:token_budget200000\n以上。".to_string()),
+            ("assistant".to_string(), "好的。".to_string()),
+        ];
+        let prepared = build_request(Provider::parse("openai"), &cfg, "", &msgs, false).unwrap();
+        let body = serde_json::to_string(&prepared.body).unwrap();
+        assert!(
+            !body.to_ascii_lowercase().contains("budget"),
+            "出站 body 仍含 budget: {body}"
+        );
+    }
+
+    /// 真实 HTTP 往返（本地 socket），走生产出站构造路径：
+    ///   1) trace_budget(&raw)  —— pre（原始 messages）
+    ///   2) build_request(...)   —— 内部 sanitize + trace_budget(cleaned) post
+    ///   3) 真发 TCP HTTP POST 到本地服务并读回 200
+    /// 以 `FLOWREAD_AI_TRACE=1 cargo test real_http_roundtrip_trace -- --nocapture` 运行。
+    #[test]
+    fn real_http_roundtrip_trace() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 16384];
+                let _ = sock.read(&mut buf);
+                let body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let cfg = AiConfig {
+            provider: "openai".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "k".to_string(),
+            model: "m".to_string(),
+            deployment: String::new(),
+            api_version: String::new(),
+        };
+        // 真实消息：正文 + 一行注入元数据。
+        let raw: Vec<(String, String)> =
+            vec![("user".to_string(), "正文\nbudget:token_budget200000\n尾部".to_string())];
+
+        trace_budget(&raw); // pre
+        let prepared = build_request(Provider::parse("openai"), &cfg, "", &raw, false).unwrap(); // 内部 post
+        let body = serde_json::to_string(&prepared.body).unwrap();
+        assert!(!body.to_ascii_lowercase().contains("budget"), "出站 body 含 budget");
+
+        // 真发 TCP HTTP POST。
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let req = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            prepared.url, addr, body.len(), body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "未拿到 200: {}", &resp.chars().take(80).collect::<String>());
+        srv.join().ok();
+    }
+
+    /// 证明 trace 的独立宽松检测器**能捕获残留**（不是同源 no-op）：
+    /// 直接对未清洗的污染文本调用 trace_budget，应打印 HIT head=。
+    #[test]
+    fn trace_detects_residue() {
+        let polluted: Vec<(String, String)> = vec![
+            ("user".to_string(), "正常正文\n<budget:token_budget>20oooo</budget:token_budget>".to_string()),
+        ];
+        trace_budget(&polluted); // FLOWREAD_AI_TRACE=1 时打印 hits=1 + head=
     }
 }

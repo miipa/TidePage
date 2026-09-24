@@ -22,7 +22,7 @@
 </script>
 
 <div class="modal-body">
-  <h3>阅读统计（近 14 天）</h3>
+  <h3>近 14 天阅读统计</h3>
   {#if !stats.length}
     <div class="empty">暂无数据，开始阅读后每 30 秒记录一次。</div>
   {:else}

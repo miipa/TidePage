@@ -10,11 +10,29 @@
     text,
     anchor,
     onclose,
+    /** H3：若来自某条划线，则提供其 id —— 可把 AI 输出追加进该划线的 note。 */
+    targetHighlightId = null,
+    onadded,
   }: {
     text: string;
     anchor: PopupAnchor;
     onclose: () => void;
+    targetHighlightId?: number | null;
+    onadded?: () => void;
   } = $props();
+
+  let added = $state(false);
+  async function addToNote() {
+    if (!targetHighlightId || !output.trim()) return;
+    try {
+      await api.appendHighlightNote(targetHighlightId, output.trim());
+      added = true;
+      toast("已添加到笔记");
+      onadded?.();
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
 
   let output = $state("");
   let busy = $state(false);
@@ -181,6 +199,11 @@
       {#if !busy && output}
         <button class="mini" title="重新生成" onclick={retry}>↻</button>
         <button class="mini" title="复制结果" onclick={() => copyText(output)}>复制</button>
+        {#if targetHighlightId}
+          <button class="mini primary" title="把 AI 输出追加到该划线的笔记" onclick={addToNote} disabled={added}>
+            {added ? "已添加" : "添加到笔记"}
+          </button>
+        {/if}
       {/if}
       <button class="mini" title="关闭" onclick={onclose}>×</button>
     </div>
@@ -231,7 +254,7 @@
   .qa-body {
     overflow-y: auto;
     padding: 10px 13px;
-    font-size: 13.5px;
+    font-size: 13px;
     line-height: 1.7;
   }
 
@@ -248,7 +271,7 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .qa-mark.err { opacity: 0.85; font-size: 12.5px; }
+  .qa-mark.err { opacity: 0.85; font-size: 13px; }
 
   .qa-loading {
     opacity: 0.55;

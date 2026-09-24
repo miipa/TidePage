@@ -206,7 +206,7 @@
 
   .cp-row label {
     width: 34px;
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.6;
     flex-shrink: 0;
   }

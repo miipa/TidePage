@@ -9,11 +9,13 @@
     ttsState,
     ttsStop,
   } from "../lib/tts.svelte";
-  import type { FlatSegment } from "../lib/tts.svelte";
+  import type { FlatSegment, OnlineVoice } from "../lib/tts.svelte";
 
   let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
 
-  const FALLBACK_ONLINE_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage"];
+  // 不再内置 OpenAI 别名预设（alloy/echo/…）：对克隆引擎（VoiceStudio/OmniVoice）无用，
+  // 且没有固定说话人、会逐句换人。音色一律以服务端返回的为准。
+  const FALLBACK_ONLINE_VOICES: OnlineVoice[] = [];
 
   let expanded = $state(false);
   let sleepLeft = $state(0);
@@ -23,6 +25,11 @@
 
   const onlineVoices = $derived(
     ttsState.onlineVoices.length ? ttsState.onlineVoices : FALLBACK_ONLINE_VOICES
+  );
+  const onlineVoiceProfiles = $derived(onlineVoices.filter((v) => v.type === "profile"));
+  // 隐藏 OpenAI 别名（无固定说话人，逐句换人），只保留服务端的真实固定音色/预设。
+  const onlineVoiceOthers = $derived(
+    onlineVoices.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
 
   $effect(() => {
@@ -96,10 +103,21 @@
         <label>{config.tts.engine === "online" ? "音色" : "语音"}</label>
         {#if config.tts.engine === "online"}
           <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
-            <option value="">默认（服务端参考音色）</option>
-            {#each onlineVoices as v (v)}
-              <option value={v}>{v}</option>
-            {/each}
+            <option value="">默认</option>
+            {#if onlineVoiceProfiles.length}
+              <optgroup label="固定音色">
+                {#each onlineVoiceProfiles as v (v.id)}
+                  <option value={v.id}>{v.name || v.id}{v.language ? ` · ${v.language}` : ""}</option>
+                {/each}
+              </optgroup>
+            {/if}
+            {#if onlineVoiceOthers.length}
+              <optgroup label="其它音色">
+                {#each onlineVoiceOthers as v (v.id)}
+                  <option value={v.id}>{v.name && v.name !== v.id ? `${v.name} (${v.id})` : v.id}</option>
+                {/each}
+              </optgroup>
+            {/if}
           </select>
           {#if config.tts.onlineSource === "custom"}
             <button
@@ -111,7 +129,7 @@
           {/if}
         {:else}
           <select bind:value={config.tts.voice} onchange={saveConfig}>
-            <option value="">自动（按语言）</option>
+            <option value="">自动</option>
             {#if zhVoices.length}
               <optgroup label="中文">
                 {#each zhVoices as v (v.voiceURI)}
@@ -178,7 +196,7 @@
     border: none;
     background: transparent;
     color: inherit;
-    font-size: 15px;
+    font-size: 16px;
     line-height: 1;
     padding: 6px 8px;
     border-radius: 50%;
@@ -205,14 +223,14 @@
   }
 
   .tb-count {
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.65;
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
   }
 
   .tb-text {
-    font-size: 12.5px;
+    font-size: 13px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -227,7 +245,7 @@
   }
 
   .tb-buffering {
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.7;
     flex-shrink: 0;
     animation: tb-pulse 1s ease-in-out infinite;

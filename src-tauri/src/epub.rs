@@ -4,19 +4,33 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub struct EpubDoc {
     pub title: String,
     pub author: String,
     pub spine: Vec<String>,
     pub toc: Vec<TocEntry>,
+    /// 每个目录项对应的章节在 spine 中的结束下标（不含）。有些 EPUB 把一个章节拆成
+    /// 多个小文件、目录只指向首个小文件，必须靠这个区间把整章内容合起来。
+    pub toc_end: Vec<usize>,
     pub cover_href: Option<String>,
     pub spine_chars: Vec<i64>,
     pub total_chars: i64,
     pub total_text_chars: i64,
+    /// OPF manifest 中的图片资源（zip 内绝对路径，按声明顺序）。供图片查看器快速列举。
+    pub image_hrefs: Vec<String>,
 }
 
-type CiMap = HashMap<String, usize>;
+pub type CiMap = HashMap<String, usize>;
+
+/// 从已读入内存的 zip 字节构建条目索引（供 CachedEpub 复用，避免每章重跑）。
+pub fn build_ci_map(zip_bytes: &[u8]) -> CiMap {
+    match zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
+        Ok(mut z) => build_ci(&mut z),
+        Err(_) => CiMap::new(),
+    }
+}
 
 fn build_ci<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> CiMap {
     let mut map: CiMap = HashMap::new();
@@ -55,6 +69,81 @@ fn zip_read<R: Read + std::io::Seek>(
     f.read_to_end(&mut buf).ok()?;
     Some(buf)
 }
+
+/// 解码文本，兼容 UTF-8 与带 BOM 的 UTF-16（部分工具生成的 XML 是 UTF-16）。
+fn decode_text(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        return decode_utf16(bytes, true);
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        return decode_utf16(bytes, false);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn decode_utf16(bytes: &[u8], little: bool) -> String {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 2; // 跳过 BOM
+    while i + 1 < bytes.len() {
+        let v = if little {
+            u16::from_le_bytes([bytes[i], bytes[i + 1]])
+        } else {
+            u16::from_be_bytes([bytes[i], bytes[i + 1]])
+        };
+        units.push(v);
+        i += 2;
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// 从 container.xml 文本里取出 rootfile 的 full-path，兼容单引号/双引号（原来只认双引号，
+/// 导致 `full-path='...'` 的 EPUB 报「container.xml 中未找到 OPF」）。
+fn opf_path_from_container(container: &str) -> Option<String> {
+    let re_d = Regex::new(r#"(?i)full-path\s*=\s*"([^"]+)""#).ok()?;
+    if let Some(c) = re_d.captures(container) {
+        return Some(c[1].to_string());
+    }
+    let re_s = Regex::new(r#"(?i)full-path\s*=\s*'([^']+)'"#).ok()?;
+    re_s.captures(container).map(|c| c[1].to_string())
+}
+
+/// container.xml 缺失/损坏时的兜底：在压缩包里找一个 .opf（优先 content.opf）。
+fn find_opf_in_zip(ci: &CiMap) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for k in ci.keys() {
+        if k.starts_with("b:") {
+            continue;
+        }
+        let path = k.strip_prefix("./").unwrap_or(k);
+        if !path.ends_with(".opf") {
+            continue;
+        }
+        if path.ends_with("/content.opf") || path == "content.opf" {
+            return Some(path.to_string());
+        }
+        if fallback.is_none() {
+            fallback = Some(path.to_string());
+        }
+    }
+    fallback
+}
+
+fn zip_has(ci: &CiMap, name: &str) -> bool {
+    resolve_idx(ci, name).is_some()
+}
+
+/// 判断是否受 DRM/加密保护（掌阅 zhangyue、或其他声明了 encryption.xml 的加密书）。
+fn is_encrypted(ci: &CiMap) -> bool {
+    zip_has(ci, "META-INF/encryption.xml") || zip_has(ci, "META-INF/zhangyue-expansion.xml")
+}
+
+fn looks_like_opf(s: &str) -> bool {
+    let low = s.to_ascii_lowercase();
+    low.contains("<package") || low.contains("<opf:package")
+}
+
+const ERR_ENCRYPTED: &str =
+    "这本 EPUB 是加密的，需要官方阅读器才能打开；请获取无 DRM 的版本后再导入。";
 
 fn norm_path(base: &str, href: &str) -> String {
     let href = href.split('#').next().unwrap_or(href);
@@ -105,22 +194,50 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 快速解析：只解析 container/OPF/目录/封面，**不做全书逐章文本统计**。
+/// 打开书籍与取章节走这里，避免 7000+ 章的书在打开时卡 5 秒以上。
+/// 需要全书字数时用 `parse_with_chars`（后台元数据阶段）。
 pub fn parse(data: Vec<u8>) -> Result<EpubDoc, String> {
+    parse_impl(data, false).map(|(doc, _)| doc)
+}
+
+/// 完整解析：额外统计每一章的字符数（供元数据/统计用，后台执行）。
+pub fn parse_with_chars(data: Vec<u8>) -> Result<EpubDoc, String> {
+    parse_impl(data, true).map(|(doc, _)| doc)
+}
+
+/// 快速解析并**同时返回条目索引**（避免调用方再扫一遍 zip 建 CiMap）。
+pub fn parse_with_ci(data: Vec<u8>) -> Result<(EpubDoc, CiMap), String> {
+    parse_impl(data, false)
+}
+
+fn parse_impl(data: Vec<u8>, compute_chars: bool) -> Result<(EpubDoc, CiMap), String> {
     let cursor = std::io::Cursor::new(&data);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("EPUB 打开失败: {e}"))?;
     let ci = build_ci(&mut zip);
 
     let container = zip_read(&mut zip, &ci, "META-INF/container.xml")
         .ok_or("缺少 META-INF/container.xml")?;
-    let container_str = String::from_utf8_lossy(&container).into_owned();
-    let opf_path = Regex::new(r#"full-path\s*=\s*"([^"]+)""#)
-        .ok()
-        .and_then(|re| re.captures(&container_str))
-        .map(|c| c[1].to_string())
-        .ok_or("container.xml 中未找到 OPF")?;
+    let container_str = decode_text(&container);
+    let opf_path = opf_path_from_container(&container_str)
+        .or_else(|| find_opf_in_zip(&ci))
+        .ok_or_else(|| {
+            if is_encrypted(&ci) {
+                ERR_ENCRYPTED.to_string()
+            } else {
+                "container.xml 中未找到 OPF，且压缩包内没有 .opf 文件".to_string()
+            }
+        })?;
 
     let opf_bytes = zip_read(&mut zip, &ci, &opf_path).ok_or("OPF 文件缺失")?;
-    let opf = String::from_utf8_lossy(&opf_bytes).into_owned();
+    let opf = decode_text(&opf_bytes);
+    if !looks_like_opf(&opf) {
+        return Err(if is_encrypted(&ci) {
+            ERR_ENCRYPTED.to_string()
+        } else {
+            "OPF 内容无法解析（文件可能已加密或损坏）".to_string()
+        });
+    }
     let opf_dir = opf_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
     let mut title = String::new();
@@ -281,9 +398,23 @@ pub fn parse(data: Vec<u8>) -> Result<EpubDoc, String> {
         cover_href = cover_href.map(|h| norm_path(&opf_dir, &h));
     }
 
+    // OPF manifest 里的图片资源（按声明顺序），供图片查看器快速列举（无需扫描全部章节）。
+    let image_hrefs: Vec<String> = items
+        .iter()
+        .filter(|(_, _, meta)| {
+            let (_, mtype) = meta.split_once('\u{1}').unwrap_or(("", ""));
+            mtype.starts_with("image")
+        })
+        .map(|(_, href, _)| norm_path(&opf_dir, href))
+        .collect();
+
     let spine_idx: Vec<Option<usize>> = spine.iter().map(|s| resolve_idx(&ci, s)).collect();
     let nworkers = rayon::current_num_threads().max(1);
-    let spine_chars: Vec<(i64, i64)> = {
+    // 全书逐章文本统计（7000+ 章时可达数秒）。仅在需要字数的后台元数据阶段执行；
+    // 打开书籍/取章节的快速路径跳过，保证首屏尽快出现。
+    let spine_chars: Vec<(i64, i64)> = if !compute_chars {
+        vec![(0i64, 0i64); spine_idx.len()]
+    } else {
         let counter = std::sync::atomic::AtomicUsize::new(0);
         let results = std::sync::Mutex::new(vec![(0i64, 0i64); spine_idx.len()]);
         let spine_idx_ref: &[Option<usize>] = &spine_idx;
@@ -324,19 +455,34 @@ pub fn parse(data: Vec<u8>) -> Result<EpubDoc, String> {
 
     let toc = extract_toc(&mut zip, &ci, &opf_dir, &items, &spine, &title, &spine_chars);
 
+    // 每章 = 从本章目录项指向的 spine 下标，直到下一个目录项（或 spine 末尾）。
+    // 这样「一章拆成多个小文件」的 EPUB 也能显示完整正文。
+    let toc_end: Vec<usize> = (0..toc.len())
+        .map(|i| {
+            let start = toc[i].index;
+            let next = toc.get(i + 1).map(|t| t.index).unwrap_or(spine.len());
+            next.max(start + 1).min(spine.len())
+        })
+        .collect();
+
     let total_chars: i64 = spine_chars.iter().map(|c| c.0).sum();
     let total_text_chars: i64 = spine_chars.iter().map(|c| c.1).sum();
 
-    Ok(EpubDoc {
-        title,
-        author,
-        spine,
-        toc,
-        cover_href,
-        spine_chars: spine_chars.iter().map(|c| c.0).collect(),
-        total_chars,
-        total_text_chars,
-    })
+    Ok((
+        EpubDoc {
+            title,
+            author,
+            spine,
+            toc,
+            toc_end,
+            cover_href,
+            spine_chars: spine_chars.iter().map(|c| c.0).collect(),
+            total_chars,
+            total_text_chars,
+            image_hrefs,
+        },
+        ci,
+    ))
 }
 
 fn extract_toc<R: Read + std::io::Seek>(
@@ -497,14 +643,208 @@ pub fn resolve_in_doc(doc_path: &str, href: &str) -> String {
     norm_path(doc_path, href)
 }
 
+/// 按已缓存的 `CiMap` 读取 zip 内任意条目（供按需图片服务使用）。
+pub fn read_entry(zip_bytes: &[u8], ci: &CiMap, name: &str) -> Option<Vec<u8>> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut zip = zip::ZipArchive::new(cursor).ok()?;
+    zip_read(&mut zip, ci, name)
+}
+
+/// 供协议处理器的 MIME 判断。
+pub fn mime_for_path(target: &str) -> &'static str {
+    mime_of(target)
+}
+
+/// 列出单个 XHTML 文档中引用的图片（解析为 zip 内绝对路径，按出现顺序）。
+pub fn doc_image_refs<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    ci: &CiMap,
+    doc_path: &str,
+) -> Vec<String> {
+    let Some(bytes) = zip_read(zip, ci, doc_path) else {
+        return Vec::new();
+    };
+    let html = String::from_utf8_lossy(&bytes);
+    let img_re = Regex::new(
+        r#"(?i)(?:src|xlink:href|href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#,
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for caps in img_re.captures_iter(&html) {
+        out.push(resolve_in_doc(doc_path, &caps[1]));
+    }
+    out
+}
+
+/// 从图片字节头部解析宽高（webp/jpeg/png/gif/bmp），用于在正文里预置 `width/height`
+/// 属性，避免图片解码后布局跳变引发反复重排。
+pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    // PNG
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) && bytes.len() >= 24 {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return Some((w, h));
+    }
+    // GIF
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return Some((w, h));
+    }
+    // BMP
+    if bytes.starts_with(b"BM") && bytes.len() >= 26 {
+        let w = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+        let h = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
+        return Some((w, h));
+    }
+    // WebP
+    if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        let fourcc = &bytes[12..16];
+        if fourcc == b"VP8X" {
+            let w = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+            let h = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+            return Some((w, h));
+        }
+        if fourcc == b"VP8 " && bytes.len() >= 30 {
+            let w = u16::from_le_bytes([bytes[26], bytes[27]]) as u32 & 0x3FFF;
+            let h = u16::from_le_bytes([bytes[28], bytes[29]]) as u32 & 0x3FFF;
+            return Some((w, h));
+        }
+        if fourcc == b"VP8L" && bytes.len() >= 25 {
+            let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+            let w = (bits & 0x3FFF) + 1;
+            let h = ((bits >> 14) & 0x3FFF) + 1;
+            return Some((w, h));
+        }
+    }
+    // JPEG：扫描 SOF 段
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2usize;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if (0xC0..=0xCF).contains(&marker)
+                && marker != 0xC4
+                && marker != 0xC8
+                && marker != 0xCC
+            {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                return Some((w, h));
+            }
+            i += 2 + len;
+        }
+    }
+    None
+}
+
 pub fn chapter_html(zip_bytes: &[u8], doc_path: &str) -> Result<String, String> {
+    chapter_html_ci(zip_bytes, None, doc_path, None, false)
+}
+
+/// 可复用外部 `CiMap`（避免每章重跑 build_ci）与按需图片 URL（book_id=Some 时不内联 base64）。
+/// `keep_styles=true` 时保留原书样式表（作用域隔离后内联），否则剥离全部原书 CSS。
+pub fn chapter_html_ci(
+    zip_bytes: &[u8],
+    ci: Option<&CiMap>,
+    doc_path: &str,
+    book_id: Option<i64>,
+    keep_styles: bool,
+) -> Result<String, String> {
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
-    let ci = build_ci(&mut zip);
-    let bytes = zip_read(&mut zip, &ci, doc_path).ok_or("章节文件缺失")?;
+    let owned;
+    let ci = match ci {
+        Some(c) => c,
+        None => {
+            owned = build_ci(&mut zip);
+            &owned
+        }
+    };
+    let bytes = zip_read(&mut zip, ci, doc_path).ok_or("章节文件缺失")?;
     let html = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(render_doc_html(&mut zip, ci, doc_path, &html, book_id, keep_styles))
+}
 
-    let body = extract_body(&html);
+/// 单次打开 zip，连续渲染「一章拆成多个小文件」的整段章节（一次 build_ci、
+/// 一次内联图片），避免每个 spine 文件重复开 zip/建索引。
+pub fn chapter_html_multi(zip_bytes: &[u8], doc_paths: &[String]) -> Result<String, String> {
+    chapter_html_multi_ci(zip_bytes, None, doc_paths, None, false)
+}
+
+/// 带外部 `CiMap` 与按需图片 URL 的多文件章节渲染。
+pub fn chapter_html_multi_ci(
+    zip_bytes: &[u8],
+    ci: Option<&CiMap>,
+    doc_paths: &[String],
+    book_id: Option<i64>,
+    keep_styles: bool,
+) -> Result<String, String> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut zip = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
+    let owned;
+    let ci = match ci {
+        Some(c) => c,
+        None => {
+            owned = build_ci(&mut zip);
+            &owned
+        }
+    };
+    let mut out = String::new();
+    for doc_path in doc_paths {
+        if let Some(bytes) = zip_read(&mut zip, ci, doc_path) {
+            let html = String::from_utf8_lossy(&bytes).into_owned();
+            out.push_str(&render_doc_html(&mut zip, ci, doc_path, &html, book_id, keep_styles));
+        }
+    }
+    Ok(out)
+}
+
+/// 生成按需图片 URL（不内联 base64，避免单章 HTML 达到几百 KB）。
+/// 形如 `http://flowread.localhost/epubimg/<book_id>/<b64url(zip内路径)>`。
+pub fn epub_image_url(book_id: i64, target: &str) -> String {
+    use base64::Engine;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
+    format!("http://flowread.localhost/epubimg/{book_id}/{enc}")
+}
+
+/// 把单个 XHTML 文档渲染为可内联进阅读器的 HTML 片段（复用已打开的 zip 与索引）。
+/// `book_id=Some` 时图片改写为按需 URL（懒加载）；`None` 时回退 base64 内联。
+fn render_doc_html<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    ci: &CiMap,
+    doc_path: &str,
+    html: &str,
+    book_id: Option<i64>,
+    keep_styles: bool,
+) -> String {
+    let body = extract_body(html);
+
+    // 原书样式：keep_styles=true 时把 <head> 的样式表与文档内 <style> 作用域隔离后内联，
+    // 否则整体剥离（由阅读器「覆盖书籍排版」等全局设置决定版式）。
+    let mut book_css = String::new();
+    if keep_styles {
+        for href in head_stylesheet_hrefs(html) {
+            let target = resolve_in_doc(doc_path, &href);
+            let mut visited = std::collections::HashSet::new();
+            load_css_recursive(zip, ci, &target, book_id, &mut visited, &mut book_css, 0);
+        }
+        for css in inline_style_blocks(html) {
+            book_css.push_str(&rewrite_css_urls(&css, doc_path, zip, ci, book_id));
+            book_css.push('\n');
+        }
+    }
 
     let css_link = Regex::new(r#"(?is)<link[^>]+rel\s*=\s*["']?stylesheet["']?[^>]*>"#).unwrap();
     let mut styled = css_link.replace_all(&body, "").into_owned();
@@ -513,6 +853,16 @@ pub fn chapter_html(zip_bytes: &[u8], doc_path: &str) -> Result<String, String> 
     let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
     styled = script_re.replace_all(&styled, "").into_owned();
 
+    // 先处理整段 <img ...>：改写 src 为按需 URL，并预置 width/height/loading/decoding，
+    // 让浏览器在图片解码前就占好位，避免布局跳变与反复重排（卡死根因之一）。
+    let tag_re = Regex::new(r#"(?is)<img\b[^>]*>"#).unwrap();
+    styled = tag_re
+        .replace_all(&styled, |caps: &regex::Captures| {
+            process_img_tag(&caps[0], zip, ci, doc_path, book_id)
+        })
+        .into_owned();
+
+    // 再处理非 <img> 的图片引用（如 SVG <image xlink:href>、<a href="x.jpg">）。
     let img_re = Regex::new(
         r#"(?i)(src|xlink:href|href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#,
     )
@@ -521,19 +871,16 @@ pub fn chapter_html(zip_bytes: &[u8], doc_path: &str) -> Result<String, String> 
         .replace_all(&styled, |caps: &regex::Captures| {
             let attr = caps[1].to_string();
             let target = resolve_in_doc(doc_path, &caps[2]);
-            if let Some(bytes) = zip_read(&mut zip, &ci, &target) {
-                let mime = match target.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "gif" => "image/gif",
-                    "bmp" => "image/bmp",
-                    "webp" => "image/webp",
-                    "svg" => "image/svg+xml",
-                    _ => "application/octet-stream",
-                };
-                format!("{attr}=\"data:{mime};base64,{}\"", crate::covers::b64(&bytes))
-            } else {
-                caps[0].to_string()
+            match book_id {
+                Some(bid) => format!("{attr}=\"{}\"", epub_image_url(bid, &target)),
+                None => {
+                    if let Some(bytes) = zip_read(zip, ci, &target) {
+                        let mime = mime_of(&target);
+                        format!("{attr}=\"data:{mime};base64,{}\"", crate::covers::b64(&bytes))
+                    } else {
+                        caps[0].to_string()
+                    }
+                }
             }
         })
         .into_owned();
@@ -544,33 +891,527 @@ pub fn chapter_html(zip_bytes: &[u8], doc_path: &str) -> Result<String, String> 
     styled = css_url_re
         .replace_all(&styled, |caps: &regex::Captures| {
             let target = resolve_in_doc(doc_path, &caps[1]);
-            if let Some(bytes) = zip_read(&mut zip, &ci, &target) {
-                let mime = match target.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "gif" => "image/gif",
-                    "bmp" => "image/bmp",
-                    "webp" => "image/webp",
-                    "svg" => "image/svg+xml",
-                    _ => "application/octet-stream",
-                };
-                format!("url(data:{mime};base64,{})", crate::covers::b64(&bytes))
-            } else {
-                caps[0].to_string()
+            match book_id {
+                Some(bid) => {
+                    if resolve_idx(ci, &target).is_some() {
+                        format!("url({})", epub_image_url(bid, &target))
+                    } else {
+                        caps[0].to_string()
+                    }
+                }
+                None => {
+                    if let Some(bytes) = zip_read(zip, ci, &target) {
+                        let mime = mime_of(&target);
+                        format!("url(data:{mime};base64,{})", crate::covers::b64(&bytes))
+                    } else {
+                        caps[0].to_string()
+                    }
+                }
             }
         })
         .into_owned();
 
-    // 去掉内联 style，保证阅读器字体/颜色与用户自定义 CSS 生效
-    let style_attr_re =
-        Regex::new(r#"(?is)\sstyle\s*=\s*"[^"]*"|\sstyle\s*=\s*'[^']*'"#).unwrap();
-    styled = style_attr_re.replace_all(&styled, " ").into_owned();
+    // 关闭「覆盖书籍排版」时保留内联 style（属于原书排版的一部分）；
+    // 开启时去掉内联 style，保证阅读器字体/颜色与用户自定义 CSS 生效。
+    if !keep_styles {
+        let style_attr_re =
+            Regex::new(r#"(?is)\sstyle\s*=\s*"[^"]*"|\sstyle\s*=\s*'[^']*'"#).unwrap();
+        styled = style_attr_re.replace_all(&styled, " ").into_owned();
+    }
 
-    Ok(format!(
-        "<div class=\"epub-doc\" data-doc=\"{}\">{}</div>",
+    // body 的 class（如 body.cip）迁移到包裹层，保证原书 body 级样式仍能命中。
+    let body_cls = body_classes(html);
+    let mut classes = String::from("epub-doc");
+    if !body_cls.is_empty() {
+        classes.push(' ');
+        classes.push_str(&body_cls);
+    }
+
+    let mut style_tag = String::new();
+    if keep_styles && !book_css.trim().is_empty() {
+        let scoped = scope_book_css(&book_css);
+        if !scoped.trim().is_empty() {
+            style_tag = format!("<style class=\"fr-book-css\">{scoped}</style>");
+        }
+    }
+
+    format!(
+        "<div class=\"{}\" data-doc=\"{}\">{}{}</div>",
+        escape_html(&classes),
         escape_html(doc_path),
+        style_tag,
         styled
-    ))
+    )
+}
+
+/// 取出 `<head>...</head>` 之间的内容（原书样式表引用都在这里）。
+fn extract_head(html: &str) -> String {
+    let lower = html.to_lowercase();
+    if let Some(start) = lower.find("<head") {
+        let after = lower[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
+        let end = lower[after..].find("</head>").map(|i| after + i).unwrap_or(html.len());
+        if after < end {
+            return html[after..end].to_string();
+        }
+    }
+    String::new()
+}
+
+/// 文档 `<head>` 中所有 `<link rel=stylesheet>` 的 href（原样，未解析）。
+fn head_stylesheet_hrefs(html: &str) -> Vec<String> {
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    static HREF: OnceLock<Regex> = OnceLock::new();
+    static REL: OnceLock<Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| Regex::new(r#"(?is)<link\b[^>]*>"#).unwrap());
+    let href = HREF.get_or_init(|| Regex::new(r#"(?is)href\s*=\s*["']([^"']+)["']"#).unwrap());
+    let rel = REL.get_or_init(|| Regex::new(r#"(?is)rel\s*=\s*["']?([^"'\s>]+)"#).unwrap());
+    let head = extract_head(html);
+    let mut out = Vec::new();
+    for cap in tag.captures_iter(&head) {
+        let t = &cap[0];
+        let low = t.to_ascii_lowercase();
+        let is_css = rel
+            .captures(t)
+            .map(|c| c[1].to_ascii_lowercase().contains("stylesheet"))
+            .unwrap_or(false)
+            || low.contains(".css");
+        if !is_css {
+            continue;
+        }
+        if let Some(h) = href.captures(t) {
+            out.push(h[1].to_string());
+        }
+    }
+    out
+}
+
+/// 文档内所有 `<style>` 块的内容。
+fn inline_style_blocks(html: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"(?is)<style[^>]*>(.*?)</style>"#).unwrap());
+    re.captures_iter(html).map(|c| c[1].to_string()).collect()
+}
+
+/// `<body class="...">` 的 class 值。
+fn body_classes(html: &str) -> String {
+    static BODY: OnceLock<Regex> = OnceLock::new();
+    static CLS: OnceLock<Regex> = OnceLock::new();
+    let body = BODY.get_or_init(|| Regex::new(r#"(?is)<body\b[^>]*>"#).unwrap());
+    let cls = CLS.get_or_init(|| Regex::new(r#"(?is)class\s*=\s*["']([^"']*)["']"#).unwrap());
+    if let Some(m) = body.find(html) {
+        if let Some(c) = cls.captures(m.as_str()) {
+            return c[1].trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// 读取一个样式表并递归内联其 `@import`，重写其中 url() 为按需资源 URL。
+fn load_css_recursive<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    ci: &CiMap,
+    css_path: &str,
+    book_id: Option<i64>,
+    visited: &mut std::collections::HashSet<String>,
+    out: &mut String,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let key = css_path.replace('\\', "/").to_lowercase();
+    if !visited.insert(key) {
+        return;
+    }
+    let Some(bytes) = zip_read(zip, ci, css_path) else {
+        return;
+    };
+    let css = String::from_utf8_lossy(&bytes).into_owned();
+    static IMPORT: OnceLock<Regex> = OnceLock::new();
+    let import_re = IMPORT
+        .get_or_init(|| Regex::new(r#"(?is)@import\s+(?:url\(\s*)?["']?([^"')]+)["']?\s*\)?\s*;"#).unwrap());
+    for cap in import_re.captures_iter(&css) {
+        let imp = cap[1].trim();
+        if imp.is_empty()
+            || imp.starts_with("http")
+            || imp.starts_with("//")
+            || imp.starts_with("data:")
+        {
+            continue;
+        }
+        let target = resolve_in_doc(css_path, imp);
+        load_css_recursive(zip, ci, &target, book_id, visited, out, depth + 1);
+    }
+    let no_import = import_re.replace_all(&css, "").into_owned();
+    static CHARSET: OnceLock<Regex> = OnceLock::new();
+    let no_charset = CHARSET
+        .get_or_init(|| Regex::new(r#"(?is)@charset\s+["'][^"']*["']\s*;"#).unwrap())
+        .replace_all(&no_import, "")
+        .into_owned();
+    out.push_str(&rewrite_css_urls(&no_charset, css_path, zip, ci, book_id));
+    out.push('\n');
+}
+
+/// 把 CSS 中的 `url(...)` 指向 zip 内资源的引用改写为按需资源 URL（字体/图片均可）。
+fn rewrite_css_urls<R: Read + std::io::Seek>(
+    css: &str,
+    css_path: &str,
+    zip: &mut zip::ZipArchive<R>,
+    ci: &CiMap,
+    book_id: Option<i64>,
+) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"(?i)url\(\s*["']?([^"')]+)["']?\s*\)"#).unwrap());
+    re.replace_all(css, |caps: &regex::Captures| {
+        let raw = caps[1].trim();
+        if raw.is_empty()
+            || raw.starts_with("data:")
+            || raw.starts_with("http")
+            || raw.starts_with("//")
+            || raw.starts_with('#')
+            || raw.starts_with("res:")
+            || raw.starts_with("res%3A")
+            || raw.starts_with("file:")
+        {
+            return caps[0].to_string();
+        }
+        let target = resolve_in_doc(css_path, raw);
+        if resolve_idx(ci, &target).is_none() {
+            return caps[0].to_string();
+        }
+        match book_id {
+            Some(bid) => format!("url({})", epub_image_url(bid, &target)),
+            None => {
+                if let Some(bytes) = zip_read(zip, ci, &target) {
+                    let mime = mime_of(&target);
+                    format!("url(data:{mime};base64,{})", crate::covers::b64(&bytes))
+                } else {
+                    caps[0].to_string()
+                }
+            }
+        }
+    })
+    .into_owned()
+}
+
+/// 把原书 CSS 作用域隔离到 `#chapter-content` 内，避免污染阅读器 UI。
+/// 做法：所有普通选择器统一加 `#chapter-content` 前缀（`html`/`body`/`:root` 映射到包裹层
+/// `.epub-doc`）；`@font-face` / `@keyframes` 等需要全局生效的 at-rule 提到前缀外；
+/// `@media` 等分组 at-rule 递归处理。
+fn scope_book_css(css: &str) -> String {
+    let (global, scoped) = split_css_scope(css);
+    let mut out = String::new();
+    if !global.trim().is_empty() {
+        out.push_str(global.trim_end());
+        out.push('\n');
+    }
+    if !scoped.trim().is_empty() {
+        out.push_str(scoped.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn split_css_scope(css: &str) -> (String, String) {
+    let mut global = String::new();
+    let mut scoped = String::new();
+    let bytes = css.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            if let Some(end) = css[i + 2..].find("*/") {
+                i = i + 2 + end + 2;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if c == b'}' || c == b';' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i;
+        let mut paren = 0i32;
+        let mut quote: Option<u8> = None;
+        while j < n {
+            let ch = bytes[j];
+            if let Some(q) = quote {
+                if ch == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if ch == q {
+                    quote = None;
+                }
+                j += 1;
+                continue;
+            }
+            match ch {
+                b'"' | b'\'' => quote = Some(ch),
+                b'(' => paren += 1,
+                b')' => paren -= 1,
+                b'{' if paren == 0 => break,
+                b';' if paren == 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= n {
+            break;
+        }
+        if bytes[j] == b';' {
+            i = j + 1;
+            continue;
+        }
+        let prelude = css[start..j].trim();
+        let block_start = j + 1;
+        let mut k = block_start;
+        let mut depth = 1i32;
+        let mut quote2: Option<u8> = None;
+        while k < n {
+            let ch = bytes[k];
+            if let Some(q) = quote2 {
+                if ch == b'\\' {
+                    k += 2;
+                    continue;
+                }
+                if ch == q {
+                    quote2 = None;
+                }
+                k += 1;
+                continue;
+            }
+            match ch {
+                b'"' | b'\'' => quote2 = Some(ch),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let block = &css[block_start..k.min(n)];
+        let lower = prelude.to_ascii_lowercase();
+        if lower.starts_with("@font-face")
+            || lower.starts_with("@keyframes")
+            || lower.starts_with("@-webkit-keyframes")
+            || lower.starts_with("@page")
+            || lower.starts_with("@property")
+            || lower.starts_with("@counter-style")
+        {
+            global.push_str(prelude);
+            global.push('{');
+            global.push_str(block);
+            global.push_str("}\n");
+        } else if lower.starts_with("@media")
+            || lower.starts_with("@supports")
+            || lower.starts_with("@layer")
+            || lower.starts_with("@container")
+            || lower.starts_with("@scope")
+        {
+            let (g2, s2) = split_css_scope(block);
+            global.push_str(&g2);
+            scoped.push_str(prelude);
+            scoped.push('{');
+            scoped.push_str(&s2);
+            scoped.push_str("}\n");
+        } else if lower.starts_with('@') {
+            // 其余未知 at-rule 丢弃，避免污染
+        } else {
+            let sel = scope_selector_list(prelude);
+            if !sel.is_empty() {
+                scoped.push_str(&sel);
+                scoped.push('{');
+                scoped.push_str(block);
+                scoped.push_str("}\n");
+            }
+        }
+        i = k + 1;
+    }
+    (global, scoped)
+}
+
+fn scope_selector_list(sel: &str) -> String {
+    let parts = split_top_commas(sel);
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        out.push(format!("#chapter-content {}", map_root_selectors(p)));
+    }
+    out.join(",")
+}
+
+fn map_root_selectors(sel: &str) -> String {
+    // 把选择器里的 html/body/:root 类型选择器替换为包裹层 .epub-doc（保留 UTF-8 原文）。
+    let b = sel.as_bytes();
+    let n = b.len();
+    let is_delim = |c: u8| {
+        c.is_ascii_whitespace()
+            || matches!(c, b'>' | b'+' | b'~' | b',' | b'.' | b'#' | b':' | b'[' | b']' | b'(' | b')' | b'*')
+    };
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0usize;
+    let mut last = 0usize;
+    while i < n {
+        let c = b[i];
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n {
+                if b[i] == c {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let before_ok = i == 0 || is_delim(b[i - 1]);
+        if before_ok {
+            let kw_len = if i + 5 <= n && &b[i..i + 5] == b":root" {
+                5
+            } else if i + 4 <= n
+                && (b[i..i + 4].eq_ignore_ascii_case(b"html")
+                    || b[i..i + 4].eq_ignore_ascii_case(b"body"))
+            {
+                4
+            } else {
+                0
+            };
+            if kw_len > 0 {
+                let end = i + kw_len;
+                if end >= n || is_delim(b[end]) {
+                    out.push_str(&sel[last..i]);
+                    out.push_str(".epub-doc");
+                    i = end;
+                    last = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&sel[last..]);
+    out
+}
+
+fn split_top_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        if let Some(q) = quote {
+            cur.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '(' | '[' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' | ']' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(cur.clone());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 处理单个 `<img ...>` 标签：改写 src 为按需 URL（或内联 base64），
+/// 读取图片头部尺寸并预置 width/height，补 loading/decoding。
+fn process_img_tag<R: Read + std::io::Seek>(
+    tag: &str,
+    zip: &mut zip::ZipArchive<R>,
+    ci: &CiMap,
+    doc_path: &str,
+    book_id: Option<i64>,
+) -> String {
+    let low = tag.to_ascii_lowercase();
+    if !low.starts_with("<img") {
+        return tag.to_string();
+    }
+    let attr_re = Regex::new(r#"(?i)(src|xlink:href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#)
+        .unwrap();
+    let Some(caps) = attr_re.captures(tag) else {
+        return tag.to_string();
+    };
+    let target = resolve_in_doc(doc_path, &caps[2]);
+    // 读取图片头部尺寸（不内联整图）。失败则不加 width/height，由 CSS 兜底。
+    let dims = zip_read(zip, ci, &target).and_then(|b| image_size(&b));
+    let attr = &caps[1];
+    let new_src = match book_id {
+        Some(bid) => format!("{attr}=\"{}\"", epub_image_url(bid, &target)),
+        None => {
+            if let Some(bytes) = zip_read(zip, ci, &target) {
+                let mime = mime_of(&target);
+                format!("{attr}=\"data:{mime};base64,{}\"", crate::covers::b64(&bytes))
+            } else {
+                caps[0].to_string()
+            }
+        }
+    };
+    let mut out = tag.to_string();
+    out.replace_range(caps.get(0).unwrap().start()..caps.get(0).unwrap().end(), &new_src);
+    // 追加属性（在标签名之后）。不用 loading="lazy"：页模式是多列 + transform 容器，
+    // Chromium 的懒加载可见性判断不可靠，会导致图片永不加载（页模式图片空白）。
+    let mut extra = String::from(" decoding=\"async\"");
+    if let Some((w, h)) = dims {
+        if w > 0 && h > 0 {
+            extra.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+        }
+    }
+    let name_end = out
+        .to_ascii_lowercase()
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(out.len());
+    out.insert_str(name_end, &extra);
+    out
+}
+
+fn mime_of(target: &str) -> &'static str {
+    match target.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 fn extract_body(html: &str) -> String {
@@ -601,10 +1442,14 @@ pub fn doc_text(zip_bytes: &[u8], doc_path: &str) -> String {
 }
 
 pub fn html_to_text(html: &str) -> String {
+    static BLOCK_END: OnceLock<Regex> = OnceLock::new();
+    static BR: OnceLock<Regex> = OnceLock::new();
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    let block_end = BLOCK_END
+        .get_or_init(|| Regex::new(r"(?i)</(?:p|div|h[1-6]|li|tr|blockquote|section)>").unwrap());
+    let br = BR.get_or_init(|| Regex::new(r"(?i)<br\s*/?>").unwrap());
+    let tag = TAG.get_or_init(|| Regex::new(r"(?s)<[^>]*>").unwrap());
     let body = extract_body(html);
-    let block_end = Regex::new(r"(?i)</(?:p|div|h[1-6]|li|tr|blockquote|section)>").unwrap();
-    let br = Regex::new(r"(?i)<br\s*/?>").unwrap();
-    let tag = Regex::new(r"(?s)<[^>]*>").unwrap();
     let s = block_end.replace_all(&body, "\n").into_owned();
     let s = br.replace_all(&s, "\n").into_owned();
     let s = tag.replace_all(&s, "").into_owned();
@@ -615,6 +1460,29 @@ pub fn html_to_text(html: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
+}
+
+/// 一次性提取整本书每章纯文本：只开一次 zip、只建一次 CiMap，
+/// 避免按 spine 逐章调用 `doc_text` 时重复 O(条目数) 重建索引（大书会退化到分钟级）。
+pub fn collect_texts(zip_bytes: &[u8], spine: &[String]) -> Vec<String> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut zip = match zip::ZipArchive::new(cursor) {
+        Ok(z) => z,
+        Err(_) => return vec![String::new(); spine.len()],
+    };
+    let ci = build_ci(&mut zip);
+    let mut out = Vec::with_capacity(spine.len());
+    for doc in spine {
+        let text = match zip_read(&mut zip, &ci, doc) {
+            Some(b) => {
+                let html = String::from_utf8_lossy(&b);
+                html_to_text(&html)
+            }
+            None => String::new(),
+        };
+        out.push(text);
+    }
+    out
 }
 
 pub fn read_cover(zip_bytes: &[u8], cover_href: &str) -> Option<Vec<u8>> {
@@ -697,15 +1565,19 @@ pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
 
     let container = zip_read(&mut zip, &ci, "META-INF/container.xml")
         .ok_or("缺少 META-INF/container.xml")?;
-    let container_str = String::from_utf8_lossy(&container).into_owned();
-    let opf_path = Regex::new(r#"full-path\s*=\s*"([^"]+)""#)
-        .ok()
-        .and_then(|re| re.captures(&container_str))
-        .map(|c| c[1].to_string())
-        .ok_or("container.xml 中未找到 OPF")?;
+    let container_str = decode_text(&container);
+    let opf_path = opf_path_from_container(&container_str)
+        .or_else(|| find_opf_in_zip(&ci))
+        .ok_or_else(|| {
+            if is_encrypted(&ci) {
+                ERR_ENCRYPTED.to_string()
+            } else {
+                "container.xml 中未找到 OPF".to_string()
+            }
+        })?;
 
     let opf_bytes = zip_read(&mut zip, &ci, &opf_path).ok_or("OPF 文件缺失")?;
-    let opf = String::from_utf8_lossy(&opf_bytes).into_owned();
+    let opf = decode_text(&opf_bytes);
 
     let mut new_opf = set_tag_text(&opf, "dc:title", title);
     new_opf = new_opf.and_then(|x| set_tag_text(&x, "dc:creator", author).or_else(|| {
@@ -797,4 +1669,47 @@ pub fn spine_docs_with_titles(zip_bytes: &[u8], spine: &[String]) -> Vec<(String
             (title, doc.clone())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    /// 设置 FLOWREAD_PROFILE_EPUB 时，校验按需图片 URL 能被 read_entry 正确解析。
+    #[test]
+    fn epubimg_urls_resolve() {
+        let path = match std::env::var("FLOWREAD_PROFILE_EPUB") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return,
+        };
+        let data = std::fs::read(&path).unwrap();
+        let (doc, ci) = parse_with_ci(data.clone()).unwrap();
+        let mut total = 0usize;
+        let mut ok = 0usize;
+        for idx in [0usize, 1, 100, 1000, 3000] {
+            if idx >= doc.toc.len() {
+                continue;
+            }
+            let start = doc.toc[idx].index;
+            let end = doc.toc_end.get(idx).copied().unwrap_or(start + 1).max(start + 1).min(doc.spine.len());
+            let docs: Vec<String> = (start..end).filter_map(|si| doc.spine.get(si).cloned()).collect();
+            let html = chapter_html_multi_ci(&data, Some(&ci), &docs, Some(42), false).unwrap();
+            let re = Regex::new(r"epubimg/42/([A-Za-z0-9_\-]+)").unwrap();
+            for caps in re.captures_iter(&html) {
+                total += 1;
+                let target = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(caps[1].as_bytes())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default();
+                if read_entry(&data, &ci, &target).map(|b| !b.is_empty()).unwrap_or(false) {
+                    ok += 1;
+                }
+            }
+        }
+        eprintln!("[epubimg] urls={total} resolved={ok}");
+        assert!(total > 0, "no epubimg urls generated");
+        assert_eq!(total, ok, "some epubimg urls did not resolve");
+    }
 }

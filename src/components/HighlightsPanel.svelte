@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from "../lib/api";
-  import { HIGHLIGHT_STYLES, config, saveConfig, toast } from "../lib/stores.svelte";
+  import { HIGHLIGHT_STYLES, appConfirm, config, saveConfig, toast } from "../lib/stores.svelte";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
 
@@ -43,6 +43,8 @@
   });
 
   async function del(h: HighlightRow) {
+    const ok = await appConfirm(`删除这条划线？\n${h.text.slice(0, 60)}`);
+    if (!ok) return;
     try {
       await api.deleteHighlight(h.id);
       rows = rows.filter((r) => r.id !== h.id);
@@ -84,11 +86,11 @@
 <div class="sidepanel">
   <div class="sp-head">
     <span>划线 / 批注</span>
-    <button class="icon" onclick={onclose}>×</button>
+    <button class="icon" title="关闭" onclick={onclose}>×</button>
   </div>
   <div class="sp-search">
     <input
-      placeholder="搜索划线（全库：正文/书名/章节）…"
+      placeholder="搜索划线，全库正文/书名/章节…"
       bind:value={query}
     />
   </div>
@@ -184,7 +186,7 @@
   .bm-title { font-size: 13px; font-weight: 500; }
   .hl-book { font-weight: 400; opacity: 0.65; }
   .bm-excerpt {
-    font-size: 12.5px;
+    font-size: 13px;
     opacity: 0.78;
     margin-top: 3px;
     line-height: 1.55;
@@ -196,7 +198,7 @@
     overflow: hidden;
   }
   .hl-note { font-size: 12px; opacity: 0.6; margin-top: 3px; font-style: italic; }
-  .hl-time { font-size: 11px; opacity: 0.45; margin-top: 3px; }
+  .hl-time { font-size: 12px; opacity: 0.45; margin-top: 3px; }
 
   .hl-acts {
     display: flex;

@@ -9,6 +9,8 @@
     anchor,
     oncolor,
     onstyle,
+    onnote,
+    onai,
     ondelete,
     onclose,
   }: {
@@ -16,12 +18,18 @@
     anchor: PopupAnchor;
     oncolor: (color: string) => void;
     onstyle: (style: string) => void;
+    onnote: (note: string) => void;
+    /** H3：对该划线发起 AI 释义（结果可添加到笔记）。 */
+    onai: () => void;
     ondelete: () => void;
     onclose: () => void;
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
   let posStyle = $state("visibility:hidden;");
+  /** H1：添加/编辑感想。 */
+  let noteOpen = $state(false);
+  let noteText = $state(highlight.note ?? "");
 
   $effect(() => {
     const h = (e: PointerEvent) => {
@@ -65,8 +73,26 @@
         <option value={s.id}>{s.name}</option>
       {/each}
     </select>
+    <button onclick={onai} title="AI 翻译/释义（结果可添加到笔记）">AI</button>
+    <button onclick={() => (noteOpen = !noteOpen)} title="添加/编辑感想（会进入笔记列表）">
+      {highlight.note ? "编辑感想" : "添加感想"}
+    </button>
     <button class="danger" onclick={ondelete} title="删除此划线">删除</button>
   </div>
+  {#if noteOpen}
+    <div class="hm-note">
+      <textarea
+        rows="3"
+        placeholder="写下你的感想…（留空则取消笔记）"
+        bind:value={noteText}
+        onkeydown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) onnote(noteText); }}
+      ></textarea>
+      <div class="hm-note-acts">
+        <button class="primary" onclick={() => onnote(noteText)}>保存感想</button>
+        <button onclick={() => (noteOpen = false)}>取消</button>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -136,4 +162,14 @@
     color: var(--danger, #c0392b);
     font-size: 12px;
   }
+
+  .hm-note { display: flex; flex-direction: column; gap: 6px; }
+  .hm-note textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 60px;
+  }
+  .hm-note-acts { display: flex; gap: 6px; justify-content: flex-end; }
 </style>

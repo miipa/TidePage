@@ -290,7 +290,7 @@
         const prev = failures[failures.length - 1];
         // 重试前清空上一个端点可能已流式写入的内容，避免拼接错乱
         reply.content = "";
-        toast(`端点「${prev.name}」失败（${errKindLabel(prev.kind)}），已切换至「${label}」重试`);
+        toast(`端点「${prev.name}」失败：${errKindLabel(prev.kind)}，已切换至「${label}」重试`);
       }
       const id = `s${++sessionSeq}-${Date.now()}`;
       let active = true;
@@ -763,11 +763,11 @@ ${readerStyle.extra}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
         </select>
-        <button class="mini" title={isReader ? "切回对话气泡样式（原始）" : "切换为阅读样式：像正文一样翻页、隐藏自己的提问"} onclick={toggleDisplay}>
+        <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
           {isReader ? "对话样式" : "阅读样式"}
         </button>
         <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
-        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>ePub</button>
+        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
         <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
         {#if standalone}
           <button class="mini" title="停靠回主窗口" onclick={async () => {
@@ -783,7 +783,7 @@ ${readerStyle.extra}
             }
           }}>⇲ 停靠</button>
         {:else}
-          <button class="mini" title="弹出为独立窗口（记住大小）" onclick={popOut}>⧉</button>
+          <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
           <button class="icon" onclick={() => (ui.aiOpen = false)}>×</button>
         {/if}
       </div>
@@ -809,7 +809,7 @@ ${readerStyle.extra}
             <div class="ai-empty">
               {#if config.ai.enabled}
                 端点：{profile?.name || "未配置"}｜正在阅读：{ctx.title || "—"}<br />
-                点击上方提示词或输入问题，AI 回复将以阅读样式逐页呈现（←/→ 或滚轮翻页）。<br />
+                点击上方提示词或输入问题，AI 回复将以阅读样式逐页呈现，←/→ 或滚轮翻页。<br />
                 窗口关闭后内容自动清空；可用上方 TXT/ePub 按钮导出。
               {:else}
                 AI 未启用，请在设置中开启并配置端点。
@@ -862,10 +862,11 @@ ${readerStyle.extra}
     </div>
     <div class="ai-input">
       <input
-        placeholder="向 AI 提问（结合本章上下文），Enter 发送"
+        placeholder="向 AI 提问，Enter 发送"
         bind:value={input}
         onkeydown={(e) => e.key === "Enter" && send()}
         disabled={streaming}
+        title="结合本章上下文提问"
       />
       <button class="primary" onclick={send} disabled={streaming}>发送</button>
     </div>
@@ -878,11 +879,11 @@ ${readerStyle.extra}
             <option value={i}>{p.name || `端点${i + 1}`}</option>
           {/each}
         </select>
-        <button class="mini" title={isReader ? "切回对话气泡样式（原始）" : "切换为阅读样式：像正文一样翻页、隐藏自己的提问"} onclick={toggleDisplay}>
+        <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
           {isReader ? "对话样式" : "阅读样式"}
         </button>
         <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
-        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>ePub</button>
+        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
         <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
         {#if standalone}
           <button class="mini" title="停靠回主窗口" onclick={async () => {
@@ -898,7 +899,7 @@ ${readerStyle.extra}
             }
           }}>⇲ 停靠</button>
         {:else}
-          <button class="mini" title="弹出为独立窗口（记住大小）" onclick={popOut}>⧉</button>
+          <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
           <button class="icon" onclick={() => (ui.aiOpen = false)}>×</button>
         {/if}
       </div>
@@ -920,7 +921,7 @@ ${readerStyle.extra}
         <div class="ai-empty">
           {#if config.ai.enabled}
             端点：{profile?.name || "未配置"}｜正在阅读：{ctx.title || "—"}<br />
-            上方提示词可一键执行（默认 F1–F9 快捷键可自定义）；打开新章节自动执行第一个提示词；也可直接提问。
+            上方提示词可一键执行，默认 F1–F9 快捷键可自定义；打开新章节自动执行第一个提示词；也可直接提问。
           {:else}
             AI 未启用，请在设置中开启并配置端点。
           {/if}
@@ -929,10 +930,11 @@ ${readerStyle.extra}
     </div>
     <div class="ai-input">
       <input
-        placeholder="向 AI 提问（结合本章上下文）…"
+        placeholder="向 AI 提问…"
         bind:value={input}
         onkeydown={(e) => e.key === "Enter" && send()}
         disabled={streaming}
+        title="结合本章上下文提问"
       />
       <button class="primary" onclick={send} disabled={streaming}>发送</button>
     </div>
@@ -1125,7 +1127,7 @@ ${readerStyle.extra}
 
   .ai-panel .ai-actions .mini {
     padding: 3px 7px;
-    font-size: 11.5px;
+    font-size: 12px;
   }
 
   .ai-panel.reader .ai-head {

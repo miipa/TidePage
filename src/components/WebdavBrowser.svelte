@@ -148,7 +148,7 @@
 
   {#if !connected}
     <div class="wd-connect">
-      <p>连接 {config.webdav.base || "（未配置服务器）"}<br />
+      <p>连接 {config.webdav.base || "未配置服务器"}<br />
       账号：{config.webdav.user || "—"}</p>
       <button class="primary big" onclick={connect} disabled={!config.webdav.base}>
         🔗 连接并访问
@@ -232,7 +232,7 @@
 
   .wd-connect .big {
     padding: 10px 26px;
-    font-size: 15px;
+    font-size: 16px;
   }
 
   .wd-head {
@@ -244,7 +244,7 @@
 
   .wd-title {
     font-weight: 600;
-    font-size: 15px;
+    font-size: 16px;
   }
 
   .wd-path {
@@ -299,7 +299,7 @@
 
   .wd-size {
     opacity: 0.5;
-    font-size: 11px;
+    font-size: 12px;
     margin-left: 6px;
   }
 
@@ -369,7 +369,7 @@
 
   .wd-dl-err {
     margin-top: 6px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--danger);
     word-break: break-all;
     max-height: 44px;

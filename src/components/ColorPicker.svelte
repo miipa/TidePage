@@ -228,7 +228,7 @@
 
   .cp-clear {
     background: var(--panel2);
-    font-size: 11px;
+    font-size: 12px;
     line-height: 1;
   }
 
@@ -241,7 +241,7 @@
 
   .cp-row label {
     width: 34px;
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.6;
     flex-shrink: 0;
   }
@@ -259,7 +259,7 @@
   }
 
   .cp-tip {
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.5;
     margin-top: 4px;
   }

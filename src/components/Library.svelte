@@ -4,6 +4,15 @@
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dragSort } from "../lib/dragSort";
   import { listen } from "@tauri-apps/api/event";
+  import type { Icon as TablerIcon } from "@tabler/icons-svelte";
+  import {
+    IconChartBar,
+    IconCloud,
+    IconDice,
+    IconNotebook,
+    IconSearch,
+    IconSettings,
+  } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
   import type { BookRow } from "../lib/types";
 
@@ -42,6 +51,8 @@
   let refreshProgress = $state<{ phase: string; done: number; total: number } | null>(null);
   /** 封面/元数据后台生成进度（由后端 meta-progress 事件驱动；不阻塞其它操作）。 */
   let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
+  /** 让最后一帧进度（N/N）短暂可见后再隐藏，避免一闪而过看不到。 */
+  let metaHideTimer: ReturnType<typeof setTimeout> | undefined;
   /** 长按刷新弹出的菜单（普通点击=只读书籍；长按=可刷新封面）。 */
   let refreshMenu = $state(false);
 
@@ -50,16 +61,16 @@
     id: LibraryTopbarId;
     label: string;
     title: string;
-    glyph: string;
+    icon: TablerIcon;
     run: () => void;
   }
   const LIB_BTNS: LibBtn[] = [
-    { id: "webdav", label: "WebDAV 文件管理", title: "WebDAV 文件管理（向左滑也可打开）", glyph: "☁", run: () => (ui.webdavOpen = true) },
-    { id: "random", label: "随机打开", title: "随机打开一本", glyph: "🎲", run: () => openRandom() },
-    { id: "search", label: "全文搜索", title: "全文搜索", glyph: "🔍", run: () => (ui.searchOpen = true) },
-    { id: "notes", label: "笔记", title: "笔记（带感想的划线，按书汇总）", glyph: "✎", run: () => (ui.notesOpen = true) },
-    { id: "stats", label: "阅读统计", title: "阅读统计", glyph: "📈", run: () => (ui.statsOpen = true) },
-    { id: "settings", label: "设置", title: "设置", glyph: "⚙", run: () => (ui.settingsOpen = true) },
+    { id: "webdav", label: "WebDAV 文件管理", title: "WebDAV 文件管理（向左滑也可打开）", icon: IconCloud, run: () => (ui.webdavOpen = true) },
+    { id: "random", label: "随机打开", title: "随机打开一本", icon: IconDice, run: () => openRandom() },
+    { id: "search", label: "全文搜索", title: "全文搜索", icon: IconSearch, run: () => (ui.searchOpen = true) },
+    { id: "notes", label: "笔记", title: "笔记（带感想的划线，按书汇总）", icon: IconNotebook, run: () => (ui.notesOpen = true) },
+    { id: "stats", label: "阅读统计", title: "阅读统计", icon: IconChartBar, run: () => (ui.statsOpen = true) },
+    { id: "settings", label: "设置", title: "设置", icon: IconSettings, run: () => (ui.settingsOpen = true) },
   ];
   const libBtn = (id: string): LibBtn | undefined => LIB_BTNS.find((b) => b.id === id);
   const orderedLibBtns = $derived(
@@ -458,6 +469,7 @@
     try {
       await api.setCustomCover(b.id, p);
       b.cover_path = `custom-${b.id}.png`;
+      b.cover_ver = (b.cover_ver ?? 0) + 1;
       touchWindow();
       toast("封面已更新");
     } catch (e) {
@@ -469,6 +481,7 @@
     try {
       const name = await api.reextractCover(b.id);
       b.cover_path = name;
+      b.cover_ver = (b.cover_ver ?? 0) + 1;
       touchWindow();
       toast("封面已重新提取");
     } catch (e) {
@@ -536,6 +549,7 @@
     // 监听只增量刷新当前窗口与 total，不重置滚动、不拉全量。
     // library-changed 也会在换/恢复默认底图后触发：先 bump 缓存破坏版本号，
     // 保证无内嵌封面的书立即换用新底图（有内嵌封面书走各自 cover_path，不受影响）。
+    // 注意：这里**不触发** metaProgress / 扫描进度状态，避免进度条回退或跳变。
     const u1 = listen("library-changed", () => {
       bumpCoverBust();
       reloadWindow();
@@ -544,11 +558,20 @@
     const u4 = listen<{ phase: string; done: number; total: number }>("refresh-progress", (e) => {
       if (e.payload) refreshProgress = e.payload;
     });
+    // 封面增量扫描进度（入队时发一帧 / 每 16 本发一帧 / done==total 必发）。
     const u5 = listen<{ phase: string; done: number; total: number }>("meta-progress", (e) => {
-      if (!e.payload) return;
-      if (e.payload.phase === "done") metaProgress = null;
-      else metaProgress = e.payload;
+      if (e.payload) {
+        clearTimeout(metaHideTimer);
+        metaProgress = e.payload;
+      }
     });
+    // 扫完即停：让最后一帧（N/N）短暂可见后再隐藏，避免 3/3 一闪而过看不到。
+    const u6 = listen("scan-finished", () => {
+      clearTimeout(metaHideTimer);
+      metaHideTimer = setTimeout(() => { metaProgress = null; }, 600);
+    });
+    // 某本书封面已更新（提取到新封面/手动换封面）：重取窗口，per-book URL 随 coverVer 变化。
+    const u7 = listen("book-updated", () => reloadWindow());
     let u3: Promise<() => void> | null = null;
     import("@tauri-apps/api/webview")
       .then((m) => {
@@ -560,10 +583,13 @@
       })
       .catch(() => {});
     return () => {
+      clearTimeout(metaHideTimer);
       u1.then((f) => f());
       u2.then((f) => f());
       u4.then((f) => f());
       u5.then((f) => f());
+      u6.then((f) => f());
+      u7.then((f) => f());
       u3?.then((f) => f());
     };
   });
@@ -601,12 +627,15 @@
     <div class="spacer"></div>
     <div class="lib-tb-group" use:dragSort={{ onDrop: libDrop }}>
       {#each orderedLibBtns as b (b.id)}
+        {@const Icon = b.icon}
         <button
           class="icon lib-tb-btn"
           data-drag-id={b.id}
           title={b.title}
           onclick={b.run}
-        >{b.glyph}</button>
+        >
+          <Icon size={18} stroke={1.75} />
+        </button>
       {/each}
     </div>
   </div>
@@ -989,9 +1018,20 @@
     display: flex;
     align-items: center;
     gap: var(--sp-1, 4px);
+    position: relative;
   }
 
-  .lib-tb-btn { touch-action: none; }
+  .lib-tb-btn {
+    touch-action: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    min-height: 28px;
+    height: 28px;
+    padding: 0;
+    border-radius: var(--radius-sm);
+  }
 
   /* 当前视图高亮：让用户知道自己在哪个视图（skill: active nav indication） */
   .view-btn.active {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, coverUrl } from "../lib/api";
-  import { copyText, toast } from "../lib/stores.svelte";
+  import { appConfirm, copyText, toast } from "../lib/stores.svelte";
   import type { BookRow, BookSession } from "../lib/types";
 
   let { book, onclose }: { book: BookRow; onclose: () => void } = $props();
@@ -55,7 +55,7 @@
       await api.updateBookMeta(book.id, title.trim(), author.trim());
       book.title = title.trim();
       book.author = author.trim();
-      toast("书籍信息已保存（仅软件内显示）");
+      toast("书籍信息已保存，仅在软件内显示");
     } catch (e) {
       toast(String(e), "error");
     } finally {
@@ -65,12 +65,16 @@
 
   let writing = $state(false);
   async function saveToFile() {
+    const ok = await appConfirm(
+      `把书名/作者直接写回原始 EPUB 文件？\n将覆盖原文件且不备份：\n${book.path}`,
+    );
+    if (!ok) return;
     writing = true;
     try {
       await api.writeBookMeta(book.id, title.trim(), author.trim());
       book.title = title.trim();
       book.author = author.trim();
-      toast("已写入原始 EPUB 文件（直接覆盖）");
+      toast("已写入原始 EPUB 文件");
     } catch (e) {
       toast(String(e), "error");
     } finally {
@@ -87,7 +91,7 @@
       `路径：${book.path}`,
       `添加时间：${fmtTime(book.added_at)}`,
       `最近阅读：${fmtTime(book.last_read)}`,
-      wc ? `全书字数：${wc.total}（纯文字 ${wc.pure}）` : "",
+      wc ? `全书字数：${wc.total}，纯文字 ${wc.pure}` : "",
       `累计阅读：${fmtDur(totalSeconds)} · ${fmtChars(totalChars)} 字`,
     ].filter(Boolean).join("\n");
   }
@@ -104,6 +108,7 @@
     try {
       await api.setCustomCover(book.id, p);
       book.cover_path = `custom-${book.id}.png`;
+      book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
       toast("封面已更新");
     } catch (e) {
@@ -115,6 +120,7 @@
     try {
       const name = await api.reextractCover(book.id);
       book.cover_path = name;
+      book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
       toast("封面已重新提取");
     } catch (e) {
@@ -132,7 +138,7 @@
 
     <div class="bd-body">
       <div class="bd-left">
-        <img class="bd-cover" src={cover} alt="" />
+        <img class="bd-cover" src={cover} alt="《{book.title}》封面" />
         <div class="bd-cover-acts">
           <button onclick={setCover}>设置封面</button>
           <button onclick={reextract}>重新提取</button>
@@ -202,7 +208,7 @@
       <div class="flex1"></div>
       <button onclick={onclose}>关闭</button>
       <button onclick={save} disabled={saving}>{saving ? "保存中…" : "保存信息"}</button>
-      <button class="primary" onclick={saveToFile} disabled={writing} title="把书名/作者直接写回原始 EPUB 文件（覆盖，不备份）">
+      <button class="primary" onclick={saveToFile} disabled={writing} title="把书名/作者直接写回原始 EPUB 文件，覆盖且不备份">
         {writing ? "写入中…" : "保存到书籍"}
       </button>
     </div>
@@ -317,14 +323,14 @@
   }
 
   .bd-s b { display: block; font-size: 14px; color: var(--accent); }
-  .bd-s span { font-size: 11px; color: var(--fg2); }
+  .bd-s span { font-size: 12px; color: var(--fg2); }
 
   .bd-sessions { max-height: 190px; overflow-y: auto; }
 
   .bd-srow {
     display: flex;
     gap: 12px;
-    font-size: 12.5px;
+    font-size: 13px;
     padding: 5px 2px;
     border-bottom: 1px solid var(--line);
   }

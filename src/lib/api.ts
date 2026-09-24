@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
   listFolders: () => invoke<string[]>("list_folders"),
@@ -12,12 +12,28 @@ export const api = {
   refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
   fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
-  getChapter: (bookId: number, chapterIndex: number) =>
-    invoke<ChapterData>("get_chapter", { bookId, chapterIndex }),
+  getChapter: (bookId: number, chapterIndex: number, keepStyles = false) =>
+    invoke<ChapterData>("get_chapter", { bookId, chapterIndex, keepStyles }),
+  listBookImages: (bookId: number) => invoke<BookImage[]>("list_book_images", { bookId }),
   saveProgress: (bookId: number, p: Progress) => invoke<void>("save_progress", { bookId, p }),
   loadProgress: (bookId: number) => invoke<Progress | null>("load_progress", { bookId }),
-  deleteBooks: (paths: string[], fromDisk: boolean) =>
-    invoke<void>("delete_books", { paths, fromDisk }),
+  deleteBooks: (paths: string[], fromDisk: boolean, keepNotes = true) =>
+    invoke<void>("delete_books", { paths, fromDisk, keepNotes }),
+  bookNoteInfo: (bookId: number) =>
+    invoke<{ hasNotes: boolean; noteCount: number }>("book_note_info", { bookId }),
+  listNoteBooks: () =>
+    invoke<{ bookId: number; title: string; author: string; deleted: boolean; noteCount: number; lastAt: number }[]>(
+      "list_note_books",
+    ),
+  listNotesOfBook: (bookId: number) =>
+    invoke<{ id: number; chapterIndex: number; chapterTitle: string; text: string; note: string; createdAt: number }[]>(
+      "list_notes_of_book",
+      { bookId },
+    ),
+  setHighlightNote: (id: number, note: string) =>
+    invoke<void>("set_highlight_note", { id, note }),
+  appendHighlightNote: (id: number, addition: string) =>
+    invoke<string>("append_highlight_note", { id, addition }),
   previewSplit: (path: string, pattern: string) =>
     invoke<TocEntry[]>("preview_split", { path, pattern }),
   saveSplitRules: (pattern: string) => invoke<void>("save_split_rules", { pattern }),
@@ -72,6 +88,22 @@ export const api = {
   getSetting: (key: string) => invoke<string | null>("get_setting_kv", { key }),
   setMobiEncoding: (value: string) => invoke<void>("set_mobi_encoding", { value }),
   getAppDataDir: () => invoke<string>("app_data_dir"),
+  storageStats: () =>
+    invoke<{
+      data_dir: string;
+      total_bytes: number;
+      covers_bytes: number;
+      res_bytes: number;
+      fonts_bytes: number;
+      db_bytes: number;
+      cache_bytes: number;
+    }>("storage_stats"),
+  clearCache: (what: "covers" | "res" | "all") => invoke<number>("clear_cache", { what }),
+  refreshCovers: () => invoke<void>("refresh_covers"),
+  metaDebugStats: () => invoke<{ startCount: number; running: boolean }>("meta_debug_stats"),
+  setDefaultCover: (imagePath: string) => invoke<void>("set_default_cover", { imagePath }),
+  clearDefaultCover: () => invoke<void>("clear_default_cover"),
+  hasDefaultCover: () => invoke<boolean>("has_default_cover"),
   addBookmark: (bookId: number, chapterIndex: number, title: string, excerpt: string) =>
     invoke<void>("add_bookmark", { bookId, chapterIndex, title, excerpt }),
   listBookmarks: (bookId: number) => invoke<BookmarkRow[]>("list_bookmarks", { bookId }),
@@ -109,7 +141,17 @@ export const api = {
     voice: string; format: string; text: string;
   }) => invoke<string>("tts_synth", args),
   ttsVoices: (baseUrl: string, apiKey: string) =>
-    invoke<string[]>("tts_voices", { baseUrl, apiKey }),
+    invoke<{ id: string; name: string; type: string; language: string }[]>("tts_voices", {
+      baseUrl,
+      apiKey,
+    }),
+  ttsEnsureFixedVoice: (baseUrl: string, apiKey: string, language: string, instruct: string) =>
+    invoke<{ id: string; created: boolean }>("tts_ensure_fixed_voice", {
+      baseUrl,
+      apiKey,
+      language,
+      instruct,
+    }),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   searchInBook: (bookId: number, query: string) =>
@@ -135,7 +177,20 @@ export const api = {
   revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
 };
 
+// 全局封面缓存破坏版本：换底图/恢复内置后 +1（后端 cover_style_ver 的镜像）。
+let _coverBust = 0;
+export function bumpCoverBust(): void {
+  _coverBust++;
+}
+
 export function coverUrl(book: BookRow): string {
-  const name = book.cover_path || `${book.id}.none`;
-  return `http://flowread.localhost/covers/${encodeURIComponent(name)}?v=${book.mtime || book.added_at || 0}`;
+  // v = 全局分量(cover_style_ver) - per-book 分量(coverVer)。
+  // per-book 分量保证：即使同一文件名，重新提取/更换封面后 URL 也会变，浏览器不会吃缓存。
+  const v = `${_coverBust}-${book.cover_ver ?? 0}`;
+  if (!book.cover_path) {
+    // 无内嵌封面 → 共享默认封面端点（底图 + 实时叠字）。
+    return `http://flowread.localhost/cover-default/${book.id}?v=${v}`;
+  }
+  // 有内嵌封面 → per-book 端点（/book-cover/<id>），按 id + coverVer 缓存破坏。
+  return `http://flowread.localhost/book-cover/${book.id}?v=${v}`;
 }

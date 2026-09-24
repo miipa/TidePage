@@ -26,7 +26,7 @@
     indexBtn = "重建中…";
     try {
       await api.rebuildFts();
-      toast("索引已清空，现在开始重新索引全部书籍（后台进行）");
+      toast("索引已清空，现在开始重新索引全部书籍，后台进行");
       const books = await api.listBooks();
       let n = 0;
       for (const b of books) {
@@ -58,7 +58,7 @@
   <h3>全文搜索</h3>
   <div class="row-inline" style="margin-bottom:12px">
     <input
-      placeholder="输入关键词（2 字以上）…"
+      placeholder="输入关键词，至少 2 字…"
       bind:value={query}
       onkeydown={(e) => e.key === "Enter" && doSearch()}
       style="flex:1"
@@ -115,7 +115,7 @@
   }
 
   .hs {
-    font-size: 12.5px;
+    font-size: 13px;
     color: var(--fg2);
     margin-top: 2px;
     line-height: 1.5;

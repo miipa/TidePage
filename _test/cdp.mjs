@@ -18,10 +18,12 @@ export async function connectTarget(port, pred) {
 async function open(t) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const ws = new WebSocket(t.webSocketDebuggerUrl);
-  let seq = 0; const pending = new Map();
+  let seq = 0; const pending = new Map(); const events = [];
   await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
   ws.onmessage = ({ data }) => {
-    const m = JSON.parse(data); const p = pending.get(m.id); if (!p) return;
+    const m = JSON.parse(data);
+    const p = pending.get(m.id);
+    if (!p) { events.push(m); if (events.length > 500) events.shift(); return; }
     pending.delete(m.id); m.error ? p.reject(new Error(m.error.message)) : p.resolve(m.result);
   };
   const call = (method, params = {}) => new Promise((resolve, reject) => { const id = ++seq; pending.set(id, { resolve, reject }); ws.send(JSON.stringify({ id, method, params })); });
@@ -31,5 +33,9 @@ async function open(t) {
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
     return r.result.value;
   }
-  return { evalJs, call, close: () => ws.close(), url: t.url };
+  const consoleLogs = () => events
+    .filter((e) => e.method === "Runtime.consoleAPICalled")
+    .map((e) => (e.params?.args || []).map((a) => a.value ?? a.description ?? "").join(" "));
+  const drainEvents = () => { const e = events.slice(); events.length = 0; return e; };
+  return { evalJs, call, close: () => ws.close(), url: t.url, consoleLogs, drainEvents };
 }

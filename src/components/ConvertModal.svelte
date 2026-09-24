@@ -105,7 +105,7 @@
     <button class="icon" title="关闭" onclick={close}>×</button>
   </div>
   {#if book}
-    <p class="src">源文件：{book.title}（{book.format.toUpperCase()}）</p>
+    <p class="src">源文件：{book.title} · {book.format.toUpperCase()}</p>
 
     {#if targetOptions.length > 1}
       <div class="row-inline" style="margin-bottom:12px">
@@ -123,12 +123,12 @@
           <input placeholder="默认取自文件名" bind:value={title} />
         </div>
         <div class="field">
-          <label>作者（自动从文件或正文提取）</label>
-          <input placeholder="留空则不设置" bind:value={author} />
+          <label>作者</label>
+          <input placeholder="留空则不设置" bind:value={author} title="自动从文件或正文提取" />
         </div>
       </div>
       <div class="field">
-        <label>封面（自动记忆上次选择）</label>
+        <label>封面</label>
         <div class="row-inline">
           <button onclick={pickCover}>{coverPath ? "更换封面图片…" : "选择封面图片…"}</button>
           <button
@@ -141,10 +141,12 @@
             <button class="icon" title="清除" onclick={() => (coverPath = "")}>×</button>
           {/if}
         </div>
+        <p class="tip">封面会自动记忆上次选择。</p>
       </div>
       <div class="field">
-        <label>EPUB 内嵌 CSS（自动记忆上次输入，与阅读样式无关）</label>
+        <label>EPUB 内嵌 CSS</label>
         <textarea rows="8" bind:value={css} spellcheck="false" placeholder={"body { font-family: 'Songti SC', serif; }\np { line-height: 2; text-indent: 2em; }"}></textarea>
+        <p class="tip">自动记忆上次输入，与阅读样式无关。</p>
       </div>
     {:else}
       <p class="src">将去除样式，仅保留纯文本与章节标题。</p>
@@ -193,6 +195,13 @@
     word-break: break-all;
   }
 
+  .tip {
+    font-size: 12px;
+    color: var(--fg2);
+    line-height: 1.7;
+    margin: 4px 0 0;
+  }
+
   .covername {
     font-size: 12px;
     color: var(--fg2);
@@ -204,7 +213,7 @@
 
   textarea {
     font-family: Consolas, monospace;
-    font-size: 12.5px;
+    font-size: 13px;
     resize: vertical;
   }
 

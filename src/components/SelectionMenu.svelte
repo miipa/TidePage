@@ -115,7 +115,7 @@
 
   .sw-line {
     display: block;
-    font-size: 15px;
+    font-size: 16px;
     line-height: 1.15;
     color: var(--hl-color, var(--accent, #c0392b));
   }

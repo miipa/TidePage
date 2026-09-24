@@ -1,4 +1,4 @@
-import { config, toast } from "./stores.svelte";
+import { config, saveConfig, toast } from "./stores.svelte";
 import { api } from "./api";
 
 export interface FlatSegment {
@@ -71,6 +71,16 @@ export function segIndexAt(segs: FlatSegment[], offset: number): number {
 
 const supported = typeof window !== "undefined" && "speechSynthesis" in window;
 
+/** 在线语音服务返回的音色。`type==="profile"` 是服务端保存的固定克隆音色，
+ *  用它朗读可保证整章音色一致；OpenAI 别名会映射到服务端默认音色，对克隆引擎
+ *  可能每句都换人（VoiceStudio/OmniVoice 即如此）。 */
+export interface OnlineVoice {
+  id: string;
+  name: string;
+  type: string;
+  language: string;
+}
+
 export const ttsState = $state({
   supported,
   playing: false,
@@ -79,7 +89,7 @@ export const ttsState = $state({
   total: 0,
   voices: [] as SpeechSynthesisVoice[],
   /** 在线语音：从服务 /v1/voices 读取到的音色列表 */
-  onlineVoices: [] as string[],
+  onlineVoices: [] as OnlineVoice[],
   onlineVoiceLoading: false,
   /** 在线语音：当前句音频尚未就绪（缓冲中） */
   buffering: false,
@@ -173,6 +183,48 @@ function speakSystem(seg: FlatSegment, i: number, g: number) {
 
 /* ---------------- 在线语音 ---------------- */
 
+/** OpenAI 标准别名：VoiceStudio 等克隆引擎会把它映射到「服务端默认音色」，
+ *  该默认音色没有固定说话人，逐句请求可能换成不同的人。 */
+const OPENAI_VOICE_ALIASES = new Set([
+  "alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage",
+]);
+
+/** 待朗读内容的目标语言名（VoiceStudio 用英文语言名）。优先按正文判断。 */
+function targetLanguageName(): string {
+  let hasCjk = false;
+  let hasLatin = false;
+  for (let i = 0; i < segments.length && i < 60; i++) {
+    const t = segments[i].text;
+    if (/[\u4e00-\u9fff]/.test(t)) hasCjk = true;
+    else if (/[a-zA-Z]/.test(t)) hasLatin = true;
+  }
+  if (hasCjk) return "Chinese";
+  const l = (config.tts.lang || "").toLowerCase();
+  if (l.startsWith("zh")) return "Chinese";
+  if (l.startsWith("ja") || l.startsWith("jp")) return "Japanese";
+  if (l.startsWith("ko")) return "Korean";
+  if (l.startsWith("fr")) return "French";
+  if (l.startsWith("de")) return "German";
+  if (l.startsWith("es")) return "Spanish";
+  if (hasLatin || l.startsWith("en")) return "English";
+  return "English";
+}
+
+/** 固定音色的 language 是否匹配目标语言（避免再出现「英文音色读中文」）。 */
+function voiceLangMatches(voice: OnlineVoice, target: string): boolean {
+  const l = (voice.language || "").toLowerCase();
+  if (!l) return false;
+  const t = target.toLowerCase();
+  if (t === "chinese") return l.includes("chin") || l.startsWith("zh") || l.includes("mandarin");
+  if (t === "english") return l.includes("engl") || l.startsWith("en");
+  return l.startsWith(t.slice(0, 4));
+}
+
+/** 本次请求实际要发送的音色（固定音色的选择在朗读前由 ensureFixedVoice 完成）。 */
+export function effectiveOnlineVoice(): string {
+  return (config.tts.onlineVoice || "").trim();
+}
+
 interface TtsEndpoint {
   provider: string;
   baseUrl: string;
@@ -227,7 +279,7 @@ function cacheKey(text: string): string {
   return [
     ep?.tag ?? "none",
     config.tts.onlineModel,
-    config.tts.onlineVoice,
+    effectiveOnlineVoice(),
     config.tts.onlineFormat,
     text,
   ].join("\u0001");
@@ -284,7 +336,7 @@ async function fetchAudio(text: string): Promise<string> {
     apiVersion: ep.apiVersion,
     proxyMode: ep.proxyMode,
     proxyUrl: ep.proxyUrl,
-    voice: config.tts.onlineVoice || "alloy",
+    voice: effectiveOnlineVoice(),
     format: fmt,
     text,
   });
@@ -436,6 +488,13 @@ function failOnline(err: unknown) {
 
 async function playOnline(seg: FlatSegment, i: number, g: number) {
   ttsState.buffering = true;
+  // 首次在线朗读前：读取音色列表，并确保用「同语言的固定音色」，避免逐句换人。
+  if (config.tts.onlineSource === "custom") {
+    await ensureOnlineVoices();
+    if (g !== gen) return;
+    await ensureFixedVoice();
+    if (g !== gen) return;
+  }
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (g !== gen) return;
@@ -575,7 +634,99 @@ export function refreshVoices() {
  * 从自定义在线 TTS 服务的 /v1/voices 读取可用音色。
  * 返回列表（失败返回空数组），并写入 ttsState.onlineVoices 供播放条使用。
  */
-export async function refreshOnlineVoices(): Promise<string[]> {
+let voiceListPromise: Promise<OnlineVoice[]> | null = null;
+
+/** 确保在线自定义服务的音色列表已加载（失败静默；朗读时会退回别名）。 */
+async function ensureOnlineVoices(): Promise<void> {
+  if (config.tts.onlineSource !== "custom") return;
+  if (ttsState.onlineVoices.length) return;
+  if (!voiceListPromise) {
+    voiceListPromise = refreshOnlineVoices().finally(() => {
+      voiceListPromise = null;
+    });
+  }
+  await voiceListPromise;
+}
+
+let voiceAutoFixed = false;
+
+/** 只选择「固定音色」，且语言必须匹配正文；绝不拿英文音色顶替中文。 */
+function selectFixedVoice(list: OnlineVoice[]) {
+  const cur = (config.tts.onlineVoice || "").trim();
+  const isAlias = !cur || OPENAI_VOICE_ALIASES.has(cur.toLowerCase());
+  if (!isAlias) return;
+  const profiles = list.filter((v) => v.type === "profile");
+  if (!profiles.length) return;
+  const target = targetLanguageName();
+  const match = profiles.find((v) => voiceLangMatches(v, target));
+  if (!match) return; // 没有同语言固定音色：保持现状，由 ensureFixedVoice 创建
+  config.tts.onlineVoice = match.id;
+  saveConfig();
+  if (!voiceAutoFixed) {
+    voiceAutoFixed = true;
+    toast(`已改用固定音色「${match.name || match.id}」，避免逐句音色变化`);
+  }
+}
+
+/** 设计音色的固定描述（VoiceStudio 合法 token），用于无参考音频时创建固定音色。 */
+const FIXED_VOICE_INSTRUCT = "female, young adult, moderate pitch";
+const DESIGNABLE_LANGS = new Set(["Chinese", "English"]);
+
+let fixedVoicePromise: Promise<boolean> | null = null;
+
+/**
+ * 朗读前确保有一个「与正文同语言」的固定音色：
+ *  - 已是固定音色 → 直接使用；
+ *  - 已有同语言固定音色 → 选用；
+ *  - VoiceStudio 风格服务且无同语言固定音色 → 现场创建 design profile（固定说话人）。
+ * 绝不回退到不同语言的音色（这正是之前「英文音色读中文」的原因）。
+ */
+async function ensureFixedVoice(): Promise<boolean> {
+  if (config.tts.onlineSource !== "custom") return false;
+  const cur = (config.tts.onlineVoice || "").trim();
+  if (cur && !OPENAI_VOICE_ALIASES.has(cur.toLowerCase())) return true;
+  const target = targetLanguageName();
+  const match = ttsState.onlineVoices
+    .filter((v) => v.type === "profile")
+    .find((v) => voiceLangMatches(v, target));
+  if (match) {
+    config.tts.onlineVoice = match.id;
+    saveConfig();
+    return true;
+  }
+  const voiceStudioLike = ttsState.onlineVoices.some(
+    (v) => v.type === "openai_alias" || v.type === "profile"
+  );
+  if (!voiceStudioLike || !DESIGNABLE_LANGS.has(target)) return false;
+  if (!fixedVoicePromise) {
+    fixedVoicePromise = (async () => {
+      try {
+        const base = (config.tts.customBaseUrl || "").trim();
+        const res = await api.ttsEnsureFixedVoice(
+          base,
+          config.tts.customApiKey || "",
+          target,
+          FIXED_VOICE_INSTRUCT,
+        );
+        await refreshOnlineVoices();
+        config.tts.onlineVoice = res.id;
+        saveConfig();
+        if (res.created) {
+          toast(`已为${target === "Chinese" ? "中文" : target}创建固定音色，整章将保持同一说话人`);
+        }
+        return true;
+      } catch (e) {
+        toast(`创建固定音色失败，将沿用服务音色（可能逐句变化）：${e}`, "error");
+        return false;
+      } finally {
+        fixedVoicePromise = null;
+      }
+    })();
+  }
+  return fixedVoicePromise;
+}
+
+export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
   if (config.tts.onlineSource !== "custom") {
     ttsState.onlineVoices = [];
     return [];
@@ -589,6 +740,7 @@ export async function refreshOnlineVoices(): Promise<string[]> {
   try {
     const list = await api.ttsVoices(base, config.tts.customApiKey || "");
     ttsState.onlineVoices = list;
+    selectFixedVoice(list);
     return list;
   } catch {
     ttsState.onlineVoices = [];
@@ -605,4 +757,10 @@ if (supported) {
   } catch {
     /* ignore */
   }
+}
+
+// 在线自定义服务：启动即读取音色列表，并在存在「同语言固定音色」时自动选用。
+// 若没有同语言固定音色，会在真正开始朗读时为该语言创建/选用固定音色（见 ensureFixedVoice）。
+if (config.tts.engine === "online" && config.tts.onlineSource === "custom") {
+  void refreshOnlineVoices();
 }

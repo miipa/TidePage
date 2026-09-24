@@ -104,6 +104,44 @@ export function bindKeyMatches(stored: string, combo: string): boolean {
 export type TextAlign = "justify" | "left";
 export type ScrollBounceLevel = "weak" | "medium" | "strong";
 
+/** 顶栏/底栏可显示的状态项。 */
+export type StatusItemId =
+  | "bookTitle"
+  | "chapterName"
+  | "chapterIndex"
+  | "chapterCount"
+  | "chapterPages"
+  | "bookPages"
+  | "pagePercent"
+  | "bookProgress"
+  | "chars"
+  | "clock"
+  | "speed"
+  | "mode";
+
+export interface StatusItem {
+  id: StatusItemId;
+  enabled: boolean;
+}
+
+/** 状态项清单（设置页勾选；顶栏顺序即可在阅读界面拖动排序）。 */
+export const STATUS_ITEM_DEFS: { id: StatusItemId; name: string }[] = [
+  { id: "bookTitle", name: "书名" },
+  { id: "chapterName", name: "章节名" },
+  { id: "chapterIndex", name: "当前章号（第X章）" },
+  { id: "chapterCount", name: "总章数（共Y章）" },
+  { id: "chapterPages", name: "本节页数 / 百分比" },
+  { id: "bookPages", name: "全书总页数（估算）" },
+  { id: "pagePercent", name: "本节进度" },
+  { id: "bookProgress", name: "全书进度" },
+  { id: "chars", name: "本章字数" },
+  { id: "clock", name: "时间" },
+  { id: "speed", name: "阅读速度（字/分）" },
+  { id: "mode", name: "阅读模式" },
+];
+
+export const STATUS_ITEM_IDS: Set<string> = new Set(STATUS_ITEM_DEFS.map((d) => d.id));
+
 /// 滚动模式「章节过渡」三档预设：数值越大，切换章节所需滚动量越大。
 export const SCROLL_BOUNCE_PRESETS: Record<
   ScrollBounceLevel,
@@ -113,6 +151,44 @@ export const SCROLL_BOUNCE_PRESETS: Record<
   medium: { strength: 0.5, threshold: 340, label: "中（推荐）" },
   strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" },
 };
+
+/** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
+export const READER_TOPBAR_IDS = [
+  "webdav", "convert", "bookmarkAdd", "bookmarkList", "ttsPlay", "ttsStop",
+  "highlight", "ai", "stats", "toc", "manga", "manager", "images", "css", "settings",
+] as const;
+
+/** 漫画显示方式：瀑布流（纵向连续） / 横向（横向连续阅读）。 */
+export type MangaLayout = "flow" | "horizontal";
+/** 漫画阅读方向：从左到右 / 从右到左（日漫）。 */
+export type MangaDirection = "ltr" | "rtl";
+
+/** 漫画模式独立设置（与普通阅读排版分开；仅漫画模式/手动漫画模式下生效）。 */
+export interface MangaConfig {
+  /** 默认图片大小倍率（阅读界面右下角可再按单本覆盖） */
+  imgScale: number;
+  /** 默认图片适应阅读器宽度 */
+  fitWidth: boolean;
+  /** 漫画模式左右边距（px） */
+  marginH: number;
+  /** 漫画模式上下边距（px） */
+  marginV: number;
+  /** 图片之间的间距（px，支持 0=无缝紧密连接） */
+  imgGap: number;
+  /** 显示方式：瀑布流（纵向连续）/ 横向（横向连续阅读） */
+  layout: MangaLayout;
+  /** 阅读方向：从左到右 / 从右到左 */
+  direction: MangaDirection;
+  /** 仅显示图片（隐藏正文文字） */
+  hideText: boolean;
+  /** 漫画背景色（空=跟随普通主题背景） */
+  bgColor: string;
+}
+export type ReaderTopbarId = (typeof READER_TOPBAR_IDS)[number];
+
+/** 书库顶栏可拖拽排序的图标按钮 id（默认顺序）。 */
+export const LIBRARY_TOPBAR_IDS = ["webdav", "random", "search", "notes", "stats", "settings"] as const;
+export type LibraryTopbarId = (typeof LIBRARY_TOPBAR_IDS)[number];
 
 export interface ReaderConfig {
   mode: ReadMode;
@@ -144,6 +220,8 @@ export interface ReaderConfig {
   bindings: Record<BindAction, string[]>;
   zones: Record<ZoneKey, ZoneAction>;
   zoneHints: boolean;
+  /** 沉浸阅读：无操作一段时间后自动淡出顶栏/底栏，移动鼠标或按键恢复。 */
+  immersive: boolean;
   customFonts: { family: string; file: string }[];
   aiPanelWidth: number;
   scrollBounce: boolean;
@@ -152,6 +230,22 @@ export interface ReaderConfig {
   statusPos: "left" | "center" | "right" | "none";
   statusColor: string;
   topbarColor: string;
+  /** 阅读界面顶栏右侧按钮顺序（含隐藏项；拖动排序后持久化） */
+  topbarOrder: string[];
+  /** 阅读界面顶栏隐藏的按钮 id（重新显示时回到 topbarOrder 中的位置） */
+  topbarHidden: string[];
+  /** 漫画书籍图片大小倍率（旧字段，已迁移到 manga.imgScale，保留仅用于迁移） */
+  mangaImageScale?: number;
+  /** 漫画模式独立设置 */
+  manga: MangaConfig;
+  /** 是否已展示过漫画首次引导（全局，仅第一次打开漫画时提示） */
+  mangaGuideDone: boolean;
+  /** 顶栏状态项（顺序=显示顺序；可在阅读界面拖动排序） */
+  statusItems: StatusItem[];
+  /** 底栏进度条左侧显示项（顺序=显示顺序） */
+  footerLeft: StatusItemId[];
+  /** 底栏进度条右侧显示项（顺序=显示顺序） */
+  footerRight: StatusItemId[];
   /** 划词划线默认样式（见 HIGHLIGHT_STYLES） */
   highlightStyle: string;
   /** 划词划线默认颜色（空=跟随主题强调色） */
@@ -436,7 +530,7 @@ export interface TtsConfig {
   onlineProfileId: number;
   /** 在线语音模型（如 tts-1 / gpt-4o-mini-tts） */
   onlineModel: string;
-  /** 在线语音音色（如 alloy/nova/…） */
+  /** 在线语音音色（固定音色 id；留空=服务端默认） */
   onlineVoice: string;
   /** 在线语音音频格式 */
   onlineFormat: string;
@@ -455,12 +549,144 @@ export interface TtsConfig {
   sleepMinutes: number;
 }
 
+export interface LibraryConfig {
+  /** 书库顶栏图标按钮顺序（拖动排序后持久化） */
+  topbarOrder: string[];
+}
+
+/** 应用外壳界面配色（仅影响书库/设置/面板等外壳，与阅读正文完全独立）。 */
+export type UiTheme = "light" | "dark" | "system";
+
+/** 外壳配色方案（卡片点选）。 */
+export interface UiSkin {
+  id: string;
+  name: string;
+  /** 明暗基调，用于跟随系统时挑选对应肤色。 */
+  mode: "light" | "dark";
+  bg: string;
+  panel: string;
+  panel2: string;
+  fg: string;
+  fg2: string;
+  line: string;
+  accent: string;
+  /** 主按钮实底文字色（对比 accent）。 */
+  accentFg: string;
+  /** 语义色（用于状态/危险动作）。 */
+  success: string;
+  warning: string;
+  danger: string;
+  /** 卡片圆角（部分皮肤走硬朗/柔和两种气质）。 */
+  radiusCard: string;
+  /** 卡片阴影：柔 or 细线（部分皮肤几乎不用阴影）。 */
+  shadow: string;
+}
+
+/**
+ * 外壳可选皮肤：3 浅 + 1 深 + 1 近黑（共 5 套）。
+ * - Cream Island / Nocturne：取自用户提供的设计稿（仅提取配色与"细线/平板"气质，不引入衬线标题）。
+ * - 麻布 / 冷雾 / 石墨：在保留 4px 栅格与对比度规范下做性格化扩展。
+ */
+export const UI_SKINS: UiSkin[] = [
+  // ===== 浅色 =====
+  {
+    id: "cream",
+    name: "奶油",
+    mode: "light",
+    bg: "#FFF0DF", panel: "#FFFFFF", panel2: "#FBEBDA",
+    fg: "#292524", fg2: "#78716C", line: "rgba(41,37,36,0.10)",
+    accent: "#1C1917", accentFg: "#FFF0DF",
+    success: "#2D6A4F", warning: "#FF6900", danger: "#9F1239",
+    radiusCard: "16px", shadow: "0 1px 2px rgba(41,37,36,0.06)",
+  },
+  {
+    id: "linen",
+    name: "麻布",
+    mode: "light",
+    bg: "#F5F1E8", panel: "#FFFDF9", panel2: "#ECE6D9",
+    fg: "#2E2A24", fg2: "#7A7367", line: "rgba(46,42,36,0.11)",
+    accent: "#8C5A2B", accentFg: "#FFFDF9",
+    success: "#3F7A4E", warning: "#B07A1E", danger: "#A8453C",
+    radiusCard: "10px", shadow: "0 1px 3px rgba(46,42,36,0.08), 0 1px 2px rgba(46,42,36,0.05)",
+  },
+  {
+    id: "mist",
+    name: "冷雾",
+    mode: "light",
+    bg: "#F3F6FA", panel: "#FFFFFF", panel2: "#E8EEF6",
+    fg: "#20242C", fg2: "#5F6975", line: "rgba(32,36,44,0.09)",
+    accent: "#3B6FB0", accentFg: "#FFFFFF",
+    success: "#2F7D5B", warning: "#A9761B", danger: "#B4433C",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(32,36,44,0.05), 0 6px 20px rgba(32,36,44,0.06)",
+  },
+  // ===== 深色 =====
+  {
+    id: "nocturne",
+    name: "夜行",
+    mode: "dark",
+    bg: "#13111C", panel: "#1C1A28", panel2: "#0B0B0F",
+    fg: "#F7F7F8", fg2: "#A1A0AB", line: "#33323E",
+    accent: "#59497A", accentFg: "#F7F7F8",
+    success: "#428A72", warning: "#B08A3E", danger: "#F9A8D4",
+    radiusCard: "12px", shadow: "none",
+  },
+  {
+    id: "graphite",
+    name: "石墨",
+    mode: "dark",
+    bg: "#16181D", panel: "#1E2126", panel2: "#252932",
+    fg: "#E6E8EC", fg2: "#9AA0A8", line: "rgba(255,255,255,0.10)",
+    accent: "#4FAE95", accentFg: "#0F1115",
+    success: "#46B47C", warning: "#D4A72C", danger: "#E06B62",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.35)",
+  },
+];
+
+/** 旧皮肤 id → 新皮肤 id（升级时迁移，避免用户所选失效）。 */
+export const UI_SKIN_ALIAS: Record<string, string> = {
+  mist: "mist",
+  cool: "mist",
+  eye: "linen",
+  graphite: "graphite",
+  ink: "nocturne",
+};
+
+/** 解析皮肤 id（含旧 id 迁移），找不到时按明暗返回该组第一套。 */
+export function resolveSkinId(id: string | undefined, mode: "light" | "dark"): string {
+  const mapped = id ? (UI_SKIN_ALIAS[id] ?? id) : "";
+  if (UI_SKINS.some((s) => s.id === mapped)) return mapped;
+  return UI_SKINS.find((s) => s.mode === mode)?.id ?? UI_SKINS[0].id;
+}
+
+/** 阅读配色方案（完整排版快照，作为"存档点"）。 */
+export interface ReaderScheme {
+  id: string;
+  name: string;
+  /** 内置方案标记（可改名/删除，删除后不找回）。 */
+  builtin?: boolean;
+  /** 内置方案预设版本：用于升级时把内置方案刷新到新预设，用户自建方案不受影响。 */
+  rev?: number;
+  /** 快照的阅读排版配置。 */
+  cfg: ReaderConfig;
+}
+
+/** 内置阅读方案当前预设版本；递增即可让存量安装的内置方案刷新为新预设。 */
+const BUILTIN_SCHEME_REV = 2;
+
 export interface AppConfig {
   reader: ReaderConfig;
+  library: LibraryConfig;
   webdav: WebdavConfig;
   ai: AiConfig;
   tts: TtsConfig;
   regex: string;
+  /** 外壳配色：light/dark 为指定皮肤 id；system 跟随系统明暗（用系统调色？否，用对应肤色的 system 皮肤）。 */
+  uiTheme: UiTheme;
+  /** 系统模式下浅色/深色各自使用的皮肤 id。 */
+  uiSkinLight: string;
+  uiSkinDark: string;
+  /** 阅读配色方案库（全局共享）。 */
+  readerSchemes: ReaderScheme[];
 }
 
 const DEFAULTS: AppConfig = {
@@ -469,15 +695,15 @@ const DEFAULTS: AppConfig = {
     duo: false,
     colGap: 48,
     anim: true,
-    fontFamily: '"Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif',
+    fontFamily: "lxgwwenkai-regular",
     latinFont: "",
-    fontSize: 29,
-    fontWeight: 300,
+    fontSize: 32,
+    fontWeight: 400,
     lineHeight: 1.55,
     paraSpacing: 0.5,
-    marginH: 468,
+    marginH: 320,
     maxLineChars: 0,
-    marginV: 51,
+    marginV: 80,
     indent: "1em",
     textAlign: "justify",
     theme: "paper",
@@ -485,35 +711,72 @@ const DEFAULTS: AppConfig = {
     fgColor: "#2c2c2c",
     bgImage: "",
     bgOpacity: 0.35,
-    cssExtra: `h2 {
+    cssExtra: `
+h2 {
+  color: #4682B4;
   font-size: 1.6rem;
   font-weight: bold;
   text-align: center;
   margin: 2rem auto 2rem;
   padding-bottom: 0.5rem;
-  border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-bottom: 1px solid #dddddd;
+}
+
+p {
+  text-indent: 2em;
+  margin-top: 0;
+  margin-bottom: 1rem;
 }
 
 @media (max-width: 480px) {
+  body {
+    padding: 1rem 0.5rem;
+  }
+
   h2 {
     font-size: 1.4rem;
     margin: 1.5rem auto;
+  }
+
+  p {
+    margin-bottom: 0.8rem;
   }
 }`,
     overrideBookCss: true,
     pageTurnKeys: true,
     wheelTurnPage: true,
     bindings: structuredClone(DEFAULT_BINDINGS),
-    zones: structuredClone(DEFAULT_ZONES),
+    zones: { tl: "prev", tr: "next", bl: "prev", br: "next", c: "none" },
     zoneHints: false,
-    customFonts: [],
+    immersive: false,
+    customFonts: [
+      { family: "仓耳云黑-w03", file: "仓耳云黑-w03.ttf" },
+      { family: "方正兰亭圆_gbk", file: "方正兰亭圆_gbk.ttf" },
+      { family: "lxgwneoxiheiscreen", file: "lxgwneoxiheiscreen.ttf" },
+      { family: "lxgwwenkai-regular", file: "lxgwwenkai-regular.ttf" },
+    ],
     aiPanelWidth: 360,
     scrollBounce: true,
-    scrollBounceLevel: "medium",
+    scrollBounceLevel: "weak",
     multiWindow: false,
     statusPos: "center",
     statusColor: "",
     topbarColor: "",
+    topbarOrder: [...READER_TOPBAR_IDS],
+    topbarHidden: [],
+    manga: { imgScale: 1, fitWidth: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "" },
+    mangaGuideDone: false,
+    statusItems: [
+      { id: "chapterName", enabled: true },
+      { id: "chapterPages", enabled: false },
+      { id: "bookProgress", enabled: false },
+      { id: "bookTitle", enabled: false },
+      { id: "mode", enabled: false },
+      { id: "speed", enabled: false },
+      { id: "clock", enabled: false },
+    ],
+    footerLeft: ["clock", "bookPages"],
+    footerRight: ["bookProgress", "chapterPages"],
     highlightStyle: "underline",
     highlightColor: "",
     highlightColors: structuredClone(HIGHLIGHT_COLORS),
@@ -557,6 +820,9 @@ p {
   }
 }`, coverPath: "" },
   },
+  library: {
+    topbarOrder: [...LIBRARY_TOPBAR_IDS],
+  },
   webdav: {
     enabled: false,
     base: "",
@@ -567,22 +833,47 @@ p {
     downloadDir: "",
   },
   ai: {
-    enabled: false,
+    enabled: true,
     autoOnChapter: true,
     system: "你是一位专业的阅读助手。回答务必简洁准确，使用中文。",
     profiles: structuredClone(DEFAULT_AI_PROFILES),
     active: 0,
-    prompts: structuredClone(DEFAULT_PROMPTS),
+    prompts: [
+      {
+        id: 1,
+        name: "剧情总结",
+        key: "F1",
+        text: "直观说出文本写了什么，不要做阅读理解，不要脑补，不要分段，不要分点，200字内。\n{chapter}",
+      },
+      {
+        id: 2,
+        name: "翻译为中文",
+        key: "F2",
+        text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}",
+      },
+      {
+        id: 3,
+        name: "精校润色",
+        key: "F3",
+        text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}",
+      },
+      {
+        id: 4,
+        name: "人物情节梳理",
+        key: "F4",
+        text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}",
+      },
+    ],
     display: "reader",
     style: {
-      followReader: true,
-      fontFamily: "",
-      fontSize: 0,
-      lineHeight: 0,
+      followReader: false,
+      fontFamily: "仓耳云黑-w03",
+      fontSize: 28,
+      lineHeight: 1.65,
       paraSpacing: 0,
-      marginH: 0,
-      marginV: 0,
-      bgColor: "",
+      marginH: 98,
+      marginV: 2,
+      bgColor: "#FDF5E6",
       fgColor: "",
       indent: "1em",
       cssExtra: "",
@@ -592,25 +883,120 @@ p {
       "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
   },
   tts: {
-    engine: "system",
-    onlineSource: "profile",
-    customBaseUrl: "http://127.0.0.1:8000",
+    engine: "online",
+    onlineSource: "custom",
+    customBaseUrl: "http://127.0.0.1:3900",
     customApiKey: "",
     onlineProfileId: 0,
-    onlineModel: "tts-1",
-    onlineVoice: "alloy",
+    onlineModel: "omnivoice",
+    onlineVoice: "33aa3b77",
     onlineFormat: "wav",
-    voice: "",
+    voice: "Microsoft Kangkang - Chinese (Simplified, PRC)",
     lang: "zh-CN",
-    rate: 1,
-    pitch: 1,
-    volume: 1,
+    rate: 1.4,
+    pitch: 1.05,
+    volume: 0.95,
     autoNextChapter: true,
     highlight: true,
     sleepMinutes: 0,
   },
   regex: "",
+  uiTheme: "system",
+  uiSkinLight: "cream",
+  uiSkinDark: "nocturne",
+  readerSchemes: [],
 };
+// 注：readerSchemes 默认空，由 load() 用内置方案补齐（见 builtinSchemes）。
+
+/// 内置阅读方案（首次启动/未迁移时写入方案库；可改名、可删除）。
+/// 每套方案把「排版 + 间距节奏 + 配色」整体打包，而不仅换背景色：
+///  - 衬线（lxgwwenkai 楷体）走首行缩进 + 两端对齐的纸书版式；
+///  - 无衬线（雅黑/苹方）走无缩进 + 左对齐的屏幕版式，并用每行字数上限控制行宽。
+/// 字号/行高/段距/边距均按「长文阅读」调过，避免默认值在宽屏上把行拉得过长。
+function builtinSchemes(): ReaderScheme[] {
+  const base = () => structuredClone(DEFAULTS.reader);
+  const mk = (id: string, name: string, patch: Partial<ReaderConfig>): ReaderScheme => ({
+    id,
+    name,
+    builtin: true,
+    rev: BUILTIN_SCHEME_REV,
+    cfg: { ...base(), ...patch },
+  });
+  const SERIF = "lxgwwenkai-regular";
+  const SANS = '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif';
+  return [
+    mk("s-paper", "纸质", {
+      theme: "paper", bgColor: "#FDF5E6", fgColor: "#2c2c2c",
+      fontFamily: SERIF, latinFont: "Georgia",
+      fontSize: 32, lineHeight: 1.75, paraSpacing: 0.6,
+      marginH: 320, maxLineChars: 0, marginV: 80,
+      indent: "1em", textAlign: "justify",
+    }),
+    mk("s-modern", "现代", {
+      theme: "white", bgColor: "#FAFAF9", fgColor: "#22252A",
+      fontFamily: SANS, latinFont: "Segoe UI",
+      fontSize: 30, lineHeight: 1.7, paraSpacing: 0.9,
+      marginH: 0, maxLineChars: 38, marginV: 72,
+      indent: "0em", textAlign: "left",
+    }),
+    mk("s-green", "护眼绿", {
+      theme: "green", bgColor: "#c7e6c9", fgColor: "#2d3a2d",
+      fontFamily: SERIF, latinFont: "Georgia",
+      fontSize: 32, lineHeight: 1.8, paraSpacing: 0.6,
+      marginH: 320, maxLineChars: 0, marginV: 80,
+      indent: "1em", textAlign: "justify",
+    }),
+    mk("s-night", "夜间", {
+      theme: "dark", bgColor: "#23262b", fgColor: "#b8bcc2",
+      fontFamily: SANS, latinFont: "Segoe UI",
+      fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
+      marginH: 0, maxLineChars: 40, marginV: 72,
+      indent: "0em", textAlign: "left",
+    }),
+    mk("s-ink", "纯黑", {
+      theme: "night", bgColor: "#0f1115", fgColor: "#8a8f96",
+      fontFamily: SANS, latinFont: "Segoe UI",
+      fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
+      marginH: 0, maxLineChars: 40, marginV: 72,
+      indent: "0em", textAlign: "left",
+    }),
+    mk("s-wide", "宽屏舒适", {
+      theme: "paper", bgColor: "#F7F3EA", fgColor: "#2b2b2b",
+      fontFamily: SERIF, latinFont: "Georgia",
+      fontSize: 34, lineHeight: 1.8, paraSpacing: 0.6,
+      marginH: 0, maxLineChars: 36, marginV: 96,
+      indent: "1em", textAlign: "justify",
+    }),
+  ];
+}
+
+/// 内置方案升级：把「未被用户覆盖过」的内置方案刷新到当前预设（保留用户改过的名字），
+/// 并补上新增的内置方案；用户自建方案原样保留。
+/// 判定「未被覆盖」的方式：内置方案缺 rev 或 rev 落后于当前版本。
+function upgradeBuiltinSchemes(list: ReaderScheme[]): { list: ReaderScheme[]; dirty: boolean } {
+  const fresh = builtinSchemes();
+  const freshById = new Map(fresh.map((s) => [s.id, s]));
+  const seen = new Set<string>();
+  let dirty = false;
+  const out: ReaderScheme[] = [];
+  for (const s of list) {
+    seen.add(s.id);
+    const f = s.builtin ? freshById.get(s.id) : undefined;
+    if (f && s.rev !== BUILTIN_SCHEME_REV) {
+      out.push({ ...f, name: s.name || f.name });
+      dirty = true;
+    } else {
+      out.push(s);
+    }
+  }
+  for (const f of fresh) {
+    if (!seen.has(f.id)) {
+      out.push(f);
+      dirty = true;
+    }
+  }
+  return { list: out, dirty };
+}
 
 /// 旧版默认自定义 CSS（含写死的近黑字色与固定蓝标题色，破坏深色主题）。
 /// 仅当存量配置与它逐字相同时才替换为新默认，避免覆盖用户自行修改过的内容。
@@ -701,6 +1087,119 @@ function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
     r.cssExtra = DEFAULTS.reader.cssExtra;
     dirty = true;
   }
+  // 顶栏/底栏状态项：过滤非法 id、去重、保证非空
+  if (!Array.isArray(r.statusItems)) {
+    r.statusItems = structuredClone(DEFAULTS.reader.statusItems);
+    dirty = true;
+  } else {
+    const seen = new Set<string>();
+    const items: StatusItem[] = [];
+    for (const it of r.statusItems) {
+      const id = it && typeof it.id === "string" ? it.id : "";
+      if (!STATUS_ITEM_IDS.has(id) || seen.has(id)) {
+        dirty = true;
+        continue;
+      }
+      seen.add(id);
+      items.push({ id: id as StatusItemId, enabled: it.enabled !== false });
+    }
+    if (!items.length) {
+      items.push(...structuredClone(DEFAULTS.reader.statusItems));
+      dirty = true;
+    }
+    if (items.length !== r.statusItems.length) dirty = true;
+    r.statusItems = items;
+  }
+  const normFooter = (v: any, def: StatusItemId[]): StatusItemId[] => {
+    if (!Array.isArray(v)) return [...def];
+    const out: StatusItemId[] = [];
+    for (const x of v) {
+      if (typeof x === "string" && STATUS_ITEM_IDS.has(x) && !out.includes(x as StatusItemId)) {
+        out.push(x as StatusItemId);
+      }
+    }
+    return out;
+  };
+  const fl = normFooter(r.footerLeft, DEFAULTS.reader.footerLeft);
+  if (JSON.stringify(fl) !== JSON.stringify(r.footerLeft)) {
+    r.footerLeft = fl;
+    dirty = true;
+  }
+  const fr = normFooter(r.footerRight, DEFAULTS.reader.footerRight);
+  if (JSON.stringify(fr) !== JSON.stringify(r.footerRight)) {
+    r.footerRight = fr;
+    dirty = true;
+  }
+  // 顶栏按钮顺序：过滤非法 id、去重，并把新增按钮补到末尾（保证旧配置升级后新按钮出现）。
+  const normOrder = (v: any, all: readonly string[]): string[] => {
+    const out: string[] = [];
+    if (Array.isArray(v)) {
+      for (const x of v) {
+        if (typeof x === "string" && all.includes(x) && !out.includes(x)) out.push(x);
+      }
+    }
+    for (const id of all) if (!out.includes(id)) out.push(id);
+    return out;
+  };
+  const order = normOrder(r.topbarOrder, READER_TOPBAR_IDS);
+  if (JSON.stringify(order) !== JSON.stringify(r.topbarOrder)) {
+    r.topbarOrder = order;
+    dirty = true;
+  }
+  const hidden = Array.isArray(r.topbarHidden)
+    ? r.topbarHidden.filter((x: any) => typeof x === "string" && READER_TOPBAR_IDS.includes(x as ReaderTopbarId))
+    : [];
+  const hiddenUniq = [...new Set<string>(hidden)];
+  if (JSON.stringify(hiddenUniq) !== JSON.stringify(r.topbarHidden)) {
+    r.topbarHidden = hiddenUniq;
+    dirty = true;
+  }
+  // 漫画模式设置：校验各字段；旧字段 mangaImageScale 迁移到 manga.imgScale 后删除。
+  const clampF = (v: any, min: number, max: number, def: number) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n * 20) / 20)) : def;
+  };
+  const clampI = (v: any, min: number, max: number, def: number) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : def;
+  };
+  if (!r.manga || typeof r.manga !== "object") {
+    r.manga = structuredClone(DEFAULTS.reader.manga);
+    dirty = true;
+  }
+  const legacyMs = typeof r.mangaImageScale === "number" ? r.mangaImageScale : Number(r.mangaImageScale);
+  if (Number.isFinite(legacyMs)) {
+    if (r.manga.imgScale == null) r.manga.imgScale = legacyMs;
+    dirty = true;
+  }
+  if ("mangaImageScale" in r) {
+    delete r.mangaImageScale;
+    dirty = true;
+  }
+  const mi = clampF(r.manga.imgScale, 0.3, 3, DEFAULTS.reader.manga.imgScale);
+  if (r.manga.imgScale !== mi) { r.manga.imgScale = mi; dirty = true; }
+  const mfw = r.manga.fitWidth === true;
+  if (r.manga.fitWidth !== mfw) { r.manga.fitWidth = mfw; dirty = true; }
+  const mmh = clampI(r.manga.marginH, 0, 400, DEFAULTS.reader.manga.marginH);
+  if (r.manga.marginH !== mmh) { r.manga.marginH = mmh; dirty = true; }
+  const mmv = clampI(r.manga.marginV, 0, 400, DEFAULTS.reader.manga.marginV);
+  if (r.manga.marginV !== mmv) { r.manga.marginV = mmv; dirty = true; }
+  const mg = clampI(r.manga.imgGap, 0, 80, DEFAULTS.reader.manga.imgGap);
+  if (r.manga.imgGap !== mg) { r.manga.imgGap = mg; dirty = true; }
+  // 迁移旧值：single → flow、double → horizontal。
+  let mlayout = r.manga.layout;
+  if (mlayout === "single") mlayout = "flow";
+  else if (mlayout === "double") mlayout = "horizontal";
+  else if (mlayout !== "flow" && mlayout !== "horizontal") mlayout = DEFAULTS.reader.manga.layout;
+  if (r.manga.layout !== mlayout) { r.manga.layout = mlayout; dirty = true; }
+  const mdir = r.manga.direction === "rtl" ? "rtl" : "ltr";
+  if (r.manga.direction !== mdir) { r.manga.direction = mdir; dirty = true; }
+  const mhide = r.manga.hideText === true;
+  if (r.manga.hideText !== mhide) { r.manga.hideText = mhide; dirty = true; }
+  const mbg = typeof r.manga.bgColor === "string" ? r.manga.bgColor : "";
+  if (r.manga.bgColor !== mbg) { r.manga.bgColor = mbg; dirty = true; }
+  const mgd = r.mangaGuideDone === true;
+  if (r.mangaGuideDone !== mgd) { r.mangaGuideDone = mgd; dirty = true; }
   return dirty;
 }
 
@@ -774,10 +1273,43 @@ function migrateAi(savedAi: any): AiConfig {
 
 let reasoningMigrationDirty = false;
 let readerMigrationDirty = false;
+
+/** 归一化方案库：补齐 id/name，快照用默认配置兜底；空库时注入内置方案。 */
+function normalizeSchemes(list: any): ReaderScheme[] {
+  const out: ReaderScheme[] = [];
+  const seen = new Set<string>();
+  if (Array.isArray(list)) {
+    for (const s of list) {
+      if (!s || typeof s !== "object") continue;
+      let id = typeof s.id === "string" && s.id ? s.id : `s-${Math.random().toString(36).slice(2, 9)}`;
+      if (seen.has(id)) id = `s-${Math.random().toString(36).slice(2, 9)}`;
+      seen.add(id);
+      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案";
+      const cfgSrc = s.cfg && typeof s.cfg === "object" ? s.cfg : {};
+      const cfg: ReaderConfig = {
+        ...structuredClone(DEFAULTS.reader),
+        ...cfgSrc,
+        bindings: { ...structuredClone(DEFAULT_BINDINGS), ...(cfgSrc.bindings || {}) },
+        zones: { ...structuredClone(DEFAULT_ZONES), ...(cfgSrc.zones || {}) },
+      };
+      normalizeReaderConfig(cfg, cfgSrc);
+      out.push({ id, name, builtin: s.builtin === true, rev: typeof s.rev === "number" ? s.rev : undefined, cfg });
+    }
+  }
+  if (!out.length) return builtinSchemes();
+  return out;
+}
+
 function load(): AppConfig {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return structuredClone(DEFAULTS);
+    if (!raw) {
+      // 全新安装：注入内置阅读配色方案，并落盘一次。
+      const fresh = structuredClone(DEFAULTS);
+      fresh.readerSchemes = builtinSchemes();
+      readerMigrationDirty = true;
+      return fresh;
+    }
     const saved = JSON.parse(raw);
     // “关闭思考”已彻底移除：迁移时若发现存量旧键，加载后立即物理写回，保证导出的 profile 不含这些键。
     const aiSaved = saved.ai || {};
@@ -812,15 +1344,24 @@ function load(): AppConfig {
             ? [...saved.reader.highlightColors]
             : structuredClone(HIGHLIGHT_COLORS),
       },
+      library: { ...DEFAULTS.library, ...(saved.library || {}) },
       webdav: { ...DEFAULTS.webdav, ...saved.webdav },
       ai: migrateAi(saved.ai),
       tts: { ...DEFAULTS.tts, ...(saved.tts || {}) },
       regex: saved.regex ?? "",
+      uiTheme: saved.uiTheme === "light" || saved.uiTheme === "dark" ? saved.uiTheme : "system",
+      uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
+      uiSkinDark: resolveSkinId(saved.uiSkinDark, "dark"),
+      readerSchemes: normalizeSchemes(saved.readerSchemes),
     };
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
     if (merged.reader.fontFamily === '"Microsoft YaHei", "Segoe UI", serif') {
       merged.reader.fontFamily = DEFAULTS.reader.fontFamily;
     }
+    // 迁移：把存量安装的内置阅读方案刷新到当前预设（新增「现代 / 宽屏舒适」等）。
+    const schemeUpgrade = upgradeBuiltinSchemes(merged.readerSchemes);
+    merged.readerSchemes = schemeUpgrade.list;
+    if (schemeUpgrade.dirty) readerMigrationDirty = true;
     for (const z of ZONE_DEFS) {
       if (!BIND_DEFS.some((d) => d.id === (merged.reader.zones as Record<string, string>)[z.id]) && (merged.reader.zones as Record<string, string>)[z.id] !== "none") {
         (merged.reader.zones as Record<string, string>)[z.id] = DEFAULT_ZONES[z.id];
@@ -836,6 +1377,8 @@ function load(): AppConfig {
     // 归一化 reader：清理已废弃键（伪粗体/伪斜体/字距/标点压缩/滚动缓冲数值），
     // 迁移旧默认 cssExtra 与旧滚动缓冲，修正非法新字段。返回 true 时需要落盘。
     if (normalizeReaderConfig(merged.reader, saved.reader)) readerMigrationDirty = true;
+    // 方案库首次为空时会注入内置方案：需要落盘一次，否则刷新前 localStorage 仍为空。
+    if (!Array.isArray(saved.readerSchemes) || !saved.readerSchemes.length) readerMigrationDirty = true;
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -843,6 +1386,72 @@ function load(): AppConfig {
 }
 
 export const config = $state<AppConfig>(load());
+
+/** 解析当前生效的界面主题（system 时跟随操作系统）。 */
+export function resolvedUiTheme(): "light" | "dark" {
+  const t = config.uiTheme;
+  if (t === "light" || t === "dark") return t;
+  try {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
+/** 取当前生效的外壳皮肤。 */
+export function activeUiSkin(): UiSkin {
+  const mode = resolvedUiTheme();
+  const id = resolveSkinId(mode === "dark" ? config.uiSkinDark : config.uiSkinLight, mode);
+  return UI_SKINS.find((s) => s.id === id) ?? UI_SKINS.find((s) => s.mode === mode) ?? UI_SKINS[0];
+}
+
+/** 把外壳皮肤写进 <html> 的 CSS 变量，供全局样式生效。 */
+export function applyUiTheme(): void {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  const mode = resolvedUiTheme();
+  const s = activeUiSkin();
+  root.dataset.theme = mode;
+  root.style.setProperty("--bg", s.bg);
+  root.style.setProperty("--bg-elev", s.panel);
+  root.style.setProperty("--panel", s.panel);
+  root.style.setProperty("--panel2", s.panel2);
+  root.style.setProperty("--fg", s.fg);
+  root.style.setProperty("--fg2", s.fg2);
+  root.style.setProperty("--line", s.line);
+  root.style.setProperty("--line-strong", s.line);
+  root.style.setProperty("--accent", s.accent);
+  root.style.setProperty("--accent-fg", s.accentFg);
+  root.style.setProperty("--success", s.success);
+  root.style.setProperty("--warning", s.warning);
+  root.style.setProperty("--danger", s.danger);
+  root.style.setProperty("--radius-card", s.radiusCard);
+  root.style.setProperty("--shadow-card", s.shadow);
+  // 阴影按皮肤前景色「着色」而非纯黑：更融于背景、不显脏（深色皮肤用更低透明度）。
+  const tint = s.fg;
+  const a = (v: number) => (mode === "dark" ? v * 1.0 : v * 0.55);
+  root.style.setProperty("--shadow-sm", `0 1px 2px color-mix(in srgb, ${tint} ${Math.round(a(10))}%, transparent)`);
+  root.style.setProperty("--shadow-md", `0 6px 20px color-mix(in srgb, ${tint} ${Math.round(a(16))}%, transparent)`);
+  root.style.setProperty("--shadow-lg", `0 16px 48px color-mix(in srgb, ${tint} ${Math.round(a(28))}%, transparent)`);
+}
+
+// 界面主题响应式生效：uiTheme / 皮肤变化即更新；system 时监听系统切换。
+if (typeof window !== "undefined") {
+  $effect.root(() => {
+    $effect(() => {
+      void config.uiTheme;
+      void config.uiSkinLight;
+      void config.uiSkinDark;
+      applyUiTheme();
+    });
+  });
+  try {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (config.uiTheme === "system") applyUiTheme();
+    });
+  } catch { /* ignore */ }
+  applyUiTheme();
+}
 
 /** 返回一份 reader 默认配置（深拷贝，供设置页回退字体/恢复默认使用）。 */
 export function defaultReaderConfig(): ReaderConfig {
@@ -852,6 +1461,55 @@ export function defaultReaderConfig(): ReaderConfig {
 /** 仅重置「阅读」设置段（不动 AI / WebDAV / 分章正则）。 */
 export function resetReaderConfig(): void {
   config.reader = structuredClone(DEFAULTS.reader);
+  saveConfig();
+}
+
+/* ===================== 阅读配色方案（存档点） ===================== */
+
+/** 深拷贝阅读配置：config.reader 是 Svelte $state 代理，structuredClone 会抛 DataCloneError，
+ *  因此走 JSON 序列化（纯数据、无函数/循环引用）。 */
+function snapshotReader(): ReaderConfig {
+  return JSON.parse(JSON.stringify(config.reader)) as ReaderConfig;
+}
+
+/** 以当前阅读配置为快照，新建一个方案；返回新方案 id。 */
+export function createReaderScheme(name: string): string {
+  const id = `s-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  config.readerSchemes = [
+    ...config.readerSchemes,
+    { id, name: name.trim().slice(0, 40) || "未命名方案", cfg: snapshotReader() },
+  ];
+  saveConfig();
+  return id;
+}
+
+/** 用当前阅读配置覆盖已有方案（存档）。 */
+export function overwriteReaderScheme(id: string): void {
+  config.readerSchemes = config.readerSchemes.map((s) =>
+    s.id === id ? { ...s, cfg: snapshotReader() } : s,
+  );
+  saveConfig();
+}
+
+/** 重命名方案。 */
+export function renameReaderScheme(id: string, name: string): void {
+  const n = name.trim().slice(0, 40);
+  if (!n) return;
+  config.readerSchemes = config.readerSchemes.map((s) => (s.id === id ? { ...s, name: n } : s));
+  saveConfig();
+}
+
+/** 删除方案（内置的也可删，删除后不找回）。 */
+export function deleteReaderScheme(id: string): void {
+  config.readerSchemes = config.readerSchemes.filter((s) => s.id !== id);
+  saveConfig();
+}
+
+/** 把方案应用为全局阅读设置（写进 config.reader）。 */
+export function applyReaderSchemeGlobal(id: string): void {
+  const s = config.readerSchemes.find((x) => x.id === id);
+  if (!s) return;
+  config.reader = JSON.parse(JSON.stringify(s.cfg)) as ReaderConfig;
   saveConfig();
 }
 
@@ -883,6 +1541,7 @@ export function applyConfigJson(json: string) {
     };
     // 跨窗同步/导入同样清理 reader 废弃键并迁移旧默认值
     normalizeReaderConfig(obj.reader, rawReader);
+    obj.library = { ...structuredClone(DEFAULTS.library), ...(obj.library || {}) };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
@@ -891,9 +1550,14 @@ export function applyConfigJson(json: string) {
     stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
     obj.tts = { ...structuredClone(DEFAULTS.tts), ...(obj.tts || {}) };
+    obj.uiTheme = obj.uiTheme === "light" || obj.uiTheme === "dark" ? obj.uiTheme : "system";
+    obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
+    obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");
+    obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
+    applyUiTheme();
     // 记录为“已保存”，避免收到自身广播回声时重复 apply / 再次广播
     lastSavedJson = JSON.stringify(config);
     // 跨窗同步/导入同样物理清除废弃的“关闭思考”键（stripReasoningArtifacts），
@@ -942,19 +1606,23 @@ export interface Toast {
   id: number;
   msg: string;
   kind: "info" | "error";
+  /** 保留字段以兼容旧签名；所有提示现在都会自动消失。 */
   sticky: boolean;
 }
 
 export const toasts = $state<{ items: Toast[] }>({ items: [] });
 let toastId = 0;
 
-export function toast(msg: string, kind: "info" | "error" = "info", sticky?: boolean) {
+/** 提示展示时长：普通提示 5.2s，错误提示稍长（8s），但一律自动消失，不再常驻。 */
+const TOAST_TTL_MS = 5200;
+const TOAST_TTL_ERROR_MS = 8000;
+
+export function toast(msg: string, kind: "info" | "error" = "info", _sticky?: boolean) {
   const id = ++toastId;
-  const t: Toast = { id, msg, kind, sticky: sticky ?? kind === "error" };
+  // 忽略调用方传入的 sticky：所有提示统一自动消失，避免红色错误提示无法关闭地常驻。
+  const t: Toast = { id, msg, kind, sticky: false };
   toasts.items.push(t);
-  if (!t.sticky) {
-    setTimeout(() => dismissToast(id), 5200);
-  }
+  setTimeout(() => dismissToast(id), kind === "error" ? TOAST_TTL_ERROR_MS : TOAST_TTL_MS);
 }
 
 export function dismissToast(id: number) {
@@ -993,7 +1661,9 @@ export async function copyText(text: string) {  try {
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
 
-export const APP_BUILD = "2026.09.13a";
+// 版本号单一数据源：构建期由 vite.config.js 从 package.json 注入 __APP_VERSION__
+// （与 src-tauri/tauri.conf.json 的 version 保持一致），避免运行时读版本所需的权限问题。
+export const APP_VERSION = `v${typeof __APP_VERSION__ === "string" && __APP_VERSION__ ? __APP_VERSION__ : "0.0.0"}`;
 
 // 与 Rust 主窗口本次启动实际使用的 WebView2 参数保持一致：
 // Windows 上同一 user-data-dir 的 WebView2 环境要求所有窗口的
@@ -1021,6 +1691,10 @@ export const ui = $state({
   aiOpen: false,
   statsOpen: false,
   webdavOpen: false,
+  /** 笔记界面（按书分组显示带感想的划线）。 */
+  notesOpen: false,
+  /** 阅读界面当前打开的书 id（0=未打开）；供设置页把阅读方案"仅应用到本书"。 */
+  currentBookId: 0,
 });
 
 export const convertState = $state({
@@ -1188,4 +1862,34 @@ export function confirmAnswer(v: boolean) {
   confirmBox.active = false;
   confirmResolve?.(v);
   confirmResolve = null;
+}
+
+// ===== 多动作确认框（delete-dialog）：让用户在若干明确动作间选择，不用「确定/取消」藏语义。 =====
+export interface ConfirmAction {
+  id: string;
+  label: string;
+  /** primary=主按钮 / danger=危险动作 / plain=普通。 */
+  kind?: "primary" | "danger" | "plain";
+}
+export const choiceBox = $state<{
+  msg: string;
+  actions: ConfirmAction[];
+  active: boolean;
+}>({ msg: "", actions: [], active: false });
+let choiceResolve: ((id: string | null) => void) | null = null;
+
+/** 弹出多动作确认框；返回被选动作 id，取消返回 null。 */
+export function appChoose(msg: string, actions: ConfirmAction[]): Promise<string | null> {
+  choiceBox.msg = msg;
+  choiceBox.actions = actions;
+  choiceBox.active = true;
+  return new Promise((res) => {
+    choiceResolve = res;
+  });
+}
+
+export function choiceAnswer(id: string | null) {
+  choiceBox.active = false;
+  choiceResolve?.(id);
+  choiceResolve = null;
 }

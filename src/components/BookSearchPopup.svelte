@@ -103,8 +103,9 @@
     const w = rect.width;
     const h = rect.height;
     const move = (ev: PointerEvent) => {
-      const left = Math.max(4, Math.min(ox + ev.clientX - sx, window.innerWidth - w - 4));
-      const top = Math.max(4, Math.min(oy + ev.clientY - sy, window.innerHeight - h - 4));
+      // clamp 到视口（0..innerWidth/innerHeight），不再限制在 reader 内。
+      const left = Math.max(0, Math.min(ox + ev.clientX - sx, window.innerWidth - w));
+      const top = Math.max(0, Math.min(oy + ev.clientY - sy, window.innerHeight - h));
       userPos = { left, top };
     };
     const up = () => {
@@ -115,9 +116,20 @@
     window.addEventListener("pointerup", up);
     e.preventDefault();
   }
+
+  /** Portal：把弹框节点挂到 document.body，彻底摆脱任何祖先的
+   *  transform/filter/contain/overflow 造成的 position:fixed 退化与裁剪。 */
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
 </script>
 
-<div class="sb-pop" bind:this={popEl} style={posStyle}>
+<div class="sb-pop" use:portal bind:this={popEl} style={posStyle}>
   <div class="sb-head" onpointerdown={startDrag} title="按住拖动可移动此框">
     <span class="sb-drag">⠿ 全书搜索</span>
     <div class="sb-head-acts">
@@ -225,7 +237,7 @@
   .sb-hit:hover { background: rgba(128, 128, 128, 0.14); }
   .sb-hit.active { background: color-mix(in srgb, var(--accent, #4a6b8a) 22%, transparent); }
 
-  .sb-ch { font-size: 12.5px; font-weight: 600; }
+  .sb-ch { font-size: 13px; font-weight: 600; }
 
   .sb-sn {
     font-size: 12px;
@@ -245,7 +257,7 @@
   .sb-empty {
     padding: 22px;
     text-align: center;
-    font-size: 12.5px;
+    font-size: 13px;
     opacity: 0.55;
   }
 </style>
