@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, coverUrl } from "../lib/api";
-  import { appConfirm, config, convertState, openBookInNewWindow, pendingOpen, toast, ui, APP_BUILD } from "../lib/stores.svelte";
+  import { api, coverUrl, bumpCoverBust } from "../lib/api";
+  import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
+  import { dragSort } from "../lib/dragSort";
   import { listen } from "@tauri-apps/api/event";
   import BookDetailModal from "./BookDetailModal.svelte";
   import type { BookRow } from "../lib/types";
@@ -37,6 +38,62 @@
   );
   let loading = $state(true);
   let refreshing = $state(false);
+  /** 刷新扫描进度（由后端 refresh-progress 事件驱动）。 */
+  let refreshProgress = $state<{ phase: string; done: number; total: number } | null>(null);
+  /** 封面/元数据后台生成进度（由后端 meta-progress 事件驱动；不阻塞其它操作）。 */
+  let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
+  /** 长按刷新弹出的菜单（普通点击=只读书籍；长按=可刷新封面）。 */
+  let refreshMenu = $state(false);
+
+  // 书库顶栏右侧图标按钮注册表（可拖拽排序；顺序持久化到 config.library.topbarOrder）。
+  interface LibBtn {
+    id: LibraryTopbarId;
+    label: string;
+    title: string;
+    glyph: string;
+    run: () => void;
+  }
+  const LIB_BTNS: LibBtn[] = [
+    { id: "webdav", label: "WebDAV 文件管理", title: "WebDAV 文件管理（向左滑也可打开）", glyph: "☁", run: () => (ui.webdavOpen = true) },
+    { id: "random", label: "随机打开", title: "随机打开一本", glyph: "🎲", run: () => openRandom() },
+    { id: "search", label: "全文搜索", title: "全文搜索", glyph: "🔍", run: () => (ui.searchOpen = true) },
+    { id: "notes", label: "笔记", title: "笔记（带感想的划线，按书汇总）", glyph: "✎", run: () => (ui.notesOpen = true) },
+    { id: "stats", label: "阅读统计", title: "阅读统计", glyph: "📈", run: () => (ui.statsOpen = true) },
+    { id: "settings", label: "设置", title: "设置", glyph: "⚙", run: () => (ui.settingsOpen = true) },
+  ];
+  const libBtn = (id: string): LibBtn | undefined => LIB_BTNS.find((b) => b.id === id);
+  const orderedLibBtns = $derived(
+    config.library.topbarOrder.map((id) => libBtn(id)).filter((b): b is LibBtn => !!b),
+  );
+  /** 真实拖拽排序：把 from 插入到 target 之前/之后（顺序持久化到 config.library.topbarOrder）。 */
+  function libDrop(from: string, target: string, place: "before" | "after") {
+    if (!from || from === target) return;
+    const arr = [...config.library.topbarOrder];
+    const fi = arr.indexOf(from);
+    if (fi < 0) return;
+    arr.splice(fi, 1);
+    const ti = arr.indexOf(target);
+    if (ti < 0) return;
+    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
+    config.library.topbarOrder = arr;
+    saveConfig();
+  }
+
+  const refreshPhaseText = (p: { phase: string; done: number; total: number }): string => {
+    if (p.phase === "check") return `对账缺失 ${p.done}/${p.total}`;
+    if (p.phase === "scan") return `扫描新增 ${p.done}/${p.total}`;
+    return "完成";
+  };
+  const refreshPct = $derived(
+    refreshProgress && refreshProgress.total > 0
+      ? Math.round((refreshProgress.done / refreshProgress.total) * 100)
+      : 0,
+  );
+  const metaPct = $derived(
+    metaProgress && metaProgress.total > 0
+      ? Math.min(100, Math.round((metaProgress.done / metaProgress.total) * 100))
+      : 0,
+  );
 
   function saveSort() {
     try { localStorage.setItem("flowread.lib.sort", sortKey); } catch { /* ignore */ }
@@ -110,12 +167,23 @@
     gridPadX = l + r;
   });
 
+  // 卡片几何：必须与 CSS 完全一致，否则行高预算错误会导致卡片被下一行遮挡。
+  // CARD_PAD = .card padding；COVER_INSET = .card 内边距×2（封面可用宽度 = cardW - COVER_INSET）。
+  const CARD_PAD = 8;                 // 与 .card { padding: 8px } 一致
+  const COVER_INSET = CARD_PAD * 2;   // 16
+  const CARD_GAP = 12;                // 列内卡片留白（与 cellW 扣减一致）
+  const META_H = 52;                  // .meta 固定块高（标签行 + 作者行 + 上下内边距）
+  const CARD_VGAP = 12;               // 行间垂直留白
+
   const contentW = $derived(Math.max(1, gridW - gridPadX));
   const cols = $derived(Math.max(2, Math.floor(contentW / GRID_COL_MIN)));
   const cellW = $derived(contentW / cols);
-  const cardW = $derived(Math.min(216, Math.max(120, cellW - 12)));
-  const coverH = $derived((cardW - 12) * 1.5);
-  const cellH = $derived(coverH + 62);
+  // 卡片宽度：不超过 cellW - 间距，也不超过 216 上限；下限 120 但绝不大于 cellW。
+  const cardW = $derived(Math.max(80, Math.min(216, cellW - CARD_GAP)));
+  // 封面高度按「实际内宽」算 3:2，保证与渲染一致（不再用写死的 -12）。
+  const coverH = $derived(Math.round((cardW - COVER_INSET) * 1.5));
+  // 行高 = 卡片内边距×2 + 封面 + 标签块 + 行间距。
+  const cellH = $derived(CARD_PAD * 2 + coverH + META_H + CARD_VGAP);
 
   // 网格虚拟窗口（行）
   const gridRows = $derived(Math.ceil(total / cols));
@@ -232,7 +300,7 @@
   }
 
   async function removeFolder(p: string) {
-    const ok = await appConfirm(`从书库移除文件夹 "${p}"？\n（不会删除磁盘上的文件）`);
+    const ok = await appConfirm(`从书库移除文件夹「${p}」？\n不会删除磁盘上的文件。`);
     if (!ok) return;
     await api.removeFolder(p);
     folders = await api.listFolders();
@@ -266,7 +334,7 @@
     if (!ok) return;
     try {
       const r = await api.refreshLibrary();
-      toast(`书库已刷新：移除 ${r.removed} 本、新增 ${r.added} 本`);
+      toast(`书库已刷新：新增 ${r.added} 本、减少 ${r.removed} 本`);
     } catch (e) {
       toast(String(e), "error");
     }
@@ -275,19 +343,54 @@
 
   // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）。
   // 16 万本下 IO 密集且耗时：立即给「进行中」提示并禁用按钮，完成后只增量刷新当前窗口。
+  // 注意：普通刷新**只读书籍**（对账增删），不重算封面；重算封面走「长按 → 刷新封面」。
   async function refreshAll() {
     if (refreshing) return;
     refreshing = true;
-    toast("正在刷新书库…（大书库可能耗时较久）");
+    refreshProgress = { phase: "check", done: 0, total: 0 };
     try {
       const r = await api.refreshLibrary();
-      toast(`书库已刷新：移除 ${r.removed} 本、新增 ${r.added} 本`);
+      toast(`书库已刷新：新增 ${r.added} 本、减少 ${r.removed} 本`);
       await reloadWindow();
     } catch (e) {
       toast(String(e), "error");
     } finally {
       refreshing = false;
+      refreshProgress = null;
     }
+  }
+
+  /** 仅重算封面/元数据（不重新扫描目录）。 */
+  async function refreshCoversOnly() {
+    refreshMenu = false;
+    try {
+      await api.refreshCovers();
+      toast("开始重算封面…（后台进行，不影响使用）");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  // 刷新按钮：单击=读书籍；长按（550ms）=弹出「刷新封面」选项。用 Pointer Events 兼容鼠标/触屏。
+  let refreshPressTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshLongPressed = false;
+  function refreshDown(e: PointerEvent) {
+    if (e.button !== 0 || refreshing) return;
+    refreshLongPressed = false;
+    refreshPressTimer = setTimeout(() => {
+      refreshLongPressed = true;
+      refreshMenu = true;
+    }, 550);
+  }
+  function refreshUp() {
+    clearTimeout(refreshPressTimer);
+  }
+  function refreshClick() {
+    if (refreshLongPressed) {
+      refreshLongPressed = false;
+      return; // 长按已触发菜单，不再执行普通刷新
+    }
+    refreshAll();
   }
 
   async function openRandom() {
@@ -300,15 +403,47 @@
     }
   }
 
+  /** 删除分级（G1）：有笔记时给出**三个明确动作**的弹窗；无笔记直接删。 */
   async function deleteBook(b: BookRow, fromDisk: boolean) {
-    const msg = fromDisk
-      ? `删除《${b.title}》？\n\n将同时删除本地文件（移入回收站）：\n${b.path}`
-      : `从书库中移除《${b.title}》？\n（本地文件保留）`;
-    const ok = await appConfirm(msg);
-    if (!ok) return;
+    let hasNotes = false;
+    let noteCount = 0;
     try {
-      await api.deleteBooks([b.path], fromDisk);
-      toast(fromDisk ? "已删除（移入回收站）" : "已从书库移除");
+      const info = await api.bookNoteInfo(b.id);
+      hasNotes = info.hasNotes;
+      noteCount = info.noteCount;
+    } catch { /* ignore */ }
+
+    let keepNotes = true;
+    if (hasNotes) {
+      // 三个明确动作：保留笔记并删除 / 删除笔记并删除 / 取消。绝不把选择藏进「确定/取消」。
+      const action = await appChoose(
+        fromDisk
+          ? `《${b.title}》有 ${noteCount} 条笔记。\n本地文件将移入回收站。\n\n请选择笔记的处理方式：`
+          : `《${b.title}》有 ${noteCount} 条笔记。\n将从书库移除（本地文件保留）。\n\n请选择笔记的处理方式：`,
+        [
+          { id: "keep", label: "保留笔记并删除", kind: "plain" },
+          { id: "del", label: "删除笔记并删除", kind: "danger" },
+          { id: "cancel", label: "取消", kind: "plain" },
+        ],
+      );
+      if (!action || action === "cancel") return;
+      keepNotes = action === "keep";
+    } else {
+      const ok = await appConfirm(
+        fromDisk
+          ? `删除《${b.title}》？\n\n本地文件将移入回收站：\n${b.path}`
+          : `从书库中移除《${b.title}》？\n本地文件保留。`,
+      );
+      if (!ok) return;
+    }
+
+    try {
+      await api.deleteBooks([b.path], fromDisk, keepNotes);
+      toast(
+        fromDisk
+          ? (hasNotes && keepNotes ? "已删除文件，笔记已保留" : hasNotes ? "已删除文件及笔记" : "已删除，文件已移入回收站")
+          : (hasNotes && keepNotes ? "已移出书库，笔记已保留" : hasNotes ? "已移出书库及笔记" : "已从书库移除"),
+      );
       await reloadWindow();
     } catch (e) {
       toast(String(e), "error");
@@ -374,17 +509,46 @@
     }
     await reloadWindow();
     if (last) {
-      toast(`已添加《${last.title}》到书库（原文件未移动）`);
+      toast(`已添加《${last.title}》到书库，原文件未移动`);
       await tryOpenBook(last);
     }
   }
 
   onMount(() => {
+    // DEV 调试钩子：便于自动化验证删书弹窗（release 剥离）。
+    if (import.meta.env.DEV) {
+      (window as any).__frLibDebug = {
+        deleteByPath: async (p: string, fromDisk = false) => {
+          let b = booksWindow.find((x) => x.path === p);
+          if (!b) {
+            // 分页窗口里没有 → 直接查库
+            const pg = await api.listBooksPage(p, "title", 0, 20);
+            b = pg.rows.find((x) => x.path === p) ?? pg.rows[0];
+          }
+          if (!b) return false;
+          void deleteBook(b, fromDisk);
+          return true;
+        },
+      };
+    }
     loadFolders();
     reload();
     // 监听只增量刷新当前窗口与 total，不重置滚动、不拉全量。
-    const u1 = listen("library-changed", () => reloadWindow());
+    // library-changed 也会在换/恢复默认底图后触发：先 bump 缓存破坏版本号，
+    // 保证无内嵌封面的书立即换用新底图（有内嵌封面书走各自 cover_path，不受影响）。
+    const u1 = listen("library-changed", () => {
+      bumpCoverBust();
+      reloadWindow();
+    });
     const u2 = listen("library-meta", () => reloadWindow());
+    const u4 = listen<{ phase: string; done: number; total: number }>("refresh-progress", (e) => {
+      if (e.payload) refreshProgress = e.payload;
+    });
+    const u5 = listen<{ phase: string; done: number; total: number }>("meta-progress", (e) => {
+      if (!e.payload) return;
+      if (e.payload.phase === "done") metaProgress = null;
+      else metaProgress = e.payload;
+    });
     let u3: Promise<() => void> | null = null;
     import("@tauri-apps/api/webview")
       .then((m) => {
@@ -398,6 +562,8 @@
     return () => {
       u1.then((f) => f());
       u2.then((f) => f());
+      u4.then((f) => f());
+      u5.then((f) => f());
       u3?.then((f) => f());
     };
   });
@@ -406,8 +572,25 @@
 <div class="library" onpointerdown={onPtrDown} onpointerup={onPtrUp}>
   <div class="toolbar">
     <span class="logo">FlowRead</span>
-    <button onclick={addFolder}>＋ 添加文件夹</button>
-    <button onclick={refreshAll} disabled={refreshing}>{refreshing ? "刷新中…" : "⟳ 刷新"}</button>
+    <button class="primary" onclick={addFolder}>＋ 添加文件夹</button>
+    <div class="refresh-wrap">
+      <button
+        onpointerdown={refreshDown}
+        onpointerup={refreshUp}
+        onpointerleave={refreshUp}
+        onpointercancel={refreshUp}
+        onclick={refreshClick}
+        disabled={refreshing}
+        title="点击：只读取书籍；长按：刷新封面"
+      >{refreshing ? "刷新中…" : "⟳ 刷新"}</button>
+      {#if refreshMenu}
+        <div class="refresh-menu" role="menu">
+          <button class="rm-item" onclick={refreshCoversOnly}>刷新封面（后台重算）</button>
+          <button class="rm-item" onclick={() => { refreshMenu = false; refreshAll(); }}>重新扫描书库</button>
+        </div>
+        <div class="rm-backdrop" onclick={() => (refreshMenu = false)}></div>
+      {/if}
+    </div>
     <input class="search" placeholder="搜索书名 / 作者…" bind:value={queryInput} />
     <select bind:value={sortKey} onchange={onSortChange}>
       <option value="lastread">按最近阅读</option>
@@ -416,11 +599,16 @@
       <option value="recent">按文件时间</option>
     </select>
     <div class="spacer"></div>
-    <button class="icon" title="WebDAV 文件管理（向左滑也可打开）" onclick={() => (ui.webdavOpen = true)}>☁</button>
-    <button class="icon" title="随机打开一本" onclick={openRandom}>🎲</button>
-    <button class="icon" title="全文搜索" onclick={() => (ui.searchOpen = true)}>🔍</button>
-    <button class="icon" title="阅读统计" onclick={() => (ui.statsOpen = true)}>📈</button>
-    <button class="icon" title="设置" onclick={() => (ui.settingsOpen = true)}>⚙</button>
+    <div class="lib-tb-group" use:dragSort={{ onDrop: libDrop }}>
+      {#each orderedLibBtns as b (b.id)}
+        <button
+          class="icon lib-tb-btn"
+          data-drag-id={b.id}
+          title={b.title}
+          onclick={b.run}
+        >{b.glyph}</button>
+      {/each}
+    </div>
   </div>
 
   {#if folders.length}
@@ -463,7 +651,7 @@
                   oncontextmenu={(e) => openCtx(e, b)}
                 >
                   <div class="cover" style="height:{coverH}px;">
-                    <img src={coverUrl(b)} alt="" loading="lazy" decoding="async" draggable="false" />
+                    <img src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
                     <span class="fmt">{b.format.toUpperCase()}</span>
                   </div>
                   <div class="meta">
@@ -487,7 +675,7 @@
               ondblclick={() => tryOpenBook(b)}
               oncontextmenu={(e) => openCtx(e, b)}
             >
-              <img class="row-cover" src={coverUrl(b)} alt="" loading="lazy" decoding="async" />
+              <img class="row-cover" src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" />
               <div class="row-meta">
                 <div class="t">{b.title}</div>
                 <div class="a">{b.author}</div>
@@ -503,10 +691,22 @@
 
   <div class="statusbar">
     <span>{total} 本书</span>
-    <span class="build">FlowRead {APP_BUILD}</span>
+    <span class="build" title="FlowRead 版本">FlowRead {APP_VERSION}</span>
+    {#if refreshProgress && refreshProgress.phase !== "done"}
+      <div class="scan-progress" title="书库刷新扫描进度">
+        <div class="scan-bar"><div class="scan-fill" style="width:{refreshPct}%"></div></div>
+        <span class="scan-text">{refreshPhaseText(refreshProgress)} · {refreshPct}%</span>
+      </div>
+    {/if}
+    {#if metaProgress && metaProgress.phase !== "done" && metaProgress.total > 0}
+      <div class="scan-progress meta-progress" title="封面/元数据后台生成进度（不影响使用）">
+        <div class="scan-bar"><div class="scan-fill meta-fill" style="width:{metaPct}%"></div></div>
+        <span class="scan-text">生成封面 {metaProgress.done}/{metaProgress.total} · {metaPct}%</span>
+      </div>
+    {/if}
     <div class="spacer"></div>
-    <button class="icon" title="网格视图" onclick={() => setView("grid")}>▦</button>
-    <button class="icon" title="列表视图" onclick={() => setView("list")}>≡</button>
+    <button class="icon view-btn" class:active={view === "grid"} title="网格视图" aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
+    <button class="icon view-btn" class:active={view === "list"} title="列表视图" aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
   </div>
 
   {#if ctxMenu}
@@ -521,7 +721,7 @@
         <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}>🔄 重新提取封面</button>
         <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}>📂 所在文件夹</button>
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}>↩ 仅移出书库</button>
-        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除（含本地文件）</button>
+        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除本地文件</button>
       </div>
     </div>
   {/if}
@@ -532,27 +732,40 @@
 </div>
 
 <style>
+  /* ============================================================
+     书库页观感重做（依据《界面设计规范》）
+     仅改视觉：布局结构（顶栏 + 网格/列表 + 状态栏）保持不变。
+     - 间距全部走 4px 栅格
+     - 字号只用 12/13/14/16 阶梯
+     - 圆角 6/8/12/16/999
+     - 阴影分层更柔：1px 极淡描边 + 轻阴影
+     - 悬停 ≥8% 亮度差；禁用 40% 不透明
+     ============================================================ */
   .library {
     height: 100%;
     display: flex;
     flex-direction: column;
+    background: var(--bg);
   }
 
+  /* ---------- 顶栏 ---------- */
   .toolbar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
+    gap: var(--sp-2, 8px);
+    padding: var(--sp-3, 12px) var(--sp-4, 16px);
     background: var(--panel);
     border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
   }
 
   .logo {
-    font-weight: 700;
-    font-size: 16px;
+    font-weight: 600;
+    font-size: var(--fs-lg, 16px);
     color: var(--accent);
-    margin-right: 8px;
-    letter-spacing: 0.5px;
+    margin-right: var(--sp-3, 12px);
+    letter-spacing: -0.015em;
+    user-select: none;
   }
 
   .search {
@@ -561,22 +774,23 @@
 
   .spacer { flex: 1; }
 
+  /* ---------- 文件夹胶囊 ---------- */
   .folders {
     display: flex;
-    gap: 8px;
-    padding: 8px 16px 0;
+    gap: var(--sp-2, 8px);
+    padding: var(--sp-3, 12px) var(--sp-4, 16px) 0;
     flex-wrap: wrap;
   }
 
   .folder-chip {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--sp-2, 8px);
     background: var(--panel2);
     border: 1px solid var(--line);
-    border-radius: 20px;
-    padding: 3px 6px 3px 12px;
-    font-size: 12px;
+    border-radius: var(--radius-pill, 999px);
+    padding: 4px 8px 4px 12px;
+    font-size: var(--fs-xs, 12px);
     color: var(--fg2);
     max-width: 420px;
     overflow: hidden;
@@ -590,12 +804,21 @@
     padding: 0 4px;
     cursor: pointer;
     color: var(--fg2);
+    border-radius: var(--radius-sm, 8px);
+    transition: background var(--dur, 0.2s) var(--ease);
   }
 
+  .folder-chip .x:hover {
+    background: var(--hover-bg, rgba(0, 0, 0, 0.06));
+    color: var(--fg);
+  }
+
+  /* ---------- 网格 ---------- */
   .grid {
     flex: 1;
     overflow-y: auto;
-    padding: 16px 20px;
+    /* 左右 20px 与 gridPadX 推导一致；底部多留一屏呼吸空间 */
+    padding: 16px 20px 32px;
     position: relative;
   }
 
@@ -608,28 +831,34 @@
   .card {
     position: absolute;
     cursor: pointer;
-    border-radius: var(--radius);
-    padding: 6px;
-    transition: background 0.15s, transform 0.15s ease, box-shadow 0.18s ease;
+    border-radius: var(--radius, 12px);
+    padding: var(--sp-2, 8px);
+    /* 悬停抬升：≥8% 亮度差 + 柔和阴影；位移 -2px（规范第 7 节） */
+    transition: background var(--dur, 0.2s) var(--ease),
+      transform var(--dur, 0.2s) var(--ease),
+      box-shadow var(--dur, 0.2s) var(--ease);
   }
 
   .card:hover {
-    background: var(--panel2);
-    transform: translateY(-3px);
-    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+    background: var(--hover-bg);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
   }
 
   .card:active {
     transform: translateY(0);
   }
 
+  /* 封面：外层 8px 圆角容器，内层图片裁切；用极淡描边替代重阴影 */
   .cover {
     position: relative;
     width: 100%;
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 8px);
     overflow: hidden;
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
     background: var(--panel2);
+    outline: 1px solid var(--line);
+    outline-offset: -1px;
+    box-shadow: var(--shadow-sm);
   }
 
   .cover img {
@@ -637,39 +866,59 @@
     height: 100%;
     object-fit: cover;
     display: block;
+    transition: transform var(--dur, 0.2s) var(--ease);
   }
 
+  .card:hover .cover img {
+    transform: scale(1.03);
+  }
+
+  /* 格式角标：半透明深底 + 白色小字，10px 字距 +0.015em */
   .fmt {
     position: absolute;
-    right: 5px;
-    top: 5px;
-    background: rgba(0, 0, 0, 0.55);
+    right: 8px;
+    top: 8px;
+    background: rgba(0, 0, 0, 0.6);
     color: #fff;
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    letter-spacing: 0.5px;
+    font-size: var(--fs-2xs, 10px);
+    line-height: 1;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm, 8px);
+    letter-spacing: var(--ls-wide, 0.015em);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
   }
 
-  .meta { padding: 7px 2px 2px; }
+  /* 固定块高（与脚本 META_H=52 一致）：标题 20 + 间距 1 + 作者 18 + 上内边距 8 + 余量 5，
+     保证每张卡片等高、行预算准确，卡片不会被下一行遮挡。 */
+  .meta {
+    height: 52px;
+    box-sizing: border-box;
+    padding: 8px 4px 0;
+    overflow: hidden;
+  }
 
   .meta .t {
-    font-size: 13px;
+    font-size: var(--fs-md, 14px);
+    line-height: 20px;
     font-weight: 500;
+    color: var(--fg);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .meta .a {
-    font-size: 11px;
+    font-size: var(--fs-xs, 12px);
+    line-height: 18px;
     color: var(--fg2);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    margin-top: 2px;
+    margin-top: 1px;
   }
 
+  /* ---------- 列表 ---------- */
   .list-inner {
     position: relative;
     width: 100%;
@@ -684,51 +933,139 @@
     box-sizing: border-box;
     display: flex;
     align-items: center;
-    gap: 14px;
-    padding: 8px 12px;
-    border-radius: 8px;
+    gap: var(--sp-4, 16px);
+    padding: var(--sp-2, 8px) var(--sp-3, 12px);
+    border-radius: var(--radius-sm, 8px);
     cursor: pointer;
+    transition: background var(--dur, 0.2s) var(--ease);
   }
 
-  .row:hover { background: var(--panel2); }
+  .row:hover { background: var(--hover-row, rgba(0, 0, 0, 0.04)); }
 
   .row-cover {
     width: 34px;
     height: 48px;
     object-fit: cover;
-    border-radius: 4px;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+    border-radius: var(--radius-xs, 6px);
+    outline: 1px solid var(--line);
+    outline-offset: -1px;
+    box-shadow: var(--shadow-sm);
   }
 
   .row-meta { flex: 1; min-width: 0; }
-  .row-meta .t { font-size: 14px; }
-  .row-meta .a { font-size: 12px; color: var(--fg2); }
-  .row-size, .row-date { color: var(--fg2); font-size: 12px; width: 90px; text-align: right; }
+  .row-meta .t { font-size: var(--fs-md, 14px); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-meta .a { font-size: var(--fs-xs, 12px); color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-size, .row-date { color: var(--fg2); font-size: var(--fs-xs, 12px); width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
 
+  /* ---------- 空状态 ---------- */
   .hint {
     text-align: center;
-    padding: 80px 20px;
+    padding: 48px 24px;
     color: var(--fg2);
     white-space: pre-line;
-    line-height: 2;
+    line-height: var(--lh-body, 1.6);
+    font-size: var(--fs-md, 14px);
   }
 
+  /* ---------- 状态栏 ---------- */
   .statusbar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 16px;
+    gap: var(--sp-2, 8px);
+    padding: var(--sp-2, 8px) var(--sp-4, 16px);
     border-top: 1px solid var(--line);
     color: var(--fg2);
-    font-size: 12px;
+    font-size: var(--fs-xs, 12px);
     background: var(--panel);
+    flex-shrink: 0;
   }
 
   .statusbar .build {
-    font-size: 11px;
+    font-size: var(--fs-xs, 12px);
     opacity: 0.55;
   }
 
+  .lib-tb-group {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1, 4px);
+  }
+
+  .lib-tb-btn { touch-action: none; }
+
+  /* 当前视图高亮：让用户知道自己在哪个视图（skill: active nav indication） */
+  .view-btn.active {
+    background: var(--accent-soft, var(--hover-bg));
+    color: var(--accent);
+    opacity: 1;
+  }
+
+  /* ---------- 刷新进度 ---------- */
+  /* 刷新按钮 + 长按菜单 */
+  .refresh-wrap { position: relative; display: inline-flex; }
+
+  .refresh-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 120;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    padding: 4px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius, 12px);
+    box-shadow: var(--shadow-lg);
+    animation: ctx-in 0.12s cubic-bezier(0, 0, 0.2, 1);
+  }
+
+  .refresh-menu .rm-item {
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    text-align: left;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm, 8px);
+    font-size: var(--fs-sm, 13px);
+    color: var(--fg);
+  }
+
+  .refresh-menu .rm-item:hover:not(:disabled) { background: var(--hover-bg); border-color: transparent; }
+
+  .rm-backdrop { position: fixed; inset: 0; z-index: 119; }
+
+  .scan-progress {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2, 8px);
+    min-width: 180px;
+  }
+
+  .meta-progress .meta-fill { background: var(--accent); opacity: 0.7; }
+
+  .scan-bar {
+    flex: 1;
+    height: 4px;
+    border-radius: var(--radius-pill, 999px);
+    background: color-mix(in srgb, var(--fg2) 22%, transparent);
+    overflow: hidden;
+  }
+
+  .scan-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: var(--radius-pill, 999px);
+    transition: width var(--dur, 0.2s) linear;
+  }
+
+  .scan-text {
+    white-space: nowrap;
+    opacity: 0.75;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- 右键菜单 ---------- */
   .ctx-backdrop {
     position: fixed;
     inset: 0;
@@ -741,22 +1078,31 @@
     flex-direction: column;
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 10px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
-    padding: 5px;
+    border-radius: var(--radius, 12px);
+    box-shadow: var(--shadow-lg);
+    padding: 4px;
     min-width: 190px;
     z-index: 101;
+    animation: ctx-in var(--dur-fast, 0.12s) var(--ease-in, cubic-bezier(0, 0, 0.2, 1));
+  }
+
+  @keyframes ctx-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+    to { opacity: 1; transform: none; }
   }
 
   .ctx button {
     border: none;
     background: transparent;
     text-align: left;
-    padding: 8px 14px;
-    border-radius: 6px;
-    font-size: 13px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm, 8px);
+    font-size: var(--fs-sm, 13px);
+    color: var(--fg);
+    transition: background var(--dur, 0.2s) var(--ease);
   }
 
-  .ctx button:hover { background: var(--panel2); }
+  .ctx button:hover { background: var(--hover-bg, rgba(0, 0, 0, 0.06)); }
   .ctx button.danger { color: var(--danger); }
+  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 </style>

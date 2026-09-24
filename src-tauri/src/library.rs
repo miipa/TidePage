@@ -13,6 +13,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub struct CachedEpub {
     pub doc: crate::epub::EpubDoc,
     pub data: Arc<Vec<u8>>,
+    /// zip 条目名 → 索引（含 basename 兜底），解析一次复用，避免每章重跑 build_ci。
+    pub ci: crate::epub::CiMap,
 }
 
 pub struct AppState {
@@ -23,7 +25,71 @@ pub struct AppState {
     pub rules_ver: AtomicU64,
     pub txt_cache: Mutex<HashMap<i64, (u64, Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>)>>,
     pub epub_cache: Mutex<HashMap<i64, Arc<CachedEpub>>>,
+    /// 已渲染章节 LRU：key = (book_id, chapter_index) → ChapterData。
+    /// 避免每次 get_chapter 重开 zip/重跑正则/重复 base64 内联图片；随书切换/规则变化清理。
+    pub chapter_cache: Mutex<ChapterCache>,
+    /// 全书图片列表缓存：key = book_id。
+    pub image_cache: Mutex<HashMap<i64, Arc<Vec<BookImage>>>>,
     pub http: reqwest::Client,
+    /// 元数据 worker 是否正在运行（进程内标记，天然不会跨崩溃残留，修掉
+    /// 旧实现把 `meta_busy` 持久化到 DB 导致被强杀后永久卡死、封面再也不生成的问题）。
+    pub meta_running: std::sync::atomic::AtomicBool,
+    /// worker 被请求停止（清缓存前会置位，worker 每轮检查后尽快退出，避免删/写并发）。
+    pub meta_stop: std::sync::atomic::AtomicBool,
+    /// worker 累计启动次数（用于验证互斥：连点刷新封面应仍为 1）。仅诊断用。
+    pub meta_start_count: AtomicU64,
+    /// 封面默认底图 id 与解析规则版本，参与缓存失效（F5）。
+    pub cover_style_ver: AtomicU64,
+}
+
+/// 简单的按书维度 LRU 章节缓存：容量按条数限制，随书切换/规则变化整体失效。
+/// 用 Vec 记录访问顺序（章节数不大，线性查找成本可忽略），命中即移到末尾。
+pub struct ChapterCache {
+    map: HashMap<(i64, i64, bool), Arc<ChapterData>>,
+    order: std::collections::VecDeque<(i64, i64, bool)>,
+    max: usize,
+}
+
+impl ChapterCache {
+    pub fn new(max: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            max,
+        }
+    }
+
+    fn touch(&mut self, key: (i64, i64, bool)) {
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    pub fn get(&mut self, key: (i64, i64, bool)) -> Option<Arc<ChapterData>> {
+        let v = self.map.get(&key).cloned()?;
+        self.touch(key);
+        Some(v)
+    }
+
+    pub fn put(&mut self, key: (i64, i64, bool), val: Arc<ChapterData>) {
+        self.map.insert(key, val);
+        self.touch(key);
+        while self.order.len() > self.max {
+            if let Some(old) = self.order.pop_front() {
+                // 可能已被 touch 更新到队尾，只有仍在 map 中才真正淘汰
+                if !self.order.iter().any(|k| *k == old) {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// 换书/改规则时整体失效（保持内存可控、避免跨书串味）。
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 const EXT_BOOK: &[&str] = &["txt", "epub", "mobi", "azw3", "prc"];
@@ -51,6 +117,75 @@ fn quick_title(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 从文件名解析 (书名, 作者)：去扩展名、去常见括号后缀。
+/// 兜底保证不抛异常：空名 → "未命名"；纯数字/多重括号 → 退回原文件名。
+pub fn parse_filename(path: &str) -> (String, String) {
+    let stem = Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let raw = stem.trim().to_string();
+    if raw.is_empty() {
+        return ("未命名".to_string(), String::new());
+    }
+
+    let mut title = raw.clone();
+    let mut author = String::new();
+
+    // 常见书源命名：书名 (作者) / 书名 [作者] / 《书名》作者 / 书名 - 作者 / 书名_作者
+    // 取最后一个括号组作为作者；括号内容若过长或含"出版/出版社/校对/扫描"等则忽略。
+    let bracket_pairs = [('(', ')'), ('[', ']'), ('【', '】'), ('（', '）')];
+    for (open, close) in bracket_pairs {
+        if let Some(o) = title.rfind(open) {
+            if let Some(c) = title[o..].find(close) {
+                let inner = title[o + open.len_utf8()..o + c].trim().to_string();
+                let ok = !inner.is_empty()
+                    && inner.chars().count() <= 20
+                    && !inner.contains("出版")
+                    && !inner.contains("校对")
+                    && !inner.contains("扫描")
+                    && !inner.contains("录入")
+                    && !inner.contains("简介");
+                if ok {
+                    author = inner.clone();
+                    title = title[..o].trim().to_string();
+                }
+            }
+        }
+    }
+
+    // 《书名》书名号：去掉书名号，其中内容作为书名（按 char 安全切片）。
+    if title.starts_with('《') {
+        let chars: Vec<char> = title.chars().collect();
+        if let Some(end) = chars.iter().position(|&c| c == '》') {
+            title = chars[1..end].iter().collect::<String>().trim().to_string();
+        }
+    }
+
+    // 书名 - 作者 / 书名_作者 形式（作者位较短时）
+    if author.is_empty() {
+        for sep in [" - ", "_", "—"] {
+            if let Some(idx) = title.find(sep) {
+                let right = title[idx + sep.len()..].trim();
+                if !right.is_empty() && right.chars().count() <= 16 {
+                    author = right.to_string();
+                    title = title[..idx].trim().to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let title = title.trim().to_string();
+    // 兜底：解析后为空 → 退回原文件名；仍无 → "未命名"
+    let title = if title.is_empty() {
+        if raw.is_empty() { "未命名".to_string() } else { raw }
+    } else {
+        title
+    };
+    (title, author)
+}
+
 pub fn get_rules(state: &AppState) -> String {
     let conn = state.db.0.lock().unwrap();
     db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
@@ -61,25 +196,33 @@ pub async fn scan_folders(state: &AppState) {
         let conn = state.db.0.lock().unwrap();
         db::list_folders(&conn)
     };
-    let mut found: HashMap<String, (i64, i64, String, String)> = HashMap::new();
-    for folder in &folders {
-        for entry in walkdir::WalkDir::new(folder)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
+    // 目录遍历是阻塞 IO：放到阻塞线程池，避免占住 async 运行时导致其它 IPC 排队。
+    let folders_walk = folders.clone();
+    let found: HashMap<String, (i64, i64, String, String)> =
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut found: HashMap<String, (i64, i64, String, String)> = HashMap::new();
+            for folder in &folders_walk {
+                for entry in walkdir::WalkDir::new(folder)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let path = entry.path().to_string_lossy().into_owned();
+                    if let Some(ext) = ext_of(&path) {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
+                        let mtime = file_mtime(entry.path());
+                        let title = quick_title(&path);
+                        found.insert(path, (size, mtime, title, ext));
+                    }
+                }
             }
-            let path = entry.path().to_string_lossy().into_owned();
-            if let Some(ext) = ext_of(&path) {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
-                let mtime = file_mtime(entry.path());
-                let title = quick_title(&path);
-                found.insert(path, (size, mtime, title, ext));
-            }
-        }
-    }
+            found
+        })
+        .await
+        .unwrap_or_default();
 
     let to_insert: Vec<(String, i64, i64, String, String)> = {
         let conn = state.db.0.lock().unwrap();
@@ -118,7 +261,7 @@ pub async fn scan_folders(state: &AppState) {
     if to_insert.is_empty() {
         let needs_meta = {
             let conn = state.db.0.lock().unwrap();
-            !db::books_needing_meta(&conn).is_empty()
+            db::has_books_needing_meta(&conn)
         };
         if needs_meta {
             spawn_meta_worker(state.app.clone());
@@ -175,42 +318,115 @@ pub fn spawn_watcher_loop(app: AppHandle) {
     });
 }
 
+/// worker 运行标记的 RAII 守卫：无论正常返回、`?` 提前返回，还是线程 panic 展开，
+/// `Drop` 都会复位 `meta_running`，避免「一次失败后永远拉不起来」。
+struct MetaGuard(Arc<AppState>);
+impl Drop for MetaGuard {
+    fn drop(&mut self) {
+        self.0
+            .meta_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 启动元数据/封面 worker。全局互斥：已在运行时不重复拉起。
+/// `refresh_covers` 与 `clear_cache('covers')` 都经此入口，保证同一时刻至多一个 worker。
 pub fn spawn_meta_worker(app: AppHandle) {
     std::thread::spawn(move || {
         let state = match app.try_state::<Arc<AppState>>() {
             Some(s) => s.inner().clone(),
             None => return,
         };
-        let busy = {
-            let conn = state.db.0.lock().unwrap();
-            db::get_setting(&conn, "meta_busy").unwrap_or_default()
-        };
-        if busy == "1" {
+        // 全局互斥：已在跑则不重复拉起。
+        if state
+            .meta_running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return;
         }
+        // RAII：任何退出路径（含 panic）都会复位 meta_running。
+        let _guard = MetaGuard(state.clone());
+        state.meta_start_count.fetch_add(1, Ordering::SeqCst);
+        // 本次运行不再响应旧的停止请求。
+        state.meta_stop.store(false, Ordering::SeqCst);
+        // 清理历史遗留的 DB 标志（旧版本被强杀后会永久卡死封面生成）。
         {
             let conn = state.db.0.lock().unwrap();
-            db::set_setting(&conn, "meta_busy", "1");
+            let _ = db::set_setting(&conn, "meta_busy", "");
         }
         let covers_dir = covers::covers_dir(&app);
         let chunk = 12;
-        loop {
+        // 后台元数据扫描只占用一半 CPU：避免把 async 运行时 / WebView 主线程
+        // 的调度挤掉，导致打开书籍等 IPC 被延迟数秒（表现为长时间空白）。
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads((threads / 2).max(1))
+            .build()
+            .ok();
+        // library-meta 事件按时间合并，避免逐块刷新把前端主线程刷爆。
+        let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // 进度条分母：本次启动时的待生成总数（动态变化的剩余量作为分子）。
+        let total0 = {
+            let conn = state.db.0.lock().unwrap();
+            db::count_books_needing_meta(&conn)
+        };
+        let mut done0: i64 = 0;
+        let emit_progress = |state: &Arc<AppState>, done: i64, total: i64, phase: &str| {
+            state
+                .app
+                .emit(
+                    "meta-progress",
+                    serde_json::json!({ "phase": phase, "done": done, "total": total }),
+                )
+                .ok();
+        };
+        if total0 > 0 {
+            emit_progress(&state, 0, total0, "meta");
+        }
+        // 分批拉取（每批 BATCH 本），避免一次性物化 16 万行、以及反复全表扫描。
+        const BATCH: i64 = 240;
+        'outer: loop {
+            // 收到停止请求（清缓存前会置位）：尽快退出，保证删文件与写封面不并发。
+            if state.meta_stop.load(Ordering::SeqCst) {
+                break;
+            }
             let batch = {
                 let conn = state.db.0.lock().unwrap();
-                db::books_needing_meta(&conn)
+                db::books_needing_meta_batch(&conn, BATCH)
             };
             if batch.is_empty() {
                 break;
             }
+            let batch_len = batch.len() as i64;
             for slice in batch.chunks(chunk) {
-                let results: Vec<(i64, String, String, Option<String>, i64, i64)> = slice
-                    .par_iter()
-                    .map(|(id, path, format)| {
-                        let (title, author, cover, chars, text_chars) =
-                            extract_meta(path, format, &covers_dir);
-                        (*id, title, author, cover, chars, text_chars)
-                    })
-                    .collect();
+                if state.meta_stop.load(Ordering::SeqCst) {
+                    break 'outer;
+                }
+                let app_ref = &app;
+                let covers_ref = &covers_dir;
+                let map_slice = move || {
+                    slice
+                        .par_iter()
+                        .map(|(id, path, format)| {
+                            let (title, author, cover, chars, text_chars) =
+                                extract_meta(app_ref, path, format, covers_ref);
+                            (*id, title, author, cover, chars, text_chars)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let results: Vec<(i64, String, String, Option<String>, i64, i64)> =
+                    match &pool {
+                        Some(p) => p.install(map_slice),
+                        None => map_slice(),
+                    };
                 {
                     let conn = state.db.0.lock().unwrap();
                     for (id, title, author, cover, chars, text_chars) in results {
@@ -218,113 +434,142 @@ pub fn spawn_meta_worker(app: AppHandle) {
                             .ok();
                     }
                 }
-                state.app.emit("library-meta", ()).ok();
+                if last_emit.elapsed() >= std::time::Duration::from_millis(900) {
+                    last_emit = std::time::Instant::now();
+                    state.app.emit("library-meta", ()).ok();
+                    emit_progress(&state, done0, total0.max(1), "meta");
+                }
             }
+            done0 += batch_len;
         }
-        {
-            let conn = state.db.0.lock().unwrap();
-            db::set_setting(&conn, "meta_busy", "");
-        }
+        state.app.emit("library-meta", ()).ok();
+        emit_progress(&state, total0.max(1), total0.max(1), "done");
     });
 }
 
+/// 停止 worker 并等待其退出（最多等约 3 秒），用于清缓存前避免删/写并发。
+fn stop_meta_worker_and_wait(state: &Arc<AppState>) {
+    state.meta_stop.store(true, Ordering::SeqCst);
+    for _ in 0..60 {
+        if !state.meta_running.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 读取默认封面底图为 data URL（设置里可更换）；无则 None（用内置渐变）。
+fn default_cover_data_url(app: &AppHandle) -> Option<String> {
+    let p = covers::default_cover_path(app);
+    let bytes = std::fs::read(&p).ok()?;
+    // 底图统一存为 `default-cover.img`，扩展名不可靠：按字节魔数嗅探真实类型，
+    // 保证 png/jpg/jpeg/webp/gif/bmp 底图都能被正确声明 MIME（避免 jpg/webp 被当 png）。
+    let mime = crate::sniff_mime(&bytes);
+    Some(format!("data:{};base64,{}", mime, covers::b64(&bytes)))
+}
+
+/// F2：渲染共享默认封面（底图 + 实时叠字）。
+/// 书名/作者取 DB 实时值（无则用文件名解析），文字不落盘、不缓存。
+pub fn render_default_cover(state: &Arc<AppState>, book_id: i64) -> String {
+    let (title, author) = {
+        let conn = state.db.0.lock().unwrap();
+        match db::get_book(&conn, book_id) {
+            Some(b) => {
+                let t = if b.title.trim().is_empty() {
+                    parse_filename(&b.path).0
+                } else {
+                    b.title
+                };
+                let a = if b.author.trim().is_empty() {
+                    parse_filename(&b.path).1
+                } else {
+                    b.author
+                };
+                (t, a)
+            }
+            None => ("未命名".to_string(), String::new()),
+        }
+    };
+    let base = default_cover_data_url(&state.app);
+    covers::default_cover_svg(&title, &author, base.as_deref())
+}
+
+/// 提取元数据。
+///
+/// F2 架构：**不再为无内嵌封面的书生成/落盘封面文件**。
+/// - 有内嵌封面 → 落盘一张 PNG（书内真实封面），返回其文件名；
+/// - 无内嵌封面 → 返回 `None`（封面 URL 由前端指向共享底图端点，书名作者渲染时实时叠）。
 fn extract_meta(
+    _app: &AppHandle,
     path: &str,
     format: &str,
     covers_dir: &Path,
 ) -> (String, String, Option<String>, i64, i64) {
-    let fallback = quick_title(path);
+    let (fn_title, fn_author) = parse_filename(path);
     match format {
         "epub" => {
             let data = match std::fs::read(path) {
                 Ok(d) => d,
-                Err(_) => return (fallback, String::new(), None, 0, 0),
+                Err(_) => return (fn_title, fn_author, None, 0, 0),
             };
-            match crate::epub::parse(data.clone()) {
+            match crate::epub::parse_with_chars(data.clone()) {
                 Ok(doc) => {
-                    let cover_file = doc.cover_href.as_ref().and_then(|href| {
-                        crate::epub::read_cover(&data, href).and_then(|bytes| {
-                            let name = format!("{}.png", db::path_id(path));
-                            let out = covers_dir.join(&name);
-                            covers::make_thumbnail(&bytes, &out).ok()?;
-                            Some(name)
+                    let title = if doc.title.is_empty() { fn_title } else { doc.title };
+                    let author = if doc.author.is_empty() { fn_author } else { doc.author };
+                    let cover_file = doc
+                        .cover_href
+                        .as_ref()
+                        .and_then(|href| {
+                            crate::epub::read_cover(&data, href).and_then(|bytes| {
+                                let name = format!("{}.png", db::path_id(path));
+                                let out = covers_dir.join(&name);
+                                covers::make_thumbnail(&bytes, &out).ok()?;
+                                Some(name)
+                            })
                         })
-                    });
-                    let cover_file = cover_file.or_else(|| {
-                        crate::epub::find_cover_fallback(&data, &doc.spine).and_then(|bytes| {
-                            let name = format!("{}.png", db::path_id(path));
-                            let out = covers_dir.join(&name);
-                            covers::make_thumbnail(&bytes, &out).ok()?;
-                            Some(name)
-                        })
-                    });
-                    let cover_file = cover_file.or_else(|| {
-                        let name = format!("{}.svg", db::path_id(path));
-                        let out = covers_dir.join(&name);
-                        covers::write_placeholder(&out, &doc.title, &doc.author).ok()?;
-                        Some(name)
-                    });
-                    (
-                        if doc.title.is_empty() { fallback } else { doc.title },
-                        doc.author,
-                        cover_file,
-                        doc.total_chars,
-                        doc.total_text_chars,
-                    )
+                        .or_else(|| {
+                            crate::epub::find_cover_fallback(&data, &doc.spine).and_then(|bytes| {
+                                let name = format!("{}.png", db::path_id(path));
+                                let out = covers_dir.join(&name);
+                                covers::make_thumbnail(&bytes, &out).ok()?;
+                                Some(name)
+                            })
+                        });
+                    (title, author, cover_file, doc.total_chars, doc.total_text_chars)
                 }
-                Err(_) => {
-                    let name = format!("{}.svg", db::path_id(path));
-                    let out = covers_dir.join(&name);
-                    covers::write_placeholder(&out, &fallback, "").ok();
-                    (fallback, String::new(), Some(name), 0, 0)
-                }
+                Err(_) => (fn_title, fn_author, None, 0, 0),
             }
         }
         "mobi" | "azw3" | "prc" => {
-            // 一次读取/一次解析同时拿到正文与封面，避免对大书重复整读两遍
             let (doc_res, cover_bytes) = crate::mobi::parse_with_cover(path);
             match doc_res {
                 Ok(doc) => {
-                    // 优先书内真实封面（EXTH201/202/129 或首图），失败才回退占位 SVG
-                    let cover_file = cover_bytes
-                        .and_then(|bytes| {
-                            let name = format!("{}.png", db::path_id(path));
-                            let out = covers_dir.join(&name);
-                            covers::make_thumbnail(&bytes, &out).ok()?;
-                            Some(name)
-                        })
-                        .or_else(|| {
-                            let name = format!("{}.svg", db::path_id(path));
-                            let out = covers_dir.join(&name);
-                            covers::write_placeholder(&out, &doc.title, &doc.author).ok()?;
-                            Some(name)
-                        });
+                    let title = if doc.title.is_empty() { fn_title } else { doc.title };
+                    let author = if doc.author.is_empty() { fn_author } else { doc.author };
+                    let cover_file = cover_bytes.and_then(|bytes| {
+                        let name = format!("{}.png", db::path_id(path));
+                        let out = covers_dir.join(&name);
+                        covers::make_thumbnail(&bytes, &out).ok()?;
+                        Some(name)
+                    });
                     let text = crate::epub::html_to_text(&doc.html);
                     let chars = text.chars().count() as i64;
                     let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-                    (
-                        if doc.title.is_empty() { fallback } else { doc.title },
-                        doc.author,
-                        cover_file,
-                        chars,
-                        text_chars,
-                    )
+                    (title, author, cover_file, chars, text_chars)
                 }
-                Err(_) => (fallback, String::new(), None, 0, 0),
+                Err(_) => (fn_title, fn_author, None, 0, 0),
             }
         }
         _ => {
-            let name = format!("{}.svg", db::path_id(path));
-            let out = covers_dir.join(&name);
-            covers::write_placeholder(&out, &fallback, "").ok();
+            // TXT 等：只解析文件名得到书名/作者；封面留空 → 走共享底图端点。
             let data = match std::fs::read(path) {
                 Ok(d) => d,
-                Err(_) => return (fallback, String::new(), Some(name), 0, 0),
+                Err(_) => return (fn_title, fn_author, None, 0, 0),
             };
             let (text, _) = crate::txt::decode_bytes(&data);
             let chars = text.chars().count() as i64;
             let text_chars = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-            (fallback, String::new(), Some(name), chars, text_chars)
+            (fn_title, fn_author, None, chars, text_chars)
         }
     }
 }
@@ -364,14 +609,113 @@ pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<Cache
     if let Some(c) = state.epub_cache.lock().unwrap().get(&book_id) {
         return Ok(c.clone());
     }
+    let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let doc = crate::epub::parse(data.clone())?;
+    let (doc, ci) = crate::epub::parse_with_ci(data.clone())?;
+    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+        eprintln!(
+            "[open] load_epub book={book_id} parse+ci={:?} spine={} toc={}",
+            t0.elapsed(), doc.spine.len(), doc.toc.len()
+        );
+    }
     let cached = Arc::new(CachedEpub {
         doc,
         data: Arc::new(data),
+        ci,
     });
     push_cache(&state.epub_cache, book_id, cached.clone(), 3);
     Ok(cached)
+}
+
+/// 按需读取 EPUB 内图片（供 `epubimg/` 协议路由使用）：优先用缓存，未命中则读盘解析。
+/// 返回 (mime, bytes)；找不到返回 None。
+pub fn read_epub_image(state: &AppState, book_id: i64, target: &str) -> Option<(String, Vec<u8>)> {
+    let cached = state.epub_cache.lock().unwrap().get(&book_id).cloned();
+    let cached = match cached {
+        Some(c) => c,
+        None => {
+            let path = {
+                let conn = state.db.0.lock().unwrap();
+                db::get_book(&conn, book_id)?.path
+            };
+            load_epub(state, &path, book_id).ok()?
+        }
+    };
+    let bytes = crate::epub::read_entry(&cached.data, &cached.ci, target)?;
+    Some((crate::epub::mime_for_path(target).to_string(), bytes))
+}
+
+/// 全书图片列表（按 spine/章节顺序，按解析出的 zip 路径去重）。
+/// 用于图片查看器浏览整本书所有图片。EPUB 走 zip 内路径；MOBI/AZW3 走已提取的 res 目录。
+#[tauri::command]
+pub async fn list_book_images(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+) -> Result<Vec<BookImage>, String> {
+    if let Some(hit) = state.image_cache.lock().unwrap().get(&book_id) {
+        return Ok(hit.as_ref().clone());
+    }
+    let st = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || collect_book_images(&st, book_id))
+        .await
+        .map_err(|e| e.to_string())??;
+    state
+        .image_cache
+        .lock()
+        .unwrap()
+        .insert(book_id, Arc::new(result.clone()));
+    Ok(result)
+}
+
+fn collect_book_images(state: &AppState, book_id: i64) -> Result<Vec<BookImage>, String> {
+    let book = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?
+    };
+    let ext = ext_of(&book.path).unwrap_or_default();
+    let mut out: Vec<BookImage> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if ext == "epub" {
+        let cached = load_epub(state, &book.path, book_id)?;
+        let doc = &cached.doc;
+        // 直接使用 OPF manifest 的图片清单（瞬时、绝不扫描全书章节）。
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(c) = &doc.cover_href {
+            if seen.insert(c.clone()) {
+                targets.push(c.clone());
+            }
+        }
+        for href in &doc.image_hrefs {
+            if seen.insert(href.clone()) {
+                targets.push(href.clone());
+            }
+        }
+        for (i, target) in targets.iter().enumerate() {
+            out.push(BookImage {
+                url: crate::epub::epub_image_url(book_id, target),
+                chapter_index: i as i64,
+                chapter_title: if i == 0 { "封面".to_string() } else { String::new() },
+            });
+        }
+    } else if ext == "mobi" || ext == "azw3" || ext == "prc" {
+        // 已提取到 appdata/res/<book_id>/ 的图片
+        let dir = crate::data_dir(&state.app).join("res").join(book_id.to_string());
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut files: Vec<String> = rd
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            for f in files {
+                let url = format!("http://flowread.localhost/res/{book_id}/{}", f);
+                if seen.insert(url.clone()) {
+                    out.push(BookImage { url, chapter_index: -1, chapter_title: String::new() });
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn safe_slice(s: &str, start: usize, end: usize) -> String {
@@ -435,9 +779,14 @@ pub fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn list_books(state: State<'_, Arc<AppState>>) -> Vec<BookRow> {
-    let conn = state.db.0.lock().unwrap();
-    db::list_books(&conn)
+pub async fn list_books(state: State<'_, Arc<AppState>>) -> Result<Vec<BookRow>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_books(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 超大书库分页：过滤/排序下推 SQLite，单次 IPC 最多 500 行 + total。
@@ -547,17 +896,119 @@ pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
     RefreshResult { removed: missing.len(), added }
 }
 
+/// 扫描进度事件负载（phase: check=对账缺失 / scan=扫描新增 / done=完成）。
+#[derive(serde::Serialize, Clone)]
+pub struct RefreshProgress {
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// 刷新（带进度）：分步执行，**不长时间持有 DB 锁**，因此扫描期间阅读/翻页/打开书等其它 IPC 不受阻。
+/// 与 `refresh_library_core` 对账规则一致：缺失记录移除、存活记录所在目录 ∪ 书库根及其一级子目录只扫一层。
 #[tauri::command]
 pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshResult, String> {
-    let res = {
-        let conn = state.db.0.lock().unwrap();
-        refresh_library_core(&conn)
+    let st = state.inner().clone();
+    let emit = |phase: &str, done: usize, total: usize| {
+        st.app
+            .emit(
+                "refresh-progress",
+                RefreshProgress { phase: phase.into(), done, total },
+            )
+            .ok();
     };
-    if res.removed > 0 || res.added > 0 {
-        state.app.emit("library-changed", ()).ok();
+
+    // 阶段 1：快照记录与书库根（短暂持锁），文件系统存在性检查不持锁。
+    let (records, folders) = {
+        let conn = st.db.0.lock().unwrap();
+        (db::all_book_paths(&conn), db::list_folders(&conn))
+    };
+    emit("check", 0, records.len());
+    let mut missing: Vec<String> = Vec::new();
+    let mut survivors: Vec<String> = Vec::new();
+    for (i, (_, p)) in records.iter().enumerate() {
+        if Path::new(p).exists() {
+            survivors.push(p.clone());
+        } else {
+            missing.push(p.clone());
+        }
+        if i % 200 == 0 || i + 1 == records.len() {
+            emit("check", i + 1, records.len());
+        }
     }
+    if !missing.is_empty() {
+        let conn = st.db.0.lock().unwrap();
+        let _ = db::delete_books(&conn, &missing);
+    }
+
+    // 扫描目录：存活记录所在目录 ∪ 书库根及其一级子目录。
+    let mut scan_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in &survivors {
+        if let Some(d) = Path::new(p.as_str()).parent() {
+            scan_dirs.insert(d.to_path_buf());
+        }
+    }
+    for root in &folders {
+        let rp = PathBuf::from(root);
+        if !rp.is_dir() {
+            continue;
+        }
+        scan_dirs.insert(rp.clone());
+        if let Ok(rd) = std::fs::read_dir(&rp) {
+            for entry in rd.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    scan_dirs.insert(sub);
+                }
+            }
+        }
+    }
+
+    // 阶段 2：遍历目录（不持锁），只收集索引中不存在的书；最后一次性入库。
+    let known: std::collections::HashSet<String> =
+        records.iter().map(|(_, p)| p.clone()).collect();
+    let dirs: Vec<PathBuf> = scan_dirs.into_iter().collect();
+    emit("scan", 0, dirs.len());
+    let mut new_books: Vec<(String, String, String, i64, i64)> = Vec::new();
+    for (di, dir) in dirs.iter().enumerate() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let fp = entry.path();
+                if !fp.is_file() {
+                    continue;
+                }
+                let path = fp.to_string_lossy().into_owned();
+                let ext = match ext_of(&path) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if known.contains(&path) || new_books.iter().any(|(p, ..)| p == &path) {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
+                let mtime = file_mtime(&fp);
+                let title = quick_title(&path);
+                new_books.push((path, title, ext, size, mtime));
+            }
+        }
+        emit("scan", di + 1, dirs.len());
+    }
+
+    let mut added = 0usize;
+    if !new_books.is_empty() {
+        let conn = st.db.0.lock().unwrap();
+        for (path, title, ext, size, mtime) in &new_books {
+            if db::upsert_book(&conn, path, title, ext, *size, *mtime).is_ok() {
+                added += 1;
+            }
+        }
+    }
+    if !missing.is_empty() || added > 0 {
+        st.app.emit("library-changed", ()).ok();
+    }
+    emit("done", 1, 1);
     // A：刷新只做索引对账，不触发任何元数据/AI 任务；新入书 meta_done 保持未生成（=0）。
-    Ok(res)
+    Ok(RefreshResult { removed: missing.len(), added })
 }
 
 /// 任务3：打开入口先查文件是否存在（不存在则由前端弹询问，绝不进入空白阅读）。
@@ -570,12 +1021,24 @@ pub fn file_exists(path: String) -> bool {
 pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenResult, String> {
     let book = {
         let conn = state.db.0.lock().unwrap();
-        db::get_book(&conn, id).ok_or("书籍不存在")?
+        let b = db::get_book(&conn, id).ok_or("书籍不存在")?;
+        // 记录“最后打开时间”，让这本书进入「按最近阅读」（即使随后解析失败也能看到）。
+        db::touch_book_opened(&conn, id);
+        b
     };
     let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
+    let t_open = std::time::Instant::now();
+    // 换书整体失效已渲染章节缓存，避免跨书串味与无界增长。
+    st.chapter_cache.lock().unwrap().clear();
     let (toc, docs, warn) = if ext == "epub" {
-        let cached = load_epub(&st, &book.path, id)?;
+        // 解析 7000+ 章的大书可达数秒：放到阻塞线程池，避免占用 async 运行时
+        // 导致其它 IPC（预取、进度保存等）排队卡死。
+        let st2 = st.clone();
+        let bpath = book.path.clone();
+        let cached = tauri::async_runtime::spawn_blocking(move || load_epub(&st2, &bpath, id))
+            .await
+            .map_err(|e| e.to_string())??;
         let docs = cached
             .doc
             .toc
@@ -602,11 +1065,35 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         push_cache(&st.txt_cache, id, (ver, Arc::new((html, parts, toc.clone()))), 3);
         (toc, Vec::new(), doc.warning)
     };
+    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+        eprintln!(
+            "[open] open_book id={id} ext={ext} total={:?} toc={}",
+            t_open.elapsed(),
+            toc.len()
+        );
+    }
+    // 全书图片列表：随 open_book 一次算好并缓存，图片查看器无需再发命令（避免打开后
+    // 再调用命令带来的排队/卡顿）。EPUB 用 OPF 清单（瞬时），MOBI 用已提取的 res 目录。
+    let images = collect_book_images(&st, id).unwrap_or_default();
+    st.image_cache.lock().unwrap().insert(id, Arc::new(images.clone()));
+    // 漫画检测：图片资源数量远多于章节数（每页基本是一张图）。用资源清单做廉价判断，
+    // 不读正文：普通小说（少量插图）比例很低，漫画（如 1.2 万图 / 75 章）比例极高。
+    let toc_n = toc.len().max(1);
+    let is_manga = images.len() >= 30 && (images.len() as f64) >= (toc_n as f64) * 1.5;
+    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+        eprintln!(
+            "[open] is_manga id={id} images={} toc={} => {is_manga}",
+            images.len(),
+            toc.len()
+        );
+    }
     Ok(OpenResult {
         book,
         toc,
         docs,
         encoding_warning: warn,
+        images,
+        is_manga,
     })
 }
 
@@ -615,6 +1102,7 @@ pub async fn get_chapter(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
     chapter_index: i64,
+    keep_styles: bool,
 ) -> Result<ChapterData, String> {
     let book = {
         let conn = state.db.0.lock().unwrap();
@@ -624,24 +1112,88 @@ pub async fn get_chapter(
     let idx = chapter_index.max(0) as usize;
     let st = state.inner().clone();
 
+    // 已渲染章节缓存：命中直接返回（零解析成本，快速连续翻页/来回翻页瞬时）。
+    if let Some(hit) = st
+        .chapter_cache
+        .lock()
+        .unwrap()
+        .get((book_id, idx as i64, keep_styles))
+    {
+        return Ok(hit.as_ref().clone());
+    }
+
     if ext == "epub" {
-        let cached = load_epub(&st, &book.path, book_id)?;
-        let spine_idx = cached
-            .doc
-            .toc
-            .get(idx)
-            .map(|t| t.index)
-            .unwrap_or(idx);
-        let doc_path = cached.doc.spine.get(spine_idx).ok_or("章节文件缺失")?;
-        let html = crate::epub::chapter_html(&cached.data, doc_path)?;
-        let chars = cached.doc.spine_chars.get(spine_idx).copied().unwrap_or(0);
-        let title = cached
-            .doc
-            .toc
-            .get(idx)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| format!("第 {} 节", idx + 1));
-        return Ok(ChapterData { title, html, chars });
+        // 解析/渲染放到阻塞线程池，避免占用 async 运行时拖死其它 IPC。
+        let st2 = st.clone();
+        let bpath = book.path.clone();
+        let t_render = std::time::Instant::now();
+        let data = tauri::async_runtime::spawn_blocking(move || -> Result<ChapterData, String> {
+            let cached = load_epub(&st2, &bpath, book_id)?;
+            let doc = &cached.doc;
+            // 章节 = 从本章目录项指向的 spine 下标，到下一章目录项（或末尾）为止：
+            // 支持「一章被拆成多个小文件」的 EPUB（目录只指向首个小文件）。
+            let start = doc
+                .toc
+                .get(idx)
+                .map(|t| t.index)
+                .unwrap_or(idx)
+                .min(doc.spine.len());
+            let end = doc
+                .toc_end
+                .get(idx)
+                .copied()
+                .unwrap_or(start + 1)
+                .max(start + 1)
+                .min(doc.spine.len());
+            // 复用缓存的 CiMap 与按需图片 URL（不内联 base64），连续渲染整段章节。
+            let docs: Vec<String> = (start..end)
+                .filter_map(|si| doc.spine.get(si).cloned())
+                .collect();
+            let mut html = crate::epub::chapter_html_multi_ci(
+                &cached.data,
+                Some(&cached.ci),
+                &docs,
+                Some(book_id),
+                keep_styles,
+            )
+            .unwrap_or_default();
+            let mut chars: i64 = (start..end)
+                .map(|si| doc.spine_chars.get(si).copied().unwrap_or(0))
+                .sum();
+            if html.is_empty() {
+                // 区间异常时兜底返回本章首文件，避免整章空白。
+                if let Some(dp) = doc.spine.get(start) {
+                    html = crate::epub::chapter_html_ci(
+                        &cached.data,
+                        Some(&cached.ci),
+                        dp,
+                        Some(book_id),
+                        keep_styles,
+                    )?;
+                    chars = doc.spine_chars.get(start).copied().unwrap_or(0);
+                }
+            }
+            let title = doc
+                .toc
+                .get(idx)
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| format!("第 {} 节", idx + 1));
+            Ok(ChapterData { title, html, chars })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+            eprintln!(
+                "[open] get_chapter book={book_id} idx={idx} render={:?} html={}B",
+                t_render.elapsed(),
+                data.html.len()
+            );
+        }
+        st.chapter_cache
+            .lock()
+            .unwrap()
+            .put((book_id, idx as i64, keep_styles), Arc::new(data.clone()));
+        return Ok(data);
     }
 
     let is_mobi = ext == "mobi" || ext == "azw3" || ext == "prc";
@@ -675,7 +1227,12 @@ pub async fn get_chapter(
     } else {
         body
     };
-    Ok(ChapterData { title, html, chars })
+    let data = ChapterData { title, html, chars };
+    st.chapter_cache
+        .lock()
+        .unwrap()
+        .put((book_id, idx as i64, keep_styles), Arc::new(data.clone()));
+    Ok(data)
 }
 
 #[tauri::command]
@@ -694,15 +1251,19 @@ pub fn load_progress(state: State<'_, Arc<AppState>>, book_id: i64) -> Option<Pr
     db::get_progress(&conn, book_id)
 }
 
+/// 删除书籍。`fromDisk`=删除本地文件；`keepNotes`=保留带笔记的划线（默认 true）。
+/// 前端需先调用 `book_note_info` 判断是否有笔记并弹窗让用户选择。
 #[tauri::command]
 pub fn delete_books(
     state: State<'_, Arc<AppState>>,
     paths: Vec<String>,
     from_disk: bool,
+    keep_notes: Option<bool>,
 ) -> Result<(), String> {
+    let keep = keep_notes.unwrap_or(true);
     {
         let conn = state.db.0.lock().unwrap();
-        db::delete_books(&conn, &paths)?;
+        db::delete_books_policy(&conn, &paths, keep)?;
     }
     if from_disk {
         for p in &paths {
@@ -710,7 +1271,77 @@ pub fn delete_books(
         }
     }
     state.app.emit("library-changed", ()).ok();
+    state.app.emit("notes-changed", ()).ok();
     Ok(())
+}
+
+/// 查该书是否有带笔记的划线（供前端删除前弹窗判定）。
+#[tauri::command]
+pub fn book_note_info(state: State<'_, Arc<AppState>>, book_id: i64) -> serde_json::Value {
+    let conn = state.db.0.lock().unwrap();
+    let has = db::book_has_notes(&conn, book_id);
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM highlights WHERE book_id=?1 AND note!=''",
+            rusqlite::params![book_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    serde_json::json!({ "hasNotes": has, "noteCount": n })
+}
+
+/// 笔记界面：按书分组列出（仅 note!=''）。
+#[tauri::command]
+pub fn list_note_books(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+    let conn = state.db.0.lock().unwrap();
+    db::list_note_books(&conn)
+        .into_iter()
+        .map(|(id, title, author, deleted, count, last)| {
+            serde_json::json!({
+                "bookId": id, "title": title, "author": author,
+                "deleted": deleted, "noteCount": count, "lastAt": last
+            })
+        })
+        .collect()
+}
+
+/// 某书的笔记明细。
+#[tauri::command]
+pub fn list_notes_of_book(state: State<'_, Arc<AppState>>, book_id: i64) -> Vec<serde_json::Value> {
+    let conn = state.db.0.lock().unwrap();
+    db::list_notes_of_book(&conn, book_id)
+        .into_iter()
+        .map(|(id, ch, ct, text, note, at)| {
+            serde_json::json!({
+                "id": id, "chapterIndex": ch, "chapterTitle": ct,
+                "text": text, "note": note, "createdAt": at
+            })
+        })
+        .collect()
+}
+
+/// 设置某条划线的感想（note）。
+#[tauri::command]
+pub fn set_highlight_note(state: State<'_, Arc<AppState>>, id: i64, note: String) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    db::set_highlight_note(&conn, id, &note)?;
+    drop(conn);
+    state.app.emit("notes-changed", ()).ok();
+    Ok(())
+}
+
+/// 追加感想（AI 添加到笔记：不覆盖已有）。
+#[tauri::command]
+pub fn append_highlight_note(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    addition: String,
+) -> Result<String, String> {
+    let conn = state.db.0.lock().unwrap();
+    let next = db::append_highlight_note(&conn, id, &addition)?;
+    drop(conn);
+    state.app.emit("notes-changed", ()).ok();
+    Ok(next)
 }
 
 #[tauri::command]
@@ -732,6 +1363,7 @@ pub fn save_split_rules(state: State<'_, Arc<AppState>>, pattern: String) -> Res
     }
     state.rules_ver.fetch_add(1, Ordering::Relaxed);
     state.txt_cache.lock().unwrap().clear();
+    state.chapter_cache.lock().unwrap().clear();
     Ok(())
 }
 
@@ -745,11 +1377,7 @@ pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crat
         let t = force.trim().to_ascii_lowercase();
         if t.is_empty() || t == "auto" { None } else { Some(t) }
     };
-    let dir = st
-        .app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
+    let dir = crate::data_dir(&st.app)
         .join("res")
         .join(book_id.to_string());
     let prefix = format!("http://flowread.localhost/res/{book_id}/");
@@ -943,6 +1571,65 @@ pub fn set_custom_cover(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 默认底图变更后的统一收尾（F2 修正版）。
+///
+/// 换底图 / 恢复内置【只影响共享底图那 1 份文件】：
+/// - 绝不删除 `covers/` 目录里 per-book 的封面（有内嵌封面的书不受影响）；
+/// - 绝不重置任何书的 `cover_path`/`meta_done`（不回落默认底图）；
+/// - 不清理 covers 目录、不重启元数据 worker。
+/// 只需版本号 +1（令共享默认封面缓存与前端 URL 失效）并通知前端刷新书库即可。
+fn invalidate_covers_after_base_change(state: &Arc<AppState>) {
+    state.cover_style_ver.fetch_add(1, Ordering::SeqCst);
+    state.app.emit("library-changed", ()).ok();
+}
+
+/// 默认底图原子写入：校验可解码 → 写同目录临时文件 → 原子替换。
+/// 任何失败都清理临时文件、且**不触碰**已存在的 out（失败不残留半步）。
+fn write_default_cover_atomic(out: &Path, data: &[u8]) -> Result<(), String> {
+    image::load_from_memory(data).map_err(|e| format!("不是有效图片: {e}"))?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = out.with_extension("img.tmp");
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入底图失败: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换底图失败: {e}"));
+    }
+    Ok(())
+}
+
+/// 设置默认封面底图（校验 + 原子替换；失败不破坏旧底图）。
+#[tauri::command]
+pub fn set_default_cover(state: State<'_, Arc<AppState>>, image_path: String) -> Result<(), String> {
+    let data = std::fs::read(&image_path).map_err(|e| format!("读取图片失败: {e}"))?;
+    let out = covers::default_cover_path(&state.app);
+    write_default_cover_atomic(&out, &data)?;
+    // 底图已成功落盘，才失效缓存。
+    invalidate_covers_after_base_change(state.inner());
+    Ok(())
+}
+
+/// 清除默认封面底图（恢复内置渐变），并让缓存失效重算。
+#[tauri::command]
+pub fn clear_default_cover(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let out = covers::default_cover_path(&state.app);
+    if out.exists() {
+        std::fs::remove_file(&out).map_err(|e| format!("移除底图失败: {e}"))?;
+    }
+    invalidate_covers_after_base_change(state.inner());
+    Ok(())
+}
+
+/// 默认封面底图是否存在（供设置页显示状态）。
+#[tauri::command]
+pub fn has_default_cover(state: State<'_, Arc<AppState>>) -> bool {
+    covers::default_cover_path(&state.app).is_file()
 }
 
 #[tauri::command]
@@ -1527,13 +2214,141 @@ pub fn get_setting_kv(state: State<'_, Arc<AppState>>, key: String) -> Option<St
 
 #[tauri::command]
 pub fn app_data_dir(state: State<'_, Arc<AppState>>) -> String {
-    use tauri::Manager;
-    state
-        .app
-        .path()
-        .app_data_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    crate::data_dir(&state.app).to_string_lossy().into_owned()
+}
+
+/// 递归统计目录大小（字节）与文件数。目录不存在返回 (0, 0)。
+fn dir_size(dir: &Path) -> (u64, u64) {
+    let mut bytes: u64 = 0;
+    let mut files: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = match std::fs::read_dir(&d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(p),
+                Ok(ft) if ft.is_file() => {
+                    files += 1;
+                    if let Ok(m) = e.metadata() {
+                        bytes += m.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (bytes, files)
+}
+
+/// 存储占用：数据目录总量 + 各子目录（封面/提取资源/字体/数据库）。
+#[derive(serde::Serialize)]
+pub struct StorageStats {
+    pub data_dir: String,
+    pub total_bytes: u64,
+    pub covers_bytes: u64,
+    pub res_bytes: u64,
+    pub fonts_bytes: u64,
+    pub db_bytes: u64,
+    /// 「可清理缓存」= 封面 + 提取资源（可再生，删除后重新打开/刷新会重建）。
+    pub cache_bytes: u64,
+}
+
+#[tauri::command]
+pub fn storage_stats(state: State<'_, Arc<AppState>>) -> StorageStats {
+    let dir = crate::data_dir(&state.app);
+    let (covers_bytes, _) = dir_size(&dir.join("covers"));
+    let (res_bytes, _) = dir_size(&dir.join("res"));
+    let (fonts_bytes, _) = dir_size(&dir.join("fonts"));
+    let (total_bytes, _) = dir_size(&dir);
+    let db_bytes = ["flowread.db", "flowread.db-wal", "flowread.db-shm"]
+        .iter()
+        .map(|n| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    StorageStats {
+        data_dir: dir.to_string_lossy().into_owned(),
+        total_bytes,
+        covers_bytes,
+        res_bytes,
+        fonts_bytes,
+        db_bytes,
+        cache_bytes: covers_bytes + res_bytes,
+    }
+}
+
+/// 只重算封面/元数据（不重新扫描目录）：把 meta_done 复位并拉起 worker。
+/// 用于「长按刷新 → 刷新封面」。与 clear_cache('covers') 共用同一全局互斥入口。
+#[tauri::command]
+pub fn refresh_covers(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // 全局互斥是硬要求：已在跑就视为同一次任务，直接返回，不重复拉起。
+    if state.meta_running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    {
+        let conn = state.db.0.lock().unwrap();
+        conn.execute("UPDATE books SET meta_done=0", [])
+            .map_err(|e| e.to_string())?;
+    }
+    spawn_meta_worker(state.app.clone());
+    Ok(())
+}
+
+/// 诊断：worker 启动次数 / 是否在跑（仅用于验证互斥）。
+#[tauri::command]
+pub fn meta_debug_stats(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    serde_json::json!({
+        "startCount": state.meta_start_count.load(Ordering::SeqCst),
+        "running": state.meta_running.load(Ordering::SeqCst),
+    })
+}
+
+/// 清理可再生的缓存目录。`what`: "covers" | "res" | "all"。
+/// 清理后把受影响书的 cover_path/meta_done 复位，让下次刷新/打开重新生成。
+#[tauri::command]
+pub fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Result<u64, String> {
+    let dir = crate::data_dir(&state.app);
+    let targets: Vec<&str> = match what.as_str() {
+        "covers" => vec!["covers"],
+        "res" => vec!["res"],
+        "all" => vec!["covers", "res"],
+        other => return Err(format!("未知缓存类型: {other}")),
+    };
+    // 含封面清理时：先停 worker 并等其退出，避免删文件与写封面并发（半成品残留）。
+    if targets.contains(&"covers") {
+        stop_meta_worker_and_wait(state.inner());
+    }
+    let mut freed: u64 = 0;
+    for name in &targets {
+        let p = dir.join(name);
+        let (b, _) = dir_size(&p);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("清理 {name} 失败: {e}"))?;
+        }
+        std::fs::create_dir_all(&p).ok();
+        freed += b;
+    }
+    // 清理封面后，把元数据标记复位，下次扫描/打开会重建封面。
+    if targets.contains(&"covers") {
+        // 换底图/清缓存让旧封面缓存整体失效（F5）：规则版本 +1 参与缓存 key。
+        state.cover_style_ver.fetch_add(1, Ordering::SeqCst);
+        {
+            let conn = state.db.0.lock().unwrap();
+            conn.execute("UPDATE books SET cover_path=NULL, meta_done=0", [])
+                .map_err(|e| e.to_string())?;
+        }
+        // worker 已停止，这里重新拉起（全局互斥：若已在跑则自动 no-op）。
+        spawn_meta_worker(state.app.clone());
+    }
+    if targets.contains(&"res") {
+        // 提取资源清空后，已缓存的章节/图片需要失效。
+        state.chapter_cache.lock().unwrap().clear();
+        state.image_cache.lock().unwrap().clear();
+    }
+    state.app.emit("library-changed", ()).ok();
+    Ok(freed)
 }
 
 #[tauri::command]
@@ -1673,9 +2488,23 @@ pub async fn tts_synth(
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
-/// 读取自定义 TTS 服务（如本地 VoxCPM）提供的音色列表：GET {base}/v1/voices。
+/// 自定义 TTS 服务返回的单个音色。
+/// `kind` 的取值：`profile`=服务端保存的固定克隆音色（推荐，整章音色一致）；
+/// `openai_alias`=OpenAI 别名（映射到服务端默认音色，对克隆引擎可能逐句随机）；
+/// 其它/空=服务端自定义预设。
+#[derive(serde::Serialize)]
+pub struct TtsVoiceInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub language: String,
+}
+
+/// 读取自定义 TTS 服务提供的音色列表：GET {base}/v1/audio/voices（兼容 /v1/voices）。
+/// 返回每个音色的 id/名称/类型/语言，供前端区分「固定音色」与「别名」。
 #[tauri::command]
-pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<TtsVoiceInfo>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("未填写服务地址".into());
@@ -1711,7 +2540,7 @@ pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>
                 continue;
             }
         };
-        let mut out: Vec<String> = Vec::new();
+        let mut out: Vec<TtsVoiceInfo> = Vec::new();
         // data: [...]  或  voices: [...]
         let arr = v
             .get("data")
@@ -1725,11 +2554,32 @@ pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>
                     .or_else(|| it.get("voice_id").and_then(|x| x.as_str()))
                     .or_else(|| it.get("name").and_then(|x| x.as_str()))
                     .or_else(|| it.as_str());
-                if let Some(id) = id {
-                    if !out.iter().any(|x| x == id) {
-                        out.push(id.to_string());
-                    }
+                let Some(id) = id else { continue };
+                let id = id.trim();
+                if id.is_empty() || out.iter().any(|x| x.id == id) {
+                    continue;
                 }
+                let name = it
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(id)
+                    .to_string();
+                let kind = it
+                    .get("type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let language = it
+                    .get("language")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.push(TtsVoiceInfo {
+                    id: id.to_string(),
+                    name,
+                    kind,
+                    language,
+                });
             }
         }
         if !out.is_empty() {
@@ -1740,8 +2590,128 @@ pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<String>
     Err(last_err)
 }
 
+#[derive(serde::Serialize)]
+pub struct EnsureVoiceResult {
+    pub id: String,
+    pub created: bool,
+}
+
+/// VoiceStudio 专用：确保存在一个「固定音色（design profile）」并返回其 id。
+///
+/// 背景：VoiceStudio + OmniVoice 是零样本克隆引擎。OpenAI 别名（alloy…）会走
+/// 「Auto」模式（模型自己挑说话人），逐句请求会换人；只有带固定参考音频的
+/// profile 才能锁定说话人。若用户没有同语言的固定音色，这里通过 VoiceStudio
+/// 的 `/design/describe` + `/profiles`(kind=design) 现场创建一个（内部用固定
+/// 种子渲染身份样本），从而无需英文参考音频即可得到稳定的中文音色。
 #[tauri::command]
-pub fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Vec<SearchHit> {
+pub async fn tts_ensure_fixed_voice(
+    base_url: String,
+    api_key: String,
+    language: String,
+    instruct: String,
+) -> Result<EnsureVoiceResult, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("未填写服务地址".into());
+    }
+    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let key = api_key.trim().to_string();
+    let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
+        if key.is_empty() {
+            req
+        } else {
+            req.header("Authorization", format!("Bearer {key}"))
+        }
+    };
+    const NAME_PREFIX: &str = "FlowRead";
+
+    // 1) 复用已存在的同语言 FlowRead 固定音色（避免重复创建）。
+    if let Ok(resp) = auth(client.get(format!("{base}/profiles"))).send().await {
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                let mut rows: Vec<&serde_json::Value> = Vec::new();
+                if let Some(a) = v.as_array() {
+                    rows.extend(a.iter());
+                } else if v.is_object() {
+                    rows.push(&v);
+                }
+                for it in rows {
+                    let id = it.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                    let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let lang = it.get("language").and_then(|x| x.as_str()).unwrap_or("");
+                    let kind = it.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                    let ref_audio = it
+                        .get("ref_audio_path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    if !id.is_empty()
+                        && name.starts_with(NAME_PREFIX)
+                        && kind == "design"
+                        && lang.eq_ignore_ascii_case(&language)
+                        && !ref_audio.is_empty()
+                    {
+                        return Ok(EnsureVoiceResult {
+                            id: id.to_string(),
+                            created: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) 把 instruct 解析成 VoiceStudio 需要的 vd_states（失败则用空对象）。
+    let vd_states = match auth(client.post(format!("{base}/design/describe")))
+        .json(&serde_json::json!({ "description": instruct }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("attrs").cloned())
+            .unwrap_or_else(|| serde_json::json!({})),
+        _ => serde_json::json!({}),
+    };
+
+    // 3) 创建 design profile（VoiceStudio 会用固定种子渲染身份样本作为参考音频）。
+    let form = reqwest::multipart::Form::new()
+        .text("name", format!("{NAME_PREFIX} {language} Voice"))
+        .text("kind", "design")
+        .text("language", language.clone())
+        .text("instruct", instruct.clone())
+        .text("seed", "42")
+        .text("vd_states", vd_states.to_string());
+    let resp = auth(client.post(format!("{base}/profiles")))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("创建固定音色失败：{e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let brief: String = txt.chars().take(200).collect();
+        return Err(format!("创建固定音色失败：HTTP {} {brief}", status.as_u16()));
+    }
+    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or("服务未返回音色 id")?
+        .to_string();
+    Ok(EnsureVoiceResult { id, created: true })
+}
+
+#[tauri::command]
+pub async fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Result<Vec<SearchHit>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || search_all_inner(&st, query))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn search_all_inner(state: &Arc<AppState>, query: String) -> Vec<SearchHit> {
     let conn = state.db.0.lock().unwrap();
     if !db::has_fts(&conn) || query.chars().count() < 2 {
         return vec![];
@@ -1805,24 +2775,30 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
         let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
         let doc = crate::epub::parse(data.clone())?;
         let spine_len = doc.spine.len();
+        // 一次性建好「spine 下标 → 章节号 / 标题」，避免逐章线性查找目录（大书 O(n²)）。
         let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
+        let mut title_by_spine: Vec<String> = vec![String::new(); spine_len];
         for (i, t) in doc.toc.iter().enumerate() {
-            if t.index < spine_len && toc_pos_by_spine[t.index].is_none() {
-                toc_pos_by_spine[t.index] = Some(i as i64);
+            if t.index < spine_len {
+                if toc_pos_by_spine[t.index].is_none() {
+                    toc_pos_by_spine[t.index] = Some(i as i64);
+                }
+                if title_by_spine[t.index].is_empty() {
+                    title_by_spine[t.index] = t.title.clone();
+                }
             }
         }
+        // 复用单个 zip/CiMap 提取全章文本（而非每章重建索引）。
+        let texts = crate::epub::collect_texts(&data, &doc.spine);
         doc.spine
             .iter()
             .enumerate()
-            .map(|(i, d)| {
-                let ti = toc_pos_by_spine[i].unwrap_or(i as i64);
-                let title = doc
-                    .toc
-                    .iter()
-                    .find(|t| t.index == i)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default();
-                (ti, title, crate::epub::doc_text(&data, d))
+            .map(|(i, _)| {
+                (
+                    toc_pos_by_spine[i].unwrap_or(i as i64),
+                    title_by_spine[i].clone(),
+                    texts.get(i).cloned().unwrap_or_default(),
+                )
             })
             .collect()
     } else {
@@ -1869,8 +2845,11 @@ fn ensure_book_text(state: &Arc<AppState>, book_id: i64) -> Result<usize, String
 }
 
 #[tauri::command]
-pub fn ensure_book_text_cmd(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
-    ensure_book_text(state.inner(), book_id).map(|n| n as i64)
+pub async fn ensure_book_text_cmd(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_book_text(&st, book_id).map(|n| n as i64))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// 生成带 <mark> 高亮的片段（HTML 转义正文，只保留命中两侧少量上下文）。
@@ -1906,7 +2885,14 @@ fn highlight_snippet(chars: &[char], bs: usize, be: usize) -> String {
 /// 单本书内全文检索：不依赖 FTS5，直接扫描缓存的纯文本章节。
 /// 忽略所有空白并做 ASCII 不区分大小写匹配，避免选区换行/空格与索引原文不一致导致漏命中。
 #[tauri::command]
-pub fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: String) -> Vec<BookSearchHit> {
+pub async fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: String) -> Result<Vec<BookSearchHit>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || search_in_book_inner(&st, book_id, query))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn search_in_book_inner(state: &Arc<AppState>, book_id: i64, query: String) -> Vec<BookSearchHit> {
     let compact_q: Vec<char> = query
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -1915,7 +2901,7 @@ pub fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query: Stri
     if compact_q.is_empty() {
         return vec![];
     }
-    if ensure_book_text(state.inner(), book_id).is_err() {
+    if ensure_book_text(state, book_id).is_err() {
         return vec![];
     }
     let rows: Vec<(i64, String, String)> = {
@@ -1988,6 +2974,18 @@ pub fn add_highlight(
     note: String,
 ) -> Result<i64, String> {
     let conn = state.db.0.lock().unwrap();
+    // 创建划线时 upsert 该书指纹（大小+首尾64KB sha256）与书名/作者快照。
+    // 书此时必然存在，写入最稳；每书一行，不冗余进 highlight。
+    if let Some(b) = db::get_book(&conn, book_id) {
+        let (size, mtime, hash) = db::file_fingerprint(&b.path);
+        let (t, a) = if b.title.trim().is_empty() {
+            let (ft, fa) = parse_filename(&b.path);
+            (ft, fa)
+        } else {
+            (b.title.clone(), b.author.clone())
+        };
+        db::upsert_book_fingerprint(&conn, book_id, size, mtime, &hash, &t, &a).ok();
+    }
     db::add_highlight(
         &conn,
         book_id,
@@ -2074,20 +3072,32 @@ pub fn write_book_meta(
 }
 
 #[tauri::command]
-pub fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    let conn = state.db.0.lock().unwrap();
-    if !db::has_fts(&conn) {
-        return Err("SQLite 编译未包含 FTS5".into());
-    }
-    db::ensure_fts(&conn)?;
-    let n = conn
-        .execute("DELETE FROM fts", [])
-        .map_err(|e| e.to_string())?;
-    Ok(n as i64)
+pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        if !db::has_fts(&conn) {
+            return Err("SQLite 编译未包含 FTS5".into());
+        }
+        db::ensure_fts(&conn)?;
+        let n = conn
+            .execute("DELETE FROM fts", [])
+            .map_err(|e| e.to_string())?;
+        Ok(n as i64)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
+pub async fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || index_book_fts_inner(&st, book_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn index_book_fts_inner(state: &Arc<AppState>, book_id: i64) -> Result<i64, String> {
     let needs_index = {
         let conn = state.db.0.lock().unwrap();
         if !db::has_fts(&conn) {
@@ -2105,11 +3115,11 @@ pub fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i
     };
     if !needs_index {
         // 已建过 FTS：顺手确保纯文本缓存存在（划词全文搜索不依赖 FTS）
-        let _ = ensure_book_text(state.inner(), book_id);
+        let _ = ensure_book_text(state, book_id);
         return Ok(0);
     }
 
-    let chapters = collect_book_chapters(state.inner(), book_id)?;
+    let chapters = collect_book_chapters(state, book_id)?;
     let text_empty = {
         let conn = state.db.0.lock().unwrap();
         let n: i64 = conn
@@ -2363,6 +3373,150 @@ pub async fn get_book_word_count(
     Ok(WordCount { total, pure })
 }
 
+
+#[cfg(test)]
+mod default_cover_tests {
+    use super::write_default_cover_atomic;
+    use std::path::PathBuf;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fr_dcover_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn tiny_png() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(8, 8, |x, y| image::Rgb([(x * 30) as u8, (y * 30) as u8, 128]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn valid_png_is_written_atomically() {
+        let d = tmp_dir("ok");
+        let out = d.join("default-cover.img");
+        let bytes = tiny_png();
+        write_default_cover_atomic(&out, &bytes).unwrap();
+        assert!(out.is_file());
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        // 无残留临时文件
+        assert!(!d.join("default-cover.img.tmp").exists());
+    }
+
+    #[test]
+    fn invalid_bytes_do_not_touch_existing() {
+        let d = tmp_dir("bad");
+        let out = d.join("default-cover.img");
+        let good = tiny_png();
+        write_default_cover_atomic(&out, &good).unwrap();
+        let before = std::fs::read(&out).unwrap();
+        // 塞入损坏内容：应报错，且旧底图保持不变、无 tmp 残留。
+        let err = write_default_cover_atomic(&out, b"not an image at all").unwrap_err();
+        assert!(err.contains("不是有效图片"), "err={err}");
+        assert_eq!(std::fs::read(&out).unwrap(), before, "旧底图被破坏");
+        assert!(!d.join("default-cover.img.tmp").exists(), "残留临时文件");
+    }
+
+    #[test]
+    fn creates_parent_dir() {
+        let d = tmp_dir("mk");
+        let out = d.join("nested").join("default-cover.img");
+        write_default_cover_atomic(&out, &tiny_png()).unwrap();
+        assert!(out.is_file());
+    }
+
+    /// Bug1/Bug2 回归：换底图只写共享底图那 1 份文件，绝不动同目录里其他书的封面。
+    #[test]
+    fn changing_base_does_not_touch_sibling_covers() {
+        let d = tmp_dir("sib");
+        // 模拟 covers 目录里「有内嵌封面书」的 per-book 封面文件。
+        let per_book = d.join("deadbeef.png");
+        let book_bytes = tiny_png();
+        std::fs::write(&per_book, &book_bytes).unwrap();
+        let base = d.join("default-cover.img");
+        // 换底图：只写 default-cover.img。
+        write_default_cover_atomic(&base, &tiny_png()).unwrap();
+        assert!(base.is_file());
+        // 其他书封面原封不动。
+        assert!(per_book.is_file(), "per-book cover was deleted");
+        assert_eq!(std::fs::read(&per_book).unwrap(), book_bytes, "per-book cover changed");
+        // 无残留临时文件。
+        assert!(!d.join("default-cover.img.tmp").exists());
+    }
+
+    /// 底图存为 .img，扩展名不可靠：MIME 必须按字节魔数嗅探。
+    #[test]
+    fn sniff_mime_recognizes_common_base_formats() {
+        assert_eq!(crate::sniff_mime(&[0x89, b'P', b'N', b'G']), "image/png");
+        assert_eq!(crate::sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(crate::sniff_mime(b"GIF89a"), "image/gif");
+        let mut webp = b"RIFF\0\0\0\0WEBP".to_vec();
+        webp.extend_from_slice(b"VP8 ");
+        assert_eq!(crate::sniff_mime(&webp), "image/webp");
+        assert_eq!(crate::sniff_mime(b"BM\0\0"), "image/bmp");
+    }
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use crate::library::parse_filename;
+
+    fn p(s: &str) -> (String, String) {
+        parse_filename(s)
+    }
+
+    #[test]
+    fn normal_title_author_brackets() {
+        assert_eq!(p("/x/三体 (刘慈欣).txt"), ("三体".into(), "刘慈欣".into()));
+        assert_eq!(p("/x/活着[余华].epub"), ("活着".into(), "余华".into()));
+    }
+
+    #[test]
+    fn book_marks_and_dash() {
+        assert_eq!(p("/x/《围城》.txt"), ("围城".into(), String::new()));
+        assert_eq!(p("/x/解忧杂货店 - 东野圭吾.txt"), ("解忧杂货店".into(), "东野圭吾".into()));
+    }
+
+    #[test]
+    fn no_extension_still_works() {
+        assert_eq!(p("/x/无扩展名书籍"), ("无扩展名书籍".into(), String::new()));
+    }
+
+    #[test]
+    fn pure_numeric_name() {
+        assert_eq!(p("/x/12345.txt"), ("12345".into(), String::new()));
+    }
+
+    #[test]
+    fn empty_name_falls_back() {
+        let (t, a) = p("");
+        assert_eq!(t, "未命名");
+        assert_eq!(a, "");
+    }
+
+    #[test]
+    fn publisher_bracket_ignored() {
+        // 含"出版"的括号不作为作者
+        let (t, a) = p("/x/某书 (某某出版社).txt");
+        assert_eq!(a, "");
+        assert!(t.contains("某书"));
+    }
+
+    #[test]
+    fn long_bracket_ignored() {
+        // 括号内容过长（>20）不作作者
+        let (_, a) = p("/x/书 (这是一个非常非常非常非常冗长的括号说明内容).txt");
+        assert_eq!(a, "");
+    }
+
+    #[test]
+    fn multi_bracket_takes_last() {
+        let (t, a) = p("/x/书名 (系列) (作者名).txt");
+        assert_eq!(a, "作者名");
+        assert!(t.contains("书名"));
+    }
+}
 
 #[cfg(test)]
 mod refresh_tests {
