@@ -416,6 +416,7 @@ pub fn run() {
             library::storage_stats,
             library::clear_cache,
             library::meta_debug_stats,
+            library::scan_progress,
             library::prioritize_covers,
             library::set_default_cover,
             library::clear_default_cover,

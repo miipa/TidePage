@@ -753,6 +753,16 @@
     }
     loadFolders();
     reload();
+    // 启动竞态修复：首次 `meta-progress` 常在 webview 挂载前发出而丢失，仅靠事件会让底栏空着。
+    // 挂载后主动拉一次当前进度快照初始化（若已有事件先到则保留更新值；后续帧仍由 meta-progress 事件更新）。
+    api
+      .scanProgress()
+      .then((p) => {
+        if (p && p.running && p.total > 0 && !metaProgress) {
+          metaProgress = { phase: "meta", done: Math.min(p.done, p.total), total: p.total };
+        }
+      })
+      .catch(() => {});
     // 监听只增量刷新当前窗口与 total，不重置滚动、不拉全量。
     // library-changed 也会在换/恢复默认底图后触发：先 bump 缓存破坏版本号，
     // 保证无内嵌封面的书立即换用新底图（有内嵌封面书走各自 cover_path，不受影响）。

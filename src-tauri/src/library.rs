@@ -557,7 +557,10 @@ fn on_startup(state: Arc<AppState>) {
     };
 
     // 优先表：处理其中一本（打开书籍插队，允许对失败项 0/2 重试）。返回是否命中。
-    let drain_one_priority = |commits: &mut u64| -> bool {
+    // 命中同样计入进度分子（优先项也是 meta_done=0，已包含在启动时的 total0 内）并按节流
+    // 发 meta-progress —— 否则「只服务优先表」期间 `cover_scan_done` 不动、事件不发，
+    // 底栏进度条会长时间不出现/不推进（封面却仍在插队生成）。
+    let drain_one_priority = |commits: &mut u64, since_emit: &mut u64| -> bool {
         let hit = {
             let conn = state.db.0.lock().unwrap();
             db::next_priority(&conn)
@@ -566,6 +569,14 @@ fn on_startup(state: Arc<AppState>) {
             Some((id, path, format)) => {
                 if process_one(id, &path, &format, &[0, 2]).is_some() {
                     *commits += 1;
+                    let done = state.cover_scan_done.fetch_add(1, Ordering::SeqCst) + 1;
+                    *since_emit += 1;
+                    let total = state.cover_scan_total.load(Ordering::SeqCst);
+                    if *since_emit >= EMIT_EVERY {
+                        *since_emit = 0;
+                        emit_scan_progress(&state.app, done, total);
+                        state.app.emit("library-meta", ()).ok();
+                    }
                 }
                 true
             }
@@ -578,7 +589,7 @@ fn on_startup(state: Arc<AppState>) {
             break;
         }
         // B3：每一本处理前先查优先表；命中则先把优先项清空。
-        while drain_one_priority(&mut commits) {
+        while drain_one_priority(&mut commits, &mut since_emit) {
             if state.scan_stop.load(Ordering::SeqCst) {
                 break 'outer;
             }
@@ -596,7 +607,7 @@ fn on_startup(state: Arc<AppState>) {
         if batch.is_empty() {
             // 要求6：普通待办为 0 时，必须先确认优先表也空（drain 返回 None）才允许退出，
             // 避免恰好此刻有「列表插队 / 打开书」写入而漏处理。
-            if drain_one_priority(&mut commits) {
+            if drain_one_priority(&mut commits, &mut since_emit) {
                 continue;
             }
             break; // 普通待办与优先表都空 → 退出。
@@ -618,7 +629,7 @@ fn on_startup(state: Arc<AppState>) {
                 break 'outer;
             }
             // B3：每本之前再查优先表（打开书籍可随时插队）。
-            while drain_one_priority(&mut commits) {}
+            while drain_one_priority(&mut commits, &mut since_emit) {}
             if process_one(*id, path, format, &[0]).is_some() {
                 commits += 1;
                 let done = state.cover_scan_done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2638,6 +2649,25 @@ pub fn meta_debug_stats(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "running": state.scan_running.load(Ordering::SeqCst),
         "pending": pending,
         "priority": priority,
+    })
+}
+
+/// 当前封面扫描进度快照（done/total/pending）。
+/// 供前端**挂载时主动拉取**以初始化底栏进度条：启动时那条 `meta-progress done=0` 是在
+/// Rust setup 阶段发出的，常早于 webview 挂载、事件无从接收；仅靠事件会导致底栏空着。
+#[tauri::command]
+pub fn scan_progress(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let pending = {
+        let conn = state.db.0.lock().unwrap();
+        db::count_meta_pending(&conn)
+    };
+    let done = state.cover_scan_done.load(Ordering::SeqCst);
+    let total = state.cover_scan_total.load(Ordering::SeqCst).max(done);
+    serde_json::json!({
+        "running": state.scan_running.load(Ordering::SeqCst),
+        "done": done,
+        "total": total,
+        "pending": pending,
     })
 }
 

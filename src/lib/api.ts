@@ -105,6 +105,8 @@ export const api = {
     }>("storage_stats"),
   clearCache: (what: "covers" | "res" | "all") => invoke<number>("clear_cache", { what }),
   metaDebugStats: () => invoke<{ startCount: number; running: boolean; pending: number; priority: number }>("meta_debug_stats"),
+  /** 封面扫描进度快照：前端挂载时主动拉取，初始化底栏进度条（消除启动事件早于挂载的竞态）。 */
+  scanProgress: () => invoke<{ running: boolean; done: number; total: number; pending: number }>("scan_progress"),
   /** 方案 A：把列表可见的未扫描书籍提升为高优先级扫描目标（按视野顺序生成封面）。返回入队本数。 */
   prioritizeCovers: (ids: number[]) => invoke<number>("prioritize_covers", { ids }),
   setDefaultCover: (imagePath: string) => invoke<void>("set_default_cover", { imagePath }),
