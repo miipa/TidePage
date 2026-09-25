@@ -157,6 +157,24 @@
   let scrollTop = $state(0);
   let gridH = $state(800);
   let gridW = $state(1200);
+
+  // 网格视口尺寸用 ResizeObserver 主动量取（替代 bind:clientWidth/Height）：
+  // 无论横向、纵向、还是斜向（对角）拉伸，只要 .grid 的 border-box 变化就同步刷新
+  // gridW（决定列数/封面宽度）与 gridH（决定可见行数），避免某一方向 resize 不触发重排、
+  // 出现底部空白或末行被窗口边缘裁掉半截。滚动条出现/消失改变内容宽也会一并纠正。
+  $effect(() => {
+    const el = gridEl;
+    if (!el) return;
+    const measure = () => {
+      gridW = el.clientWidth;
+      gridH = el.clientHeight;
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
   let ctxMenu = $state<{ x: number; y: number; book: BookRow } | null>(null);
   let ctxEl: HTMLDivElement | undefined = $state();
   let ctxPos = $state({ left: 0, top: 0 });
@@ -908,8 +926,6 @@
     class="grid"
     class:list-view={view === "list"}
     bind:this={gridEl}
-    bind:clientHeight={gridH}
-    bind:clientWidth={gridW}
     onscroll={onScroll}
   >
     {#if loading && total === 0}
@@ -1108,7 +1124,9 @@
   /* ---------- 网格 ---------- */
   .grid {
     flex: 1;
+    min-height: 0; /* flex 列中可滚动子项必须显式置 0，否则纵向不受视口约束、末行被窗口边缘裁切 */
     overflow-y: auto;
+    overflow-x: hidden; /* 列宽用 minmax(0,1fr) 已不溢出；禁掉横向滚动条，避免其占位挤动纵向布局 */
     /* 左右 20px 与 gridPadX 推导一致；底部多留一屏呼吸空间 */
     padding: 16px 20px 32px;
     position: relative;
