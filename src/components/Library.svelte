@@ -199,19 +199,23 @@
   // CARD_PAD = .card padding；COVER_INSET = .card 内边距×2（封面可用宽度 = cardW - COVER_INSET）。
   const CARD_PAD = 8;                 // 与 .card { padding: 8px } 一致
   const COVER_INSET = CARD_PAD * 2;   // 16
-  const CARD_GAP = 12;                // 列内卡片留白（与 cellW 扣减一致）
+  const CARD_GAP = 12;                // 列间水平留白（与 .grid-row column-gap 一致）
+  const CARD_MAX = 216;               // 卡片宽度上限（超宽窗口下不无限拉大）
   const META_H = 52;                  // .meta 固定块高（标签行 + 作者行 + 上下内边距）
   const CARD_VGAP = 12;               // 行间垂直留白
 
   const contentW = $derived(Math.max(1, gridW - gridPadXNow()));
-  // 最少 1 列：窗口极窄时不硬凑两列，避免 cardW 被下限顶出单元格。
-  const cols = $derived(Math.max(1, Math.floor(contentW / GRID_COL_MIN)));
-  const cellW = $derived(contentW / cols);
-  // 卡片宽度：不超过 cellW - 间距，也不超过 216 上限；下限 80，但最终硬钳到 cellW。
-  // 「下限」与「不出单元格」冲突时以不出单元格为准，杜绝末列越界被窗口边缘裁掉。
-  const cardW = $derived(Math.min(cellW, Math.max(80, Math.min(216, cellW - CARD_GAP))));
-  // 封面高度按「实际内宽」算 3:2，保证与渲染一致（不再用写死的 -12）。
-  const coverH = $derived(Math.round((cardW - COVER_INSET) * 1.5));
+  // 列数 = 在 contentW 里能放下多少个「最小列宽 + 列间距」（与 CSS auto-fill 语义一致）；最少 1 列。
+  const cols = $derived(
+    Math.max(1, Math.floor((contentW + CARD_GAP) / (GRID_COL_MIN + CARD_GAP))),
+  );
+  // 每列实际宽度：由 CSS `repeat(cols, minmax(0,1fr))` + column-gap 精确均分 contentW，
+  // 这里同式计算只为推导行高预算（封面高度）。列宽用 minmax(0,1fr) 永不溢出容器。
+  const trackW = $derived((contentW - (cols - 1) * CARD_GAP) / cols);
+  // 卡片显示宽度：不超过列宽，也不超过 216 上限（超宽时卡片在列内居中）。
+  const cardW = $derived(Math.min(trackW, CARD_MAX));
+  // 封面高度按「卡片内宽」算 3:2，保证行高预算与渲染一致。
+  const coverH = $derived(Math.max(1, Math.round((cardW - COVER_INSET) * 1.5)));
   // 行高 = 卡片内边距×2 + 封面 + 标签块 + 行间距。
   const cellH = $derived(CARD_PAD * 2 + coverH + META_H + CARD_VGAP);
 
@@ -917,29 +921,39 @@
     {:else if view === "grid"}
       <div class="grid-inner" style="height:{gridRows * cellH}px;">
         {#each gRows as r (r)}
-          {#each Array(cols) as _, ci (ci)}
-            {@const abs = r * cols + ci}
-            {#if abs < total}
-              {@const b = bookAt(abs)}
-              {#if b}
-                <div
-                  class="card"
-                  style="left:{ci * cellW + (cellW - cardW) / 2}px; top:{r * cellH}px; width:{cardW}px;"
-                  ondblclick={() => tryOpenBook(b)}
-                  oncontextmenu={(e) => openCtx(e, b)}
-                >
-                  <div class="cover" style="height:{coverH}px;">
-                    <img src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
-                    <span class="fmt">{b.format.toUpperCase()}</span>
+          <div
+            class="grid-row"
+            style="top:{r * cellH}px; height:{cellH}px; grid-template-columns:repeat({cols}, minmax(0, 1fr)); column-gap:{CARD_GAP}px;"
+          >
+            {#each Array(cols) as _, ci (ci)}
+              {@const abs = r * cols + ci}
+              {#if abs < total}
+                {@const b = bookAt(abs)}
+                {#if b}
+                  <div
+                    class="card"
+                    style="max-width:{CARD_MAX}px;"
+                    ondblclick={() => tryOpenBook(b)}
+                    oncontextmenu={(e) => openCtx(e, b)}
+                  >
+                    <div class="cover" style="height:{coverH}px;">
+                      <img src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
+                      <span class="fmt">{b.format.toUpperCase()}</span>
+                    </div>
+                    <div class="meta">
+                      <div class="t" title={b.title}>{b.title}</div>
+                      <div class="a">{b.author}</div>
+                    </div>
                   </div>
-                  <div class="meta">
-                    <div class="t" title={b.title}>{b.title}</div>
-                    <div class="a">{b.author}</div>
+                {:else}
+                  <div class="card card-slot" style="max-width:{CARD_MAX}px;">
+                    <div class="cover" style="height:{coverH}px;"></div>
+                    <div class="meta"></div>
                   </div>
-                </div>
+                {/if}
               {/if}
-            {/if}
-          {/each}
+            {/each}
+          </div>
         {/each}
       </div>
     {:else}
@@ -1106,8 +1120,21 @@
     will-change: transform;
   }
 
-  .card {
+  /* 每一「行」是一个绝对定位、占满内容宽的 CSS 网格：列数与列宽交给
+     grid-template-columns: repeat(cols, minmax(0,1fr)) 精确均分，minmax 下限 0
+     保证列宽可收缩、永不撑破容器 —— 任意窗口尺寸下末列都不会越过右边缘被裁切。 */
+  .grid-row {
     position: absolute;
+    left: 0;
+    right: 0;
+    display: grid;
+    justify-items: center; /* 卡片受 max-width 限制时在列内居中，超宽窗口不拉伸变形 */
+    align-content: start;
+  }
+
+  .card {
+    width: 100%;
+    box-sizing: border-box;
     cursor: pointer;
     border-radius: var(--radius, 12px);
     padding: var(--sp-2, 8px);
@@ -1125,6 +1152,17 @@
 
   .card:active {
     transform: translateY(0);
+  }
+
+  /* 未加载完成的占位槽：只占位保持列对齐，不响应交互、无悬停效果 */
+  .card-slot {
+    cursor: default;
+    pointer-events: none;
+  }
+  .card-slot:hover {
+    background: transparent;
+    transform: none;
+    box-shadow: none;
   }
 
   /* 封面：外层 8px 圆角容器，内层图片裁切；用极淡描边替代重阴影 */

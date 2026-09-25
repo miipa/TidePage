@@ -1377,6 +1377,24 @@ function load(): AppConfig {
     // 归一化 reader：清理已废弃键（伪粗体/伪斜体/字距/标点压缩/滚动缓冲数值），
     // 迁移旧默认 cssExtra 与旧滚动缓冲，修正非法新字段。返回 true 时需要落盘。
     if (normalizeReaderConfig(merged.reader, saved.reader)) readerMigrationDirty = true;
+    // 书库顶栏顺序归一化：
+    //   1) 旧配置里的「search」原地迁移为「notes」（顶栏搜索按钮已改为笔记入口），保持它原来的位置；
+    //   2) 过滤非法 id、去重；3) 把新增按钮（含 notes）补到末尾，保证旧配置升级后按钮一定出现。
+    // 不做这步的话，存量用户的 topbarOrder 仍含已删除的 search、且缺 notes，导致笔记入口整个消失。
+    {
+      const libAll = LIBRARY_TOPBAR_IDS as readonly string[];
+      const src = Array.isArray(merged.library.topbarOrder) ? merged.library.topbarOrder : [];
+      const out: string[] = [];
+      for (const raw of src) {
+        const id = raw === "search" ? "notes" : raw; // 原地迁移 search → notes
+        if (typeof id === "string" && libAll.includes(id) && !out.includes(id)) out.push(id);
+      }
+      for (const id of libAll) if (!out.includes(id)) out.push(id); // 补齐缺失（新增按钮到末尾）
+      if (JSON.stringify(out) !== JSON.stringify(merged.library.topbarOrder)) {
+        merged.library.topbarOrder = out;
+        readerMigrationDirty = true; // 复用同一落盘标记，确保迁移结果持久化
+      }
+    }
     // 方案库首次为空时会注入内置方案：需要落盘一次，否则刷新前 localStorage 仍为空。
     if (!Array.isArray(saved.readerSchemes) || !saved.readerSchemes.length) readerMigrationDirty = true;
     return merged;
