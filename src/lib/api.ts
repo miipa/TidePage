@@ -29,9 +29,16 @@ export const api = {
   bookNoteInfo: (bookId: number) =>
     invoke<{ hasNotes: boolean; noteCount: number }>("book_note_info", { bookId }),
   listNoteBooks: () =>
-    invoke<{ bookId: number; title: string; author: string; deleted: boolean; noteCount: number; lastAt: number }[]>(
-      "list_note_books",
-    ),
+    invoke<
+      {
+        bookId: number; title: string; author: string; deleted: boolean;
+        /** 划线条数（含无感想的划线） */ hlCount: number;
+        /** 其中带感想的条数 */ noteCount: number;
+        lastAt: number;
+        /** 内嵌封面文件名（空 = 无内嵌封面，走共享默认封面端点） */ coverPath: string;
+        coverVer: number;
+      }[]
+    >("list_note_books"),
   listNotesOfBook: (bookId: number) =>
     invoke<{ id: number; chapterIndex: number; chapterTitle: string; text: string; note: string; createdAt: number }[]>(
       "list_notes_of_book",
@@ -193,7 +200,7 @@ export function bumpCoverBust(): void {
   _coverBust++;
 }
 
-export function coverUrl(book: BookRow): string {
+export function coverUrl(book: Pick<BookRow, "id" | "cover_path" | "cover_ver">): string {
   // v = 全局分量(cover_style_ver) - per-book 分量(coverVer)。
   // per-book 分量保证：即使同一文件名，重新提取/更换封面后 URL 也会变，浏览器不会吃缓存。
   const v = `${_coverBust}-${book.cover_ver ?? 0}`;

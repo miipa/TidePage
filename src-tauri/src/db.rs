@@ -1264,22 +1264,25 @@ pub fn delete_book_with_policy(
     Ok(())
 }
 
-/// 笔记界面列表：按书分组聚合（仅 note!='' 的划线）。
+/// 笔记界面列表：按书分组聚合（**有划线即入列**，不要求 note!=''）。
 /// 书名优先级：books 实时名 → orphan_books 快照名 → 空（前端显示"已删除"）。
-/// 返回 (book_id, title, author, deleted, note_count, last_note_at)。
+/// 返回 (book_id, title, author, deleted, hl_count, note_count, last_at, cover_path, cover_ver)。
 pub fn list_note_books(
     conn: &Connection,
-) -> Vec<(i64, String, String, bool, i64, i64)> {
+) -> Vec<(i64, String, String, bool, i64, i64, i64, String, i64)> {
     let mut stmt = match conn.prepare(
         "SELECT h.book_id, \
                 COALESCE(NULLIF(b.title,''), o.title_snap, '') AS t, \
                 COALESCE(NULLIF(b.author,''), o.author_snap, '') AS a, \
                 CASE WHEN b.id IS NULL THEN 1 ELSE 0 END AS deleted, \
-                COUNT(*), MAX(h.created_at) \
+                COUNT(*), \
+                SUM(CASE WHEN h.note != '' THEN 1 ELSE 0 END), \
+                MAX(h.created_at), \
+                COALESCE(b.cover_path,''), \
+                COALESCE(b.cover_ver, 0) \
          FROM highlights h \
          LEFT JOIN books b ON b.id = h.book_id \
          LEFT JOIN orphan_books o ON o.book_id = h.book_id \
-         WHERE h.note != '' \
          GROUP BY h.book_id \
          ORDER BY MAX(h.created_at) DESC",
     ) {
@@ -1294,17 +1297,20 @@ pub fn list_note_books(
             r.get::<_, i64>(3)? != 0,
             r.get::<_, i64>(4)?,
             r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, i64>(8)?,
         ))
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
 }
 
-/// 某书带笔记的划线明细（供笔记界面下钻）。
+/// 某书的划线明细（供笔记界面下钻）：**含未写感想的划线**（note 可能为空串）。
 pub fn list_notes_of_book(conn: &Connection, book_id: i64) -> Vec<(i64, i64, String, String, String, i64)> {
     let mut stmt = match conn.prepare(
         "SELECT id, chapter_index, chapter_title, text, note, created_at \
-         FROM highlights WHERE book_id=?1 AND note!='' ORDER BY chapter_index, pos_start",
+         FROM highlights WHERE book_id=?1 ORDER BY chapter_index, pos_start",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],

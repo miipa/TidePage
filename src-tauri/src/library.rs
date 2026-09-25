@@ -1635,16 +1635,18 @@ pub fn book_note_info(state: State<'_, Arc<AppState>>, book_id: i64) -> serde_js
     serde_json::json!({ "hasNotes": has, "noteCount": n })
 }
 
-/// 笔记界面：按书分组列出（仅 note!=''）。
+/// 笔记界面：按书分组列出「有划线或添加过感想」的书（有划线即入列）。
+/// noteCount = 其中带感想的条数；hlCount = 划线条数（含无感想）。
 #[tauri::command]
 pub fn list_note_books(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     let conn = state.db.0.lock().unwrap();
     db::list_note_books(&conn)
         .into_iter()
-        .map(|(id, title, author, deleted, count, last)| {
+        .map(|(id, title, author, deleted, hl, notes, last, cover, cover_ver)| {
             serde_json::json!({
                 "bookId": id, "title": title, "author": author,
-                "deleted": deleted, "noteCount": count, "lastAt": last
+                "deleted": deleted, "hlCount": hl, "noteCount": notes, "lastAt": last,
+                "coverPath": cover, "coverVer": cover_ver
             })
         })
         .collect()
@@ -3389,7 +3391,7 @@ pub fn add_highlight(
         };
         db::upsert_book_fingerprint(&conn, book_id, size, mtime, &hash, &t, &a).ok();
     }
-    db::add_highlight(
+    let r = db::add_highlight(
         &conn,
         book_id,
         chapter_index,
@@ -3400,7 +3402,11 @@ pub fn add_highlight(
         &style,
         &color,
         &note,
-    )
+    );
+    drop(conn);
+    // 新增划线会把该书带进笔记窗口（有划线即入列），通知已打开的笔记窗口刷新。
+    state.app.emit("notes-changed", ()).ok();
+    r
 }
 
 #[tauri::command]
@@ -3418,7 +3424,11 @@ pub fn search_highlights(state: State<'_, Arc<AppState>>, query: String) -> Vec<
 #[tauri::command]
 pub fn delete_highlight(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     let conn = state.db.0.lock().unwrap();
-    db::delete_highlight(&conn, id)
+    let r = db::delete_highlight(&conn, id);
+    drop(conn);
+    // 删掉某书最后一条划线后，该书应立即从笔记窗口消失。
+    state.app.emit("notes-changed", ()).ok();
+    r
 }
 
 #[tauri::command]
@@ -3430,7 +3440,11 @@ pub fn update_highlight(
     note: String,
 ) -> Result<(), String> {
     let conn = state.db.0.lock().unwrap();
-    db::update_highlight(&conn, id, &style, &color, &note)
+    let r = db::update_highlight(&conn, id, &style, &color, &note);
+    drop(conn);
+    // 感想/样式变动会影响笔记窗口的条数与内容。
+    state.app.emit("notes-changed", ()).ok();
+    r
 }
 
 #[tauri::command]

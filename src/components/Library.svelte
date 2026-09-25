@@ -10,7 +10,6 @@
     IconCloud,
     IconDice,
     IconNotebook,
-    IconSearch,
     IconSettings,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
@@ -82,8 +81,8 @@
   const LIB_BTNS: LibBtn[] = [
     { id: "webdav", label: "WebDAV 文件管理", title: "WebDAV 文件管理（向左滑也可打开）", icon: IconCloud, run: () => (ui.webdavOpen = true) },
     { id: "random", label: "随机打开", title: "随机打开一本", icon: IconDice, run: () => openRandom() },
-    { id: "search", label: "全文搜索", title: "全文搜索", icon: IconSearch, run: () => (ui.searchOpen = true) },
-    { id: "notes", label: "笔记", title: "笔记（带感想的划线，按书汇总）", icon: IconNotebook, run: () => (ui.notesOpen = true) },
+    // 顶栏不再放「全文搜索」按钮（阅读界面仍有全文搜索）；原位置给「笔记」，进入与书库同款的笔记书籍视图。
+    { id: "notes", label: "笔记", title: "笔记（有划线或感想的书籍，按书汇总）", icon: IconNotebook, run: () => (ui.notesOpen = true) },
     { id: "stats", label: "阅读统计", title: "阅读统计", icon: IconChartBar, run: () => (ui.statsOpen = true) },
     { id: "settings", label: "设置", title: "设置", icon: IconSettings, run: () => (ui.settingsOpen = true) },
   ];
@@ -158,7 +157,6 @@
   let scrollTop = $state(0);
   let gridH = $state(800);
   let gridW = $state(1200);
-  let gridPadX = $state(40);
   let ctxMenu = $state<{ x: number; y: number; book: BookRow } | null>(null);
   let ctxEl: HTMLDivElement | undefined = $state();
   let ctxPos = $state({ left: 0, top: 0 });
@@ -184,14 +182,18 @@
 
   // 真实内容宽 = clientWidth - 左右 padding（用 computed style 取，不写死），
   // 保证首列左边距与末列右边距对称，且末列不出右侧边界。
-  $effect(() => {
+  // 每次 gridW 变化（含窗口 resize）都重量一次，并取与设计值 GRID_PAD_MIN 的较大者：
+  // padding 若在极端时序下读成 0，contentW 会虚高 → 末列溢出到 padding 外、被窗口右边缘裁掉；
+  // 取 max 只会让内容区更窄，永不溢出。
+  const GRID_PAD_MIN = 40; // 与 .grid { padding: 16px 20px 32px } 左右之和一致
+  function gridPadXNow(): number {
     const el = gridEl;
-    if (!el) return;
+    if (!el) return GRID_PAD_MIN;
     const cs = getComputedStyle(el);
     const l = parseFloat(cs.paddingLeft) || 0;
     const r = parseFloat(cs.paddingRight) || 0;
-    gridPadX = l + r;
-  });
+    return Math.max(GRID_PAD_MIN, l + r);
+  }
 
   // 卡片几何：必须与 CSS 完全一致，否则行高预算错误会导致卡片被下一行遮挡。
   // CARD_PAD = .card padding；COVER_INSET = .card 内边距×2（封面可用宽度 = cardW - COVER_INSET）。
@@ -201,11 +203,13 @@
   const META_H = 52;                  // .meta 固定块高（标签行 + 作者行 + 上下内边距）
   const CARD_VGAP = 12;               // 行间垂直留白
 
-  const contentW = $derived(Math.max(1, gridW - gridPadX));
-  const cols = $derived(Math.max(2, Math.floor(contentW / GRID_COL_MIN)));
+  const contentW = $derived(Math.max(1, gridW - gridPadXNow()));
+  // 最少 1 列：窗口极窄时不硬凑两列，避免 cardW 被下限顶出单元格。
+  const cols = $derived(Math.max(1, Math.floor(contentW / GRID_COL_MIN)));
   const cellW = $derived(contentW / cols);
-  // 卡片宽度：不超过 cellW - 间距，也不超过 216 上限；下限 120 但绝不大于 cellW。
-  const cardW = $derived(Math.max(80, Math.min(216, cellW - CARD_GAP)));
+  // 卡片宽度：不超过 cellW - 间距，也不超过 216 上限；下限 80，但最终硬钳到 cellW。
+  // 「下限」与「不出单元格」冲突时以不出单元格为准，杜绝末列越界被窗口边缘裁掉。
+  const cardW = $derived(Math.min(cellW, Math.max(80, Math.min(216, cellW - CARD_GAP))));
   // 封面高度按「实际内宽」算 3:2，保证与渲染一致（不再用写死的 -12）。
   const coverH = $derived(Math.round((cardW - COVER_INSET) * 1.5));
   // 行高 = 卡片内边距×2 + 封面 + 标签块 + 行间距。
@@ -213,12 +217,18 @@
 
   // 网格虚拟窗口（行）
   const gridRows = $derived(Math.ceil(total / cols));
-  const gFirst = $derived(Math.max(0, Math.floor(scrollTop / cellH) - 3));
+  // 窗口 resize 会改 cellH（卡片变宽→封面变高），scrollTop 可能短暂落在内容之外；
+  // 首行钳到「最后一行之内」，避免虚窗口整体跑到末尾之外（整屏空白）。
+  const gFirst = $derived(
+    Math.max(0, Math.min(Math.max(0, gridRows - 1), Math.floor(scrollTop / cellH) - 3)),
+  );
   const gLast = $derived(Math.min(gridRows, Math.ceil((scrollTop + gridH) / cellH) + 3));
   const gRows = $derived(Array.from({ length: Math.max(0, gLast - gFirst) }, (_, i) => gFirst + i));
 
   // 列表虚拟窗口（行）
-  const lFirst = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - 8));
+  const lFirst = $derived(
+    Math.max(0, Math.min(Math.max(0, total - 1), Math.floor(scrollTop / ROW_H) - 8)),
+  );
   const lLast = $derived(Math.min(total, Math.ceil((scrollTop + gridH) / ROW_H) + 8));
   const lRows = $derived(Array.from({ length: Math.max(0, lLast - lFirst) }, (_, i) => lFirst + i));
 
