@@ -296,6 +296,7 @@
     }
     if (!need.length) return;
     const seq = generation;
+    let nulls = 0;
     for (let i = 0; i < need.length; i += IDS_CHUNK) {
       const chunk = need.slice(i, i + IDS_CHUNK);
       let rows: (BookRow | null)[];
@@ -306,10 +307,33 @@
         return;
       }
       if (seq !== generation) return; // STALE：期间发生了重建/换档，丢弃
-      for (let j = 0; j < chunk.length; j++) rowMap.set(chunk[j], rows[j] ?? null);
+      for (let j = 0; j < chunk.length; j++) {
+        const v = rows[j] ?? null;
+        rowMap.set(chunk[j], v);
+        if (v === null) nulls++;
+      }
     }
     pruneRowMap(s, e);
     winVersion++;
+    // ❌ 死 id 收敛：idIndex 是快照，删书后其 rank 会长期留 null（空行 + 滚动高度偏大 +
+    // 为死 id 白请求封面 IO）。窗口内 null 过多或连续多窗出现 → 防抖重建（按锚点重定位）。
+    if (nulls > 0) {
+      nullStreak++;
+      if (nulls >= 8 || nullStreak >= 3) scheduleNullRebuild();
+    } else {
+      nullStreak = 0;
+    }
+  }
+
+  // 死 id 收敛：防抖 1s 重建 idIndex（length 自然收敛，滚动高度/「共 N 本」随之校正）。
+  let nullStreak = 0;
+  let nullRebuildTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleNullRebuild() {
+    if (nullRebuildTimer) return;
+    nullRebuildTimer = setTimeout(() => {
+      nullRebuildTimer = undefined;
+      if (indexMode) void rebuildIndex(topAnchorId());
+    }, 1000);
   }
 
   /** 索引档：强制刷新当前可见窗口的行（覆盖写，用于 cover/meta 更新，不重建 idIndex）。 */
@@ -361,17 +385,20 @@
     scrollTop = top;
   }
 
-  /** 重建有序 id 索引（换排序 / 增删书 / 首次进入）。anchorId 存在则重定位，否则回顶。 */
+  /** 重建有序 id 索引（换排序 / 换查询 / 增删书 / 首次进入）。anchorId 存在则重定位，否则回顶。 */
   async function rebuildIndex(anchorId?: number) {
     const seq = ++generation;
     loading = true;
     try {
-      const buf = await api.listOrderIndex(sortKey);
+      const buf = await api.listOrderIndex(sortKey, query);
       if (seq !== generation) return;
       idIndex = new BigInt64Array(buf);
       total = idIndex.length;
       rowMap = new Map();
       indexMode = true;
+      nullStreak = 0;
+      clearTimeout(nullRebuildTimer);
+      nullRebuildTimer = undefined;
       winVersion++;
       // 重定位：锚点 id 用一次线性扫定位（禁止建 id→rank 全量 Map）。找不到则回顶。
       if (anchorId != null && idIndex.length > 0) {
@@ -401,27 +428,14 @@
     }
   }
 
-  /** 全量重置：查询/排序变化或首次进入时调用。 */
+  /** 全量重置：查询/排序变化或首次进入时调用。
+   *  搜索档（query 非空）也走秩索引：list_order_index 带 query → 同样 O(W) 跳秩（不再回落 OFFSET）。
+   *  仅当结果超后端上限（order_index_too_large）时，rebuildIndex 内部才切到 list_books_page 回落。 */
   function reload() {
-    if (query.trim() === "") {
-      // 索引档
-      loading = true;
-      total = 0;
-      resetScroll();
-      void rebuildIndex();
-    } else {
-      // 搜索回落档（OFFSET）
-      generation++;
-      indexMode = false;
-      idIndex = null;
-      rowMap = new Map();
-      loading = true;
-      total = 0;
-      rangeStart = 0;
-      booksWindow = [];
-      resetScroll();
-      loadRange(0);
-    }
+    loading = true;
+    total = 0;
+    resetScroll();
+    void rebuildIndex();
   }
 
   /** 增量刷新当前窗口（library-changed / meta / cover 用）：

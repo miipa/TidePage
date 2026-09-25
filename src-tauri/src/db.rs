@@ -184,17 +184,32 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             .ok();
     }
     // last_read 一次性回填（新列/旧库）：= max(last_opened, 该书 progress.updated_at)。
-    // 之后由写入路径增量维护（touch_book_opened / set_progress）。用 settings 标记只跑一次。
+    // 原子性（🔴 修）：UPDATE 与「已回填」标记放**同一事务**，杜绝「标记在、数据缺」的半成品态；
+    //   WHERE 只补落后的行 → 中断后重跑是廉价 no-op（幂等、可重入）。事务失败则不写标记、下次重试。
     if get_setting(&conn, "last_read_backfill_v1").is_none() {
-        conn.execute(
-            "UPDATE books SET last_read = MAX(
-                COALESCE(last_opened, 0),
-                COALESCE((SELECT updated_at FROM progress WHERE progress.book_id = books.id), 0)
-             )",
-            [],
-        )
-        .ok();
-        set_setting(&conn, "last_read_backfill_v1", "1");
+        let r = (|| -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE books SET last_read = MAX(
+                    COALESCE(last_opened, 0),
+                    COALESCE((SELECT updated_at FROM progress WHERE progress.book_id = books.id), 0)
+                 )
+                 WHERE last_read < MAX(
+                    COALESCE(last_opened, 0),
+                    COALESCE((SELECT updated_at FROM progress WHERE progress.book_id = books.id), 0)
+                 )",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO settings(key,value) VALUES('last_read_backfill_v1','1')
+                 ON CONFLICT(key) DO UPDATE SET value='1'",
+                [],
+            )?;
+            tx.commit()
+        })();
+        if let Err(e) = r {
+            eprintln!("[db] last_read backfill failed (will retry next start): {e}");
+        }
     }
     // 所有索引统一放在**补列逻辑之后**创建。
     // 关键：`idx_books_lastread_id` 依赖 `books.last_read`，而老库的该列是在上面 ALTER 补出的；
@@ -502,11 +517,18 @@ pub fn list_books_page(
     crate::models::BookPage { total, rows }
 }
 
-/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` 返回**全部 books.id 的有序序列**。
-/// - 不 JOIN progress，不施加任何 WHERE（与 `list_books_page` 无过滤分支同源）；
-/// - ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
-/// - 排序键索引均含唯一 tiebreaker `id`，窗口不会漂移。
-pub fn order_index_ids(conn: &Connection, sort: &str) -> Vec<i64> {
+/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` 过滤，返回**有序 books.id 序列**。
+/// - `query` 非空时施加与 `list_books_page` **逐字同源**的 WHERE（title/author LIKE，同 escape_like +
+///   `ESCAPE '\'`），保证搜索档 rank→id 与 `list_books_by_ids` 取到的行严格对齐；
+/// - 不 JOIN progress；ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
+/// - 边收集边计数：超过 `max_rows` 立即中止并返回 `Err("order_index_too_large:N")`（禁止静默截断），
+///   避免为超大结果集构建巨大 Vec。
+pub fn order_index_ids(
+    conn: &Connection,
+    sort: &str,
+    query: &str,
+    max_rows: usize,
+) -> Result<Vec<i64>, String> {
     // 白名单 → 字面量 ORDER BY；未知一律回落 "added"。
     let order = match sort {
         "lastread" => "last_read DESC, id DESC",
@@ -514,17 +536,34 @@ pub fn order_index_ids(conn: &Connection, sort: &str) -> Vec<i64> {
         "recent" => "mtime DESC, id DESC",
         _ => "added_at DESC, id DESC",
     };
-    let sql = format!("SELECT id FROM books ORDER BY {order}");
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
+    let q = query.trim();
+    // WHERE 与 list_books_page 同源：title/author LIKE，escape_like + ESCAPE '\'。
+    let (where_sql, pat) = if q.is_empty() {
+        ("", None)
+    } else {
+        (
+            " WHERE (title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\')",
+            Some(format!("%{}%", escape_like(q))),
+        )
     };
-    stmt.query_map([], |r| r.get::<_, i64>(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    let sql = format!("SELECT id FROM books{where_sql} ORDER BY {order}");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut ids: Vec<i64> = Vec::new();
+    let mut rows = match &pat {
+        Some(p) => stmt.query(params![p]).map_err(|e| e.to_string())?,
+        None => stmt.query([]).map_err(|e| e.to_string())?,
+    };
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        if ids.len() >= max_rows {
+            return Err(format!("order_index_too_large:{max_rows}"));
+        }
+        ids.push(r.get(0).map_err(|e| e.to_string())?);
+    }
+    Ok(ids)
 }
 
-/// books 总行数（秩可寻址索引的上限校验用；O(1) 走内部统计或全表 count）。
+/// books 总行数（诊断/兜底用）。
+#[allow(dead_code)]
 pub fn count_books(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
         .unwrap_or(0)

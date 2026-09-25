@@ -9,8 +9,10 @@ export const api = {
   listBooksPage: (query: string, sort: string, offset: number, limit: number) =>
     invoke<BookPage>("list_books_page", { query, sort, offset, limit }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
-   *  超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
-  listOrderIndex: (sort: string) => invoke<ArrayBuffer>("list_order_index", { sort }),
+   *  query 为空=全量；非空=与 list_books_page 同源的 title/author 过滤（搜索档同样 O(W)）。
+   *  结果超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
+  listOrderIndex: (sort: string, query: string) =>
+    invoke<ArrayBuffer>("list_order_index", { sort, query }),
   /** 秩可寻址分页命令 2：按 ids 批量取行，返回长度/顺序恒等于 ids，缺行为 null。ids.len()>4096 抛错。 */
   listBooksByIds: (ids: number[]) => invoke<(BookRow | null)[]>("list_books_by_ids", { ids }),
   rescan: () => invoke<void>("rescan"),

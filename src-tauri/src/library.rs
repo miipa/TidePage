@@ -1094,33 +1094,28 @@ pub async fn list_books_page(
 /// 秩可寻址分页有序索引上限：超过则前端必须切 keyset 档（禁止静默截断）。
 const MAX_ORDER_INDEX_ROWS: i64 = 300_000;
 
-/// 命令 1（秩可寻址分页）：返回当前 `sort` 下**全部 books.id 的有序序列**，
+/// 命令 1（秩可寻址分页）：返回当前 `sort` + 可选 `query` 下**有序 books.id 序列**，
 /// 编码为小端 i64 原始字节流（每 8 字节一个 id）；前端得到 ArrayBuffer 后建 BigInt64Array。
-/// - 行数 > `MAX_ORDER_INDEX_ROWS` 返回 `Err("order_index_too_large:300000")`；
+/// - 结果行数 > `MAX_ORDER_INDEX_ROWS` 返回 `Err("order_index_too_large:300000")`（边收集边中止）；
 /// - `sort` 白名单外一律回落 "added"；ORDER BY 为字面量（见 `db::order_index_ids`）；
-/// - 不 JOIN progress，WHERE/ORDER BY 与 `list_books_page` 无过滤分支同源。
+/// - `query` 非空时施加与 `list_books_page` 逐字同源的 WHERE，搜索档同样 O(W) 跳秩（不再回落 OFFSET）。
 #[tauri::command]
 pub async fn list_order_index(
     state: State<'_, Arc<AppState>>,
     sort: String,
+    query: Option<String>,
 ) -> Result<tauri::ipc::Response, String> {
     // 白名单归一（未知回落 added），避免把任意字符串带入下游。
     let sort = match sort.as_str() {
         "added" | "recent" | "title" | "lastread" => sort,
         _ => "added".to_string(),
     };
+    let query = query.unwrap_or_default();
     let st = state.inner().clone();
     let bytes: Vec<u8> = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let conn = st.db.0.lock().unwrap();
-        let n = db::count_books(&conn);
-        if n > MAX_ORDER_INDEX_ROWS {
-            return Err(format!("order_index_too_large:{MAX_ORDER_INDEX_ROWS}"));
-        }
-        let ids = db::order_index_ids(&conn, &sort);
-        // 二次防线：ORDER BY 与 count 之间若有并发插入导致越限，同样报错切档。
-        if ids.len() as i64 > MAX_ORDER_INDEX_ROWS {
-            return Err(format!("order_index_too_large:{MAX_ORDER_INDEX_ROWS}"));
-        }
+        // 边收集边计数：越限立即 Err（禁止静默截断），不为超大结果集构建巨大 Vec。
+        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize)?;
         let mut buf = Vec::with_capacity(ids.len() * 8);
         for id in ids {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -4198,7 +4193,7 @@ mod refresh_tests {
 
         // 每个 sort：order_index_ids 的序列必须与 list_books_page 全量窗口逐行 id 一致。
         for sort in ["added", "recent", "title", "lastread"] {
-            let idx = db::order_index_ids(&conn, sort);
+            let idx = db::order_index_ids(&conn, sort, "", 1_000_000).unwrap();
             let page = db::list_books_page(&conn, "", sort, 0, 500);
             let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
             assert_eq!(idx, page_ids, "order_index_ids 与 list_books_page 不同源: sort={sort}");
@@ -4206,13 +4201,26 @@ mod refresh_tests {
 
         // 未知 sort 回落 added。
         assert_eq!(
-            db::order_index_ids(&conn, "bogus"),
-            db::order_index_ids(&conn, "added"),
+            db::order_index_ids(&conn, "bogus", "", 1_000_000).unwrap(),
+            db::order_index_ids(&conn, "added", "", 1_000_000).unwrap(),
             "未知 sort 必须回落 added"
         );
 
+        // 过滤档：order_index_ids(query) 必须与 list_books_page(query) 逐行同源（rank→id 对齐）。
+        for (sort, q) in [("title", "delta"), ("added", "a"), ("recent", "e")] {
+            let idx = db::order_index_ids(&conn, sort, q, 1_000_000).unwrap();
+            let page = db::list_books_page(&conn, q, sort, 0, 500);
+            let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+            assert_eq!(idx, page_ids, "过滤档不同源: sort={sort} q={q}");
+            assert_eq!(idx.len() as i64, page.total, "过滤档条数应等于 total");
+        }
+
+        // 越限：max_rows 限制触发 Err，不静默截断。
+        let err = db::order_index_ids(&conn, "added", "", 2).unwrap_err();
+        assert!(err.starts_with("order_index_too_large:"), "越限必须报错: {err}");
+
         // books_by_ids_aligned：长度/顺序恒等于入参，缺行补 None。
-        let idx = db::order_index_ids(&conn, "title");
+        let idx = db::order_index_ids(&conn, "title", "", 1_000_000).unwrap();
         let missing = 424242i64; // 不存在
         let query_ids = vec![idx[2], missing, idx[0], idx[0]]; // 含重复与缺失
         let rows = db::books_by_ids_aligned(&conn, &query_ids);
@@ -4240,18 +4248,18 @@ mod refresh_tests {
             ids.push(db::upsert_book(&conn, &sp(&p), name, "txt", 1, 1).unwrap());
         }
         // 初始 last_read 全 0 → 顺序按 id DESC。
-        let idx0 = db::order_index_ids(&conn, "lastread");
+        let idx0 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
         assert_eq!(idx0.len(), 3);
 
         // 打开中间那本 → 它的 last_read 变大，应排到最前。
         db::touch_book_opened(&conn, ids[1]);
-        let idx1 = db::order_index_ids(&conn, "lastread");
+        let idx1 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
         assert_eq!(idx1[0], ids[1], "打开的书应排在按最近阅读的最前");
 
         // 保存另一本的进度（更大的 updated_at）→ 它应排到最前。
         let p = crate::models::Progress { updated_at: db::now_ms() + 10_000, ..Default::default() };
         db::set_progress(&conn, ids[2], &p).unwrap();
-        let idx2 = db::order_index_ids(&conn, "lastread");
+        let idx2 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
         assert_eq!(idx2[0], ids[2], "刚更新进度的书应排在最前");
 
         // 该档不得出现 TEMP B-TREE（走 idx_books_lastread_id）。
