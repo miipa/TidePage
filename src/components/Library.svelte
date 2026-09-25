@@ -16,17 +16,32 @@
   import BookDetailModal from "./BookDetailModal.svelte";
   import type { BookRow } from "../lib/types";
 
-  // ===== 超大书库（实测 16 万本）：前端永不全量持有书籍 =====
-  // 只保留「按需窗口 + total」：过滤/排序/分页全部下推 Rust，单次 IPC 至多 FETCH 行。
-  const FETCH = 500;        // 单次分页窗口（Rust 端 limit 上限 500）
+  // ===== 超大书库（实测 16 万本）：秩可寻址分页（id 有序索引 + 有界窗口取行）=====
+  // 常驻内存只有两样（契约）：
+  //   1) idIndex: BigInt64Array —— 当前 (query|sort) 下的有序 books.id（rank→id 为 O(1)）；
+  //   2) rowMap: Map<id, BookRow|null> —— 仅当前可见窗口 ± 缓冲的行（有界前视环，会剪枝）。
+  // 禁止保留 N 长的行对象数组；禁止在 N 长数组上 filter/slice。
   const GRID_COL_MIN = 168; // 网格最小列宽
   const ROW_H = 66;         // 列表行步长（行高 64 + 间距 2，与 .row / .list-inner CSS 一致）
+  const WIN_PAD = 200;      // 窗口前后各多取的缓冲行数（减少连续滚动的取数次数）
+  const ROWMAP_CAP = 3000;  // rowMap 常驻上限（超过即按当前窗口剪枝，保证内存有界）
+  const IDS_CHUNK = 4096;   // 命令 2 单批 ids 上限（与后端 too_many_ids 对齐）
 
   let total = $state(0);
-  // $state.raw：窗口数组不递归代理（避免 16 万对象的深层响应式开销），整体替换更新。
+  // idIndex 为普通（非响应式）变量：整块替换，避免 16 万元素的深层代理开销。
+  let idIndex: BigInt64Array | null = null;
+  // rowMap 为普通 Map（非响应式）；内容变化时 bump winVersion 触发模板重算 bookAt。
+  let rowMap = new Map<number, BookRow | null>();
+  let winVersion = $state(0);
+  // generation：每次「重建索引 / 换查询 / 换排序」自增；异步取数回来若不等即丢弃（STALE）。
+  let generation = 0;
+  // 是否处于「有序索引」档：query 为空走索引档；query 非空（搜索）回落 list_books_page（OFFSET）。
+  // 另：N 超过后端上限（order_index_too_large）时也回落。
+  let indexMode = $state(true);
+  // ---- 搜索/回落档（query!=='' 或 N 超限）：沿用 OFFSET 窗口 ----
+  const FETCH = 500;
   let booksWindow: BookRow[] = $state.raw([]);
   let rangeStart = $state(0);
-  let loadSeq = 0;
 
   let folders: string[] = $state([]);
   let queryInput = $state("");
@@ -208,6 +223,14 @@
   const lRows = $derived(Array.from({ length: Math.max(0, lLast - lFirst) }, (_, i) => lFirst + i));
 
   function bookAt(abs: number): BookRow | undefined {
+    // 读 winVersion 建立响应式依赖：窗口数据到达后模板中的 bookAt 会重算。
+    void winVersion;
+    if (indexMode) {
+      if (!idIndex || abs < 0 || abs >= idIndex.length) return undefined;
+      const id = Number(idIndex[abs]);
+      const r = rowMap.get(id);
+      return r ?? undefined; // 未加载 / null 占位 → 渲染空槽，秩仍对齐
+    }
     return booksWindow[abs - rangeStart];
   }
 
@@ -224,21 +247,21 @@
   }
 
   async function loadRange(offset: number) {
-    const seq = ++loadSeq;
+    const seq = ++generation;
     try {
       const r = await api.listBooksPage(query, sortKey, offset, FETCH);
-      if (seq !== loadSeq) return;
+      if (seq !== generation) return;
       total = r.total;
       rangeStart = offset;
       booksWindow = r.rows;
     } catch (e) {
-      if (seq === loadSeq) toast(String(e), "error");
+      if (seq === generation) toast(String(e), "error");
     } finally {
-      if (seq === loadSeq) loading = false;
+      if (seq === generation) loading = false;
     }
   }
 
-  /** 窗口未覆盖 [start,end) 时，按 FETCH 对齐拉取一段；已覆盖则 no-op（不会循环）。 */
+  /** 回落档（搜索/超限）：窗口未覆盖 [start,end) 时按 FETCH 对齐拉取一段。 */
   function ensureRange(start: number, end: number) {
     if (total === 0 || end <= start) return;
     const rangeEnd = rangeStart + booksWindow.length;
@@ -246,28 +269,222 @@
     loadRange(Math.max(0, Math.floor(start / FETCH) * FETCH));
   }
 
-  /** 全量重置：查询/排序变化或首次进入时调用（回到顶部并重拉窗口）。 */
-  function reload() {
-    loadSeq++;
-    loading = true;
-    total = 0;
-    rangeStart = 0;
-    booksWindow = [];
-    resetScroll();
-    loadRange(0);
+  // ===== 索引档：窗口取行 + 剪枝 + 重建 =====
+
+  /** 剪枝 rowMap：超过上限时，只保留当前窗口 ± WIN_PAD 内的 id（有界前视环）。 */
+  function pruneRowMap(s: number, e: number) {
+    if (!idIndex || rowMap.size <= ROWMAP_CAP) return;
+    const from = Math.max(0, s - WIN_PAD);
+    const to = Math.min(idIndex.length, e + WIN_PAD);
+    const keep = new Set<number>();
+    for (let i = from; i < to; i++) keep.add(Number(idIndex[i]));
+    for (const id of rowMap.keys()) if (!keep.has(id)) rowMap.delete(id);
   }
 
-  /** 增量刷新：只重拉当前窗口与 total，不重置滚动、不拉全量（library-changed/meta 用）。 */
-  async function reloadWindow() {
-    const offset = Math.floor(Math.max(0, rangeStart) / FETCH) * FETCH;
-    await loadRange(offset);
+  /** 索引档：确保可见区间 [first,last) 的行已在 rowMap（缺哪取哪，分批 ≤ IDS_CHUNK）。 */
+  async function ensureWindowIndex(first: number, last: number) {
+    if (!idIndex) return;
+    const len = idIndex.length;
+    if (len === 0) return;
+    const s = Math.max(0, Math.min(first, len));
+    const e = Math.max(0, Math.min(last, len));
+    if (e <= s) return;
+    const need: number[] = [];
+    for (let i = s; i < e; i++) {
+      const id = Number(idIndex[i]);
+      if (!rowMap.has(id)) need.push(id);
+    }
+    if (!need.length) return;
+    const seq = generation;
+    for (let i = 0; i < need.length; i += IDS_CHUNK) {
+      const chunk = need.slice(i, i + IDS_CHUNK);
+      let rows: (BookRow | null)[];
+      try {
+        rows = await api.listBooksByIds(chunk);
+      } catch (err) {
+        if (seq === generation) toast(String(err), "error");
+        return;
+      }
+      if (seq !== generation) return; // STALE：期间发生了重建/换档，丢弃
+      for (let j = 0; j < chunk.length; j++) rowMap.set(chunk[j], rows[j] ?? null);
+    }
+    pruneRowMap(s, e);
+    winVersion++;
   }
+
+  /** 索引档：强制刷新当前可见窗口的行（覆盖写，用于 cover/meta 更新，不重建 idIndex）。 */
+  async function refreshVisibleIndex() {
+    if (!indexMode || !idIndex) return;
+    const len = idIndex.length;
+    if (len === 0) return;
+    const start = view === "grid" ? gFirst * cols : lFirst;
+    const end = view === "grid" ? Math.min(len, gLast * cols) : Math.min(len, lLast);
+    const s = Math.max(0, Math.min(start, len));
+    const e = Math.max(0, Math.min(end, len));
+    if (e <= s) return;
+    const ids: number[] = [];
+    for (let i = s; i < e; i++) ids.push(Number(idIndex[i]));
+    const seq = generation;
+    for (let i = 0; i < ids.length; i += IDS_CHUNK) {
+      const chunk = ids.slice(i, i + IDS_CHUNK);
+      let rows: (BookRow | null)[];
+      try {
+        rows = await api.listBooksByIds(chunk);
+      } catch {
+        return;
+      }
+      if (seq !== generation) return;
+      for (let j = 0; j < chunk.length; j++) rowMap.set(chunk[j], rows[j] ?? null);
+    }
+    winVersion++;
+  }
+
+  /** 当前顶部可见行对应的 id（重建索引后据此重定位，保持视线不跳）。 */
+  function topAnchorId(): number | undefined {
+    if (!indexMode || !idIndex || idIndex.length === 0) return undefined;
+    const step = view === "grid" ? cellH : ROW_H;
+    const topRow = Math.floor(scrollTop / Math.max(1, step));
+    const rank = view === "grid" ? topRow * cols : topRow;
+    const r = Math.max(0, Math.min(rank, idIndex.length - 1));
+    return Number(idIndex[r]);
+  }
+
+  /** 把某个 rank 滚到顶部（clamp 到 [0,len-1]）。 */
+  function scrollToRank(rank: number) {
+    if (!gridEl || !idIndex) return;
+    const len = idIndex.length;
+    const r = Math.max(0, Math.min(rank, Math.max(0, len - 1)));
+    const step = view === "grid" ? cellH : ROW_H;
+    const row = view === "grid" ? Math.floor(r / Math.max(1, cols)) : r;
+    const top = row * step;
+    gridEl.scrollTop = top;
+    scrollTop = top;
+  }
+
+  /** 重建有序 id 索引（换排序 / 增删书 / 首次进入）。anchorId 存在则重定位，否则回顶。 */
+  async function rebuildIndex(anchorId?: number) {
+    const seq = ++generation;
+    loading = true;
+    try {
+      const buf = await api.listOrderIndex(sortKey);
+      if (seq !== generation) return;
+      idIndex = new BigInt64Array(buf);
+      total = idIndex.length;
+      rowMap = new Map();
+      indexMode = true;
+      winVersion++;
+      // 重定位：锚点 id 用一次线性扫定位（禁止建 id→rank 全量 Map）。找不到则回顶。
+      if (anchorId != null && idIndex.length > 0) {
+        let rank = -1;
+        for (let i = 0; i < idIndex.length; i++) {
+          if (Number(idIndex[i]) === anchorId) { rank = i; break; }
+        }
+        if (rank >= 0) scrollToRank(rank);
+        else resetScroll();
+      } else {
+        resetScroll();
+      }
+    } catch (err) {
+      const msg = String(err);
+      if (seq !== generation) return;
+      if (msg.includes("order_index_too_large")) {
+        // N 超过后端上限 → 切 keyset/OFFSET 回落档（本轮以 list_books_page 承接）。
+        indexMode = false;
+        idIndex = null;
+        rowMap = new Map();
+        await loadRange(0);
+      } else {
+        toast(msg, "error");
+      }
+    } finally {
+      if (seq === generation) loading = false;
+    }
+  }
+
+  /** 全量重置：查询/排序变化或首次进入时调用。 */
+  function reload() {
+    if (query.trim() === "") {
+      // 索引档
+      loading = true;
+      total = 0;
+      resetScroll();
+      void rebuildIndex();
+    } else {
+      // 搜索回落档（OFFSET）
+      generation++;
+      indexMode = false;
+      idIndex = null;
+      rowMap = new Map();
+      loading = true;
+      total = 0;
+      rangeStart = 0;
+      booksWindow = [];
+      resetScroll();
+      loadRange(0);
+    }
+  }
+
+  /** 增量刷新当前窗口（library-changed / meta / cover 用）：
+   *  索引档 —— 增删书会改变 N 与顺序，需按锚点重建 idIndex；
+   *  回落档 —— 重拉当前 OFFSET 窗口与 total。 */
+  async function reloadWindow() {
+    if (indexMode) {
+      await rebuildIndex(topAnchorId());
+    } else {
+      const offset = Math.floor(Math.max(0, rangeStart) / FETCH) * FETCH;
+      await loadRange(offset);
+    }
+  }
+
+  // C1：路由重新进入本组件时 onMount 会重跑 reload()（本应用书库/阅读是 {#if} 切换，非 keep-alive）。
+  // 另外响应全局 cover-updated 信号（ui.coverTick，来自 +page 根组件监听）重拉当前窗口，
+  // 令扫描/打开插队扫出的新封面即时显示。queueMicrotask 逃离响应式追踪，避免误依赖内部变量成环。
+  let coverTickSeen = ui.coverTick;
+  $effect(() => {
+    const t = ui.coverTick;
+    if (t === coverTickSeen) return;
+    coverTickSeen = t;
+    // 封面更新不改变顺序：索引档只刷新可见窗口的行（不重建 idIndex）；回落档重拉窗口。
+    queueMicrotask(() => {
+      if (indexMode) void refreshVisibleIndex();
+      else void reloadWindow();
+    });
+  });
 
   // 可见范围变化时按需拉取窗口（effect 内只发起异步请求，不阻塞主线程）。
   $effect(() => {
     if (total === 0) return;
-    if (view === "grid") ensureRange(gFirst * cols, Math.min(total, gLast * cols));
-    else ensureRange(lFirst, lLast);
+    const first = view === "grid" ? gFirst * cols : lFirst;
+    const last = view === "grid" ? Math.min(total, gLast * cols) : lLast;
+    if (indexMode) ensureWindowIndex(first, last);
+    else ensureRange(first, last);
+  });
+
+  // 方案 A：视口 index 区间变化时，把可见的未扫描书籍提升为高优先级扫描目标。
+  // 200ms 防抖；依赖仅为视口 index 区间（不依赖 booksWindow/rowMap，避免回环）。
+  // ids 数量 = 渲染窗口行数（O(W)），与滚动位置无关（约束 2）。
+  let prioTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    if (total === 0) return;
+    const start = view === "grid" ? gFirst * cols : lFirst;
+    const end = view === "grid" ? gLast * cols : lLast;
+    const s = Math.max(0, start);
+    const e = Math.min(total, end);
+    const mode = indexMode;
+    clearTimeout(prioTimer);
+    prioTimer = setTimeout(() => {
+      const ids: number[] = [];
+      if (mode && idIndex) {
+        // 索引档：直接用 idIndex 的可见区间（后端按 meta_done!=1 过滤，无需前端持有行）。
+        for (let i = s; i < e && i < idIndex.length; i++) ids.push(Number(idIndex[i]));
+      } else {
+        for (let i = s; i < e; i++) {
+          const b = bookAt(i);
+          if (b && b.meta_done !== 1) ids.push(b.id);
+        }
+      }
+      if (ids.length) api.prioritizeCovers(ids).catch(() => {});
+    }, 200);
   });
 
   // 搜索 250ms 防抖后再请求（输入不触发全量过滤）。
@@ -289,9 +506,10 @@
     reload();
   }
 
-  /** 就地修改窗口内某本书后，替换数组引用以触发重渲染（raw 数组不深层代理）。 */
+  /** 就地修改窗口内某本书后触发重渲染。索引档：bump winVersion；回落档：替换 raw 数组引用。 */
   function touchWindow() {
-    booksWindow = booksWindow.slice();
+    if (indexMode) winVersion++;
+    else booksWindow = booksWindow.slice();
   }
 
   async function loadFolders() {
@@ -368,17 +586,6 @@
     } finally {
       refreshing = false;
       refreshProgress = null;
-    }
-  }
-
-  /** 仅重算封面/元数据（不重新扫描目录）。 */
-  async function refreshCoversOnly() {
-    refreshMenu = false;
-    try {
-      await api.refreshCovers();
-      toast("开始重算封面…（后台进行，不影响使用）");
-    } catch (e) {
-      toast(String(e), "error");
     }
   }
 
@@ -552,9 +759,14 @@
     // 注意：这里**不触发** metaProgress / 扫描进度状态，避免进度条回退或跳变。
     const u1 = listen("library-changed", () => {
       bumpCoverBust();
+      // 增删书改变 N 与顺序：索引档按锚点重建，回落档重拉窗口。
       reloadWindow();
     });
-    const u2 = listen("library-meta", () => reloadWindow());
+    const u2 = listen("library-meta", () => {
+      // 仅封面/元数据（不改顺序）：索引档只刷新可见行，回落档重拉窗口。
+      if (indexMode) void refreshVisibleIndex();
+      else void reloadWindow();
+    });
     const u4 = listen<{ phase: string; done: number; total: number }>("refresh-progress", (e) => {
       if (e.payload) refreshProgress = e.payload;
     });
@@ -570,8 +782,11 @@
       clearTimeout(metaHideTimer);
       metaHideTimer = setTimeout(() => { metaProgress = null; }, 600);
     });
-    // 某本书封面已更新（提取到新封面/手动换封面）：重取窗口，per-book URL 随 coverVer 变化。
-    const u7 = listen("book-updated", () => reloadWindow());
+    // 某本书封面已更新（提取到新封面/手动换封面）：刷新可见窗口（不改顺序，不重建索引）。
+    const u7 = listen("book-updated", () => {
+      if (indexMode) void refreshVisibleIndex();
+      else void reloadWindow();
+    });
     let u3: Promise<() => void> | null = null;
     import("@tauri-apps/api/webview")
       .then((m) => {
@@ -611,7 +826,6 @@
       >{refreshing ? "刷新中…" : "⟳ 刷新"}</button>
       {#if refreshMenu}
         <div class="refresh-menu" role="menu">
-          <button class="rm-item" onclick={refreshCoversOnly}>刷新封面（后台重算）</button>
           <button class="rm-item" onclick={() => { refreshMenu = false; refreshAll(); }}>重新扫描书库</button>
         </div>
         <div class="rm-backdrop" onclick={() => (refreshMenu = false)}></div>
@@ -629,12 +843,13 @@
       {#each orderedLibBtns as b (b.id)}
         {@const Icon = b.icon}
         <button
-          class="icon lib-tb-btn"
+          class="icon lib-tb-btn tip-left"
           data-drag-id={b.id}
-          title={b.title}
+          aria-label={b.title}
+          data-tip={b.title}
           onclick={b.run}
         >
-          <Icon size={18} stroke={1.75} />
+          <Icon size={20} stroke={1.75} />
         </button>
       {/each}
     </div>
@@ -1026,9 +1241,9 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    min-height: 28px;
-    height: 28px;
+    width: 30px;
+    min-height: 30px;
+    height: 30px;
     padding: 0;
     border-radius: var(--radius-sm);
   }

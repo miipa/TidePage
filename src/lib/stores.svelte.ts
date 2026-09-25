@@ -1695,6 +1695,11 @@ export const ui = $state({
   notesOpen: false,
   /** 阅读界面当前打开的书 id（0=未打开）；供设置页把阅读方案"仅应用到本书"。 */
   currentBookId: 0,
+  /** 封面刷新信号：后端 `cover-updated` 事件在 App 根组件（+page）监听后递增此值，
+   *  书库组件响应式重拉当前窗口，令扫描/打开插队扫出的新封面即时显示。 */
+  coverTick: 0,
+  /** 最近一次 cover-updated 的 book id（取自事件 payload.id）。 */
+  lastCoverId: 0,
 });
 
 export const convertState = $state({

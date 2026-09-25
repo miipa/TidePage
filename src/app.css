@@ -527,6 +527,69 @@ p, .tip, .hint, .empty {
   height: 2px;
 }
 
+/* ===================== 顶栏图标自定义提示 ===================== */
+/* 原生 title 提示出现在指针附近，会被鼠标/图标挡住且延迟不定；
+   这里改用 data-tip：提示统一出现在按钮正下方、无延迟、不被指针遮挡。
+   仅顶栏图标使用（挂 data-tip 的按钮同时保留 aria-label 供读屏）。 */
+[data-tip] {
+  position: relative;
+}
+
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  z-index: 3000;
+  padding: 4px 9px;
+  border-radius: var(--radius-xs, 6px);
+  background: color-mix(in srgb, var(--fg) 90%, transparent);
+  color: var(--bg-elev);
+  font-size: 12px;
+  line-height: 1.25;
+  font-weight: 500;
+  letter-spacing: var(--ls-wide, 0.015em);
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: var(--shadow-md);
+  animation: fr-tip-in var(--dur-fast, 0.12s) var(--ease-in) both;
+}
+
+/* 靠近窗口左右边缘的按钮：让提示向内侧对齐，避免溢出被裁掉 */
+[data-tip].tip-left::after {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+[data-tip].tip-right::after {
+  left: 0;
+  right: auto;
+  transform: none;
+}
+
+@keyframes fr-tip-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -3px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+[data-tip].tip-left::after,
+[data-tip].tip-right::after {
+  animation-name: fr-tip-in-side;
+}
+
+@keyframes fr-tip-in-side {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* ===================== 无障碍：尊重「减少动效」 ===================== */
 @media (prefers-reduced-motion: reduce) {
   *,

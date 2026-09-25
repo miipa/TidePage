@@ -837,6 +837,117 @@ pub fn extract_cover_path(path: &str) -> Option<Vec<u8>> {
     .flatten()
 }
 
+/// **只提取封面（seek）**：不读全文。仅读取
+///   ① PDB 头(78B) + 记录偏移表；② record0（PalmDOC+MOBI 头 + EXTH）；③ 封面所在的单条图片记录。
+/// 从 record0 的 EXTH 201/202 取封面记录相对偏移（叠加 first_image_index），seek 到该记录读取。
+/// 供扫描路径使用，避免为取封面而 `fs::read` 整本（MOBI 常为几十 MB）。
+pub fn extract_cover_seek(path: &str) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<Vec<u8>> {
+        let mut f = std::fs::File::open(path).ok()?;
+        let flen = f.metadata().ok()?.len();
+        // PDB 头：0x4C(76) 处 u16 BE = num_records。
+        let mut phdr = [0u8; 78];
+        f.read_exact(&mut phdr).ok()?;
+        let num = u16::from_be_bytes([phdr[76], phdr[77]]) as usize;
+        if num == 0 || num > 200_000 {
+            return None;
+        }
+        // 记录偏移表：紧随 78B 之后，num 条，每条 8B（前 4B 为该记录在文件中的偏移）。
+        let mut tbl = vec![0u8; num.checked_mul(8)?];
+        f.read_exact(&mut tbl).ok()?;
+        let rec_off = |i: usize| -> u64 {
+            u32::from_be_bytes([tbl[i * 8], tbl[i * 8 + 1], tbl[i * 8 + 2], tbl[i * 8 + 3]]) as u64
+        };
+        let read_rec = |f: &mut std::fs::File, i: usize, cap: u64| -> Option<Vec<u8>> {
+            if i >= num {
+                return None;
+            }
+            let s = rec_off(i);
+            let e = if i + 1 < num { rec_off(i + 1) } else { flen };
+            if e <= s {
+                return None;
+            }
+            let n = e - s;
+            if n > cap {
+                return None;
+            }
+            let mut b = vec![0u8; n as usize];
+            f.seek(SeekFrom::Start(s)).ok()?;
+            f.read_exact(&mut b).ok()?;
+            Some(b)
+        };
+        // record0：PalmDOC 头(16B) + MOBI 头(+EXTH)。cap 16MB（record0 通常 < 64KB）。
+        let r0 = read_rec(&mut f, 0, 16 * 1024 * 1024)?;
+        if r0.len() < 16 + 0x84 || &r0[16..20] != b"MOBI" {
+            return None;
+        }
+        let mobi_hdr_len =
+            u32::from_be_bytes([r0[16 + 0x14], r0[16 + 0x15], r0[16 + 0x16], r0[16 + 0x17]]) as usize;
+        let first_image =
+            u32::from_be_bytes([r0[16 + 0x6C], r0[16 + 0x6D], r0[16 + 0x6E], r0[16 + 0x6F]]) as usize;
+        let exth_flags =
+            u32::from_be_bytes([r0[16 + 0x80], r0[16 + 0x81], r0[16 + 0x82], r0[16 + 0x83]]);
+        let mut cover_offs: Vec<u32> = Vec::new();
+        if exth_flags & 0x40 != 0 {
+            let exth_start = 16 + mobi_hdr_len;
+            if exth_start + 12 <= r0.len() && &r0[exth_start..exth_start + 4] == b"EXTH" {
+                let rec_count = u32::from_be_bytes([
+                    r0[exth_start + 8],
+                    r0[exth_start + 9],
+                    r0[exth_start + 10],
+                    r0[exth_start + 11],
+                ]) as usize;
+                let mut p = exth_start + 12;
+                for _ in 0..rec_count.min(4096) {
+                    if p + 8 > r0.len() {
+                        break;
+                    }
+                    let ty = u32::from_be_bytes([r0[p], r0[p + 1], r0[p + 2], r0[p + 3]]);
+                    let len = u32::from_be_bytes([r0[p + 4], r0[p + 5], r0[p + 6], r0[p + 7]]) as usize;
+                    if len < 8 || p + len > r0.len() {
+                        break;
+                    }
+                    // 201=cover offset, 202=thumbnail offset（值为相对 first_image 的记录偏移）。
+                    if (ty == 201 || ty == 202) && len >= 12 {
+                        cover_offs.push(u32::from_be_bytes([
+                            r0[p + 8],
+                            r0[p + 9],
+                            r0[p + 10],
+                            r0[p + 11],
+                        ]));
+                    }
+                    p += len;
+                }
+            }
+        }
+        let is_img = |b: &[u8]| -> bool {
+            b.starts_with(&[0xFF, 0xD8, 0xFF])
+                || b.starts_with(b"\x89PNG")
+                || b.starts_with(b"GIF8")
+                || (b.len() > 12 && &b[8..12] == b"WEBP")
+        };
+        for v in &cover_offs {
+            if let Some(idx) = first_image.checked_add(*v as usize) {
+                if let Some(b) = read_rec(&mut f, idx, 64 * 1024 * 1024) {
+                    if is_img(&b) {
+                        return Some(b);
+                    }
+                }
+            }
+        }
+        // 回退：first_image 记录本身（单条），仍不读全文。
+        if let Some(b) = read_rec(&mut f, first_image, 64 * 1024 * 1024) {
+            if is_img(&b) {
+                return Some(b);
+            }
+        }
+        None
+    }))
+    .ok()
+    .flatten()
+}
+
 /// 从 first_image 索引到 EOF 提取图片记录：嗅探魔数、写盘并建立
 /// (记录索引→URL)、(EXTH121 资源号→URL)、按序列表 三种映射。
 pub fn extract_images(

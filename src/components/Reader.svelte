@@ -29,6 +29,7 @@
   } from "../lib/stores.svelte";
   import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import { dragSort } from "../lib/dragSort";
+  import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
   import { preloadReaderFonts } from "../lib/fontfaces";
   import {
@@ -1979,6 +1980,28 @@ ${effCssExtra() || ""}
     styleTag.textContent = css;
   });
 
+  // 旧式 MOBI <font face/size/color> 硬修复：章节进入 DOM 后剥离属性并注入通用覆盖 CSS。
+  // 依赖：章节内容 + 五项排版设置 + 是否覆盖书籍排版。幂等（固定 id=__read_fix，替换 textContent）。
+  $effect(() => {
+    const override = effOverrideCss();
+    void chapter;
+    const opts = {
+      fontFamily: fontStack(effFontFamily(), effLatinFont()),
+      monoFont: "Consolas, \"Courier New\", monospace",
+      fontSize: effFontSize(),
+      lineHeight: effLineHeight(),
+      color: effFgColor() || THEMES[effTheme()].fg,
+      background: effBgColor() || THEMES[effTheme()].bg,
+    };
+    void tick().then(() => {
+      if (!override) {
+        clearReadFix();
+        return;
+      }
+      applyReadFix(opts);
+    });
+  });
+
   $effect(() => {
     const r = config.reader;
     r.mode;
@@ -2869,8 +2892,13 @@ ${effCssExtra() || ""}
   {/if}
   <div class="topbar" class:dim={chromeHidden} style="background:var(--rdr-top);">
     <div class="tb-zone tb-l">
-      <button class="icon tb-btn" title={standalone ? "关闭 (Esc)" : "返回 (Esc)"} onclick={goBack}>
-        <IconArrowLeft size={18} stroke={1.75} />
+      <button
+        class="icon tb-btn tip-right"
+        aria-label={standalone ? "关闭" : "返回"}
+        data-tip={standalone ? "关闭 (Esc)" : "返回 (Esc)"}
+        onclick={goBack}
+      >
+        <IconArrowLeft size={20} stroke={1.75} />
       </button>
       <div class="btitle">{book?.book.title ?? ""}</div>
     </div>
@@ -2894,14 +2922,16 @@ ${effCssExtra() || ""}
     <div class="tb-zone tb-r" use:dragSort={{ onDrop: tbDrop }}>
       {#each visibleTopbarBtns as b (b.id)}
         {@const Icon = b.icon()}
+        {@const label = tbTitle(b)}
         <button
-          class="icon tb-btn"
+          class="icon tb-btn tip-left"
           class:on={b.on?.()}
           data-drag-id={b.id}
-          title={tbTitle(b)}
+          aria-label={label}
+          data-tip={label}
           onclick={b.run}
         >
-          <Icon size={18} stroke={1.75} />
+          <Icon size={20} stroke={1.75} />
         </button>
       {/each}
     </div>
@@ -3348,15 +3378,15 @@ ${effCssExtra() || ""}
 
   .spacer { flex: 1; }
 
-  /* 顶栏图标按钮：统一为 28×28 方形命中区，图标居中、颜色随 currentColor。 */
+  /* 顶栏图标按钮：统一为 30×30 方形命中区，图标居中、颜色随 currentColor。 */
   .tb-btn {
     touch-action: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    min-height: 28px;
-    height: 28px;
+    width: 30px;
+    min-height: 30px;
+    height: 30px;
     padding: 0;
     border-radius: var(--radius-sm);
   }

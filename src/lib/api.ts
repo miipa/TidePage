@@ -8,6 +8,11 @@ export const api = {
   listBooks: () => invoke<BookRow[]>("list_books"),
   listBooksPage: (query: string, sort: string, offset: number, limit: number) =>
     invoke<BookPage>("list_books_page", { query, sort, offset, limit }),
+  /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
+   *  超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
+  listOrderIndex: (sort: string) => invoke<ArrayBuffer>("list_order_index", { sort }),
+  /** 秩可寻址分页命令 2：按 ids 批量取行，返回长度/顺序恒等于 ids，缺行为 null。ids.len()>4096 抛错。 */
+  listBooksByIds: (ids: number[]) => invoke<(BookRow | null)[]>("list_books_by_ids", { ids }),
   rescan: () => invoke<void>("rescan"),
   refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
   fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
@@ -99,8 +104,9 @@ export const api = {
       cache_bytes: number;
     }>("storage_stats"),
   clearCache: (what: "covers" | "res" | "all") => invoke<number>("clear_cache", { what }),
-  refreshCovers: () => invoke<void>("refresh_covers"),
-  metaDebugStats: () => invoke<{ startCount: number; running: boolean }>("meta_debug_stats"),
+  metaDebugStats: () => invoke<{ startCount: number; running: boolean; pending: number; priority: number }>("meta_debug_stats"),
+  /** 方案 A：把列表可见的未扫描书籍提升为高优先级扫描目标（按视野顺序生成封面）。返回入队本数。 */
+  prioritizeCovers: (ids: number[]) => invoke<number>("prioritize_covers", { ids }),
   setDefaultCover: (imagePath: string) => invoke<void>("set_default_cover", { imagePath }),
   clearDefaultCover: () => invoke<void>("clear_default_cover"),
   hasDefaultCover: () => invoke<boolean>("has_default_cover"),

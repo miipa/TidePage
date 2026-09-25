@@ -202,6 +202,7 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
     const W: usize = 320;
     const H: usize = 480;
     const MARGIN: usize = 22;
+    const ACCENT_X: usize = MARGIN - 9;
     let max_w = W - MARGIN * 2; // 276
 
     let lay = layout_cover(title, author, W, H);
@@ -215,7 +216,7 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
     for (i, l) in lay.lines.iter().enumerate() {
         let y = block_top + i * lay.line_h + lay.font_size;
         text.push_str(&format!(
-            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{}\" font-weight=\"700\" fill=\"#ffffff\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
+            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{}\" font-weight=\"700\" fill=\"#f4ecdc\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
             lay.font_size,
             escape(l)
         ));
@@ -224,7 +225,7 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
         let afs = (lay.font_size * 62 / 100).max(13);
         let y = block_top + n * lay.line_h + afs;
         text.push_str(&format!(
-            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{afs}\" fill=\"#ffffff\" fill-opacity=\"0.85\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
+            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{afs}\" fill=\"#f4ecdc\" fill-opacity=\"0.62\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
             escape(a)
         ));
     }
@@ -241,7 +242,7 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" viewBox="0 0 {W} {H}">
 <defs>
-<linearGradient id="cvbg" x1="0" y1="0" x2="0.9" y2="1"><stop offset="0" stop-color="#3d4f63"/><stop offset="1" stop-color="#1b2530"/></linearGradient>
+<linearGradient id="cvbg" x1="0" y1="0" x2="0.85" y2="1"><stop offset="0" stop-color="#36485c"/><stop offset="0.55" stop-color="#212d3c"/><stop offset="1" stop-color="#141c26"/></linearGradient>
 <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
 <stop offset="0" stop-color="#000000" stop-opacity="0"/>
 <stop offset="0.55" stop-color="#000000" stop-opacity="0"/>
@@ -250,6 +251,7 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
 </defs>
 {base}
 <rect width="{W}" height="{H}" fill="url(#shade)"/>
+<rect x="{ACCENT_X}" y="{block_top}" width="3" height="{block_h}" rx="1.5" fill="#c8a86a" fill-opacity="0.85"/>
 {text}
 </svg>"##
     )
@@ -328,14 +330,16 @@ mod tests {
     }
 
     #[test]
-    fn cover_has_gradient_shade_and_white_text() {
+    fn cover_has_gradient_shade_and_warm_text() {
         let svg = default_cover_svg("测试书名", "测试作者", None);
         // 底部渐变遮罩（非全幅纯黑）
         assert!(svg.contains("id=\"shade\""));
         assert!(svg.contains("stop-opacity=\"0.75\""));
         assert!(!svg.contains("fill-opacity=\"0.60\""));
-        // 固定白字
-        assert!(svg.contains("fill=\"#ffffff\""));
+        // 暖白文字（避免纯白刺眼）+ 左侧强调竖线
+        assert!(svg.contains("fill=\"#f4ecdc\""));
+        assert!(!svg.contains("fill=\"#ffffff\""));
+        assert!(svg.contains("#c8a86a"));
         assert!(svg.contains("测试书名"));
     }
 
@@ -344,7 +348,7 @@ mod tests {
         let svg = default_cover_svg("书名", "作者", Some("data:image/png;base64,AAAA"));
         assert!(svg.contains("preserveAspectRatio=\"xMidYMid slice\""));
         assert!(svg.contains("id=\"shade\""));
-        assert!(svg.contains("fill=\"#ffffff\""));
+        assert!(svg.contains("fill=\"#f4ecdc\""));
     }
 
     #[test]

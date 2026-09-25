@@ -13,6 +13,14 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 秒级时间戳（扫描重试元数据 last_attempt_at / cover_priority.queued_at 用）。
+pub fn now_s() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn path_id(path: &str) -> i64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in path.to_lowercase().bytes() {
@@ -46,18 +54,11 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             meta_done INTEGER NOT NULL DEFAULT 0,
             total_chars INTEGER NOT NULL DEFAULT 0,
             total_text_chars INTEGER NOT NULL DEFAULT 0,
-            cover_ver INTEGER NOT NULL DEFAULT 0
+            cover_ver INTEGER NOT NULL DEFAULT 0,
+            -- 秩可寻址分页专用：最近阅读时间的普通持久列（= max(last_opened, progress.updated_at)）。
+            -- 由写入路径（打开书 / 保存进度 / 进度重置）维护，供 ORDER BY 走索引、消除 TEMP B-TREE。
+            last_read INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
-        CREATE INDEX IF NOT EXISTS idx_books_title_nocase ON books(title COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_books_author ON books(author);
-        CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_books_mtime ON books(mtime DESC);
-        -- 复合覆盖索引：让 ORDER BY <列> DESC, id DESC + LIMIT/OFFSET 走索引顺序，
-        -- 避免对 16 万行做临时 B-tree 排序（深 offset 场景）。
-        CREATE INDEX IF NOT EXISTS idx_books_added_id ON books(added_at DESC, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_books_mtime_id ON books(mtime DESC, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_books_title_nocase_id ON books(title COLLATE NOCASE, id);
         CREATE TABLE IF NOT EXISTS progress(
             book_id INTEGER PRIMARY KEY,
             chapter_index INTEGER NOT NULL DEFAULT 0,
@@ -87,8 +88,6 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             note TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_highlights_book ON highlights(book_id);
-        CREATE INDEX IF NOT EXISTS idx_highlights_created ON highlights(created_at DESC);
         -- 每书一行：文件指纹（大小+首尾64KB 哈希）+ 创建划线时的书名/作者快照。
         -- 用于「重导按新文件处理、旧笔记不复活」与「书删后仍能显示书名」的判定；
         -- 不在每条 highlight 上冗余存储。
@@ -134,12 +133,14 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             seconds INTEGER NOT NULL DEFAULT 0,
             chars INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_sessions_book ON reading_sessions(book_id);
-        CREATE INDEX IF NOT EXISTS idx_progress_book ON progress(book_id);
-        CREATE INDEX IF NOT EXISTS idx_progress_updated ON progress(updated_at DESC);
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
+        );
+        -- 打开未扫描书籍时把该本封面扫描提升为最高优先级（持久化，非内存队列）。
+        CREATE TABLE IF NOT EXISTS cover_priority(
+            book_id INTEGER PRIMARY KEY,
+            queued_at INTEGER NOT NULL
         );
         "#,
     )
@@ -149,6 +150,11 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "total_text_chars INTEGER NOT NULL DEFAULT 0",
         "last_opened INTEGER NOT NULL DEFAULT 0",
         "cover_ver INTEGER NOT NULL DEFAULT 0",
+        "last_read INTEGER NOT NULL DEFAULT 0",
+        // 扫描重试元数据（A5/A9）：失败原因、上次尝试秒级时间、失败次数。
+        "meta_error TEXT",
+        "last_attempt_at INTEGER",
+        "fail_count INTEGER NOT NULL DEFAULT 0",
     ] {
         let name = col.split(' ').next().unwrap_or("");
         let exists: bool = conn
@@ -177,6 +183,49 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         conn.execute("ALTER TABLE highlights ADD COLUMN color TEXT NOT NULL DEFAULT ''", [])
             .ok();
     }
+    // last_read 一次性回填（新列/旧库）：= max(last_opened, 该书 progress.updated_at)。
+    // 之后由写入路径增量维护（touch_book_opened / set_progress）。用 settings 标记只跑一次。
+    if get_setting(&conn, "last_read_backfill_v1").is_none() {
+        conn.execute(
+            "UPDATE books SET last_read = MAX(
+                COALESCE(last_opened, 0),
+                COALESCE((SELECT updated_at FROM progress WHERE progress.book_id = books.id), 0)
+             )",
+            [],
+        )
+        .ok();
+        set_setting(&conn, "last_read_backfill_v1", "1");
+    }
+    // 所有索引统一放在**补列逻辑之后**创建。
+    // 关键：`idx_books_lastread_id` 依赖 `books.last_read`，而老库的该列是在上面 ALTER 补出的；
+    // 若把索引放在建表批内，老库建表被跳过、列尚不存在 → `no such column: last_read` → setup panic。
+    // 先补列、再建索引，对老库/新库都安全（新库建表已含 last_read，跳过 ALTER）。
+    // 索引放在回填之后，避免回填 UPDATE 维护 last_read 索引的额外开销。
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+        CREATE INDEX IF NOT EXISTS idx_books_title_nocase ON books(title COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_books_author ON books(author);
+        CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_mtime ON books(mtime DESC);
+        -- 复合覆盖索引：让 ORDER BY <列> DESC, id DESC + LIMIT/OFFSET 走索引顺序，
+        -- 避免对 16 万行做临时 B-tree 排序（深 offset 场景）。
+        CREATE INDEX IF NOT EXISTS idx_books_added_id ON books(added_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_mtime_id ON books(mtime DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_books_title_nocase_id ON books(title COLLATE NOCASE, id);
+        -- 「按最近阅读」秩可寻址分页：与 ORDER BY last_read DESC, id DESC 逐列一致，含唯一 tiebreaker。
+        CREATE INDEX IF NOT EXISTS idx_books_lastread_id ON books(last_read DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_highlights_book ON highlights(book_id);
+        CREATE INDEX IF NOT EXISTS idx_highlights_created ON highlights(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_book ON reading_sessions(book_id);
+        CREATE INDEX IF NOT EXISTS idx_progress_book ON progress(book_id);
+        CREATE INDEX IF NOT EXISTS idx_progress_updated ON progress(updated_at DESC);
+        -- 增量扫描的关键索引：让 `WHERE meta_done=0 ORDER BY id LIMIT 200`
+        -- 与 `COUNT(*) WHERE meta_done=0` 走索引，避免 16 万行时每批从头线性扫（二次方）。
+        CREATE INDEX IF NOT EXISTS idx_books_meta_done ON books(meta_done, id);
+        "#,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -322,15 +371,17 @@ fn book_from_row(r: &Row) -> rusqlite::Result<BookRow> {
     })
 }
 
-/// `last_read`（下标 10）= 阅读进度更新时间与「最后打开时间」取大者：
-/// 这样只要打开过（哪怕打开失败）就会进入「按最近阅读」，不再依赖是否产生过进度。
-const BOOK_COLS: &str = "b.id, b.path, b.title, b.author, b.format, b.size, b.mtime, b.added_at, b.cover_path, b.meta_done, MAX(COALESCE(p.updated_at, 0), COALESCE(b.last_opened, 0)), COALESCE(b.total_chars, 0), COALESCE(b.total_text_chars, 0), b.cover_ver";
+/// `last_read`（下标 10）= 普通持久列 `books.last_read`（由写入路径维护）。
+/// 不再跨表 JOIN progress 计算，故所有列表/单查询都不需要 `LEFT JOIN progress`。
+const BOOK_COLS: &str = "b.id, b.path, b.title, b.author, b.format, b.size, b.mtime, b.added_at, b.cover_path, b.meta_done, b.last_read, COALESCE(b.total_chars, 0), COALESCE(b.total_text_chars, 0), b.cover_ver";
 
 /// 记录「最近打开」时间（不改动阅读进度）。打开失败的书也能出现在「按最近阅读」里。
+/// 同步维护 last_read（取大），保证秩可寻址分页的排序键与显示一致。
 pub fn touch_book_opened(conn: &Connection, book_id: i64) {
+    let now = now_ms();
     conn.execute(
-        "UPDATE books SET last_opened=?1 WHERE id=?2",
-        params![now_ms(), book_id],
+        "UPDATE books SET last_opened=?1, last_read=MAX(last_read, ?1) WHERE id=?2",
+        params![now, book_id],
     )
     .ok();
 }
@@ -365,7 +416,7 @@ pub fn upsert_book(
 
 pub fn list_books(conn: &Connection) -> Vec<BookRow> {
     let sql = format!(
-        "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id ORDER BY b.added_at DESC, b.id DESC"
+        "SELECT {BOOK_COLS} FROM books b ORDER BY b.added_at DESC, b.id DESC"
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -395,7 +446,7 @@ pub fn list_books_page(
     limit: i64,
 ) -> crate::models::BookPage {
     let order = match sort {
-        "lastread" => "MAX(COALESCE(p.updated_at, 0), COALESCE(b.last_opened, 0)) DESC, b.id DESC",
+        "lastread" => "b.last_read DESC, b.id DESC",
         "title" => "b.title COLLATE NOCASE ASC, b.id ASC",
         "recent" => "b.mtime DESC, b.id DESC",
         // "added" 为默认
@@ -425,11 +476,11 @@ pub fn list_books_page(
 
     let sql = if pat.is_some() {
         format!(
-            "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id{where_sql} ORDER BY {order} LIMIT ?2 OFFSET ?3"
+            "SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT ?2 OFFSET ?3"
         )
     } else {
         format!(
-            "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id ORDER BY {order} LIMIT ?1 OFFSET ?2"
+            "SELECT {BOOK_COLS} FROM books b ORDER BY {order} LIMIT ?1 OFFSET ?2"
         )
     };
     let mut stmt = match conn.prepare(&sql) {
@@ -451,9 +502,63 @@ pub fn list_books_page(
     crate::models::BookPage { total, rows }
 }
 
+/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` 返回**全部 books.id 的有序序列**。
+/// - 不 JOIN progress，不施加任何 WHERE（与 `list_books_page` 无过滤分支同源）；
+/// - ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
+/// - 排序键索引均含唯一 tiebreaker `id`，窗口不会漂移。
+pub fn order_index_ids(conn: &Connection, sort: &str) -> Vec<i64> {
+    // 白名单 → 字面量 ORDER BY；未知一律回落 "added"。
+    let order = match sort {
+        "lastread" => "last_read DESC, id DESC",
+        "title" => "title COLLATE NOCASE ASC, id ASC",
+        "recent" => "mtime DESC, id DESC",
+        _ => "added_at DESC, id DESC",
+    };
+    let sql = format!("SELECT id FROM books ORDER BY {order}");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| r.get::<_, i64>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// books 总行数（秩可寻址索引的上限校验用；O(1) 走内部统计或全表 count）。
+pub fn count_books(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// 秩可寻址分页：命令 2 的数据源。按入参 `ids` 批量取行，**返回顺序与长度恒等于 ids**：
+/// 库中不存在的 id 以 `None` 占位（不跳过，保持秩对齐）。单次 `IN (...)` 查询，无循环单查。
+pub fn books_by_ids_aligned(conn: &Connection, ids: &[i64]) -> Vec<Option<BookRow>> {
+    if ids.is_empty() {
+        return vec![];
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT {BOOK_COLS} FROM books b WHERE b.id IN ({placeholders})");
+    let mut by_id: std::collections::HashMap<i64, BookRow> =
+        std::collections::HashMap::with_capacity(ids.len());
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+        if let Ok(rows) = stmt.query_map(params.as_slice(), book_from_row) {
+            for r in rows.flatten() {
+                by_id.insert(r.id, r);
+            }
+        }
+    }
+    // 按入参顺序对齐输出（去重的 id 会各自命中同一行的克隆）。
+    ids.iter().map(|id| by_id.get(id).cloned()).collect()
+}
+
 pub fn get_book(conn: &Connection, id: i64) -> Option<BookRow> {
     let sql = format!(
-        "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id WHERE b.id=?1"
+        "SELECT {BOOK_COLS} FROM books b WHERE b.id=?1"
     );
     conn.query_row(&sql, params![id], book_from_row)
         .optional()
@@ -462,7 +567,7 @@ pub fn get_book(conn: &Connection, id: i64) -> Option<BookRow> {
 
 pub fn get_book_by_path(conn: &Connection, path: &str) -> Option<BookRow> {
     let sql = format!(
-        "SELECT {BOOK_COLS} FROM books b LEFT JOIN progress p ON p.book_id = b.id WHERE b.path=?1"
+        "SELECT {BOOK_COLS} FROM books b WHERE b.path=?1"
     );
     conn.query_row(&sql, params![path], book_from_row)
         .optional()
@@ -479,16 +584,131 @@ pub fn all_book_paths(conn: &Connection) -> Vec<(i64, String)> {
         .unwrap_or_default()
 }
 
-/// 启动续扫用：所有 `meta_done=0`（未处理/上次中断）的书 id。
-/// 已扫完的（`meta_done=1`）与可重试的（`meta_done=2`）都不会被捞出。
-pub fn ids_needing_meta(conn: &Connection) -> Vec<i64> {
-    let mut stmt = match conn.prepare("SELECT id FROM books WHERE meta_done=0") {
+/// 一次性读入全部书籍路径为 `HashSet`（`SELECT path FROM books`）。
+/// 供 scan_folders 阶段二：单次短锁读取后立即释放，随后无锁求差集。
+pub fn all_paths_set(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut stmt = match conn.prepare("SELECT path FROM books") {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+
+/// 增量扫描：取下一批待处理（`meta_done=0`）的 (id, path, format)，按 id 升序、上限 limit。
+/// 走 idx_books_meta_done 索引，16 万行也不会每批从头线性扫。
+pub fn next_meta_batch(conn: &Connection, limit: i64) -> Vec<(i64, String, String)> {
+    let mut stmt = match conn
+        .prepare("SELECT id, path, format FROM books WHERE meta_done = 0 ORDER BY id ASC LIMIT ?1")
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    stmt.query_map([], |r| r.get::<_, i64>(0))
+    stmt.query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+}
+
+/// 待处理书籍数（`meta_done=0`）。用于进度分母与每批「是否在推进」的判定（A6）。
+pub fn count_meta_pending(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM books WHERE meta_done = 0", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// 崩溃残留回收（B4）：把上次中断时停在「处理中」(meta_done=3) 的书还原为未处理(0)。
+pub fn recover_processing(conn: &Connection) -> i64 {
+    conn.execute("UPDATE books SET meta_done = 0 WHERE meta_done = 3", [])
+        .map(|n| n as i64)
+        .unwrap_or(0)
+}
+
+/// 读取单本 meta_done（B6：批次内已取到内存的书，处理前重读状态，避免二次读盘）。
+pub fn meta_done_of(conn: &Connection, id: i64) -> Option<i64> {
+    conn.query_row("SELECT meta_done FROM books WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()
+        .unwrap_or(None)
+}
+
+/// 读取单本 (meta_done, meta_error)。打开书籍时据 meta_error 判断是否值得插队重试。
+/// 读取单本 (meta_done, meta_error, fail_count)。打开书籍时据 meta_error 类型与
+/// fail_count 判断是否插队重试。
+pub fn meta_state_of(conn: &Connection, id: i64) -> Option<(i64, Option<String>, i64)> {
+    conn.query_row(
+        "SELECT meta_done, meta_error, fail_count FROM books WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .unwrap_or(None)
+}
+
+/// CAS 认领（B5）：仅当当前状态在 `allow` 集合内时置为 3(处理中)。
+/// 返回 true 表示本线程成功认领（changes()==1），可安全解析该本；否则说明已被处理/认领。
+/// 启动批次传 &[0]；打开插队重试传 &[0, 2]（允许对失败项重试）。
+pub fn claim_meta(conn: &Connection, id: i64, allow: &[i64]) -> bool {
+    let list = allow
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("UPDATE books SET meta_done = 3 WHERE id = ?1 AND meta_done IN ({list})");
+    conn.execute(&sql, params![id]).map(|n| n == 1).unwrap_or(false)
+}
+
+/// 写扫描状态（A5）：state=1 完成 / 2 失败。同时更新 meta_error、last_attempt_at(秒)、
+/// fail_count（state=2 递增，state=1 归零）。**不写标题/封面等业务字段**（由 set_book_meta_ex 负责）。
+/// 返回 `Result`：写入失败不再吞错，交由调用方记录/降级。
+pub fn mark_meta(conn: &Connection, id: i64, state: i64, err: Option<&str>) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE books SET meta_done = ?2, meta_error = ?3, last_attempt_at = ?4,
+         fail_count = CASE WHEN ?2 = 2 THEN fail_count + 1 ELSE 0 END WHERE id = ?1",
+        params![id, state, err, now_s()],
+    )?;
+    Ok(())
+}
+
+/// 打开书籍时把该本写入优先表（B1）。已存在则刷新 queued_at。
+/// 返回 `Result`：写入失败不再吞错（否则 enqueued 计数与日志会失真）。
+pub fn enqueue_priority(conn: &Connection, book_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO cover_priority(book_id, queued_at) VALUES(?1, ?2)
+         ON CONFLICT(book_id) DO UPDATE SET queued_at = excluded.queued_at",
+        params![book_id, now_s()],
+    )?;
+    Ok(())
+}
+
+/// 取优先表队首且仍需处理的一本（B3）：meta_done IN (0,2,3)，按 queued_at **降序**
+/// （最近关注的优先——列表滚到的可见项 / 刚打开的书排在最前）。
+pub fn next_priority(conn: &Connection) -> Option<(i64, String, String)> {
+    conn.query_row(
+        "SELECT b.id, b.path, b.format FROM cover_priority c
+         JOIN books b ON b.id = c.book_id
+         WHERE b.meta_done IN (0, 2, 3)
+         ORDER BY c.queued_at DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .unwrap_or(None)
+}
+
+/// 处理完成后从优先表移除（B5：无论成败都 DELETE）。
+pub fn delete_priority(conn: &Connection, book_id: i64) {
+    conn.execute("DELETE FROM cover_priority WHERE book_id = ?1", params![book_id])
+        .ok();
+}
+
+/// 只更新封面路径一列（扫描路径专用；不写 title/author/chars 等元数据）。
+/// cover_path 由 NULL→文件名会让前端封面 URL 从「默认底图端点」切到「per-book 端点」而刷新。
+pub fn set_cover_path(conn: &Connection, id: i64, cover_path: Option<&str>) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE books SET cover_path = ?2 WHERE id = ?1",
+        params![id, cover_path],
+    )?;
+    Ok(())
 }
 
 /// 按 id 批量取 (id, path, format)：队列 worker 消费时用。
@@ -593,7 +813,24 @@ pub fn set_progress(conn: &Connection, book_id: i64, p: &Progress) -> Result<(),
         params![book_id, p.chapter_index, p.chapter_ratio, p.pct, p.updated_at, p.device],
     )
     .map_err(|e| e.to_string())?;
+    // 同步维护 books.last_read（取大）：秩可寻址分页「按最近阅读」的排序键。
+    conn.execute(
+        "UPDATE books SET last_read=MAX(last_read, ?2) WHERE id=?1",
+        params![book_id, p.updated_at],
+    )
+    .ok();
     Ok(())
+}
+
+/// 进度重置/清除时调用：把 last_read 回落到 last_opened（不再受已删进度影响）。
+/// 当前无「重置进度」命令，保留供将来接入；书籍删除走整行删除，不需调用本函数。
+#[allow(dead_code)]
+pub fn reset_last_read(conn: &Connection, book_id: i64) {
+    conn.execute(
+        "UPDATE books SET last_read=COALESCE(last_opened, 0) WHERE id=?1",
+        params![book_id],
+    )
+    .ok();
 }
 
 pub fn get_txt_cache(conn: &Connection, book_id: i64) -> Option<(String, String)> {
@@ -1088,6 +1325,70 @@ mod notes_tests {
         add_highlight(conn, bid, 0, "第一章", 0, 5, text, "underline", "", note).unwrap()
     }
 
+    /// 老库升级路径：books 表不含 last_read、user_version=0。
+    /// 旧实现会在建表批内执行 `CREATE INDEX ... ON books(last_read ...)` → no such column → setup panic。
+    /// 修复后：先按 pragma_table_info 补列，再统一建索引。
+    #[test]
+    fn init_upgrades_old_books_table_missing_last_read() {
+        let p = std::env::temp_dir().join(format!("fr_old_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let old = Connection::open(&p).unwrap();
+            old.execute_batch(
+                "CREATE TABLE books(
+                    id INTEGER PRIMARY KEY,
+                    path TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    author TEXT NOT NULL DEFAULT '',
+                    format TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    mtime INTEGER NOT NULL DEFAULT 0,
+                    added_at INTEGER NOT NULL DEFAULT 0,
+                    cover_path TEXT,
+                    meta_done INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO books(id,path,title,format,size,mtime,added_at,meta_done)
+                    VALUES(1,'/a.txt','a','txt',1,1,1,0),(2,'/b.txt','b','txt',1,1,1,0);",
+            )
+            .unwrap();
+            let uv: i64 = old
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(uv, 0, "老库 user_version 应为 0");
+            let has: i64 = old
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('books') WHERE name='last_read'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has, 0, "老库不应含 last_read");
+        }
+        let conn = init(&p).expect("老库 init 不应报错");
+        let has: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('books') WHERE name='last_read'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has, 1, "升级后应补出 last_read 列");
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_books_lastread_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "应创建 idx_books_lastread_id");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "升级不得改变行数");
+        let _ = std::fs::remove_file(&p);
+    }
+
+
     #[test]
     fn fingerprint_one_row_per_book_even_with_5000_highlights() {
         let conn = tmpdb("fp");
@@ -1258,7 +1559,7 @@ mod cover_scan_tests {
     }
 
     /// 需求2：Some/None 写 meta_done=1，Err 写 meta_done=2；三种情况都**不再是 0**，
-    /// 因此 `ids_needing_meta`（启动续扫用）不会再把它们捞出来。
+    /// 因此增量扫描（`count_meta_pending` / `next_meta_batch`）不会再把它们捞出来。
     #[test]
     fn meta_done_never_stays_zero_after_scan() {
         let conn = tmpdb("md");
@@ -1269,7 +1570,7 @@ mod cover_scan_tests {
         let id2 = upsert_book(&conn, p2, "无封面", "txt", 10, 1).unwrap();
         let id3 = upsert_book(&conn, p3, "损坏", "epub", 10, 1).unwrap();
         // 初始全部 meta_done=0（导入书籍落库后的状态）
-        assert_eq!(ids_needing_meta(&conn).len(), 3);
+        assert_eq!(count_meta_pending(&conn), 3);
 
         // Some：有内嵌封面 → meta_done=1，cover_ver+1
         set_book_meta_ex(&conn, id1, "有封面", "作者", Some("a.png"), 100, 90, 1, true).unwrap();
@@ -1288,7 +1589,8 @@ mod cover_scan_tests {
         let b3 = get_book(&conn, id3).unwrap();
         assert_eq!(b3.meta_done, 2, "失败必须写 2，不能留 0");
         // 启动只捞 meta_done=0 → 三本都不再被自动重扫
-        assert!(ids_needing_meta(&conn).is_empty(), "扫完的书不应再入队");
+        assert_eq!(count_meta_pending(&conn), 0, "扫完的书不应再入队");
+        assert!(next_meta_batch(&conn, 200).is_empty());
     }
 
     /// 再次提取到新封面：cover_ver 递增（per-book URL 缓存失效）。

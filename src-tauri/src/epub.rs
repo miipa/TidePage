@@ -4,7 +4,8 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub struct EpubDoc {
     pub title: String,
@@ -642,6 +643,292 @@ fn extract_ncx_pairs(xml: &str, base_doc: &str) -> Vec<(String, String)> {
 pub fn resolve_in_doc(doc_path: &str, href: &str) -> String {
     norm_path(doc_path, href)
 }
+
+/// 从 OPF 文本里找封面图片的 href（不解析全书）：
+///   1) `<meta name="cover" content="ID">` → 找同 ID 的 `<item ... href=...>`；
+///   2) 退而求其次：`<item properties="cover-image" href=...>`。
+fn cover_href_from_opf(opf: &str) -> Option<String> {
+    if let Ok(re) = Regex::new(
+        r#"(?is)<meta[^>]*\bname\s*=\s*["']cover["'][^>]*\bcontent\s*=\s*["']([^"']+)["']"#,
+    ) {
+        if let Some(c) = re.captures(opf) {
+            let id = c[1].to_string();
+            let esc = regex::escape(&id);
+            if let Ok(re2) = Regex::new(&format!(
+                r#"(?is)<item[^>]*\bid\s*=\s*["']{esc}["'][^>]*\bhref\s*=\s*["']([^"']+)["']"#
+            )) {
+                if let Some(c2) = re2.captures(opf) {
+                    return Some(c2[1].to_string());
+                }
+            }
+            if let Ok(re3) = Regex::new(&format!(
+                r#"(?is)<item[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*\bid\s*=\s*["']{esc}["']"#
+            )) {
+                if let Some(c3) = re3.captures(opf) {
+                    return Some(c3[1].to_string());
+                }
+            }
+        }
+    }
+    if let Ok(re) = Regex::new(
+        r#"(?is)<item\b[^>]*\bproperties\s*=\s*["'][^"']*cover-image[^"']*["'][^>]*>"#,
+    ) {
+        if let Some(m) = re.find(opf) {
+            if let Ok(hre) = Regex::new(r#"(?is)\bhref\s*=\s*["']([^"']+)["']"#) {
+                if let Some(c) = hre.captures(m.as_str()) {
+                    return Some(c[1].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// **封面提取前的 EOCD 预检**：只读文件尾最多 1 KiB 定位 EOCD（`PK\x05\x06`），
+/// 取出中央目录大小；CD > 8 MiB 或找不到 EOCD 即返回 Err，**不进入 `ZipArchive::new`**。
+/// 用于在解析前挡住畸形/超大中央目录的文件（否则 `ZipArchive::new` 可能长时间不返回）。
+/// 该函数只读 EOCD 搜索范围（≤1 KiB），不读其它字节。
+pub fn precheck_eocd(path: &str) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_CD_BYTES: u64 = 8 * 1024 * 1024;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    if len < 22 {
+        return Err("文件过小，不是有效 ZIP/EPUB".to_string());
+    }
+    let read_n = len.min(1024);
+    f.seek(SeekFrom::End(-(read_n as i64))).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; read_n as usize];
+    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    // 在尾部 ≤1KiB 内找最后一个 EOCD 签名。
+    let sig = [0x50u8, 0x4b, 0x05, 0x06];
+    let pos = buf
+        .windows(4)
+        .rposition(|w| w == sig)
+        .ok_or("尾部 1KiB 内未找到 EOCD 签名")?;
+    if pos + 16 > buf.len() {
+        return Err("EOCD 记录被截断".to_string());
+    }
+    // EOCD +12：中央目录大小(u32 LE)。
+    let cd_size = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]) as u64;
+    if cd_size > MAX_CD_BYTES {
+        return Err(format!("中央目录过大: {cd_size} 字节 (> 8 MiB)"));
+    }
+    Ok(())
+}
+
+/// **解析阶段**的读取预算上限：字节数与 read 调用次数（两者任一耗尽即判为病态）。
+///
+/// 背景：zip 2.4.x 的 `get_metadata` 在「中央目录某条目解析失败」时会回退为
+/// **在全文件内向前搜索更早的 EOCD 候选**，以 2 KiB 窗口回扫整个文件——对若干
+/// 局部头偏移指向垃圾/零区的畸形条目，会读取数百 MiB 且大量 read 调用、长时间不返回。
+/// 仅靠 EOCD 预检（CD 大小 > 8 MiB / 无 EOCD）无法拦住这类文件（其 CD 可能只有几百 KiB）。
+///
+/// 上限取值由本模块 `budget_probe` 的实测决定（正常书解析期消耗见下）：
+/// - **字节**：正常 EPUB 解析期仅读 CD + 各条目局部头，实测 18 MB 书 10–312 KB、
+///   100 MB 书 33–154 KB、434 MB 书 1.1 MB；病态回扫读数百 MiB。故 8 MiB 有 >7x 余量。
+/// - **调用次数**：正常书随条目数增长，实测 18 MB 书 270–9684 次、124 MB 书 4806 次、
+///   147 MB 书 5394 次、434 MB 书 **34683** 次。**初值 5000 会误伤正常书**，故按实测
+///   校准为 200000（约 5.8x 余量）；病态文件则由 8 MiB 字节上限更早拦下。
+pub const MAX_PARSE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_PARSE_CALLS: u64 = 200_000;
+
+/// worker 与看门狗共享的读取预算/取消令牌。
+pub struct CoverReadBudget {
+    bytes_limit: u64,
+    calls_limit: u64,
+    bytes_left: AtomicU64,
+    calls_left: AtomicU64,
+    /// 解析阶段为 true（执行上限）；`finish_parse()` 后为 false（只保留取消）。
+    limiting: AtomicBool,
+    /// 预算（字节或调用次数）被 worker 自身耗尽。
+    exhausted: AtomicBool,
+    /// 看门狗超时取消。
+    cancelled: AtomicBool,
+}
+
+impl CoverReadBudget {
+    pub fn new(bytes_limit: u64, calls_limit: u64) -> Self {
+        Self {
+            bytes_limit,
+            calls_limit,
+            bytes_left: AtomicU64::new(bytes_limit),
+            calls_left: AtomicU64::new(calls_limit),
+            limiting: AtomicBool::new(true),
+            exhausted: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// 解析成功：解除上限（封面数据读取不受限），仅保留取消语义。
+    fn finish_parse(&self) {
+        self.limiting.store(false, Ordering::SeqCst);
+    }
+
+    /// 看门狗超时：令 worker 内下一次 read 立即失败退出（消除线程泄漏）。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// 预算是否被耗尽（病态文件的判据，由 worker 侧读取）。
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+
+    /// 解析阶段已消耗的 read 调用次数 / 字节数（供计量）。
+    pub fn calls_used(&self) -> u64 {
+        self.calls_limit.saturating_sub(self.calls_left.load(Ordering::SeqCst))
+    }
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_limit.saturating_sub(self.bytes_left.load(Ordering::SeqCst))
+    }
+}
+
+impl Default for CoverReadBudget {
+    fn default() -> Self {
+        Self::new(MAX_PARSE_BYTES, MAX_PARSE_CALLS)
+    }
+}
+
+/// 带读取预算的 reader：解析阶段超过字节/调用上限即返回 io::Error（中止 zip 解析）。
+/// 预算为共享的 `Arc<CoverReadBudget>`：看门狗可 `cancel()` 取消。
+struct BudgetReader<R> {
+    inner: R,
+    budget: Arc<CoverReadBudget>,
+}
+
+impl<R> BudgetReader<R> {
+    fn new(inner: R, budget: Arc<CoverReadBudget>) -> Self {
+        Self { inner, budget }
+    }
+}
+
+impl<R: Read> Read for BudgetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.budget.cancelled.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "cover read cancelled",
+            ));
+        }
+        let limiting = self.budget.limiting.load(Ordering::SeqCst);
+        if limiting {
+            let c = self.budget.calls_left.load(Ordering::SeqCst);
+            if c == 0 {
+                self.budget.exhausted.store(true, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "cover read call limit exceeded",
+                ));
+            }
+            self.budget.calls_left.store(c - 1, Ordering::SeqCst);
+        }
+        let n = self.inner.read(buf)?;
+        if limiting {
+            let b = self.budget.bytes_left.load(Ordering::SeqCst);
+            if n as u64 > b {
+                self.budget.bytes_left.store(0, Ordering::SeqCst);
+                self.budget.exhausted.store(true, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "cover read byte budget exceeded",
+                ));
+            }
+            self.budget.bytes_left.store(b - n as u64, Ordering::SeqCst);
+        }
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for BudgetReader<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// **只提取封面**：以 `File`(Seek) 打开 zip，仅读取中央目录 + `META-INF/container.xml`
+/// + OPF + 封面图片三个条目，其余条目一律不解压（不读全文）。返回封面图字节（不含任何元数据）。
+/// `budget` 为共享读取预算/取消令牌（看门狗可 cancel 取消）。
+pub fn extract_cover_file(path: &str, budget: &Arc<CoverReadBudget>) -> Result<Option<Vec<u8>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    extract_cover_from_reader(std::io::BufReader::new(file), budget.clone())
+}
+
+/// 泛型版（供计量测试用 counting reader 精确统计读取字节数）。
+pub fn extract_cover_from_reader<R: Read + std::io::Seek>(
+    reader: R,
+    budget: Arc<CoverReadBudget>,
+) -> Result<Option<Vec<u8>>, String> {
+    // 解析阶段带字节/调用上限：拦住 zip 2.4.x 因中央目录条目损坏而回扫整文件的病态读取。
+    let mut zip = zip::ZipArchive::new(BudgetReader::new(reader, budget.clone()))
+        .map_err(|e| format!("EPUB 打开失败: {e}"))?;
+    // 解析成功：解除上限，封面数据（可达 32 MiB）读取不受限；取消语义仍保留。
+    budget.finish_parse();
+    // 仅读中央目录建立「小写名→索引」表（by_index_raw 不解压条目数据）。
+    let mut idx_of: HashMap<String, usize> = HashMap::new();
+    for i in 0..zip.len() {
+        if let Ok(f) = zip.by_index_raw(i) {
+            idx_of.insert(f.name().trim_start_matches("./").to_ascii_lowercase(), i);
+        }
+    }
+    let read_entry = |zip: &mut zip::ZipArchive<BudgetReader<R>>, name: &str| -> Option<Vec<u8>> {
+        let key = name.trim_start_matches("./").to_ascii_lowercase();
+        let i = *idx_of.get(&key)?;
+        let mut f = zip.by_index(i).ok()?;
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).ok()?;
+        Some(b)
+    };
+    let container = match read_entry(&mut zip, "META-INF/container.xml") {
+        Some(b) => decode_text(&b),
+        None => return Ok(None),
+    };
+    let opf_path = match opf_path_from_container(&container) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let opf = match read_entry(&mut zip, &opf_path) {
+        Some(b) => decode_text(&b),
+        None => return Ok(None),
+    };
+    let href = match cover_href_from_opf(&opf) {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    let full = norm_path(&opf_path, &href);
+    Ok(read_entry(&mut zip, &full).filter(|b| !b.is_empty()))
+}
+
+/// **只提取封面（CBZ=图片 zip）**：seek 打开 zip，按条目名排序取第一张图片，仅解压该条目。
+pub fn extract_cbz_cover_file(path: &str, budget: &Arc<CoverReadBudget>) -> Result<Option<Vec<u8>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(BudgetReader::new(std::io::BufReader::new(file), budget.clone()))
+        .map_err(|e| e.to_string())?;
+    budget.finish_parse(); // 解析成功：解除上限
+    let mut imgs: Vec<(String, usize)> = Vec::new();
+    for i in 0..zip.len() {
+        if let Ok(f) = zip.by_index_raw(i) {
+            let n = f.name().to_string();
+            let l = n.to_ascii_lowercase();
+            if l.ends_with(".jpg") || l.ends_with(".jpeg") || l.ends_with(".png")
+                || l.ends_with(".webp") || l.ends_with(".gif")
+            {
+                imgs.push((n, i));
+            }
+        }
+    }
+    if imgs.is_empty() {
+        return Ok(None);
+    }
+    imgs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut b = Vec::new();
+    zip.by_index(imgs[0].1)
+        .map_err(|e| e.to_string())?
+        .read_to_end(&mut b)
+        .map_err(|e| e.to_string())?;
+    Ok(if b.is_empty() { None } else { Some(b) })
+}
+
 
 /// 按已缓存的 `CiMap` 读取 zip 内任意条目（供按需图片服务使用）。
 pub fn read_entry(zip_bytes: &[u8], ci: &CiMap, name: &str) -> Option<Vec<u8>> {
@@ -1675,6 +1962,208 @@ pub fn spine_docs_with_titles(zip_bytes: &[u8], spine: &[String]) -> Vec<(String
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// 计量：对给定文件，(1) 从尾部 EOCD 读出中央目录大小；(2) 用共享计数 reader 执行一次
+    /// `ZipArchive::new`，报告读取字节总数（用看门狗防止畸形 CD 卡死）。
+    /// 用法：FR_ZIP_BENCH=<epub> cargo test zipnew_bytes_bench -- --nocapture
+    #[test]
+    fn zipnew_bytes_bench() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let Ok(spec) = std::env::var("FR_ZIP_BENCH") else { return };
+        // 支持 "@文件" 形式（文件首行是 UTF-8 路径），避免命令行传非 ASCII 路径被转码。
+        let path = if let Some(f) = spec.strip_prefix('@') {
+            std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
+        } else {
+            spec
+        };
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        // EOCD：读尾部 ≤1KiB，取中央目录大小(+12)。
+        let (eocd_found, cd_size) = {
+            let mut f = std::fs::File::open(&path).unwrap();
+            let n = file_len.min(1024);
+            f.seek(SeekFrom::End(-(n as i64))).unwrap();
+            let mut b = vec![0u8; n as usize];
+            f.read_exact(&mut b).unwrap();
+            match b.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]) {
+                Some(p) if p + 16 <= b.len() => (
+                    true,
+                    u32::from_le_bytes([b[p + 12], b[p + 13], b[p + 14], b[p + 15]]) as u64,
+                ),
+                _ => (false, 0),
+            }
+        };
+        // ZipArchive::new 读取字节（共享计数，看门狗 30s）。
+        #[derive(Default)]
+        struct Stats { calls: u64, bytes: u64, min_off: u64, max_end: u64, seq: bool, first: Vec<(u64,u64)>, last: Vec<(u64,u64)>, below_cd: u64, at_cd: u64 }
+        let cd_off = {
+            // 再从 EOCD 取 CD 起始偏移(+16)，用于分区域统计。
+            let mut f = std::fs::File::open(&path).unwrap();
+            let n = file_len.min(1024);
+            f.seek(SeekFrom::End(-(n as i64))).unwrap();
+            let mut b = vec![0u8; n as usize];
+            f.read_exact(&mut b).unwrap();
+            match b.windows(4).rposition(|w| w == [0x50,0x4b,0x05,0x06]) {
+                Some(p) if p + 20 <= b.len() => u32::from_le_bytes([b[p+16],b[p+17],b[p+18],b[p+19]]) as u64,
+                _ => 0,
+            }
+        };
+        let stats = Arc::new(std::sync::Mutex::new(Stats { min_off: u64::MAX, ..Default::default() }));
+        struct Counting<R> { inner: R, pos: u64, cd_off: u64, stats: Arc<std::sync::Mutex<Stats>> }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                let mut s = self.stats.lock().unwrap();
+                let start = self.pos; let end = self.pos + n as u64;
+                s.calls += 1; s.bytes += n as u64;
+                if start < s.min_off { s.min_off = start; }
+                if end > s.max_end { s.max_end = end; }
+                if start < self.cd_off { s.below_cd += n as u64; } else { s.at_cd += n as u64; }
+                if s.first.len() < 6 { s.first.push((start, n as u64)); }
+                s.last.push((start, n as u64)); if s.last.len() > 6 { s.last.remove(0); }
+                self.pos = end;
+                Ok(n)
+            }
+        }
+        impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> { let r = self.inner.seek(p)?; self.pos = r; Ok(r) }
+        }
+        let counter = Arc::new(AtomicU64::new(0));
+        let c2 = counter.clone();
+        let s2 = stats.clone();
+        let p2 = path.clone();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        std::thread::spawn(move || {
+            let f = std::fs::File::open(&p2).unwrap();
+            let c = Counting { inner: f, pos: 0, cd_off, stats: s2 };
+            let _ = zip::ZipArchive::new(c);
+            done2.store(true, Ordering::SeqCst);
+        });
+        let t0 = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && t0.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let finished = done.load(Ordering::SeqCst);
+        let s = stats.lock().unwrap();
+        eprintln!(
+            "[zipnew_bench] file_size={} eocd_found={} cd_size={} cd_offset={} zipnew_finished={} bytes_read={} calls={} min_off={} max_end={} below_cd={} at_cd={} first={:?} last={:?} elapsed_ms={}",
+            file_len, eocd_found, cd_size, cd_off, finished, counter.load(Ordering::SeqCst),
+            s.calls, s.min_off, s.max_end, s.below_cd, s.at_cd, s.first, s.last, t0.elapsed().as_millis()
+        );
+    }
+
+    /// 计量：对给定文件执行**带预算**的封面提取，输出解析阶段消耗的 read 调用次数/字节数、
+    /// 是否命中预算（病态）、耗时与结果。用于为 `MAX_PARSE_CALLS` 取值提供依据，并对失败文件归类。
+    /// 用法：FR_EPUB_COVER=<epub|@pathfile> cargo test cover_budget_bench -- --nocapture
+    #[test]
+    fn cover_budget_bench() {
+        let Ok(spec) = std::env::var("FR_EPUB_COVER") else { return };
+        let path = if let Some(f) = spec.strip_prefix('@') {
+            std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
+        } else {
+            spec
+        };
+        let t = std::time::Instant::now();
+        let bytes = std::env::var("FR_EPUB_COVER_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_BYTES);
+        let calls = std::env::var("FR_EPUB_COVER_CALLS").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_CALLS);
+        let budget = Arc::new(CoverReadBudget::new(bytes, calls));
+        let r = extract_cover_file(&path, &budget);
+        let desc = match &r {
+            Ok(Some(b)) => format!("Ok(cover {} bytes)", b.len()),
+            Ok(None) => "Ok(no cover)".to_string(),
+            Err(e) => format!("Err({e})"),
+        };
+        let kind = if r.is_ok() {
+            "ok"
+        } else if budget.exhausted() {
+            "cover-pathological"
+        } else {
+            "cover-error"
+        };
+        eprintln!(
+            "[cover_budget] kind={kind} exhausted={} calls_used={} bytes_used={} result={desc} elapsed_ms={}",
+            budget.exhausted(), budget.calls_used(), budget.bytes_used(), t.elapsed().as_millis()
+        );
+    }
+
+    /// 计量：对病态文件执行带预算的封面提取，并在 500ms 后 cancel（模拟看门狗取消），
+    /// 验证 worker 线程随即结束（不再泄漏）。用法：FR_EPUB_CANCEL=<epub> cargo test cover_cancel_bench -- --nocapture
+    #[test]
+    fn cover_cancel_bench() {
+        let Ok(spec) = std::env::var("FR_EPUB_CANCEL") else { return };
+        let path = if let Some(f) = spec.strip_prefix('@') {
+            std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
+        } else {
+            spec
+        };
+        let budget = Arc::new(CoverReadBudget::default());
+        let b = budget.clone();
+        let p = path.clone();
+        let t = std::time::Instant::now();
+        let h = std::thread::spawn(move || extract_cover_file(&p, &b).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        budget.cancel(); // 取消
+        let is_err = h.join().unwrap();
+        eprintln!(
+            "[cover_cancel] is_err={} elapsed_ms={}",
+            is_err,
+            t.elapsed().as_millis()
+        );
+    }
+
+    /// 计量：用共享计数的 reader 统计 extract_cover 各阶段实际从磁盘拉取的字节数。
+    /// 用法：FR_COVER_BENCH=<epub 路径> cargo test cover_bytes_bench -- --nocapture
+    #[test]
+    fn cover_bytes_bench() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let Ok(path) = std::env::var("FR_COVER_BENCH") else { return };
+        struct Counting<R> { inner: R, read: Arc<AtomicU64> }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.read.fetch_add(n as u64, Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> { self.inner.seek(p) }
+        }
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = Counting { inner: std::fs::File::open(&path).unwrap(), read: counter.clone() };
+        let snap = || counter.load(Ordering::SeqCst);
+
+        let mut zip = zip::ZipArchive::new(c).unwrap();
+        let after_open = snap(); // EOCD + 中央目录
+
+        let read_named = |zip: &mut zip::ZipArchive<Counting<std::fs::File>>, name: &str| -> Option<Vec<u8>> {
+            let mut e = zip.by_name(name).ok()?;
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut e, &mut b).ok()?;
+            Some(b)
+        };
+        let container = read_named(&mut zip, "META-INF/container.xml").map(|b| decode_text(&b)).unwrap_or_default();
+        let after_container = snap();
+        let opf_path = opf_path_from_container(&container).unwrap_or_default();
+        let opf = if opf_path.is_empty() { String::new() }
+                  else { read_named(&mut zip, &opf_path).map(|b| decode_text(&b)).unwrap_or_default() };
+        let after_opf = snap();
+        let href = cover_href_from_opf(&opf).unwrap_or_default();
+        let full = if href.is_empty() { String::new() } else { norm_path(&opf_path, &href) };
+        let cover = if full.is_empty() { None } else { read_named(&mut zip, &full) };
+        let after_cover = snap();
+        let cover_len = cover.as_ref().map(|b| b.len()).unwrap_or(0);
+
+        eprintln!(
+            "[cover_bench] file_size={} total_read={} ratio={:.4} | open_CD={} container={} opf={} cover_entry={} (cover_decoded={}) path={}",
+            file_len, after_cover, after_cover as f64 / file_len as f64,
+            after_open, after_container - after_open, after_opf - after_container,
+            after_cover - after_opf, cover_len, path
+        );
+    }
 
     /// 设置 FLOWREAD_PROFILE_EPUB 时，校验按需图片 URL 能被 read_entry 正确解析。
     #[test]

@@ -62,8 +62,8 @@
   /** 设置导航分组（左侧列表；含分组标题与线性图标）。 */
   const NAV: { group: string; items: { id: SettingsTab; label: string; icon: TablerIcon }[] }[] = [
     { group: "外观", items: [
-      { id: "appearance", label: "界面外观", icon: IconColorSwatch },
       { id: "reader", label: "阅读排版", icon: IconTypography },
+      { id: "appearance", label: "界面外观", icon: IconColorSwatch },
       { id: "manga", label: "漫画模式", icon: IconPhoto },
     ] },
     { group: "内容", items: [
@@ -233,6 +233,30 @@
     if (!id) return false;
     const o = getBookOverride(id);
     return o.schemeTheme !== undefined;
+  }
+
+  /** 清除本书单独套用的方案，回到全局设置（全局字体/配色此后对本书生效）。 */
+  function clearBookScheme() {
+    const id = ui.currentBookId;
+    if (!id) return;
+    setBookOverride(id, {
+      fontSize: undefined,
+      overrideBookCss: undefined,
+      schemeTheme: undefined,
+      schemeBg: undefined,
+      schemeFg: undefined,
+      schemeFontFamily: undefined,
+      schemeLatinFont: undefined,
+      schemeLineHeight: undefined,
+      schemeParaSpacing: undefined,
+      schemeIndent: undefined,
+      schemeTextAlign: undefined,
+      schemeBgImage: undefined,
+      schemeBgOpacity: undefined,
+      schemeCssExtra: undefined,
+      schemeFontWeight: undefined,
+    });
+    toast("已清除本书方案，恢复为全局设置");
   }
 
   function openSchemeSave() {
@@ -1013,8 +1037,9 @@
       </div>
     </div>
 
-    <div class="field">
-      <label>顶栏 / 底栏显示内容</label>
+    <details class="adv">
+      <summary>顶栏 / 底栏显示内容（高级）</summary>
+      <div class="field">
       <div class="stat-grid">
         <div class="stat-head">项目</div>
         <div class="stat-head">顶栏</div>
@@ -1042,7 +1067,8 @@
         {/each}
       </div>
       <p class="tip">顶栏项在阅读界面可用鼠标拖动排序；底栏顺序用 ‹ › 调整。“本节页数/百分比”“全书总页数”仅在翻页模式有意义。</p>
-    </div>
+      </div>
+    </details>
 
     <div class="field">
       <label class="check">
@@ -1078,7 +1104,10 @@
         {/each}
       </div>
       {#if bookSchemeNote()}
-        <p class="tip">本书已单独套用方案。</p>
+        <div class="book-scheme-note">
+          <span>本书已单独套用方案，全局字体/配色不会影响它。</span>
+          <button class="link-btn" onclick={clearBookScheme}>清除本书方案（回到全局）</button>
+        </div>
       {/if}
     </div>
 
@@ -2159,6 +2188,32 @@
     gap: 12px;
   }
 
+  /* 高级折叠区：把顶栏/底栏显示项这类低频配置收起来，减少阅读排版页的视觉负担 */
+  details.adv {
+    margin: 4px 0 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm, 8px);
+    background: var(--panel2);
+  }
+  details.adv > summary {
+    cursor: pointer;
+    padding: 8px 12px;
+    font-size: var(--fs-sm, 13px);
+    color: var(--fg2);
+    list-style: none;
+    user-select: none;
+  }
+  details.adv > summary::-webkit-details-marker { display: none; }
+  details.adv > summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform var(--dur, 0.2s) var(--ease);
+  }
+  details.adv[open] > summary::before { transform: rotate(90deg); }
+  details.adv > summary:hover { color: var(--fg); }
+  details.adv > .field { padding: 0 12px 10px; margin-bottom: 0; }
+
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr auto auto auto;
@@ -2392,6 +2447,33 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  /* 「本书已单独套用方案」提示 + 清除按钮 */
+  .book-scheme-note {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    font-size: var(--fs-xs, 12px);
+    color: var(--fg2);
+  }
+  .link-btn {
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    min-height: auto;
+    padding: 2px 4px;
+    font-size: var(--fs-xs, 12px);
+    font-weight: 600;
+    border-radius: var(--radius-xs, 6px);
+    cursor: pointer;
+  }
+  .link-btn:hover:not(:disabled) {
+    background: var(--accent-soft);
+    color: var(--accent);
   }
 
   .scheme-menu {

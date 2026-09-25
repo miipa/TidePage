@@ -165,23 +165,15 @@ pub fn run() {
                 scan_running: std::sync::atomic::AtomicBool::new(false),
                 scan_stop: std::sync::atomic::AtomicBool::new(false),
                 scan_start_count: std::sync::atomic::AtomicU64::new(0),
-                cover_scan: Mutex::new(library::CoverScanQueue::default()),
                 cover_scan_done: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_total: std::sync::atomic::AtomicU64::new(0),
                 cover_style_ver: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
 
-            // 启动续扫：只捞 `meta_done=0`（未处理/上次中断）的书入队；
-            // 已扫完的（meta_done=1）与可重试失败的（meta_done=2）都不会被重新捞出来。
-            // 队列为空则 worker 立即退出（扫完即停、不驻留、不轮询）。
-            {
-                let pending: Vec<i64> = {
-                    let conn = state.db.0.lock().unwrap();
-                    db::ids_needing_meta(&conn)
-                };
-                library::enqueue_cover_scan(&state, pending);
-            }
+            // 冷启动增量扫描：处理全部 `meta_done=0`（含存量与新增），逐本提交、扫完即静默。
+            // 不再一次性把全部未处理 id 载入内存；worker 内部分批查询 + 限流（见 library::on_startup）。
+            library::ensure_scan_worker(&app.handle().clone());
 
             {
                 let st = state.clone();
@@ -386,6 +378,8 @@ pub fn run() {
             library::remove_folder,
             library::list_books,
             library::list_books_page,
+            library::list_order_index,
+            library::list_books_by_ids,
             library::rescan,
             library::refresh_library,
             library::file_exists,
@@ -421,8 +415,8 @@ pub fn run() {
             library::app_data_dir,
             library::storage_stats,
             library::clear_cache,
-            library::refresh_covers,
             library::meta_debug_stats,
+            library::prioritize_covers,
             library::set_default_cover,
             library::clear_default_cover,
             library::has_default_cover,

@@ -47,6 +47,24 @@
     });
   });
 
+  // 全局封面刷新监听（C2：注册在 App 根组件，非书库页面内部；根组件常驻，卸载时解绑）。
+  // 后端每本扫描完成发 cover-updated{ id }；取 e.payload.id 记录最近更新的书，
+  // 并节流递增 ui.coverTick，书库组件据此重拉当前窗口（按 cover_ver 令 per-book URL 失效）。
+  $effect(() => {
+    if (standalone) return;
+    let tick: ReturnType<typeof setTimeout> | undefined;
+    const un = listen<{ id: number }>("cover-updated", (e) => {
+      const id = e.payload?.id;          // 后端 payload = { "id": id }
+      if (typeof id === "number") ui.lastCoverId = id;
+      clearTimeout(tick);
+      tick = setTimeout(() => { ui.coverTick++; }, 300);
+    });
+    return () => {
+      clearTimeout(tick);
+      un.then((f) => f());
+    };
+  });
+
   $effect(() => {
     if (standalone) return;
     // 捕获阶段处理 Esc：弹窗打开时阻止事件继续传播，
