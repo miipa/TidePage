@@ -1123,6 +1123,16 @@ pub fn breeze_voices_url(base: &str) -> String {
     }
 }
 
+/// 由网关根地址推导默认音色合成端点 `{base}/api`（GET，参数 text/seed）。
+pub fn breeze_api_url(base: &str) -> String {
+    let b = strip_trailing_slash(base);
+    if b.ends_with("/api") {
+        b.to_string()
+    } else {
+        format!("{b}/api")
+    }
+}
+
 /// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
 /// 整章逐句合成时避免重复拉取同一音色的参考音频。
 fn breeze_voice_cache(
@@ -1235,8 +1245,66 @@ fn is_breeze_model(model: &str) -> bool {
     )
 }
 
-/// 调用本地 Breeze-TTS-2 网关的克隆合成接口，返回音频字节（WAV）。
-async fn synthesize_breeze(
+/// 读取 Breeze 网关响应体：优先原始音频字节，兼容 JSON 内 Base64 音频。
+async fn read_breeze_audio(resp: reqwest::Response) -> Result<Vec<u8>, AiError> {
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    if ctype.contains("application/json") {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let data = v
+                .get("audio")
+                .and_then(|a| a.as_str().or_else(|| a.get("data").and_then(|d| d.as_str())));
+            if let Some(data) = data {
+                if !data.is_empty() {
+                    use base64::Engine as _;
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+                    if !raw.is_empty() {
+                        return Ok(raw);
+                    }
+                }
+            }
+        }
+        return Err(AiError::protocol("网关返回 JSON 但未包含音频数据"));
+    }
+    if bytes.is_empty() {
+        return Err(AiError::protocol("语音接口返回空音频"));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// 使用网关默认音色合成：`GET {base}/api?text=...&seed=...`，
+/// 与「开源阅读」的接入方式一致。固定 seed 保证整章听感一致。
+async fn synthesize_breeze_default(
+    http: reqwest::Client,
+    base: &str,
+    text: &str,
+    seed: i64,
+) -> Result<Vec<u8>, AiError> {
+    let seed_value = seed.to_string();
+    let resp = http
+        .get(breeze_api_url(base))
+        .query(&[("text", text), ("seed", seed_value.as_str())])
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    read_breeze_audio(resp).await
+}
+
+/// 使用网关中已保存的克隆音色合成：先取音色参考音频，再调 `/api/tts/clone`。
+async fn synthesize_breeze_clone(
     http: reqwest::Client,
     cfg: &AiConfig,
     base: &str,
@@ -1262,43 +1330,23 @@ async fn synthesize_breeze(
         .send()
         .await
         .map_err(|e| classify_req(&e))?;
-    let status = resp.status();
-    let ctype = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        let brief: String = msg.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+    read_breeze_audio(resp).await
+}
+
+/// 调用本地 Breeze-TTS-2 网关合成，返回音频字节（WAV）。
+/// 未指定音色时走网关默认音色（`/api`），指定音色时走克隆合成（`/api/tts/clone`）。
+async fn synthesize_breeze(
+    http: reqwest::Client,
+    cfg: &AiConfig,
+    base: &str,
+    voice: &str,
+    text: &str,
+    seed: i64,
+) -> Result<Vec<u8>, AiError> {
+    if voice.trim().is_empty() {
+        return synthesize_breeze_default(http, base, text, seed).await;
     }
-    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
-    if ctype.contains("application/json") {
-        // 兼容以 JSON 携带 Base64 音频的实现。
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let data = v
-                .get("audio")
-                .and_then(|a| a.as_str().or_else(|| a.get("data").and_then(|d| d.as_str())));
-            if let Some(data) = data {
-                if !data.is_empty() {
-                    use base64::Engine as _;
-                    let raw = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
-                    if !raw.is_empty() {
-                        return Ok(raw);
-                    }
-                }
-            }
-        }
-        return Err(AiError::protocol("网关返回 JSON 但未包含音频数据"));
-    }
-    if bytes.is_empty() {
-        return Err(AiError::protocol("语音接口返回空音频"));
-    }
-    Ok(bytes.to_vec())
+    synthesize_breeze_clone(http, cfg, base, voice, text).await
 }
 
 /// 调用在线语音合成接口，返回音频字节（如 mp3/wav）。
@@ -1310,15 +1358,16 @@ pub async fn synthesize(
     voice: &str,
     format: &str,
     text: &str,
+    seed: i64,
 ) -> Result<Vec<u8>, AiError> {
     let p = Provider::parse(&cfg.provider);
     let base = strip_trailing_slash(&cfg.base_url);
     if base.is_empty() {
         return Err(AiError::config("未配置语音端点地址"));
     }
-    // Breeze-TTS-2 为本地自建协议（先取音色参考音频再克隆合成），单独处理。
+    // Breeze-TTS-2 为本地自建协议（默认音色或克隆音色），单独处理。
     if is_breeze_provider(&cfg.provider) {
-        return synthesize_breeze(http, &cfg, base, voice, text).await;
+        return synthesize_breeze(http, &cfg, base, voice, text, seed).await;
     }
     // DashScope 协议与 OpenAI 不同（JSON 回包 + 二次下载），单独处理。
     if p == Provider::DashScope {
@@ -1449,6 +1498,14 @@ mod tests {
         assert_eq!(
             breeze_voices_url("http://127.0.0.1:7863/api"),
             "http://127.0.0.1:7863/api/voices"
+        );
+        assert_eq!(
+            breeze_api_url("http://127.0.0.1:7863"),
+            "http://127.0.0.1:7863/api"
+        );
+        assert_eq!(
+            breeze_api_url("http://127.0.0.1:7863/api"),
+            "http://127.0.0.1:7863/api"
         );
 
         assert_eq!(detect_tts_language("你好，世界"), "Chinese");

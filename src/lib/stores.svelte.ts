@@ -536,6 +536,8 @@ export interface TtsConfig {
   onlineVoice: string;
   /** 在线语音音频格式 */
   onlineFormat: string;
+  /** Breeze-TTS-2 默认音色的随机种子（固定值保证整章听感一致） */
+  breezeSeed: number;
   /** 指定语音（voice.name 或 voiceURI），空=按语言自动选择 */
   voice: string;
   /** 自动选择语音时的语言 */
@@ -894,6 +896,7 @@ p {
     onlineModel: "omnivoice",
     onlineVoice: "33aa3b77",
     onlineFormat: "wav",
+    breezeSeed: 3721,
     voice: "Microsoft Kangkang - Chinese (Simplified, PRC)",
     lang: "zh-CN",
     rate: 1.4,

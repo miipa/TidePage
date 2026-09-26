@@ -233,6 +233,8 @@ interface TtsEndpoint {
   apiVersion: string;
   proxyMode: string;
   proxyUrl: string;
+  /** Breeze 默认音色的随机种子（固定值保证整章听感一致）。 */
+  seed?: number;
   tag: string;
 }
 
@@ -257,6 +259,7 @@ function resolveEndpoint(): TtsEndpoint | null {
       apiVersion: "",
       proxyMode: "auto",
       proxyUrl: "",
+      seed: provider === "breeze" ? (config.tts.breezeSeed ?? 3721) : undefined,
       tag: `custom:${provider}:${base}`,
     };
   }
@@ -308,6 +311,7 @@ function cacheKey(text: string): string {
     config.tts.onlineModel,
     effectiveOnlineVoice(),
     config.tts.onlineFormat,
+    ep?.seed ?? "",
     text,
   ].join("\u0001");
 }
@@ -366,6 +370,7 @@ async function fetchAudio(text: string): Promise<string> {
     voice: effectiveOnlineVoice(),
     format: fmt,
     text,
+    seed: ep.seed,
   });
   return base64ToObjectUrl(b64);
 }
