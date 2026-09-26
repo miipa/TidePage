@@ -1098,29 +1098,30 @@ pub fn is_breeze_provider(provider: &str) -> bool {
     )
 }
 
-/// 由网关根地址推导克隆合成端点，兼容 `http://127.0.0.1:7863`、
-/// `http://127.0.0.1:7863/api` 与完整 `.../api/tts/clone` 三种写法。
-pub fn breeze_clone_url(base: &str) -> String {
-    let b = strip_trailing_slash(base);
-    if b.ends_with("/api/tts/clone") {
-        b.to_string()
-    } else if b.ends_with("/api") {
-        format!("{b}/tts/clone")
-    } else {
-        format!("{b}/api/tts/clone")
+/// 归一化 Breeze 网关根地址：容忍用户填写 `.../v1`、`.../api`、
+/// `.../api/voices`、`.../api/tts/clone` 等任意常见后缀。
+pub fn breeze_root(base: &str) -> String {
+    let mut b = strip_trailing_slash(base).to_string();
+    loop {
+        let stripped: Option<String> = ["/api/tts/clone", "/api/voices", "/api", "/v1"]
+            .iter()
+            .find_map(|suf| b.strip_suffix(suf).map(|s| s.trim_end_matches('/').to_string()));
+        match stripped {
+            Some(s) if !s.is_empty() => b = s,
+            _ => break,
+        }
     }
+    b
+}
+
+/// 由网关根地址推导克隆合成端点。
+pub fn breeze_clone_url(base: &str) -> String {
+    format!("{}/api/tts/clone", breeze_root(base))
 }
 
 /// 由网关根地址推导音色列表端点。
 pub fn breeze_voices_url(base: &str) -> String {
-    let b = strip_trailing_slash(base);
-    if b.ends_with("/api/voices") {
-        b.to_string()
-    } else if b.ends_with("/api") {
-        format!("{b}/voices")
-    } else {
-        format!("{b}/api/voices")
-    }
+    format!("{}/api/voices", breeze_root(base))
 }
 
 /// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
@@ -1443,11 +1444,31 @@ mod tests {
             "http://127.0.0.1:7863/api/tts/clone"
         );
         assert_eq!(
+            breeze_clone_url("http://127.0.0.1:7863/v1"),
+            "http://127.0.0.1:7863/api/tts/clone"
+        );
+        assert_eq!(
+            breeze_clone_url("http://127.0.0.1:7863/api/tts/clone"),
+            "http://127.0.0.1:7863/api/tts/clone"
+        );
+        assert_eq!(
             breeze_voices_url("http://127.0.0.1:7863"),
             "http://127.0.0.1:7863/api/voices"
         );
         assert_eq!(
             breeze_voices_url("http://127.0.0.1:7863/api"),
+            "http://127.0.0.1:7863/api/voices"
+        );
+        assert_eq!(
+            breeze_voices_url("http://127.0.0.1:7863/v1"),
+            "http://127.0.0.1:7863/api/voices"
+        );
+        assert_eq!(
+            breeze_voices_url("http://127.0.0.1:7863/v1/"),
+            "http://127.0.0.1:7863/api/voices"
+        );
+        assert_eq!(
+            breeze_voices_url("http://127.0.0.1:7863/api/voices"),
             "http://127.0.0.1:7863/api/voices"
         );
 
