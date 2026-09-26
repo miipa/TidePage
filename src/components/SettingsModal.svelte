@@ -332,7 +332,7 @@
   let ttsVoiceMsg = $state("");
 
   const ttsVoiceProfiles = $derived(ttsVoiceList.filter((v) => v.type === "profile"));
-  // 隐藏 OpenAI 别名（无固定说话人，逐句换人）。
+  // 隐藏 OpenAI 别名：无固定说话人，不适用于克隆引擎。
   const ttsVoiceOthers = $derived(
     ttsVoiceList.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
@@ -342,12 +342,16 @@
     ttsVoiceLoading = true;
     ttsVoiceMsg = "";
     try {
-      // 同时写入 ttsState.onlineVoices，供阅读界面播放条的音色下拉复用。
+      // 列表同时写入 ttsState.onlineVoices，供阅读界面播放条复用。
       ttsVoiceList = await refreshOnlineVoices();
       const nProfile = ttsVoiceList.filter((v) => v.type === "profile").length;
+      const endpointHint =
+        config.tts.customProvider === "breeze"
+          ? "网关未返回音色，请先在服务端创建克隆音色"
+          : "服务未返回音色列表，需支持 /v1/audio/voices 或 /v1/voices";
       ttsVoiceMsg = ttsVoiceList.length
         ? `共 ${ttsVoiceList.length} 个音色，其中固定音色 ${nProfile} 个；固定音色可保证整章说话人一致`
-        : "服务未返回音色列表，需支持 /v1/audio/voices 或 /v1/voices";
+        : endpointHint;
       if (ttsVoiceList.length && !config.tts.onlineVoice) {
         config.tts.onlineVoice = ttsVoiceList[0].id;
         saveConfig();
@@ -1536,7 +1540,7 @@
     </div>
   {:else if tab === "tts"}
     <p class="tip">
-      这里集中管理「语音朗读」的全部设置，与 AI 助手设置相互独立。系统语音离线可用；在线语音更自然，可接本地 VoxCPM、GPT-SoVITS、CosyVoice 等 OpenAI 兼容服务。
+      集中管理「语音朗读」的全部设置，与 AI 助手设置相互独立。系统语音离线可用；在线语音更自然，可接入 OpenAI 兼容服务、通义千问 Qwen-TTS 或本地 Breeze-TTS-2 网关。
     </p>
 
     <div class="field">
@@ -1545,7 +1549,7 @@
         <option value="system">系统语音</option>
         <option value="online">在线语音</option>
       </select>
-      <p class="tip">系统语音离线可用，使用 Windows 语音；在线语音更自然，需一个 OpenAI 兼容 TTS 服务。</p>
+      <p class="tip">系统语音离线可用，使用 Windows 语音；在线语音更自然，需一个语音合成服务。</p>
     </div>
 
     {#if config.tts.engine === "online"}
@@ -1561,22 +1565,24 @@
         <div class="field">
           <label>接口协议</label>
           <select bind:value={config.tts.customProvider} onchange={saveConfig}>
-            <option value="openai">OpenAI 兼容 (/v1/audio/speech)</option>
-            <option value="dashscope">通义千问 Qwen-TTS (DashScope)</option>
+            <option value="openai">OpenAI 兼容（/v1/audio/speech）</option>
+            <option value="dashscope">通义千问 Qwen-TTS（DashScope）</option>
+            <option value="breeze">Breeze-TTS-2 本地网关</option>
           </select>
           <p class="tip">
-            OpenAI 兼容：本地 VoiceStudio/VoxCPM、OpenAI、vLLM-Omni 等；
-            通义千问：阿里云百炼云端 Qwen-TTS，服务地址填 <code>https://dashscope.aliyuncs.com</code>，音色如 <code>Cherry</code>。
+            OpenAI 兼容：适用于提供 <code>/v1/audio/speech</code> 的服务（VoiceStudio、VoxCPM、GPT-SoVITS、OpenAI 等）；
+            通义千问：阿里云百炼云端 Qwen-TTS，服务地址填 <code>https://dashscope.aliyuncs.com</code>；
+            Breeze-TTS-2：本地网关，服务地址填网关根地址（如 <code>http://127.0.0.1:7863</code>），音色读取网关中已保存的克隆音色。
           </p>
         </div>
         <div class="grid2">
           <div class="field">
             <label>服务地址</label>
-            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "https://dashscope.aliyuncs.com" : "http://127.0.0.1:8000"} title="OpenAI 兼容的 /v1/audio/speech 服务地址；通义千问填 DashScope 根地址" />
+            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "https://dashscope.aliyuncs.com" : config.tts.customProvider === "breeze" ? "http://127.0.0.1:7863" : "http://127.0.0.1:8000"} title="OpenAI 兼容填 /v1/audio/speech 服务地址；通义千问填 DashScope 根地址；Breeze-TTS-2 填网关根地址" />
           </div>
           <div class="field">
             <label>密钥</label>
-            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "DashScope API Key (sk-...)" : "可留空"} title="本地服务可留空；通义千问必填 DashScope API Key" />
+            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "DashScope API Key (sk-...)" : "本地服务可留空"} title="本地服务可留空；通义千问必填 DashScope API Key" />
           </div>
         </div>
       {:else}
@@ -1594,7 +1600,7 @@
       <div class="grid2">
         <div class="field">
           <label>语音模型</label>
-          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" title="本地 VoxCPM 可填 voxcpm，OpenAI 用 tts-1，通义千问用 qwen3-tts-flash" />
+          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "qwen3-tts-flash" : config.tts.customProvider === "breeze" ? "breeze-tts-2" : "tts-1"} title="OpenAI 兼容填服务端模型名；通义千问填 qwen3-tts-flash；Breeze-TTS-2 填 breeze-tts-2" />
         </div>
         <div class="field">
           <label>音色</label>
@@ -1624,33 +1630,44 @@
           {/if}
         </div>
       </div>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "openai"}
         <div class="field">
           <label>参考音频路径</label>
           <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="D:\VoxCPM\voices\ref_male.wav" title="直接填参考音频 .wav 完整路径，仅部分服务支持；VoiceStudio 请选上方的固定音色" />
           <p class="tip">直接填 .wav 完整路径，仅部分服务支持；使用 VoiceStudio 等克隆服务时请选上方的固定音色。</p>
         </div>
-        {#if ttsVoiceMsg}<p class="tip">{ttsVoiceMsg}</p>{/if}
       {/if}
-      <div class="field">
-        <label>音频格式</label>
-        <select bind:value={config.tts.onlineFormat} onchange={saveConfig} title="本地 VoxCPM 服务请选 wav">
-          <option value="wav">wav</option>
-          <option value="mp3">mp3</option>
-          <option value="opus">opus</option>
-          <option value="aac">aac</option>
-          <option value="flac">flac</option>
-        </select>
-      </div>
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope" && ttsVoiceMsg}
+        <p class="tip">{ttsVoiceMsg}</p>
+      {/if}
+      {#if config.tts.customProvider !== "breeze"}
+        <div class="field">
+          <label>音频格式</label>
+          <select bind:value={config.tts.onlineFormat} onchange={saveConfig} title="本地 VoxCPM 服务请选 wav">
+            <option value="wav">wav</option>
+            <option value="mp3">mp3</option>
+            <option value="opus">opus</option>
+            <option value="aac">aac</option>
+            <option value="flac">flac</option>
+          </select>
+        </div>
+      {/if}
       <p class="tip">
         OpenAI 兼容需目标服务提供 <code>/v1/audio/speech</code>（OpenAI、Azure OpenAI、vLLM-Omni 的 VoxCPM、GPT-SoVITS 封装等）；
-        通义千问走 DashScope 云端 <code>qwen3-tts-flash</code>。某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
+        通义千问走 DashScope 云端 <code>qwen3-tts-flash</code>；Breeze-TTS-2 走本地网关 <code>/api/tts/clone</code> 克隆音色。
+        某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
       </p>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "openai"}
         <p class="tip">
           使用零样本克隆引擎（如 VoiceStudio + OmniVoice）时，OpenAI 别名（alloy/echo/…）没有固定说话人，
-          逐句请求会换人。请选择「固定音色」（<code>type=profile</code>）；若列表里没有与正文语言一致的固定音色，
-          朗读时会自动创建一个「FlowRead 中文音色」并固定使用，不会再拿英文音色读中文。
+          逐句请求结果可能不一致。请选择「固定音色」（<code>type=profile</code>）；若列表中没有与正文语言一致的固定音色，
+          朗读时会自动创建一个「FlowRead 中文音色」并固定使用，避免以英文音色朗读中文。
+        </p>
+      {/if}
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "breeze"}
+        <p class="tip">
+          Breeze-TTS-2 使用本地网关中已保存的克隆音色，选择音色后整章保持同一说话人；
+          网关无已保存音色时请先在服务端创建。
         </p>
       {/if}
     {:else if !ttsState.supported}

@@ -1088,9 +1088,222 @@ async fn synthesize_dashscope(
     Err(AiError::protocol("DashScope 响应中未找到音频数据"))
 }
 
+/* ------------------------ 本地 Breeze-TTS-2 网关 ------------------------ */
+
+/// 判定是否走本地 Breeze-TTS-2 HTTP 网关（自建协议，非 OpenAI 兼容）。
+pub fn is_breeze_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "breeze" | "breeze-tts" | "breeze-tts-2" | "breeze_tts" | "breeze_tts_2"
+    )
+}
+
+/// 由网关根地址推导克隆合成端点，兼容 `http://127.0.0.1:7863`、
+/// `http://127.0.0.1:7863/api` 与完整 `.../api/tts/clone` 三种写法。
+pub fn breeze_clone_url(base: &str) -> String {
+    let b = strip_trailing_slash(base);
+    if b.ends_with("/api/tts/clone") {
+        b.to_string()
+    } else if b.ends_with("/api") {
+        format!("{b}/tts/clone")
+    } else {
+        format!("{b}/api/tts/clone")
+    }
+}
+
+/// 由网关根地址推导音色列表端点。
+pub fn breeze_voices_url(base: &str) -> String {
+    let b = strip_trailing_slash(base);
+    if b.ends_with("/api/voices") {
+        b.to_string()
+    } else if b.ends_with("/api") {
+        format!("{b}/voices")
+    } else {
+        format!("{b}/api/voices")
+    }
+}
+
+/// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
+/// 整章逐句合成时避免重复拉取同一音色的参考音频。
+fn breeze_voice_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 按正文判定合成语种：含汉字取 Chinese，否则 English（网关仅支持这两种）。
+fn detect_tts_language(text: &str) -> &'static str {
+    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        "Chinese"
+    } else {
+        "English"
+    }
+}
+
+/// 读取指定音色的参考音频（Base64）与参考文本；voice 为空时取列表首个音色。
+/// 结果写入进程内缓存，供后续逐句合成复用。
+async fn fetch_breeze_voice(
+    http: &reqwest::Client,
+    base: &str,
+    voice: &str,
+) -> Result<(String, String), AiError> {
+    let key = format!("{}\u{1f}{}", strip_trailing_slash(base), voice.trim());
+    if let Ok(cache) = breeze_voice_cache().lock() {
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let resp = http
+        .get(breeze_voices_url(base))
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let arr = v
+        .get("voices")
+        .and_then(|x| x.as_array())
+        .or_else(|| v.get("data").and_then(|x| x.as_array()))
+        .unwrap_or(&empty);
+    let want = voice.trim();
+    let picked = if want.is_empty() {
+        arr.first()
+    } else {
+        arr.iter()
+            .find(|it| {
+                it.get("id")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s == want)
+                    .unwrap_or(false)
+            })
+            .or_else(|| arr.first())
+    };
+    let Some(item) = picked else {
+        return Err(AiError::config("该服务未保存音色，请先在服务端创建克隆音色"));
+    };
+    let id = item
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(AiError::protocol("音色缺少 id，无法合成"));
+    }
+    let reference_text = item
+        .get("reference_text")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let audio_url = format!("{}/{}/audio", breeze_voices_url(base), id);
+    let aref = http
+        .get(&audio_url)
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    if !aref.status().is_success() {
+        return Err(AiError::http(aref.status().as_u16(), "读取音色参考音频失败"));
+    }
+    let bytes = aref.bytes().await.map_err(|e| classify_req(&e))?;
+    if bytes.is_empty() {
+        return Err(AiError::protocol("音色参考音频为空"));
+    }
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let pair = (b64, reference_text);
+    if let Ok(mut cache) = breeze_voice_cache().lock() {
+        cache.insert(key, pair.clone());
+    }
+    Ok(pair)
+}
+
+/// 判定模型名是否属于 Breeze 系列（用于决定是否下发 model 字段）。
+/// 网关仅内置一个模型，填其它协议遗留的模型名会导致 500，故非 Breeze 模型一律省略。
+fn is_breeze_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "" | "breeze" | "breeze-tts" | "breeze-tts-2" | "breeze_tts" | "breeze_tts_2"
+            | "q8" | "q8_0" | "q4" | "q4_k" | "base" | "instruct"
+    )
+}
+
+/// 调用本地 Breeze-TTS-2 网关的克隆合成接口，返回音频字节（WAV）。
+async fn synthesize_breeze(
+    http: reqwest::Client,
+    cfg: &AiConfig,
+    base: &str,
+    voice: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    let (voice_ref_b64, reference_text) = fetch_breeze_voice(&http, base, voice).await?;
+    let mut body = json!({
+        "model": "breeze-tts-2",
+        "text": text,
+        "voice_ref_b64": voice_ref_b64,
+        "reference_text": reference_text,
+        "language": detect_tts_language(text),
+        "do_split": true,
+    });
+    // 省略非 Breeze 模型名，交由网关使用其内置模型，避免 500。
+    if !is_breeze_model(cfg.model.trim()) {
+        body.as_object_mut().map(|o| o.remove("model"));
+    }
+    let resp = http
+        .post(breeze_clone_url(base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    if ctype.contains("application/json") {
+        // 兼容以 JSON 携带 Base64 音频的实现。
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let data = v
+                .get("audio")
+                .and_then(|a| a.as_str().or_else(|| a.get("data").and_then(|d| d.as_str())));
+            if let Some(data) = data {
+                if !data.is_empty() {
+                    use base64::Engine as _;
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+                    if !raw.is_empty() {
+                        return Ok(raw);
+                    }
+                }
+            }
+        }
+        return Err(AiError::protocol("网关返回 JSON 但未包含音频数据"));
+    }
+    if bytes.is_empty() {
+        return Err(AiError::protocol("语音接口返回空音频"));
+    }
+    Ok(bytes.to_vec())
+}
+
 /// 调用在线语音合成接口，返回音频字节（如 mp3/wav）。
-/// 支持 OpenAI 兼容 / Azure OpenAI 的 `/audio/speech`，以及
-/// 阿里云百炼 DashScope 的通义千问 Qwen-TTS 多模态端点。
+/// 支持 OpenAI 兼容 / Azure OpenAI 的 `/audio/speech`、
+/// 阿里云百炼 DashScope 的通义千问 Qwen-TTS，以及本地 Breeze-TTS-2 网关。
 pub async fn synthesize(
     http: reqwest::Client,
     cfg: AiConfig,
@@ -1102,6 +1315,10 @@ pub async fn synthesize(
     let base = strip_trailing_slash(&cfg.base_url);
     if base.is_empty() {
         return Err(AiError::config("未配置语音端点地址"));
+    }
+    // Breeze-TTS-2 为本地自建协议（先取音色参考音频再克隆合成），单独处理。
+    if is_breeze_provider(&cfg.provider) {
+        return synthesize_breeze(http, &cfg, base, voice, text).await;
     }
     // DashScope 协议与 OpenAI 不同（JSON 回包 + 二次下载），单独处理。
     if p == Provider::DashScope {
@@ -1203,6 +1420,45 @@ mod tests {
         assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com/"), full);
         assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com/api/v1"), full);
         assert_eq!(dashscope_tts_url(full), full);
+    }
+
+    #[test]
+    fn breeze_provider_and_urls() {
+        assert!(is_breeze_provider("breeze"));
+        assert!(is_breeze_provider("Breeze-TTS-2"));
+        assert!(is_breeze_provider("breeze_tts"));
+        assert!(!is_breeze_provider("openai"));
+        assert!(!is_breeze_provider("dashscope"));
+
+        assert_eq!(
+            breeze_clone_url("http://127.0.0.1:7863"),
+            "http://127.0.0.1:7863/api/tts/clone"
+        );
+        assert_eq!(
+            breeze_clone_url("http://127.0.0.1:7863/"),
+            "http://127.0.0.1:7863/api/tts/clone"
+        );
+        assert_eq!(
+            breeze_clone_url("http://127.0.0.1:7863/api"),
+            "http://127.0.0.1:7863/api/tts/clone"
+        );
+        assert_eq!(
+            breeze_voices_url("http://127.0.0.1:7863"),
+            "http://127.0.0.1:7863/api/voices"
+        );
+        assert_eq!(
+            breeze_voices_url("http://127.0.0.1:7863/api"),
+            "http://127.0.0.1:7863/api/voices"
+        );
+
+        assert_eq!(detect_tts_language("你好，世界"), "Chinese");
+        assert_eq!(detect_tts_language("hello world"), "English");
+
+        assert!(is_breeze_model("breeze-tts-2"));
+        assert!(is_breeze_model("Breeze"));
+        assert!(is_breeze_model(""));
+        assert!(!is_breeze_model("omnivoice"));
+        assert!(!is_breeze_model("tts-1"));
     }
 
     #[test]

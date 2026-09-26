@@ -71,9 +71,8 @@ export function segIndexAt(segs: FlatSegment[], offset: number): number {
 
 const supported = typeof window !== "undefined" && "speechSynthesis" in window;
 
-/** 在线语音服务返回的音色。`type==="profile"` 是服务端保存的固定克隆音色，
- *  用它朗读可保证整章音色一致；OpenAI 别名会映射到服务端默认音色，对克隆引擎
- *  可能每句都换人（VoiceStudio/OmniVoice 即如此）。 */
+/** 在线语音服务返回的音色。`type==="profile"` 表示服务端保存的固定克隆音色，
+ *  使用该音色可保证整章说话人一致。 */
 export interface OnlineVoice {
   id: string;
   name: string;
@@ -183,8 +182,8 @@ function speakSystem(seg: FlatSegment, i: number, g: number) {
 
 /* ---------------- 在线语音 ---------------- */
 
-/** OpenAI 标准别名：VoiceStudio 等克隆引擎会把它映射到「服务端默认音色」，
- *  该默认音色没有固定说话人，逐句请求可能换成不同的人。 */
+/** OpenAI 标准音色别名：部分克隆服务会将其映射到服务端默认音色，
+ *  该默认音色无固定说话人，逐句请求结果可能不一致。 */
 const OPENAI_VOICE_ALIASES = new Set([
   "alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "sage",
 ]);
@@ -243,7 +242,12 @@ function resolveEndpoint(): TtsEndpoint | null {
     const base = (config.tts.customBaseUrl || "").trim();
     if (!base) return null;
     const provider = (config.tts.customProvider || "openai").trim() || "openai";
-    const defaultModel = provider === "dashscope" ? "qwen3-tts-flash" : "tts-1";
+    const defaultModel =
+      provider === "dashscope"
+        ? "qwen3-tts-flash"
+        : provider === "breeze"
+          ? "breeze-tts-2"
+          : "tts-1";
     return {
       provider,
       baseUrl: base,
@@ -276,12 +280,25 @@ function resolveEndpoint(): TtsEndpoint | null {
   };
 }
 
-/** 自定义源且走 OpenAI 兼容协议（VoiceStudio/VoxCPM 等）；DashScope 无 /v1/audio/voices，排除之。 */
-function isCustomOpenAiLike(): boolean {
+/** 自定义源是否为 Breeze-TTS-2 本地网关（自建协议，音色即服务端克隆音色）。 */
+function isBreeze(): boolean {
   return (
     config.tts.onlineSource === "custom" &&
-    (config.tts.customProvider || "openai") !== "dashscope"
+    (config.tts.customProvider || "").trim().toLowerCase() === "breeze"
   );
+}
+
+/** 自定义源且由服务端提供音色列表（OpenAI 兼容或 Breeze；DashScope 无音色列表接口）。 */
+function isCustomVoiceService(): boolean {
+  return (
+    config.tts.onlineSource === "custom" &&
+    (config.tts.customProvider || "openai").trim() !== "dashscope"
+  );
+}
+
+/** 支持服务端创建固定音色的协议（VoiceStudio 等）；Breeze 直接使用网关已保存的音色。 */
+function isCustomOpenAiLike(): boolean {
+  return isCustomVoiceService() && !isBreeze();
 }
 
 function cacheKey(text: string): string {
@@ -498,8 +515,8 @@ function failOnline(err: unknown) {
 
 async function playOnline(seg: FlatSegment, i: number, g: number) {
   ttsState.buffering = true;
-  // 首次在线朗读前：读取音色列表，并确保用「同语言的固定音色」，避免逐句换人。
-  if (isCustomOpenAiLike()) {
+  // 首次在线朗读前读取音色列表；需要固定音色的服务在此补齐同语言音色。
+  if (isCustomVoiceService()) {
     await ensureOnlineVoices();
     if (g !== gen) return;
     await ensureFixedVoice();
@@ -641,14 +658,14 @@ export function refreshVoices() {
 }
 
 /**
- * 从自定义在线 TTS 服务的 /v1/voices 读取可用音色。
- * 返回列表（失败返回空数组），并写入 ttsState.onlineVoices 供播放条使用。
+ * 从自定义在线 TTS 服务读取可用音色（OpenAI 兼容走 /v1/audio/voices，
+ * Breeze-TTS-2 走 /api/voices）。失败返回空数组并静默。
  */
 let voiceListPromise: Promise<OnlineVoice[]> | null = null;
 
-/** 确保在线自定义服务的音色列表已加载（失败静默；朗读时会退回别名）。 */
+/** 确保在线自定义服务的音色列表已加载（失败静默）。 */
 async function ensureOnlineVoices(): Promise<void> {
-  if (!isCustomOpenAiLike()) return;
+  if (!isCustomVoiceService()) return;
   if (ttsState.onlineVoices.length) return;
   if (!voiceListPromise) {
     voiceListPromise = refreshOnlineVoices().finally(() => {
@@ -685,11 +702,11 @@ const DESIGNABLE_LANGS = new Set(["Chinese", "English"]);
 let fixedVoicePromise: Promise<boolean> | null = null;
 
 /**
- * 朗读前确保有一个「与正文同语言」的固定音色：
- *  - 已是固定音色 → 直接使用；
- *  - 已有同语言固定音色 → 选用；
- *  - VoiceStudio 风格服务且无同语言固定音色 → 现场创建 design profile（固定说话人）。
- * 绝不回退到不同语言的音色（这正是之前「英文音色读中文」的原因）。
+ * 朗读前确保存在与正文同语言的固定音色：
+ *  - 当前已是固定音色 → 直接使用；
+ *  - 列表中存在同语言固定音色 → 选用；
+ *  - VoiceStudio 风格服务且缺少同语言固定音色 → 现场创建 design profile。
+ * 不匹配语言时保持现状，避免以英文音色朗读中文。
  */
 async function ensureFixedVoice(): Promise<boolean> {
   if (!isCustomOpenAiLike()) return false;
@@ -737,7 +754,7 @@ async function ensureFixedVoice(): Promise<boolean> {
 }
 
 export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
-  if (!isCustomOpenAiLike()) {
+  if (!isCustomVoiceService()) {
     ttsState.onlineVoices = [];
     return [];
   }
@@ -748,7 +765,11 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
   }
   ttsState.onlineVoiceLoading = true;
   try {
-    const list = await api.ttsVoices(base, config.tts.customApiKey || "");
+    const list = await api.ttsVoices(
+      base,
+      config.tts.customApiKey || "",
+      config.tts.customProvider || "openai",
+    );
     ttsState.onlineVoices = list;
     selectFixedVoice(list);
     return list;
@@ -769,8 +790,7 @@ if (supported) {
   }
 }
 
-// 在线自定义服务：启动即读取音色列表，并在存在「同语言固定音色」时自动选用。
-// 若没有同语言固定音色，会在真正开始朗读时为该语言创建/选用固定音色（见 ensureFixedVoice）。
-if (config.tts.engine === "online" && isCustomOpenAiLike()) {
+// 在线自定义服务：启动即读取音色列表；缺少同语言固定音色时在开始朗读时补建（见 ensureFixedVoice）。
+if (config.tts.engine === "online" && isCustomVoiceService()) {
   void refreshOnlineVoices();
 }

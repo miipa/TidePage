@@ -2906,13 +2906,22 @@ pub struct TtsVoiceInfo {
     pub language: String,
 }
 
-/// 读取自定义 TTS 服务提供的音色列表：GET {base}/v1/audio/voices（兼容 /v1/voices）。
+/// 读取自定义 TTS 服务提供的音色列表。
+/// OpenAI 兼容服务：GET {base}/v1/audio/voices（兼容 /v1/voices）；
+/// Breeze-TTS-2 本地网关：GET {base}/api/voices。
 /// 返回每个音色的 id/名称/类型/语言，供前端区分「固定音色」与「别名」。
 #[tauri::command]
-pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<TtsVoiceInfo>, String> {
+pub async fn tts_voices(
+    base_url: String,
+    api_key: String,
+    provider: Option<String>,
+) -> Result<Vec<TtsVoiceInfo>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("未填写服务地址".into());
+    }
+    if crate::ai::is_breeze_provider(provider.as_deref().unwrap_or("")) {
+        return list_breeze_voices(base, &api_key).await;
     }
     let root = base.strip_suffix("/v1").unwrap_or(base);
     // 兼容常见写法：VoiceStudio 用 /v1/audio/voices，其它服务用 /v1/voices
@@ -2993,6 +3002,63 @@ pub async fn tts_voices(base_url: String, api_key: String) -> Result<Vec<TtsVoic
         last_err = "服务未返回音色列表".into();
     }
     Err(last_err)
+}
+
+/// 读取 Breeze-TTS-2 本地网关中保存的克隆音色。网关返回
+/// `{"voices":[{"id","name","reference_text",...}]}`，全部视为固定音色。
+async fn list_breeze_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInfo>, String> {
+    let client = crate::ai::build_client("auto", "")?;
+    let mut req = client.get(crate::ai::breeze_voices_url(base));
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    let resp = req.send().await.map_err(|e| format!("请求失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let arr = v
+        .get("voices")
+        .and_then(|x| x.as_array())
+        .or_else(|| v.get("data").and_then(|x| x.as_array()))
+        .unwrap_or(&empty);
+    let mut out: Vec<TtsVoiceInfo> = Vec::new();
+    for it in arr {
+        let id = it.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+        if id.is_empty() || out.iter().any(|x| x.id == id) {
+            continue;
+        }
+        let name = it
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(id)
+            .to_string();
+        let reference = it
+            .get("reference_text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let language = if reference
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+        {
+            "Chinese"
+        } else if reference.chars().any(|c| c.is_ascii_alphabetic()) {
+            "English"
+        } else {
+            ""
+        };
+        out.push(TtsVoiceInfo {
+            id: id.to_string(),
+            name,
+            kind: "profile".to_string(),
+            language: language.to_string(),
+        });
+    }
+    if out.is_empty() {
+        return Err("服务未返回音色列表".into());
+    }
+    Ok(out)
 }
 
 #[derive(serde::Serialize)]

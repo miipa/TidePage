@@ -522,7 +522,7 @@ export interface TtsConfig {
   engine: TtsEngine;
   /** 在线语音来源：profile=复用 AI 端点；custom=自定义本地/远程 TTS 服务地址 */
   onlineSource: "profile" | "custom";
-  /** 自定义 TTS 服务的接口协议：openai=OpenAI 兼容 /v1/audio/speech；dashscope=通义千问 Qwen-TTS */
+  /** 自定义 TTS 服务的接口协议：openai=OpenAI 兼容 /v1/audio/speech；dashscope=通义千问 Qwen-TTS；breeze=本地 Breeze-TTS-2 网关 */
   customProvider: string;
   /** 自定义 TTS 服务地址（OpenAI 兼容 /v1/audio/speech） */
   customBaseUrl: string;

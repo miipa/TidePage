@@ -13,8 +13,8 @@
 
   let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
 
-  // 不再内置 OpenAI 别名预设（alloy/echo/…）：对克隆引擎（VoiceStudio/OmniVoice）无用，
-  // 且没有固定说话人、会逐句换人。音色一律以服务端返回的为准。
+  // 不内置 OpenAI 别名预设（alloy/echo/…）：无固定说话人，不适用于克隆引擎。
+  // 音色一律以服务端返回的列表为准。
   const FALLBACK_ONLINE_VOICES: OnlineVoice[] = [];
 
   let expanded = $state(false);
@@ -27,7 +27,7 @@
     ttsState.onlineVoices.length ? ttsState.onlineVoices : FALLBACK_ONLINE_VOICES
   );
   const onlineVoiceProfiles = $derived(onlineVoices.filter((v) => v.type === "profile"));
-  // 隐藏 OpenAI 别名（无固定说话人，逐句换人），只保留服务端的真实固定音色/预设。
+  // 隐藏 OpenAI 别名，仅保留服务端的固定音色与预设。
   const onlineVoiceOthers = $derived(
     onlineVoices.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
