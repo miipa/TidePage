@@ -1630,13 +1630,6 @@
           {/if}
         </div>
       </div>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "breeze"}
-        <div class="field">
-          <label>随机种子</label>
-          <input type="number" bind:value={config.tts.breezeSeed} onchange={saveConfig} placeholder="3721" title="固定种子可保证整章听感一致，更改可获得不同语气与节奏" />
-          <p class="tip">使用网关默认音色朗读时的随机种子。音色选「默认」时生效；固定值可保证整章听感一致。</p>
-        </div>
-      {/if}
       {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "openai"}
         <div class="field">
           <label>参考音频路径</label>
@@ -1673,8 +1666,8 @@
       {/if}
       {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "breeze"}
         <p class="tip">
-          音色选「默认」时使用网关默认音色（<code>/api?text=&amp;seed=</code>，与开源阅读一致）；
-          选择具体音色时使用网关中已保存的克隆音色，整章保持同一说话人。网关无已保存音色时请先在服务端创建。
+          Breeze-TTS-2 使用本地网关中已保存的克隆音色，选择音色后整章保持同一说话人；
+          网关无已保存音色时请先在服务端创建。
         </p>
       {/if}
     {:else if !ttsState.supported}

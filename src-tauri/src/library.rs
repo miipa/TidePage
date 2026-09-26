@@ -2877,7 +2877,6 @@ pub async fn tts_synth(
     voice: String,
     format: String,
     text: String,
-    seed: Option<i64>,
 ) -> Result<String, crate::ai::AiError> {
     let cfg = crate::ai::AiConfig {
         provider,
@@ -2889,7 +2888,7 @@ pub async fn tts_synth(
     };
     let http = crate::ai::build_client(proxy_mode.as_deref().unwrap_or("auto"), proxy_url.as_deref().unwrap_or(""))
         .map_err(crate::ai::AiError::config)?;
-    let bytes = crate::ai::synthesize(http, cfg, &voice, &format, &text, seed.unwrap_or(3721)).await?;
+    let bytes = crate::ai::synthesize(http, cfg, &voice, &format, &text).await?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
