@@ -90,6 +90,8 @@ export const ttsState = $state({
   /** 在线语音：从服务 /v1/voices 读取到的音色列表 */
   onlineVoices: [] as OnlineVoice[],
   onlineVoiceLoading: false,
+  /** 在线语音：最近一次读取音色列表的错误（空=无错误） */
+  onlineVoiceError: "",
   /** 在线语音：当前句音频尚未就绪（缓冲中） */
   buffering: false,
 });
@@ -771,9 +773,11 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
       config.tts.customProvider || "openai",
     );
     ttsState.onlineVoices = list;
+    ttsState.onlineVoiceError = list.length ? "" : "服务未返回音色列表";
     selectFixedVoice(list);
     return list;
-  } catch {
+  } catch (e) {
+    ttsState.onlineVoiceError = e instanceof Error ? e.message : String(e);
     ttsState.onlineVoices = [];
     return [];
   } finally {

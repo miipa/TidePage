@@ -345,26 +345,32 @@
       // 列表同时写入 ttsState.onlineVoices，供阅读界面播放条复用。
       ttsVoiceList = await refreshOnlineVoices();
       const nProfile = ttsVoiceList.filter((v) => v.type === "profile").length;
-      const endpointHint =
-        config.tts.customProvider === "breeze"
-          ? "网关未返回音色，请先在服务端创建克隆音色"
-          : "服务未返回音色列表，需支持 /v1/audio/voices 或 /v1/voices";
-      ttsVoiceMsg = ttsVoiceList.length
-        ? `共 ${ttsVoiceList.length} 个音色，其中固定音色 ${nProfile} 个；固定音色可保证整章说话人一致`
-        : endpointHint;
+      if (ttsVoiceList.length) {
+        ttsVoiceMsg = `共 ${ttsVoiceList.length} 个音色，其中固定音色 ${nProfile} 个；固定音色可保证整章说话人一致`;
+      } else {
+        const err = ttsState.onlineVoiceError || "服务未返回音色列表";
+        const hint =
+          config.tts.customProvider !== "breeze" && /404|未找到|未返回/.test(err)
+            ? "；若为 Breeze-TTS-2 网关，请将「接口协议」改为 Breeze-TTS-2 本地网关"
+            : "";
+        ttsVoiceMsg = `读取音色失败：${err}${hint}`;
+      }
       if (ttsVoiceList.length && !config.tts.onlineVoice) {
         config.tts.onlineVoice = ttsVoiceList[0].id;
         saveConfig();
       }
-    } catch (e) {
-      ttsVoiceMsg = `读取失败：${e}`;
     } finally {
       ttsVoiceLoading = false;
     }
   }
 
   $effect(() => {
-    if (tab === "tts") loadTtsVoices();
+    if (tab !== "tts") return;
+    // 依赖协议与地址：切换后自动重新读取音色。
+    void config.tts.onlineSource;
+    void config.tts.customProvider;
+    void config.tts.customBaseUrl;
+    loadTtsVoices();
   });
 
   $effect(() => {
@@ -1630,13 +1636,6 @@
           {/if}
         </div>
       </div>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "openai"}
-        <div class="field">
-          <label>参考音频路径</label>
-          <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="D:\VoxCPM\voices\ref_male.wav" title="直接填参考音频 .wav 完整路径，仅部分服务支持；VoiceStudio 请选上方的固定音色" />
-          <p class="tip">直接填 .wav 完整路径，仅部分服务支持；使用 VoiceStudio 等克隆服务时请选上方的固定音色。</p>
-        </div>
-      {/if}
       {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope" && ttsVoiceMsg}
         <p class="tip">{ttsVoiceMsg}</p>
       {/if}
