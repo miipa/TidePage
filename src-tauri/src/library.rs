@@ -3006,59 +3006,80 @@ pub async fn tts_voices(
 
 /// 读取 Breeze-TTS-2 本地网关中保存的克隆音色。网关返回
 /// `{"voices":[{"id","name","reference_text",...}]}`，全部视为固定音色。
+/// 依次尝试候选网关根地址（配置地址 + 7863 回退，修正误填上游 8080 端口）；
+/// 本机 / 局域网服务一律直连（绕过系统代理）。
 async fn list_breeze_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInfo>, String> {
-    let client = crate::ai::build_client("auto", "")?;
-    let mut req = client.get(crate::ai::breeze_voices_url(base));
-    if !api_key.trim().is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
-    }
-    let resp = req.send().await.map_err(|e| format!("请求失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let empty: Vec<serde_json::Value> = Vec::new();
-    let arr = v
-        .get("voices")
-        .and_then(|x| x.as_array())
-        .or_else(|| v.get("data").and_then(|x| x.as_array()))
-        .unwrap_or(&empty);
-    let mut out: Vec<TtsVoiceInfo> = Vec::new();
-    for it in arr {
-        let id = it.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
-        if id.is_empty() || out.iter().any(|x| x.id == id) {
+    let client = crate::ai::breeze_client().map_err(|e| e.message)?;
+    let candidates = crate::ai::breeze_root_candidates(base);
+    let mut last_err = String::from("服务未返回音色列表");
+    for root in &candidates {
+        let voices_url = format!("{root}/api/voices");
+        let mut req = client.get(&voices_url);
+        if !api_key.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("请求失败：{e}");
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = format!("HTTP {}", resp.status());
             continue;
         }
-        let name = it
-            .get("name")
-            .and_then(|x| x.as_str())
-            .unwrap_or(id)
-            .to_string();
-        let reference = it
-            .get("reference_text")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        let language = if reference
-            .chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-        {
-            "Chinese"
-        } else if reference.chars().any(|c| c.is_ascii_alphabetic()) {
-            "English"
-        } else {
-            ""
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
         };
-        out.push(TtsVoiceInfo {
-            id: id.to_string(),
-            name,
-            kind: "profile".to_string(),
-            language: language.to_string(),
-        });
+        let empty: Vec<serde_json::Value> = Vec::new();
+        let arr = v
+            .get("voices")
+            .and_then(|x| x.as_array())
+            .or_else(|| v.get("data").and_then(|x| x.as_array()))
+            .unwrap_or(&empty);
+        let mut out: Vec<TtsVoiceInfo> = Vec::new();
+        for it in arr {
+            let id = it.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if id.is_empty() || out.iter().any(|x| x.id == id) {
+                continue;
+            }
+            let name = it
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or(id)
+                .to_string();
+            let reference = it
+                .get("reference_text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let language = if reference
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+            {
+                "Chinese"
+            } else if reference.chars().any(|c| c.is_ascii_alphabetic()) {
+                "English"
+            } else {
+                ""
+            };
+            out.push(TtsVoiceInfo {
+                id: id.to_string(),
+                name,
+                kind: "profile".to_string(),
+                language: language.to_string(),
+            });
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        last_err = "服务未返回音色列表".into();
     }
-    if out.is_empty() {
-        return Err("服务未返回音色列表".into());
-    }
-    Ok(out)
+    Err(last_err)
 }
 
 #[derive(serde::Serialize)]

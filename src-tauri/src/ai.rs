@@ -1124,6 +1124,53 @@ pub fn breeze_voices_url(base: &str) -> String {
     format!("{}/api/voices", breeze_root(base))
 }
 
+/// Breeze 网关标准监听端口（app.py 启动 uvicorn 的默认端口）。
+/// 上游 C++ 推理服务 audiocpp_server 监听 8080，仅供网关内部调用，不提供
+/// /api/voices、/api/tts/clone 等对外接口；用户常误把 8080 当成网关地址。
+const BREEZE_GATEWAY_PORT: &str = "7863";
+
+/// 把根地址的端口替换为网关标准端口 7863；已是 7863 或无法解析则返回 None。
+/// 仅做纯字符串解析（scheme://authority[/...]，authority=host[:port]），
+/// 不引入 url 依赖；IPv6 字面量（含 `[`）不处理。
+fn swap_to_gateway_port(root: &str) -> Option<String> {
+    let (scheme, rest) = root.split_once("://")?;
+    // authority 到首个 '/' 为止（breeze_root 已去尾部路径，通常无 '/'）。
+    let (authority, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if authority.contains('[') {
+        return None; // IPv6，保守不处理
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => (authority, ""), // 无端口：http 默认 80，仍追加 7863 候选
+    };
+    if host.is_empty() || port == BREEZE_GATEWAY_PORT {
+        return None;
+    }
+    Some(format!("{scheme}://{host}:{BREEZE_GATEWAY_PORT}{tail}"))
+}
+
+/// 返回按优先级排列的候选网关根地址：先用用户配置的地址，若其端口不是网关
+/// 标准端口，再追加「同主机 + 7863」作为回退（修正误填上游 8080 端口等情况）。
+pub fn breeze_root_candidates(base: &str) -> Vec<String> {
+    let root = breeze_root(base);
+    let mut out = vec![root.clone()];
+    if let Some(alt) = swap_to_gateway_port(&root) {
+        if !out.contains(&alt) {
+            out.push(alt);
+        }
+    }
+    out
+}
+
+/// Breeze 网关为本机 / 局域网服务，请求一律直连（绕过系统代理）。
+/// 否则 192.168.x.x 等局域网地址会被系统代理拦截而连不通。
+pub fn breeze_client() -> Result<reqwest::Client, AiError> {
+    build_client("direct", "").map_err(AiError::config)
+}
+
 /// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
 /// 整章逐句合成时避免重复拉取同一音色的参考音频。
 fn breeze_voice_cache(
@@ -1144,20 +1191,22 @@ fn detect_tts_language(text: &str) -> &'static str {
 }
 
 /// 读取指定音色的参考音频（Base64）与参考文本；voice 为空时取列表首个音色。
+/// `root` 为已归一化（无 /api、/v1 等后缀）的网关根地址。
 /// 结果写入进程内缓存，供后续逐句合成复用。
-async fn fetch_breeze_voice(
+async fn fetch_breeze_voice_at(
     http: &reqwest::Client,
-    base: &str,
+    root: &str,
     voice: &str,
 ) -> Result<(String, String), AiError> {
-    let key = format!("{}\u{1f}{}", strip_trailing_slash(base), voice.trim());
+    let key = format!("{}\u{1f}{}", root, voice.trim());
     if let Ok(cache) = breeze_voice_cache().lock() {
         if let Some(hit) = cache.get(&key) {
             return Ok(hit.clone());
         }
     }
+    let voices_url = format!("{root}/api/voices");
     let resp = http
-        .get(breeze_voices_url(base))
+        .get(&voices_url)
         .send()
         .await
         .map_err(|e| classify_req(&e))?;
@@ -1204,7 +1253,7 @@ async fn fetch_breeze_voice(
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let audio_url = format!("{}/{}/audio", breeze_voices_url(base), id);
+    let audio_url = format!("{root}/api/voices/{id}/audio");
     let aref = http
         .get(&audio_url)
         .send()
@@ -1237,6 +1286,7 @@ fn is_breeze_model(model: &str) -> bool {
 }
 
 /// 调用本地 Breeze-TTS-2 网关的克隆合成接口，返回音频字节（WAV）。
+/// 依次尝试候选网关根地址（配置地址 + 7863 回退），首个能取到音色的根即用于克隆。
 async fn synthesize_breeze(
     http: reqwest::Client,
     cfg: &AiConfig,
@@ -1244,62 +1294,79 @@ async fn synthesize_breeze(
     voice: &str,
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
-    let (voice_ref_b64, reference_text) = fetch_breeze_voice(&http, base, voice).await?;
-    let mut body = json!({
-        "model": "breeze-tts-2",
-        "text": text,
-        "voice_ref_b64": voice_ref_b64,
-        "reference_text": reference_text,
-        "language": detect_tts_language(text),
-        "do_split": true,
-    });
-    // 省略非 Breeze 模型名，交由网关使用其内置模型，避免 500。
-    if !is_breeze_model(cfg.model.trim()) {
-        body.as_object_mut().map(|o| o.remove("model"));
-    }
-    let resp = http
-        .post(breeze_clone_url(base))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| classify_req(&e))?;
-    let status = resp.status();
-    let ctype = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        let brief: String = msg.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
-    }
-    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
-    if ctype.contains("application/json") {
-        // 兼容以 JSON 携带 Base64 音频的实现。
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let data = v
-                .get("audio")
-                .and_then(|a| a.as_str().or_else(|| a.get("data").and_then(|d| d.as_str())));
-            if let Some(data) = data {
-                if !data.is_empty() {
-                    use base64::Engine as _;
-                    let raw = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
-                    if !raw.is_empty() {
-                        return Ok(raw);
+    let candidates = breeze_root_candidates(base);
+    let mut last_err: Option<AiError> = None;
+    for root in &candidates {
+        let (voice_ref_b64, reference_text) =
+            match fetch_breeze_voice_at(&http, root, voice).await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+        let mut body = json!({
+            "model": "breeze-tts-2",
+            "text": text,
+            "voice_ref_b64": voice_ref_b64,
+            "reference_text": reference_text,
+            "language": detect_tts_language(text),
+            "do_split": true,
+        });
+        // 省略非 Breeze 模型名，交由网关使用其内置模型，避免 500。
+        if !is_breeze_model(cfg.model.trim()) {
+            body.as_object_mut().map(|o| o.remove("model"));
+        }
+        let clone_url = format!("{root}/api/tts/clone");
+        let resp = match http.post(&clone_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(classify_req(&e));
+                continue;
+            }
+        };
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !status.is_success() {
+            let msg = resp.text().await.unwrap_or_default();
+            let brief: String = msg.chars().take(300).collect();
+            last_err = Some(AiError::http(status.as_u16(), brief));
+            continue;
+        }
+        let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+        if ctype.contains("application/json") {
+            // 兼容以 JSON 携带 Base64 音频的实现。
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let data = v
+                    .get("audio")
+                    .and_then(|a| a.as_str().or_else(|| a.get("data").and_then(|d| d.as_str())));
+                if let Some(data) = data {
+                    if !data.is_empty() {
+                        use base64::Engine as _;
+                        let raw = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+                        if !raw.is_empty() {
+                            return Ok(raw);
+                        }
                     }
                 }
             }
+            last_err = Some(AiError::protocol("网关返回 JSON 但未包含音频数据"));
+            continue;
         }
-        return Err(AiError::protocol("网关返回 JSON 但未包含音频数据"));
+        if bytes.is_empty() {
+            last_err = Some(AiError::protocol("语音接口返回空音频"));
+            continue;
+        }
+        return Ok(bytes.to_vec());
     }
-    if bytes.is_empty() {
-        return Err(AiError::protocol("语音接口返回空音频"));
-    }
-    Ok(bytes.to_vec())
+    Err(last_err.unwrap_or_else(|| AiError::config("未配置 Breeze 网关地址")))
 }
 
 /// 调用在线语音合成接口，返回音频字节（如 mp3/wav）。
@@ -1318,8 +1385,10 @@ pub async fn synthesize(
         return Err(AiError::config("未配置语音端点地址"));
     }
     // Breeze-TTS-2 为本地自建协议（先取音色参考音频再克隆合成），单独处理。
+    // 本机 / 局域网服务一律直连，避免系统代理拦截局域网地址。
     if is_breeze_provider(&cfg.provider) {
-        return synthesize_breeze(http, &cfg, base, voice, text).await;
+        let local = breeze_client().unwrap_or(http);
+        return synthesize_breeze(local, &cfg, base, voice, text).await;
     }
     // DashScope 协议与 OpenAI 不同（JSON 回包 + 二次下载），单独处理。
     if p == Provider::DashScope {
@@ -1480,6 +1549,49 @@ mod tests {
         assert!(is_breeze_model(""));
         assert!(!is_breeze_model("omnivoice"));
         assert!(!is_breeze_model("tts-1"));
+    }
+
+    #[test]
+    fn breeze_gateway_port_fallback() {
+        // 端口就是网关端口：无回退候选。
+        assert_eq!(swap_to_gateway_port("http://127.0.0.1:7863"), None);
+        // 误填上游 8080：回退到同主机 7863。
+        assert_eq!(
+            swap_to_gateway_port("http://127.0.0.1:8080"),
+            Some("http://127.0.0.1:7863".to_string())
+        );
+        // 局域网地址同样回退。
+        assert_eq!(
+            swap_to_gateway_port("http://192.168.1.20:8080"),
+            Some("http://192.168.1.20:7863".to_string())
+        );
+        // 无端口：追加 7863 候选（http 默认 80 视为非网关端口）。
+        assert_eq!(
+            swap_to_gateway_port("http://127.0.0.1"),
+            Some("http://127.0.0.1:7863".to_string())
+        );
+        // IPv6 字面量：保守不处理。
+        assert_eq!(swap_to_gateway_port("http://[::1]:8080"), None);
+
+        // 候选列表：配置地址在前，7863 回退在后；含 /v1、/api 等后缀先归一化。
+        assert_eq!(
+            breeze_root_candidates("http://127.0.0.1:8080/v1"),
+            vec![
+                "http://127.0.0.1:8080".to_string(),
+                "http://127.0.0.1:7863".to_string()
+            ]
+        );
+        assert_eq!(
+            breeze_root_candidates("http://127.0.0.1:7863/api/voices"),
+            vec!["http://127.0.0.1:7863".to_string()]
+        );
+        assert_eq!(
+            breeze_root_candidates("http://192.168.1.20:8080"),
+            vec![
+                "http://192.168.1.20:8080".to_string(),
+                "http://192.168.1.20:7863".to_string()
+            ]
+        );
     }
 
     #[test]

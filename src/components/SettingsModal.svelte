@@ -4,6 +4,7 @@
     config,
     saveConfig,
     saveConfigNow,
+    normalizeBreezeBaseUrl,
     THEMES,
     toast,
     ui,
@@ -339,6 +340,14 @@
 
   async function loadTtsVoices() {
     if (config.tts.onlineSource !== "custom") return;
+    // Breeze 网关地址纠偏（上游 8080 → 网关 7863、去 /v1 尾巴），读取前顺手修正。
+    if (config.tts.customProvider === "breeze") {
+      const fixed = normalizeBreezeBaseUrl(config.tts.customBaseUrl);
+      if (fixed !== config.tts.customBaseUrl) {
+        config.tts.customBaseUrl = fixed;
+        saveConfig();
+      }
+    }
     ttsVoiceLoading = true;
     ttsVoiceMsg = "";
     try {
@@ -350,9 +359,11 @@
       } else {
         const err = ttsState.onlineVoiceError || "服务未返回音色列表";
         const hint =
-          config.tts.customProvider !== "breeze" && /404|未找到|未返回/.test(err)
-            ? "；若为 Breeze-TTS-2 网关，请将「接口协议」改为 Breeze-TTS-2 本地网关"
-            : "";
+          config.tts.customProvider === "breeze"
+            ? "；请确认服务地址填的是网关根地址（默认 http://127.0.0.1:7863），而非上游推理端口 8080"
+            : /404|未找到|未返回/.test(err)
+              ? "；若为 Breeze-TTS-2 网关，请将「接口协议」改为 Breeze-TTS-2 本地网关"
+              : "";
         ttsVoiceMsg = `读取音色失败：${err}${hint}`;
       }
       if (ttsVoiceList.length && !config.tts.onlineVoice) {

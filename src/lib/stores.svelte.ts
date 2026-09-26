@@ -1276,6 +1276,38 @@ function migrateAi(savedAi: any): AiConfig {
 
 let reasoningMigrationDirty = false;
 let readerMigrationDirty = false;
+let ttsMigrationDirty = false;
+
+/**
+ * 归一化 Breeze-TTS-2 网关地址：
+ *  - 端口纠偏：上游 C++ 推理服务端口 8080 常被误当成网关地址，网关标准端口为
+ *    7863（对外提供 /api/voices、/api/tts/clone）。仅在端口恰为 8080 时改为 7863。
+ *  - 去掉 OpenAI 风格的 /v1 尾巴（网关用 /api 前缀，/v1 不适用）。
+ * 仅当发生上述纠偏时返回新地址；否则原样返回，避免无谓改写用户输入。
+ */
+export function normalizeBreezeBaseUrl(raw: string): string {
+  const s = (raw || "").trim();
+  if (!s) return s;
+  const withScheme = /:\/\//.test(s) ? s : `http://${s}`;
+  try {
+    const u = new URL(withScheme);
+    let changed = false;
+    if (u.port === "8080") {
+      u.port = "7863";
+      changed = true;
+    }
+    let path = u.pathname.replace(/\/+$/, "");
+    if (path.toLowerCase().endsWith("/v1")) {
+      path = path.slice(0, -3);
+      changed = true;
+    }
+    u.pathname = path;
+    if (!changed) return s;
+    return u.toString().replace(/\/+$/, "");
+  } catch {
+    return s;
+  }
+}
 
 /** 归一化方案库：补齐 id/name，快照用默认配置兜底；空库时注入内置方案。 */
 function normalizeSchemes(list: any): ReaderScheme[] {
@@ -1400,6 +1432,15 @@ function load(): AppConfig {
     }
     // 方案库首次为空时会注入内置方案：需要落盘一次，否则刷新前 localStorage 仍为空。
     if (!Array.isArray(saved.readerSchemes) || !saved.readerSchemes.length) readerMigrationDirty = true;
+    // 迁移：Breeze-TTS-2 网关地址纠偏（上游 8080 端口 → 网关 7863、去 /v1 尾巴），
+    // 修正历史误填导致「读不到音色 / unknown endpoint」。仅在协议为 breeze 时处理。
+    if (merged.tts.customProvider === "breeze") {
+      const fixed = normalizeBreezeBaseUrl(merged.tts.customBaseUrl);
+      if (fixed !== merged.tts.customBaseUrl) {
+        merged.tts.customBaseUrl = fixed;
+        ttsMigrationDirty = true;
+      }
+    }
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -1536,7 +1577,7 @@ export function applyReaderSchemeGlobal(id: string): void {
 
 // 迁移落盘：检测到已废弃的旧键/需迁移的旧值（“关闭思考”、reader 废弃字段与旧默认）时，
 // 启动即把清理后的配置写回 localStorage。延后到模块初始化完成，避免 TDZ。
-if (reasoningMigrationDirty || readerMigrationDirty) setTimeout(saveConfig, 0);
+if (reasoningMigrationDirty || readerMigrationDirty || ttsMigrationDirty) setTimeout(saveConfig, 0);
 
 export function applyConfigJson(json: string) {
   try {
