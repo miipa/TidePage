@@ -242,16 +242,18 @@ function resolveEndpoint(): TtsEndpoint | null {
   if (config.tts.onlineSource === "custom") {
     const base = (config.tts.customBaseUrl || "").trim();
     if (!base) return null;
+    const provider = (config.tts.customProvider || "openai").trim() || "openai";
+    const defaultModel = provider === "dashscope" ? "qwen3-tts-flash" : "tts-1";
     return {
-      provider: "openai",
+      provider,
       baseUrl: base,
       apiKey: config.tts.customApiKey || "",
-      model: config.tts.onlineModel || "tts-1",
+      model: config.tts.onlineModel || defaultModel,
       deployment: "",
       apiVersion: "",
       proxyMode: "auto",
       proxyUrl: "",
-      tag: `custom:${base}`,
+      tag: `custom:${provider}:${base}`,
     };
   }
   const list = config.ai.profiles;
@@ -272,6 +274,14 @@ function resolveEndpoint(): TtsEndpoint | null {
     proxyUrl: p.proxyUrl,
     tag: `profile:${p.id}`,
   };
+}
+
+/** 自定义源且走 OpenAI 兼容协议（VoiceStudio/VoxCPM 等）；DashScope 无 /v1/audio/voices，排除之。 */
+function isCustomOpenAiLike(): boolean {
+  return (
+    config.tts.onlineSource === "custom" &&
+    (config.tts.customProvider || "openai") !== "dashscope"
+  );
 }
 
 function cacheKey(text: string): string {
@@ -489,7 +499,7 @@ function failOnline(err: unknown) {
 async function playOnline(seg: FlatSegment, i: number, g: number) {
   ttsState.buffering = true;
   // 首次在线朗读前：读取音色列表，并确保用「同语言的固定音色」，避免逐句换人。
-  if (config.tts.onlineSource === "custom") {
+  if (isCustomOpenAiLike()) {
     await ensureOnlineVoices();
     if (g !== gen) return;
     await ensureFixedVoice();
@@ -638,7 +648,7 @@ let voiceListPromise: Promise<OnlineVoice[]> | null = null;
 
 /** 确保在线自定义服务的音色列表已加载（失败静默；朗读时会退回别名）。 */
 async function ensureOnlineVoices(): Promise<void> {
-  if (config.tts.onlineSource !== "custom") return;
+  if (!isCustomOpenAiLike()) return;
   if (ttsState.onlineVoices.length) return;
   if (!voiceListPromise) {
     voiceListPromise = refreshOnlineVoices().finally(() => {
@@ -682,7 +692,7 @@ let fixedVoicePromise: Promise<boolean> | null = null;
  * 绝不回退到不同语言的音色（这正是之前「英文音色读中文」的原因）。
  */
 async function ensureFixedVoice(): Promise<boolean> {
-  if (config.tts.onlineSource !== "custom") return false;
+  if (!isCustomOpenAiLike()) return false;
   const cur = (config.tts.onlineVoice || "").trim();
   if (cur && !OPENAI_VOICE_ALIASES.has(cur.toLowerCase())) return true;
   const target = targetLanguageName();
@@ -727,7 +737,7 @@ async function ensureFixedVoice(): Promise<boolean> {
 }
 
 export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
-  if (config.tts.onlineSource !== "custom") {
+  if (!isCustomOpenAiLike()) {
     ttsState.onlineVoices = [];
     return [];
   }
@@ -761,6 +771,6 @@ if (supported) {
 
 // 在线自定义服务：启动即读取音色列表，并在存在「同语言固定音色」时自动选用。
 // 若没有同语言固定音色，会在真正开始朗读时为该语言创建/选用固定音色（见 ensureFixedVoice）。
-if (config.tts.engine === "online" && config.tts.onlineSource === "custom") {
+if (config.tts.engine === "online" && isCustomOpenAiLike()) {
   void refreshOnlineVoices();
 }

@@ -522,6 +522,8 @@ export interface TtsConfig {
   engine: TtsEngine;
   /** 在线语音来源：profile=复用 AI 端点；custom=自定义本地/远程 TTS 服务地址 */
   onlineSource: "profile" | "custom";
+  /** 自定义 TTS 服务的接口协议：openai=OpenAI 兼容 /v1/audio/speech；dashscope=通义千问 Qwen-TTS */
+  customProvider: string;
   /** 自定义 TTS 服务地址（OpenAI 兼容 /v1/audio/speech） */
   customBaseUrl: string;
   /** 自定义 TTS 服务密钥（本地服务可留空） */
@@ -885,6 +887,7 @@ p {
   tts: {
     engine: "online",
     onlineSource: "custom",
+    customProvider: "openai",
     customBaseUrl: "http://127.0.0.1:3900",
     customApiKey: "",
     onlineProfileId: 0,

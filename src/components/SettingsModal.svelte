@@ -1558,14 +1558,25 @@
       </div>
 
       {#if config.tts.onlineSource === "custom"}
+        <div class="field">
+          <label>接口协议</label>
+          <select bind:value={config.tts.customProvider} onchange={saveConfig}>
+            <option value="openai">OpenAI 兼容 (/v1/audio/speech)</option>
+            <option value="dashscope">通义千问 Qwen-TTS (DashScope)</option>
+          </select>
+          <p class="tip">
+            OpenAI 兼容：本地 VoiceStudio/VoxCPM、OpenAI、vLLM-Omni 等；
+            通义千问：阿里云百炼云端 Qwen-TTS，服务地址填 <code>https://dashscope.aliyuncs.com</code>，音色如 <code>Cherry</code>。
+          </p>
+        </div>
         <div class="grid2">
           <div class="field">
             <label>服务地址</label>
-            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder="http://127.0.0.1:8000" title="OpenAI 兼容的 /v1/audio/speech 服务地址" />
+            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "https://dashscope.aliyuncs.com" : "http://127.0.0.1:8000"} title="OpenAI 兼容的 /v1/audio/speech 服务地址；通义千问填 DashScope 根地址" />
           </div>
           <div class="field">
             <label>密钥</label>
-            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder="可留空" title="本地服务可留空" />
+            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "DashScope API Key (sk-...)" : "可留空"} title="本地服务可留空；通义千问必填 DashScope API Key" />
           </div>
         </div>
       {:else}
@@ -1583,11 +1594,11 @@
       <div class="grid2">
         <div class="field">
           <label>语音模型</label>
-          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" title="本地 VoxCPM 可填 voxcpm，OpenAI 用 tts-1" />
+          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder="tts-1" title="本地 VoxCPM 可填 voxcpm，OpenAI 用 tts-1，通义千问用 qwen3-tts-flash" />
         </div>
         <div class="field">
           <label>音色</label>
-          {#if config.tts.onlineSource === "custom"}
+          {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
             <div class="row-inline">
               <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
                 <option value="">默认</option>
@@ -1609,11 +1620,11 @@
               <button onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
             </div>
           {:else}
-            <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="如 tts-1 / 音色名" />
+            <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "如 Cherry / Ethan" : "如 tts-1 / 音色名"} />
           {/if}
         </div>
       </div>
-      {#if config.tts.onlineSource === "custom"}
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
         <div class="field">
           <label>参考音频路径</label>
           <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder="D:\VoxCPM\voices\ref_male.wav" title="直接填参考音频 .wav 完整路径，仅部分服务支持；VoiceStudio 请选上方的固定音色" />
@@ -1632,10 +1643,10 @@
         </select>
       </div>
       <p class="tip">
-        需目标服务提供 OpenAI 兼容的 <code>/v1/audio/speech</code>（OpenAI、Azure OpenAI、vLLM-Omni 的 VoxCPM、GPT-SoVITS 封装等）。
-        某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
+        OpenAI 兼容需目标服务提供 <code>/v1/audio/speech</code>（OpenAI、Azure OpenAI、vLLM-Omni 的 VoxCPM、GPT-SoVITS 封装等）；
+        通义千问走 DashScope 云端 <code>qwen3-tts-flash</code>。某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
       </p>
-      {#if config.tts.onlineSource === "custom"}
+      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
         <p class="tip">
           使用零样本克隆引擎（如 VoiceStudio + OmniVoice）时，OpenAI 别名（alloy/echo/…）没有固定说话人，
           逐句请求会换人。请选择「固定音色」（<code>type=profile</code>）；若列表里没有与正文语言一致的固定音色，

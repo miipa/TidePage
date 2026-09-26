@@ -245,6 +245,8 @@ pub enum Provider {
     Anthropic,
     Gemini,
     Azure,
+    /// 阿里云百炼 / DashScope（通义千问 Qwen-TTS 多模态合成端点）
+    DashScope,
 }
 
 impl Provider {
@@ -254,6 +256,9 @@ impl Provider {
             "anthropic" | "claude" => Provider::Anthropic,
             "gemini" | "google" => Provider::Gemini,
             "azure-openai" | "azure" | "azure_openai" => Provider::Azure,
+            "dashscope" | "qwen" | "qwen-tts" | "qwen3-tts" | "tongyi" | "bailian" => {
+                Provider::DashScope
+            }
             _ => Provider::OpenAi,
         }
     }
@@ -264,6 +269,7 @@ impl Provider {
             Provider::Anthropic => "Anthropic",
             Provider::Gemini => "Gemini",
             Provider::Azure => "Azure OpenAI",
+            Provider::DashScope => "通义千问 TTS",
         }
     }
 }
@@ -521,7 +527,7 @@ fn build_request(
                 stream,
             }),
         }),
-        Provider::OpenAi => Ok(Prepared {
+        Provider::OpenAi | Provider::DashScope => Ok(Prepared {
             url: format!("{}/chat/completions", ensure_v1(base)),
             headers: bearer_headers(&cfg.api_key),
             body: ChatBody::OpenAi(OpenAiChatBody {
@@ -624,6 +630,9 @@ fn stream_delta(p: Provider, v: &serde_json::Value) -> Option<String> {
         Provider::OpenAi | Provider::Azure => {
             v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(str::to_string)
         }
+        Provider::DashScope => {
+            v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(str::to_string)
+        }
         Provider::Anthropic => {
             if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
                 v.pointer("/delta/text").and_then(|c| c.as_str()).map(str::to_string)
@@ -644,6 +653,12 @@ fn full_content(p: Provider, v: &serde_json::Value) -> Option<String> {
             .and_then(|c| c.as_str())
             .map(str::to_string),
         Provider::OpenAi | Provider::Azure => v
+            .pointer("/choices/0/message/content")
+            .or_else(|| v.pointer("/choices/0/delta/content"))
+            .or_else(|| v.pointer("/choices/0/text"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        Provider::DashScope => v
             .pointer("/choices/0/message/content")
             .or_else(|| v.pointer("/choices/0/delta/content"))
             .or_else(|| v.pointer("/choices/0/text"))
@@ -980,7 +995,102 @@ struct TtsBody {
     response_format: String,
 }
 
-/// 调用 OpenAI 兼容 / Azure OpenAI 的语音合成接口，返回音频字节（如 mp3）。
+/// 由 DashScope 的 base_url 推导出千问 TTS 多模态合成端点。
+/// 兼容用户填写 `https://dashscope.aliyuncs.com`、`.../api/v1`
+/// 或完整的 `.../generation` 三种写法。
+fn dashscope_tts_url(base: &str) -> String {
+    let b = strip_trailing_slash(base);
+    if b.ends_with("/generation") {
+        b.to_string()
+    } else if b.ends_with("/api/v1") {
+        format!("{b}/services/aigc/multimodal-generation/generation")
+    } else {
+        format!("{b}/api/v1/services/aigc/multimodal-generation/generation")
+    }
+}
+
+/// 调用阿里云百炼 / DashScope 的通义千问 Qwen-TTS 合成接口。
+/// 该端点返回 JSON（`output.audio.url` 或 base64 `output.audio.data`），
+/// 与 OpenAI `/audio/speech` 直接回传音频字节不同，需在此解析后二次下载。
+async fn synthesize_dashscope(
+    http: reqwest::Client,
+    cfg: &AiConfig,
+    base: &str,
+    voice: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if cfg.api_key.trim().is_empty() {
+        return Err(AiError::config("通义千问语音需要填写 DashScope API Key"));
+    }
+    let model = if cfg.model.trim().is_empty() {
+        "qwen3-tts-flash"
+    } else {
+        cfg.model.trim()
+    };
+    let voice = if voice.trim().is_empty() { "Cherry" } else { voice.trim() };
+    // language_type：复用 api_version 字段承载（前端可留空），默认 Auto（自动识别语种）。
+    let lang = if cfg.api_version.trim().is_empty() {
+        "Auto"
+    } else {
+        cfg.api_version.trim()
+    };
+    let url = dashscope_tts_url(base);
+    let body = json!({
+        "model": model,
+        "input": { "text": text, "voice": voice, "language_type": lang },
+    });
+    let resp = http
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", cfg.api_key.trim()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
+    // DashScope 可能以 HTTP 200 携带业务错误码返回。
+    let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
+    if !code.is_empty() {
+        let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
+        return Err(AiError::protocol(format!("DashScope 返回错误 {code}：{m}")));
+    }
+    let audio = v.get("output").and_then(|o| o.get("audio"));
+    // 优先取内联 base64；否则回落到二次下载 url。
+    if let Some(data) = audio.and_then(|a| a.get("data")).and_then(|x| x.as_str()) {
+        if !data.is_empty() {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
+    if let Some(audio_url) = audio.and_then(|a| a.get("url")).and_then(|x| x.as_str()) {
+        if !audio_url.is_empty() {
+            let ar = http.get(audio_url).send().await.map_err(|e| classify_req(&e))?;
+            if !ar.status().is_success() {
+                return Err(AiError::http(ar.status().as_u16(), "下载合成音频失败"));
+            }
+            let bytes = ar.bytes().await.map_err(|e| classify_req(&e))?;
+            if bytes.is_empty() {
+                return Err(AiError::protocol("下载的合成音频为空"));
+            }
+            return Ok(bytes.to_vec());
+        }
+    }
+    Err(AiError::protocol("DashScope 响应中未找到音频数据"))
+}
+
+/// 调用在线语音合成接口，返回音频字节（如 mp3/wav）。
+/// 支持 OpenAI 兼容 / Azure OpenAI 的 `/audio/speech`，以及
+/// 阿里云百炼 DashScope 的通义千问 Qwen-TTS 多模态端点。
 pub async fn synthesize(
     http: reqwest::Client,
     cfg: AiConfig,
@@ -992,6 +1102,10 @@ pub async fn synthesize(
     let base = strip_trailing_slash(&cfg.base_url);
     if base.is_empty() {
         return Err(AiError::config("未配置语音端点地址"));
+    }
+    // DashScope 协议与 OpenAI 不同（JSON 回包 + 二次下载），单独处理。
+    if p == Provider::DashScope {
+        return synthesize_dashscope(http, &cfg, base, voice, text).await;
     }
     let (url, headers) = match p {
         Provider::OpenAi | Provider::Ollama => {
@@ -1020,7 +1134,7 @@ pub async fn synthesize(
         }
         _ => {
             return Err(AiError::config(
-                "在线语音仅支持 OpenAI 兼容或 Azure OpenAI 端点；请改用系统语音",
+                "在线语音仅支持 OpenAI 兼容 / Azure OpenAI / 通义千问(DashScope) 端点；请改用系统语音",
             ))
         }
     };
@@ -1077,7 +1191,18 @@ mod tests {
         assert_eq!(Provider::parse("claude"), Provider::Anthropic);
         assert_eq!(Provider::parse("gemini"), Provider::Gemini);
         assert_eq!(Provider::parse("azure-openai"), Provider::Azure);
+        assert_eq!(Provider::parse("dashscope"), Provider::DashScope);
+        assert_eq!(Provider::parse("qwen"), Provider::DashScope);
         assert_eq!(Provider::parse("whatever"), Provider::OpenAi);
+    }
+
+    #[test]
+    fn dashscope_tts_url_shape() {
+        let full = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
+        assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com"), full);
+        assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com/"), full);
+        assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com/api/v1"), full);
+        assert_eq!(dashscope_tts_url(full), full);
     }
 
     #[test]
