@@ -2,6 +2,7 @@
   import { tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
+  import { dragSort } from "../lib/dragSort";
   import {
     config,
     saveConfig,
@@ -361,6 +362,22 @@
       return;
     }
     run(config.ai.system, renderPrompt(p));
+  }
+
+  /** 提示词按钮真实拖拽排序（特效同主程序顶栏，走 dragSort + .fr-drag-* 样式）。
+   *  直接重排 config.ai.prompts 数组并持久化：这样「自动执行第一个提示词」(prompts[0])
+   *  在排序变动后天然指向新的首位，无需另存顺序表，避免出现执行到旧首位的漂移。 */
+  function promptDrop(from: string, target: string, place: "before" | "after") {
+    if (!from || from === target) return;
+    const arr = [...config.ai.prompts];
+    const fi = arr.findIndex((p) => String(p.id) === from);
+    if (fi < 0) return;
+    const [moved] = arr.splice(fi, 1);
+    const ti = arr.findIndex((p) => String(p.id) === target);
+    if (ti < 0) return;
+    arr.splice(place === "after" ? ti + 1 : ti, 0, moved);
+    config.ai.prompts = arr;
+    saveConfig();
   }
 
   /* ---------- 翻页辅助数据 ---------- */
@@ -788,9 +805,9 @@ ${readerStyle.extra}
         {/if}
       </div>
     </div>
-    <div class="prompt-bar">
+    <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
       {#each config.ai.prompts as p (p.id)}
-        <button class="prompt-chip" onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
+        <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
           {p.name}<span class="pkey">{p.key}</span>
         </button>
       {/each}
@@ -904,9 +921,9 @@ ${readerStyle.extra}
         {/if}
       </div>
     </div>
-    <div class="prompt-bar">
+    <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
       {#each config.ai.prompts as p (p.id)}
-        <button class="prompt-chip" onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
+        <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
           {p.name}<span class="pkey">{p.key}</span>
         </button>
       {/each}
@@ -1060,6 +1077,8 @@ ${readerStyle.extra}
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    /* 拖拽排序：禁用触屏滚动手势，指针拖动才可靠（与主程序顶栏一致）。 */
+    touch-action: none;
   }
 
   .prompt-chip.add {
