@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window and AI window",
-  "windows": ["main", "flowread-ai", "reader-*"],
+  "windows": ["main", "flowread-ai", "reader-*", "panel-*"],
   "permissions": [
     "core:default",
     "opener:default",
@@ -13,6 +13,13 @@
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
     "core:window:allow-set-title",
-    "core:window:allow-center"
+    "core:window:allow-center",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-set-position",
+    "core:window:allow-start-dragging",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-inner-size"
   ]
 }

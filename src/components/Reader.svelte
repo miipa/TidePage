@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
+  import { fade } from "svelte/transition";
+  import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
   import {
     config,
@@ -15,6 +17,7 @@
     comboOf,
     bindKeyMatches,
     toggleAi,
+    openPanelWindow,
     ZONE_DEFS,
     copyText,
     stripNonTextHtml,
@@ -29,6 +32,7 @@
   } from "../lib/stores.svelte";
   import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import { dragSort } from "../lib/dragSort";
+  import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
   import { preloadReaderFonts } from "../lib/fontfaces";
@@ -257,9 +261,9 @@
     { id: "bookmarkList", label: "书签列表", title: "书签列表", icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
     { id: "ttsPlay", label: "朗读", title: "朗读（可选中文字或从本页/本章开始）", icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), visible: () => true, run: () => toggleTts() },
     { id: "ttsStop", label: "停止朗读", title: "停止朗读", icon: () => IconPlayerStop, visible: () => true, run: () => stopTts() },
-    { id: "highlight", label: "划线 / 批注", title: "划线 / 批注", icon: () => IconHighlight, visible: () => true, run: () => (highlightsOpen = !highlightsOpen) },
-    { id: "ai", label: "AI 助手", title: "AI 助手", icon: () => IconSparkles, visible: () => true, run: () => toggleAi() },
-    { id: "stats", label: "本书统计", title: "本书统计", icon: () => IconChartBar, visible: () => true, run: () => (statsOpen = !statsOpen) },
+    { id: "highlight", label: "划线 / 批注", title: "划线 / 批注", icon: () => IconHighlight, visible: () => true, run: () => setRight("highlights") },
+    { id: "ai", label: "AI 助手", title: "AI 助手", icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
+    { id: "stats", label: "本书统计", title: "本书统计", icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
     { id: "toc", label: "目录", title: "目录 (F3)", icon: () => IconList, visible: () => true, run: () => (tocOpen = !tocOpen) },
     { id: "manga", label: "漫画模式", title: () => (isMangaMode() ? "退出漫画模式（本书）" : "切换到漫画模式（本书）"), icon: () => (isMangaMode() ? IconLayoutGrid : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
     { id: "manager", label: "顶栏按钮管理", title: "顶栏按钮管理（显示/隐藏、拖动排序）", icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => (tbManagerOpen = !tbManagerOpen) },
@@ -399,8 +403,11 @@
   let scroller: SmoothScroller | null = null;
 
   let tocOpen = $state(false);
-  let bookmarksOpen = $state(false);
-  let statsOpen = $state(false);
+  // 右侧互斥面板的单一状态源（left:0 的目录 tocOpen 不参与）
+  let rightPanel = $state<null | "bookmarks" | "highlights" | "stats" | "ai">(null);
+  let bookmarksOpen = $derived(rightPanel === "bookmarks");
+  let statsOpen = $derived(rightPanel === "stats");
+  let aiDrawerOpen = $derived(rightPanel === "ai");
   let bookmarks: { id: number; chapter_index: number; title: string; excerpt: string }[] = $state([]);
 
   // 顶栏按钮管理 / 图片开关 / 漫画引导 / 拖拽排序
@@ -412,7 +419,7 @@
   let mangaGuideScale = $state(1);
 
   let highlights: HighlightRow[] = $state([]);
-  let highlightsOpen = $state(false);
+  let highlightsOpen = $derived(rightPanel === "highlights");
   let hlVersion = $state(0);
   let pendingHighlightJump: HighlightRow | null = null;
 
@@ -420,7 +427,79 @@
   let selMenu: SelMenuState | null = $state(null);
   let hlMenu: { h: HighlightRow; anchor: PopupAnchor } | null = $state(null);
   let searchPopup: { query: string; anchor: PopupAnchor } | null = $state(null);
-  let quickAiPopup: { text: string; anchor: PopupAnchor; highlightId?: number } | null = $state(null);
+  let quickAiPopup: { text: string; anchor: PopupAnchor; highlightId?: number; sel?: { start: number; end: number; text: string } } | null = $state(null);
+
+  /* ================= 右侧面板互斥（单一状态源 rightPanel） =================
+   * rightPanel 是唯一可写来源；bookmarksOpen/statsOpen/highlightsOpen/aiDrawerOpen 全部由它 $derived。
+   * 所有 toggle 只改 rightPanel，互斥自动成立（同侧任意时刻最多一个）。
+   * 左侧目录 tocOpen（left:0）为独立 $state，不参与本互斥。
+   * 抽屉显隐彻底不读 ui.aiOpen，也不再有任何监听 ui.aiOpen 的 $effect。 */
+  function setRight(panel: "bookmarks" | "highlights" | "stats" | "ai") {
+    rightPanel = rightPanel === panel ? null : panel;
+  }
+
+  /** AI 抽屉/独立窗切换：drawer 模式并入右侧互斥（rightPanel==='ai'）；
+   *  window 模式交由 store.toggleAi() 管理独立窗，建窗失败(返回 false)时直接 setRight('ai') 回退抽屉，
+   *  不经 ui.aiOpen 中转、不靠 effect 拉起。 */
+  async function toggleAiPanel() {
+    let mode: string | null = null;
+    try { mode = localStorage.getItem("fr.ai.mode"); } catch { /* ignore */ }
+    if (mode === "window") {
+      const shownAsWindow = await toggleAi();
+      if (!shownAsWindow) setRight("ai");            // 建窗失败 → 直接回退抽屉
+      else if (rightPanel === "ai") rightPanel = null; // 独立窗呈现时确保抽屉不并存
+      return;
+    }
+    setRight("ai");
+  }
+
+  /** 任务 5：把右侧/目录面板拉出为独立窗口，并从互斥组回收（tocOpen/rightPanel 置空）。 */
+  async function popOutPanel(kind: "toc" | "bookmarks" | "highlights" | "stats") {
+    if (!book) return;
+    const ok = await openPanelWindow(kind, book.book.id, book.book.title || "FlowRead");
+    if (!ok) { toast("弹出窗口失败", "error"); return; }
+    // 互斥回收：拉出为独立窗后从右侧互斥/目录移除，互斥逻辑不再管它
+    if (kind === "toc") tocOpen = false;
+    else rightPanel = null;
+  }
+
+  // ② 独立划线窗实时同步：本窗划线集变化时广播，独立窗订阅后重载
+  $effect(() => {
+    void hlVersion;
+    void emit("flowread-hl-changed", {});
+  });
+
+  /* ================= F11 全屏切换（任务 8） =================
+   * keydown 命中 F11 先 preventDefault（挡掉 WebView2 自带全屏），再切 Tauri 窗口全屏。
+   * isFullscreen 跟随 setFullscreen 后的实际结果，连按不错位。 */
+  let isFullscreen = $state(false);
+  let showFsHint = $state(false);
+  let fsHintTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function toggleFullscreen() {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const win = getCurrentWindow();
+      const next = !isFullscreen;
+      await win.setFullscreen(next);
+      // 跟随实际切换结果（避免连按状态错位）
+      let actual = next;
+      try { actual = await win.isFullscreen(); } catch { /* 读取失败则用目标值兜底 */ }
+      isFullscreen = actual;
+      clearTimeout(fsHintTimer);
+      if (isFullscreen) {
+        // 进入全屏：淡入大字号浮层提示，2.2s 后自动淡出（不长期遮挡正文）
+        showFsHint = true;
+        fsHintTimer = setTimeout(() => { showFsHint = false; }, 2200);
+      } else {
+        // 退出全屏：提示立即淡出
+        showFsHint = false;
+      }
+    } catch (e) {
+      toast(`全屏切换失败：${e}`, "error");
+    }
+  }
+
 
   // 搜索结果跳转历史：可逐步/一键返回跳转前的位置
   type NavPos = { chapter_index: number; ratio: number };
@@ -1566,10 +1645,10 @@
         loadBookmarks();
         break;
       case "ai":
-        toggleAi();
+        toggleAiPanel();
         break;
       case "bookStats":
-        statsOpen = !statsOpen;
+        setRight("stats");
         break;
       case "ttsPlayPause":
         toggleTts();
@@ -1596,9 +1675,7 @@
           blockPickMode = false;
         } else if (tocOpen || bookmarksOpen || statsOpen || highlightsOpen || selMenu || searchPopup || quickAiPopup || hlMenu) {
           tocOpen = false;
-          bookmarksOpen = false;
-          statsOpen = false;
-          highlightsOpen = false;
+          rightPanel = null;
           selMenu = null;
           searchPopup = null;
           quickAiPopup = null;
@@ -1612,6 +1689,13 @@
 
   function onKeyDown(e: KeyboardEvent) {
     pokeChrome();
+    // F11 全屏：置于所有早退之前——先 preventDefault 挡掉 WebView2 默认全屏，再切 Tauri 全屏。
+    // 焦点在输入框/文本区时仍触发（并吃掉默认行为），符合交付说明的处理方式。
+    if (e.key === "F11") {
+      e.preventDefault();
+      void toggleFullscreen();
+      return;
+    }
     const tgt = e.target as HTMLElement | null;
     if (tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)) return;
 
@@ -1826,12 +1910,30 @@
     };
     window.addEventListener("flowread-jump", onJump);
     window.addEventListener("pagehide", onUnload);
+    // 独立 AI 窗口「⇲ 停靠」回主窗口：以 rightPanel 打开抽屉（不经 ui.aiOpen）。
+    const aiDockUn = listen("ai-dock", () => { setRight("ai"); });
+    // 任务 5：独立面板窗口的跳转请求（跨窗 Tauri 事件）→ 主窗执行导航
+    const gotoChUn = listen<{ index: number }>("flowread-goto-chapter", (e) => {
+      const i = e.payload?.index;
+      if (book && typeof i === "number" && i >= 0 && i < book.toc.length) loadChapter(i);
+    });
+    const gotoHlUn = listen<{ id: number }>("flowread-goto-highlight", async (e) => {
+      const id = e.payload?.id;
+      if (typeof id !== "number") return;
+      await refreshHighlights();
+      const h = highlights.find((x) => x.id === id);
+      if (h) jumpToHighlight(h);
+    });
     return () => {
       ttsStop();
       scroller?.destroy();
       if (statsTimer) clearInterval(statsTimer);
       window.removeEventListener("flowread-jump", onJump);
       window.removeEventListener("pagehide", onUnload);
+      aiDockUn.then((un) => un()).catch(() => {});
+      gotoChUn.then((un) => un()).catch(() => {});
+      gotoHlUn.then((un) => un()).catch(() => {});
+      clearTimeout(fsHintTimer);
       doSaveProgress();
       const el = document.getElementById("flowread-dynamic-css");
       if (el) el.remove();
@@ -2125,7 +2227,7 @@ ${effCssExtra() || ""}
   async function loadBookmarks() {
     if (!book) return;
     bookmarks = await api.listBookmarks(book.book.id);
-    bookmarksOpen = !bookmarksOpen;
+    setRight("bookmarks");
   }
 
   async function addBookmark() {
@@ -2352,7 +2454,130 @@ ${effCssExtra() || ""}
     const s = selMenu;
     selMenu = null;
     if (!s) return;
-    quickAiPopup = { text: s.text, anchor: s.anchor };
+    // 携带选区信息：QuickAiPopup「添加到感想」在新划选来源时据此创建划线
+    quickAiPopup = { text: s.text, anchor: s.anchor, sel: { start: s.start, end: s.end, text: s.text } };
+  }
+
+  /** 判重（口径对齐 src-tauri/src/db.rs::append_highlight_note）：
+   *  db 拼接形式为 `format!("{}\n\n{}", cur.trim_end(), addition.trim())`，首段为 addition.trim()，
+   *  各段之间恰以 "\n\n" 相连。故按「以 \n\n 为边界、匹配完整 add 块」判重（add 内部可含空行不误判）。 */
+  function noteHasSegment(note: string | undefined, addition: string): boolean {
+    const add = addition.trim();
+    if (!add) return false;
+    const c = (note ?? "").trim();
+    if (!c) return false;
+    if (c === add) return true;                          // 唯一一段即等
+    if (c.startsWith(add + "\n\n")) return true;         // 位于开头块
+    if (c.endsWith("\n\n" + add)) return true;           // 位于末尾块
+    if (c.includes("\n\n" + add + "\n\n")) return true;  // 位于中间块
+    return false;
+  }
+
+  /** 任务 7：把 AI 释义结果添加到「感想」(highlight.note)。
+   *  来源①已有划线 → appendHighlightNote（幂等判重）；
+   *  来源②新划选（无 highlightId）→ 先按 onHighlight 方式创建划线拿 id，再写入 note。
+   *  返回 true 表示已处理（添加/已存在，按钮置「已添加」）；false 表示失败/无选区（按钮保持可点）。 */
+  async function quickAiAddNote(output: string): Promise<boolean> {
+    const q = quickAiPopup;
+    const add = output.trim();
+    if (!q || !add) {
+      toast("无可添加内容", "error");
+      return false;
+    }
+    // 来源①：已有划线
+    if (q.highlightId != null) {
+      const h = highlights.find((x) => x.id === q.highlightId);
+      if (h && noteHasSegment(h.note, add)) {
+        toast("感想中已有相同内容");
+        return true;
+      }
+      try {
+        const next = await api.appendHighlightNote(q.highlightId, add);
+        if (h) h.note = next;
+        hlVersion++;
+        await tick();
+        paintNow();
+        toast("已添加到感想");
+        return true;
+      } catch (e) {
+        toast(String(e), "error");
+        return false;
+      }
+    }
+    // 来源②：新划选 → 先建划线（note 空）拿 id，再写入 note；写 note 失败则回滚删除，杜绝无 note 残留划线
+    const s = q.sel;
+    if (!s || !book || !chapter) {
+      toast("无有效选区，无法添加到感想", "error");
+      return false;
+    }
+    const style = config.reader.highlightStyle || "underline";
+    const color = config.reader.highlightColor || config.reader.highlightColors[0] || "#c0392b";
+    let id: number;
+    try {
+      id = await api.addHighlight({
+        bookId: book.book.id,
+        chapterIndex: chapterNum,
+        chapterTitle: chapter.title,
+        start: s.start,
+        end: s.end,
+        text: s.text,
+        style,
+        color,
+        note: "",
+      });
+    } catch (e) {
+      toast(`创建划线失败：${e}`, "error");
+      return false;
+    }
+    // 本地先插入（note 空），便于回滚时精确移除
+    highlights.push({
+      id,
+      book_id: book.book.id,
+      book_title: book.book.title,
+      chapter_index: chapterNum,
+      chapter_title: chapter.title,
+      pos_start: s.start,
+      pos_end: s.end,
+      text: s.text,
+      style,
+      color,
+      note: "",
+      created_at: Date.now(),
+    });
+    hlVersion++;
+    try {
+      await api.setHighlightNote(id, add);
+    } catch (e) {
+      // 写 note 失败 → 尝试回滚删除刚建的划线；据删除真实结果给一致文案，绝不谎称"已回滚"
+      let deleted = false;
+      try { await api.deleteHighlight(id); deleted = true; } catch { /* 删除也失败 */ }
+      const ri = highlights.findIndex((x) => x.id === id);
+      if (deleted) {
+        // 服务端已删 → 本地一并移除，状态一致
+        if (ri >= 0) highlights.splice(ri, 1);
+        hlVersion++;
+        await tick();
+        paintNow();
+        toast(`写入感想失败，已回滚新建划线：${e}`, "error");
+      } else {
+        // 服务端未删成功 → 保留本地行（note 空，与服务端一致），如实提示可能残留
+        hlVersion++;
+        await tick();
+        paintNow();
+        toast(`写入感想失败，且划线可能残留（自动删除未成功），请在划线面板手动删除`, "error");
+      }
+      return false;
+    }
+    const nh = highlights.find((x) => x.id === id);
+    if (nh) nh.note = add;
+    hlVersion++;
+    // 重复点击时走「已有划线」判重分支，避免重复创建
+    quickAiPopup = { ...q, highlightId: id };
+    window.getSelection()?.removeAllRanges();
+    await tick();
+    paintNow();
+    toast("已创建划线并添加到感想");
+    return true;
   }
 
   function scrollRangeIntoView(range: Range) {
@@ -2421,7 +2646,7 @@ ${effCssExtra() || ""}
   }
 
   async function jumpToHighlight(h: HighlightRow) {
-    highlightsOpen = false;
+    if (rightPanel === "highlights") rightPanel = null;
     if (!book) return;
     if (h.book_id !== book.book.id) {
       pendingHighlightJump = h;
@@ -2890,6 +3115,9 @@ ${effCssExtra() || ""}
   {#if bgImageUrl}
     <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{bookScheme()?.schemeBgOpacity ?? config.reader.bgOpacity};"></div>
   {/if}
+  {#if showFsHint}
+    <div class="fs-hint" transition:fade={{ duration: 220 }}>按 F11 退出全屏</div>
+  {/if}
   <div class="topbar" class:dim={chromeHidden} style="background:var(--rdr-top);">
     <div class="tb-zone tb-l">
       <button
@@ -3121,16 +3349,16 @@ ${effCssExtra() || ""}
     {/if}
 
     {#if tocOpen && book}
-      <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; loadChapter(i); }} onclose={() => (tocOpen = false)} />
+      <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; loadChapter(i); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
     {/if}
 
     {#if bookmarksOpen}
       <div class="sidepanel">
-        <div class="sp-head"><span>书签</span><button class="icon" title="关闭" onclick={() => (bookmarksOpen = false)}>×</button></div>
+        <div class="sp-head" use:dragOutHandle={() => popOutPanel("bookmarks")} title="按住标题栏拖出面板外可弹为独立窗口"><span>书签</span><div style="display:flex; gap:6px; align-items:center;"><button class="icon" title="弹出为独立窗口" onclick={() => popOutPanel("bookmarks")}>⧉</button><button class="icon" title="关闭" onclick={() => (rightPanel = null)}>×</button></div></div>
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
-              <div class="bm-main" onclick={() => { loadChapter(bm.chapter_index); bookmarksOpen = false; }}>
+              <div class="bm-main" onclick={() => { loadChapter(bm.chapter_index); rightPanel = null; }}>
                 <div class="bm-title">{bm.title || "未命名"}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
@@ -3148,8 +3376,9 @@ ${effCssExtra() || ""}
         bookId={book.book.id}
         version={hlVersion}
         onjump={jumpToHighlight}
-        onclose={() => (highlightsOpen = false)}
+        onclose={() => (rightPanel = null)}
         onchanged={refreshHighlights}
+        onpopout={() => popOutPanel("highlights")}
       />
     {/if}
 
@@ -3169,6 +3398,7 @@ ${effCssExtra() || ""}
         text={quickAiPopup.text}
         anchor={quickAiPopup.anchor}
         targetHighlightId={quickAiPopup.highlightId ?? null}
+        onaddnote={quickAiAddNote}
         onadded={() => { hlVersion++; void refreshHighlights(); }}
         onclose={() => (quickAiPopup = null)}
       />
@@ -3205,12 +3435,12 @@ ${effCssExtra() || ""}
       />
     {/if}
 
-    {#if ui.aiOpen}
-      <AiPanel chapterTitle={chapter?.title ?? ""} chapterHtml={chapter?.html ?? ""} />
+    {#if aiDrawerOpen}
+      <AiPanel chapterTitle={chapter?.title ?? ""} chapterHtml={chapter?.html ?? ""} onclose={() => (rightPanel = null)} />
     {/if}
 
     {#if statsOpen && book}
-      <BookStatsModal bookId={book.book.id} bookTitle={book.book.title} onclose={() => (statsOpen = false)} />
+      <BookStatsModal bookId={book.book.id} bookTitle={book.book.title} onclose={() => (rightPanel = null)} onpopout={() => popOutPanel("stats")} />
     {/if}
 
     {#if book && !openError}
@@ -3278,6 +3508,25 @@ ${effCssExtra() || ""}
     background-repeat: no-repeat;
     pointer-events: none;
     z-index: 0;
+  }
+
+  /* 任务 8：进入全屏时的大字号、居中淡入浮层提示（transition:fade 负责淡入/淡出） */
+  .fs-hint {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 9999;
+    padding: 22px 40px;
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.62);
+    border-radius: 14px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    white-space: nowrap;
   }
 
   .topbar {

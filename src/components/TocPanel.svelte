@@ -1,12 +1,13 @@
 <script lang="ts">
   import type { TocEntry } from "../lib/types";
-  import { ui } from "../lib/stores.svelte";
+  import { dragOutHandle } from "../lib/windowSnap";
 
-  let { toc, current, onpick, onclose }: {
+  let { toc, current, onpick, onclose, onpopout }: {
     toc: TocEntry[];
     current: number;
     onpick: (index: number) => void;
     onclose: () => void;
+    onpopout?: () => void;
   } = $props();
 
   let query = $state("");
@@ -62,10 +63,10 @@
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head">
+  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
     <span>目录</span>
     <div class="sp-head-acts">
-      <button class="icon" title="笔记（带感想的划线）" onclick={() => { ui.notesOpen = true; }}>✎ 笔记</button>
+      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
       <button class="icon" title="关闭" onclick={onclose}>×</button>
     </div>
   </div>

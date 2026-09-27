@@ -13,24 +13,44 @@
     /** H3：若来自某条划线，则提供其 id —— 可把 AI 输出追加进该划线的 note。 */
     targetHighlightId = null,
     onadded,
+    /** 任务 7：由 Reader 统一处理「添加到感想」。返回 true=已处理(禁用按钮)，false=失败(保持可点)。
+     *  支持两种来源：已有划线追加 / 新划选先建划线再写 note；判重与提示由回调内部负责。 */
+    onaddnote,
   }: {
     text: string;
     anchor: PopupAnchor;
     onclose: () => void;
     targetHighlightId?: number | null;
     onadded?: () => void;
+    onaddnote?: (output: string) => Promise<boolean>;
   } = $props();
 
   let added = $state(false);
+  let adding = $state(false);
   async function addToNote() {
-    if (!targetHighlightId || !output.trim()) return;
+    const out = output.trim();
+    if (!out || busy || failed || added || adding) return;
+    adding = true;
     try {
-      await api.appendHighlightNote(targetHighlightId, output.trim());
-      added = true;
-      toast("已添加到笔记");
-      onadded?.();
+      if (onaddnote) {
+        const ok = await onaddnote(out);
+        if (ok) {
+          added = true;
+          onadded?.();
+        }
+      } else if (targetHighlightId) {
+        // 兜底：无回调时沿用旧行为（仅已有划线可追加）
+        await api.appendHighlightNote(targetHighlightId, out);
+        added = true;
+        toast("已添加到感想");
+        onadded?.();
+      } else {
+        toast("无可用选区", "error");
+      }
     } catch (e) {
       toast(String(e), "error");
+    } finally {
+      adding = false;
     }
   }
 
@@ -199,12 +219,15 @@
       {#if !busy && output}
         <button class="mini" title="重新生成" onclick={retry}>↻</button>
         <button class="mini" title="复制结果" onclick={() => copyText(output)}>复制</button>
-        {#if targetHighlightId}
-          <button class="mini primary" title="把 AI 输出追加到该划线的笔记" onclick={addToNote} disabled={added}>
-            {added ? "已添加" : "添加到笔记"}
-          </button>
-        {/if}
       {/if}
+      <button
+        class="mini primary"
+        title="把 AI 释义添加到感想（划线的 note）"
+        onclick={addToNote}
+        disabled={busy || !output.trim() || failed || added || adding}
+      >
+        {added ? "已添加" : "添加到感想"}
+      </button>
       <button class="mini" title="关闭" onclick={onclose}>×</button>
     </div>
   </div>

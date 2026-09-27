@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from "../lib/api";
   import { HIGHLIGHT_STYLES, appConfirm, config, saveConfig, toast } from "../lib/stores.svelte";
+  import { dragOutHandle } from "../lib/windowSnap";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
 
@@ -10,12 +11,14 @@
     onjump,
     onclose,
     onchanged,
+    onpopout,
   }: {
     bookId: number;
     version?: number;
     onjump: (h: HighlightRow) => void;
     onclose: () => void;
     onchanged: () => void;
+    onpopout?: () => void;
   } = $props();
 
   let query = $state("");
@@ -84,9 +87,12 @@
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head">
+  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
     <span>划线 / 批注</span>
-    <button class="icon" title="关闭" onclick={onclose}>×</button>
+    <div style="display:flex; gap:6px; align-items:center;">
+      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
+      <button class="icon" title="关闭" onclick={onclose}>×</button>
+    </div>
   </div>
   <div class="sp-search">
     <input

@@ -1784,36 +1784,41 @@ export function saveAiMode(m: "drawer" | "window") {
   } catch { /* ignore */ }
 }
 
-export async function openAiWindow() {
+/** 打开独立 AI 窗口。返回是否成功建窗（true=已建/建成，false=建窗失败需回退抽屉）。
+ *  不再读写 ui.aiOpen：抽屉显隐一律由使用方（Reader.rightPanel）掌控。 */
+export async function openAiWindow(): Promise<boolean> {
   saveAiMode("window");
   const w = Number(localStorage.getItem("fr.ai.winw")) || 430;
   const h = Number(localStorage.getItem("fr.ai.winh")) || 700;
-  try {
-    const win = new WebviewWindow(AI_WIN_LABEL, {
-      url: "/?ai=1",
-      title: "FlowRead AI",
-      width: w,
-      height: h,
-      minWidth: 300,
-      minHeight: 260,
-      center: true,
-      ...(await winExtraOptions()),
-    });
-    win.once("tauri://created", () => {
-      ui.aiOpen = false;
-      localStorage.setItem("fr.ai.open", "1");
-      try {
-        emit("ai-window-status", { open: true });
-      } catch { /* ignore */ }
-    });
-    win.once("tauri://error", () => {
+  const extra = await winExtraOptions();
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const win = new WebviewWindow(AI_WIN_LABEL, {
+        url: "/?ai=1",
+        title: "FlowRead AI",
+        width: w,
+        height: h,
+        minWidth: 300,
+        minHeight: 260,
+        center: true,
+        ...extra,
+      });
+      win.once("tauri://created", () => {
+        localStorage.setItem("fr.ai.open", "1");
+        try {
+          emit("ai-window-status", { open: true });
+        } catch { /* ignore */ }
+        resolve(true);
+      });
+      win.once("tauri://error", () => {
+        saveAiMode("drawer");
+        resolve(false);
+      });
+    } catch {
       saveAiMode("drawer");
-      ui.aiOpen = true;
-    });
-  } catch {
-    saveAiMode("drawer");
-    ui.aiOpen = true;
-  }
+      resolve(false);
+    }
+  });
 }
 
 export function aiWindowOpenMark(): string | null {
@@ -1824,13 +1829,52 @@ export function aiWindowOpenMark(): string | null {
   }
 }
 
+/** 任务 5：把阅读界面面板拉出为独立窗口。复用 AI 窗创建范式（同 additional_browser_args）。
+ *  URL 走 ?panel=xxx&book=<id>，由 +page.svelte standalone 挂载对应组件并按 book id 自拉数据。
+ *  返回是否成功建窗（true=聚焦已有/建成，false=失败）。 */
+export type PanelKind = "toc" | "bookmarks" | "highlights" | "stats" | "notes";
+
+export async function openPanelWindow(panel: PanelKind, bookId: number, title: string): Promise<boolean> {
+  const label = `panel-${panel}`;
+  try {
+    const ex = await WebviewWindow.getByLabel(label);
+    if (ex) {
+      await ex.unminimize().catch(() => {});
+      await ex.show().catch(() => {});
+      await ex.setFocus().catch(() => {});
+      return true;
+    }
+  } catch { /* ignore */ }
+  const extra = await winExtraOptions(); // 与 AI 窗一致：带主窗相同 additional_browser_args
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const win = new WebviewWindow(label, {
+        url: `/?panel=${panel}&book=${bookId}`,
+        title,
+        width: 440,
+        height: 660,
+        minWidth: 300,
+        minHeight: 260,
+        center: true,
+        ...extra,
+      });
+      win.once("tauri://created", () => resolve(true));
+      win.once("tauri://error", () => resolve(false));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 export async function emit(_event: string, _payload: unknown) {
   try {
     await (await import("@tauri-apps/api/event")).emit(_event, _payload);
   } catch { /* ignore */ }
 }
 
-export async function toggleAi() {
+/** 切换 AI：返回 true=已以独立窗口呈现（聚焦已有/建窗成功）；false=需由调用方回退抽屉。
+ *  不再改写 ui.aiOpen；抽屉态完全交由 Reader.rightPanel 管理。 */
+export async function toggleAi(): Promise<boolean> {
   let mode = aiState.lastMode;
   try {
     const m = localStorage.getItem("fr.ai.mode");
@@ -1844,7 +1888,7 @@ export async function toggleAi() {
         await w.show().catch(() => {});
         await w.setFocus().catch(() => {});
         localStorage.setItem("fr.ai.open", "1");
-        return;
+        return true;
       }
     } catch { /* ignore */ }
     try {
@@ -1855,14 +1899,14 @@ export async function toggleAi() {
         existing.show();
         existing.setFocus();
         localStorage.setItem("fr.ai.open", "1");
-        return;
+        return true;
       }
     } catch { /* ignore */ }
     localStorage.setItem("fr.ai.open", "0");
-    openAiWindow();
-    return;
+    return await openAiWindow();
   }
-  ui.aiOpen = !ui.aiOpen;
+  // drawer 模式：抽屉显隐由 Reader.rightPanel 掌控，这里不再改 ui.aiOpen；返回 false 让调用方开抽屉。
+  return false;
 }
 
 export async function listWindowLabels(): Promise<string[]> {

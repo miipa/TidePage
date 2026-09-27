@@ -11,17 +11,18 @@
     ui,
     openAiWindow,
     saveAiMode,
-    copyText,
     THEMES,
     AI_WIN_LABEL,
     stripNonTextHtml,
     type PromptItem,
   } from "../lib/stores.svelte";
 
-  let { chapterTitle = "", chapterHtml = "", standalone = false }: {
+  let { chapterTitle = "", chapterHtml = "", standalone = false, onclose }: {
     chapterTitle?: string;
     chapterHtml?: string;
     standalone?: boolean;
+    /** 抽屉模式下由 Reader 传入：× 关闭与「弹出为独立窗成功」时调用，统一把单一状态源 rightPanel 置 null。 */
+    onclose?: () => void;
   } = $props();
 
   interface Msg {
@@ -411,8 +412,10 @@
     run(config.ai.system, context);
   }
 
-  function popOut() {
-    openAiWindow();
+  async function popOut() {
+    // 弹出为独立窗口成功后关闭抽屉（onclose→rightPanel=null）；失败则保持抽屉打开
+    const ok = await openAiWindow();
+    if (ok) onclose?.();
   }
 
   let panelWidth = $derived(config.reader.aiPanelWidth);
@@ -585,6 +588,50 @@ ${readerStyle.extra}
     const np = Math.max(0, Math.min(aiPage + dir, aiPages - 1));
     aiPage = np;
     applyAiPage();
+  }
+
+  /* ---------- 阅读样式：内容区四角点击翻页热区 ----------
+   * 左上/左下 → 上一页；右上/右下 → 下一页；中段不响应。复用 aiFlip。
+   * pointerup 命中四角即时翻页（跟手、无任何 setTimeout/判定窗/延时）。
+   * 选词优先（不依赖延时，三条判定）：
+   *   ① pointerdown→pointerup 位移超阈值（划词/拖拽）→ 不翻页；
+   *   ② 抬起时存在非折叠选区 → 不翻页；
+   *   ③ 命中可交互元素 closest("a,button,input,textarea,select") → 不翻页。 */
+  const CLIP_MOVE_THRESHOLD = 6; // px，指针按下→抬起位移超此值视为划词/拖拽
+  let clipDown: { x: number; y: number } | null = null;
+
+  function onClipPointerDown(e: PointerEvent) {
+    if (!isReader) return;
+    if (e.button !== 0) { clipDown = null; return; } // 仅主键
+    clipDown = { x: e.clientX, y: e.clientY };
+  }
+
+  function onClipPointerUp(e: PointerEvent) {
+    if (!isReader || !aiClip) return;
+    const down = clipDown;
+    clipDown = null;
+    if (!down || e.button !== 0) return;
+    // ① 位移超阈值 → 划词/拖拽，不翻页（取样时机=按下与抬起之间）
+    if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > CLIP_MOVE_THRESHOLD) return;
+    // ② 抬起时刻存在非折叠选区（划词结果）→ 选词优先
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim()) return;
+    // ③ 命中可交互元素优先
+    const el = e.target as HTMLElement | null;
+    if (el && el.closest("a,button,input,textarea,select")) return;
+    // 命中四角？上下各 35%、左右各 30%
+    const rect = aiClip.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const zoneW = rect.width * 0.3;
+    const zoneH = rect.height * 0.35;
+    const inCorner = y <= zoneH || y >= rect.height - zoneH;
+    if (!inCorner) return; // 垂直中段不响应
+    let dir = 0;
+    if (x <= zoneW) dir = -1;
+    else if (x >= rect.width - zoneW) dir = 1;
+    if (!dir) return; // 水平中间不响应
+    aiFlip(dir); // 命中即时翻页，无延时
   }
 
   function aiTurnBind(id: "next" | "prev"): boolean {
@@ -770,56 +817,73 @@ ${readerStyle.extra}
   <div class="ai-resize" onpointerdown={startResize}></div>
 {/if}
 
-<div class="ai-panel" class:standalone class:reader={isReader} style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}>
-  {#if isReader}
-    <div class="ai-head">
+<!-- 共享块：顶部 header（两分支共用，无参数）。两行布局：
+     第一行 = 标题 +（standalone: ⇲停靠 / 抽屉: ×）；第二行 = 动作按钮单独成行、左对齐、换行规律。 -->
+{#snippet aiHead()}
+  <div class="ai-head">
+    <div class="ai-head-top">
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
-      <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
-          {#each config.ai.profiles as p, i (p.id)}
-            <option value={i}>{p.name || `端点${i + 1}`}</option>
-          {/each}
-        </select>
-        <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
-          {isReader ? "对话样式" : "阅读样式"}
-        </button>
-        <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
-        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
-        <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
-        {#if standalone}
-          <button class="mini" title="停靠回主窗口" onclick={async () => {
-            saveAiMode("drawer");
-            try {
-              await import("@tauri-apps/api/event").then((m) => m.emit("ai-dock", {}));
-            } catch { /* ignore */ }
-            try {
-              const m = await import("@tauri-apps/api/window");
-              await m.getCurrentWindow().close();
-            } catch {
-              try { window.close(); } catch { /* ignore */ }
-            }
-          }}>⇲ 停靠</button>
-        {:else}
-          <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
-          <button class="icon" onclick={() => (ui.aiOpen = false)}>×</button>
-        {/if}
-      </div>
+      {#if standalone}
+        <button class="mini" title="停靠回主窗口" onclick={async () => {
+          saveAiMode("drawer");
+          try {
+            await import("@tauri-apps/api/event").then((m) => m.emit("ai-dock", {}));
+          } catch { /* ignore */ }
+          try {
+            const m = await import("@tauri-apps/api/window");
+            await m.getCurrentWindow().close();
+          } catch {
+            try { window.close(); } catch { /* ignore */ }
+          }
+        }}>⇲ 停靠</button>
+      {:else}
+        <button class="icon" onclick={() => onclose?.()}>×</button>
+      {/if}
     </div>
-    <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
-      {#each config.ai.prompts as p (p.id)}
-        <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
-          {p.name}<span class="pkey">{p.key}</span>
-        </button>
-      {/each}
-      <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title="在设置→AI 中切换窗口样式/管理提示词">⚙</button>
+    <div class="ai-actions">
+      <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
+        {#each config.ai.profiles as p, i (p.id)}
+          <option value={i}>{p.name || `端点${i + 1}`}</option>
+        {/each}
+      </select>
+      <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
+        {isReader ? "对话样式" : "阅读样式"}
+      </button>
+      <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
+      <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
+      <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
+      {#if !standalone}
+        <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
+<!-- 共享块：提示词栏。showPager=true 时（阅读样式）在末尾追加翻页指示与 ‹ › 按钮 -->
+{#snippet promptBar(showPager: boolean)}
+  <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
+    {#each config.ai.prompts as p (p.id)}
+      <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
+        {p.name}<span class="pkey">{p.key}</span>
+      </button>
+    {/each}
+    <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title="在设置→AI 中切换窗口样式/管理提示词">⚙</button>
+    {#if showPager}
       <div class="flex-fill"></div>
       <span class="pg-ind">{aiPages > 1 ? `${aiPage + 1}/${aiPages}` : ""}</span>
       {#if aiPages > 1}
         <button class="mini" onclick={() => aiFlip(-1)} title="上一页 (←)">‹</button>
         <button class="mini" onclick={() => aiFlip(1)} title="下一页 (→)">›</button>
       {/if}
-    </div>
-    <div class="ai-clip" bind:this={aiClip} role="document" onwheel={onListWheel}>
+    {/if}
+  </div>
+{/snippet}
+
+<div class="ai-panel" class:standalone class:reader={isReader} style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}>
+  {#if isReader}
+    {@render aiHead()}
+    {@render promptBar(true)}
+    <div class="ai-clip" bind:this={aiClip} role="document" onwheel={onListWheel} onpointerdown={onClipPointerDown} onpointerup={onClipPointerUp}>
       <div class="ai-inner" bind:this={aiInner}>
         {#if !msgs.length}
           <div class="ai-page">
@@ -840,7 +904,7 @@ ${readerStyle.extra}
               <div class="ai-q-title">问：{qShort(msgs[gi - 1])}</div>
             {/if}
             <div class="ai-q-title">《{ctx.title || "AI 回复"}》</div>
-            <div class="ai-mark" ondblclick={() => copyText(m.content)} title="双击复制回复">{@html m.content ? mdToHtml(m.content) : "<p>…</p>"}</div>
+            <div class="ai-mark">{@html m.content ? mdToHtml(m.content) : "<p>…</p>"}</div>
           </div>
         {/each}
       </div>
@@ -888,50 +952,11 @@ ${readerStyle.extra}
       <button class="primary" onclick={send} disabled={streaming}>发送</button>
     </div>
   {:else}
-    <div class="ai-head">
-      <span class="ai-title">{ctx.title || "AI 助手"}</span>
-      <div class="ai-actions">
-        <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
-          {#each config.ai.profiles as p, i (p.id)}
-            <option value={i}>{p.name || `端点${i + 1}`}</option>
-          {/each}
-        </select>
-        <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
-          {isReader ? "对话样式" : "阅读样式"}
-        </button>
-        <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
-        <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
-        <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
-        {#if standalone}
-          <button class="mini" title="停靠回主窗口" onclick={async () => {
-            saveAiMode("drawer");
-            try {
-              await import("@tauri-apps/api/event").then((m) => m.emit("ai-dock", {}));
-            } catch { /* ignore */ }
-            try {
-              const m = await import("@tauri-apps/api/window");
-              await m.getCurrentWindow().close();
-            } catch {
-              try { window.close(); } catch { /* ignore */ }
-            }
-          }}>⇲ 停靠</button>
-        {:else}
-          <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
-          <button class="icon" onclick={() => (ui.aiOpen = false)}>×</button>
-        {/if}
-      </div>
-    </div>
-    <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
-      {#each config.ai.prompts as p (p.id)}
-        <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
-          {p.name}<span class="pkey">{p.key}</span>
-        </button>
-      {/each}
-      <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title="在设置→AI 中切换窗口样式/管理提示词">⚙</button>
-    </div>
+    {@render aiHead()}
+    {@render promptBar(false)}
     <div class="ai-list" bind:this={listEl}>
       {#each msgs as m, i (i)}
-        <div class="ai-msg {m.role}" ondblclick={() => m.role === "assistant" && copyText(m.content)} title={m.role === "assistant" ? "双击复制回复" : ""}>
+        <div class="ai-msg {m.role}">
           <div class="ai-bubble">{m.content || (streaming && i === msgs.length - 1 ? "…" : "")}</div>
         </div>
       {:else}
@@ -968,10 +993,12 @@ ${readerStyle.extra}
   .prompt-bar {
     display: flex;
     flex-wrap: wrap;
-    gap: 5px;
+    gap: 6px;
+    row-gap: 6px;
     padding: 8px 10px;
     border-bottom: 1px solid rgba(128, 128, 128, 0.13);
     align-items: center;
+    align-content: flex-start;
   }
 
   .flex-fill { flex: 1; }
@@ -1076,7 +1103,11 @@ ${readerStyle.extra}
     border-radius: 20px;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 5px;
+    min-height: 26px;
+    box-sizing: border-box;
+    white-space: nowrap;
     /* 拖拽排序：禁用触屏滚动手势，指针拖动才可靠（与主程序顶栏一致）。 */
     touch-action: none;
   }
@@ -1136,12 +1167,18 @@ ${readerStyle.extra}
 
   .ai-head {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    flex-direction: column;   /* 两行：标题行 + 动作行 */
+    align-items: stretch;
+    gap: 6px;
     padding: 10px 14px;
     border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-    flex-wrap: wrap;
+  }
+
+  .ai-head-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between; /* 标题左、关闭/停靠右 */
+    gap: 8px;
   }
 
   .ai-panel .ai-actions .mini {
@@ -1159,15 +1196,27 @@ ${readerStyle.extra}
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .ai-actions {
     display: flex;
     gap: 6px;
+    row-gap: 6px;
     align-items: center;
     flex-wrap: wrap;
-    justify-content: flex-end;
+    justify-content: flex-start; /* 动作按钮整行左对齐、换行规律，不甩尾 */
+  }
+
+  /* 统一动作区各控件高度，消除换行锯齿；控件不收缩（flex:0 0 auto），窄宽整块折行不裁切 */
+  .ai-actions > * {
+    height: 26px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
   }
 
   .mini {

@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api } from "../lib/api";
+  import { dragOutHandle } from "../lib/windowSnap";
   import type { BookSession } from "../lib/types";
 
-  let { bookId, bookTitle, onclose }: {
+  let { bookId, bookTitle, onclose, onpopout }: {
     bookId: number;
     bookTitle: string;
     onclose: () => void;
+    onpopout?: () => void;
   } = $props();
 
   let sessions: BookSession[] = $state([]);
@@ -76,9 +78,12 @@
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head">
+  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
     <span>本书统计</span>
-    <button class="icon" title="关闭" onclick={onclose}>×</button>
+    <div style="display:flex; gap:6px; align-items:center;">
+      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
+      <button class="icon" title="关闭" onclick={onclose}>×</button>
+    </div>
   </div>
   <div class="stats-body">
     {#if !loaded}

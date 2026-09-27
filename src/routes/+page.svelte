@@ -8,14 +8,19 @@
   import AiPanel from "../components/AiPanel.svelte";
   import WebdavBrowser from "../components/WebdavBrowser.svelte";
   import StandaloneBook from "../components/StandaloneBook.svelte";
+  import StandalonePanel from "../components/StandalonePanel.svelte";
   import NotesPanel from "../components/NotesPanel.svelte";
-  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
+  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, openPanelWindow } from "../lib/stores.svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
+  import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const standalone = !!params && params.get("ai") === "1";
-  const standaloneBook = !!params && !!params.get("book");
+  const panelKind = (params && params.get("panel")) || "";
+  const standalonePanel = !!panelKind;
+  // 独立阅读窗：有 book 参数且既非 AI 窗也非面板窗
+  const standaloneBook = !!params && !!params.get("book") && !standalone && !standalonePanel;
 
   const aiRootStyle = $derived.by(() => {
     const t = THEMES[config.reader.theme];
@@ -45,6 +50,33 @@
     listen("ai-dock", () => {
       ui.aiOpen = true;
     });
+  });
+
+  // 窗口吸附体系：每个窗口启动一次（模块内按 label 自动区分基准窗/卫星窗），卸载时清理监听与组引用。
+  $effect(() => {
+    void startSnap();
+    return () => { void stopSnap(); };
+  });
+
+  // 吸附特效：卫星窗拖动进入吸附区显示预吸附虚线（fr-snap-preview），吸附命中闪一下发光（fr-snap-flash）。
+  // 事件由 windowSnap.ts 在本窗 dispatch，故只在触发的那个卫星窗渲染。
+  let snapPreview = $state(false);
+  let snapFlash = $state(false);
+  let snapFlashTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const onPreview = (e: Event) => { snapPreview = !!(e as CustomEvent<boolean>).detail; };
+    const onFlash = () => {
+      snapFlash = true;
+      clearTimeout(snapFlashTimer);
+      snapFlashTimer = setTimeout(() => { snapFlash = false; }, 1000);
+    };
+    window.addEventListener("fr-snap-preview", onPreview);
+    window.addEventListener("fr-snap-flash", onFlash);
+    return () => {
+      clearTimeout(snapFlashTimer);
+      window.removeEventListener("fr-snap-preview", onPreview);
+      window.removeEventListener("fr-snap-flash", onFlash);
+    };
   });
 
   // 全局封面刷新监听（C2：注册在 App 根组件，非书库页面内部；根组件常驻，卸载时解绑）。
@@ -125,7 +157,9 @@
     </dialog>
   {/if}
 {/if}
-{#if standaloneBook}
+{#if standalonePanel}
+  <StandalonePanel />
+{:else if standaloneBook}
   <StandaloneBook />
 {:else if !standalone}
 <div class="layout-root">
@@ -191,6 +225,12 @@
   {/if}
 
   {#if ui.notesOpen}
+    <!-- 笔记面板弹出入口：置于 NotesPanel 之外（不改其组件本体），成功后关闭内联笔记面板 -->
+    <button
+      class="notes-popout-btn"
+      title="弹出为独立窗口"
+      onclick={async () => { const ok = await openPanelWindow("notes", ui.currentBookId || 0, "笔记"); if (ok) ui.notesOpen = false; }}
+    >⧉</button>
     <NotesPanel />
   {/if}
 
@@ -206,6 +246,11 @@
       </div>
     </dialog>
   {/if}
+{/if}
+
+<!-- 吸附特效叠层（预吸附虚线 / 吸附命中发光），pointer-events:none 不挡交互 -->
+{#if snapPreview || snapFlash}
+  <div class="snap-fx" class:preview={snapPreview} class:flash={snapFlash}></div>
 {/if}
 
 <div class="fr-toast-wrap">
@@ -282,6 +327,45 @@
   .layout-root {
     height: 100%;
   }
+
+  /* 吸附特效叠层 */
+  .snap-fx {
+    position: fixed;
+    inset: 0;
+    z-index: 10001;
+    pointer-events: none;
+    border-radius: 6px;
+  }
+  .snap-fx.preview {
+    outline: 2px dashed var(--accent, #4a6b8a);
+    outline-offset: -6px;
+    box-shadow: inset 0 0 0 6px color-mix(in srgb, var(--accent, #4a6b8a) 14%, transparent);
+  }
+  .snap-fx.flash {
+    outline: 3px solid var(--accent, #4a6b8a);
+    outline-offset: -3px;
+    box-shadow: inset 0 0 24px color-mix(in srgb, var(--accent, #4a6b8a) 55%, transparent);
+    animation: snap-flash-out 1s ease forwards;
+  }
+  @keyframes snap-flash-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+
+  .notes-popout-btn {
+    position: fixed;
+    top: 10px;
+    right: 56px;
+    z-index: 10000;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: rgba(128, 128, 128, 0.18);
+    border: none;
+    cursor: pointer;
+    font-size: 15px;
+  }
+  .notes-popout-btn:hover { background: rgba(128, 128, 128, 0.32); }
 
   .overlay {
     position: fixed;
