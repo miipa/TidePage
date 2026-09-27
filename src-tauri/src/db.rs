@@ -1,5 +1,6 @@
 use crate::models::{BookRow, Progress};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,7 +58,12 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             cover_ver INTEGER NOT NULL DEFAULT 0,
             -- 秩可寻址分页专用：最近阅读时间的普通持久列（= max(last_opened, progress.updated_at)）。
             -- 由写入路径（打开书 / 保存进度 / 进度重置）维护，供 ORDER BY 走索引、消除 TEMP B-TREE。
-            last_read INTEGER NOT NULL DEFAULT 0
+            last_read INTEGER NOT NULL DEFAULT 0,
+            -- 反规范化的阅读进度（0–100，量纲同 progress.pct）：由写 progress.pct 的每条路径同步维护（红线 5），
+            -- 供封面进度环与「阅读状态」过滤下推 SQLite，避免 JOIN progress。
+            read_pct REAL NOT NULL DEFAULT 0,
+            -- 手动状态覆盖：0=自动推导 / 1=手动已读 / 2=手动未读。
+            read_state INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS progress(
             book_id INTEGER PRIMARY KEY,
@@ -151,6 +157,9 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "last_opened INTEGER NOT NULL DEFAULT 0",
         "cover_ver INTEGER NOT NULL DEFAULT 0",
         "last_read INTEGER NOT NULL DEFAULT 0",
+        // 阅读状态相关反规范化列（老库补列；新库建表已含）。
+        "read_pct REAL NOT NULL DEFAULT 0",
+        "read_state INTEGER NOT NULL DEFAULT 0",
         // 扫描重试元数据（A5/A9）：失败原因、上次尝试秒级时间、失败次数。
         "meta_error TEXT",
         "last_attempt_at INTEGER",
@@ -209,6 +218,28 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         })();
         if let Err(e) = r {
             eprintln!("[db] last_read backfill failed (will retry next start): {e}");
+        }
+    }
+    // read_pct 一次性回填（新列/旧库）：progress ↔ books 为 1:1（progress.book_id 主键），
+    // 直接取该书 progress.pct，无记录留 0。与 last_read 回填同款：UPDATE 与标记同事务、幂等可重入。
+    if get_setting(&conn, "read_pct_backfill_v1").is_none() {
+        let r = (|| -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE books SET read_pct = COALESCE(
+                    (SELECT pct FROM progress WHERE progress.book_id = books.id), 0
+                 )",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO settings(key,value) VALUES('read_pct_backfill_v1','1')
+                 ON CONFLICT(key) DO UPDATE SET value='1'",
+                [],
+            )?;
+            tx.commit()
+        })();
+        if let Err(e) = r {
+            eprintln!("[db] read_pct backfill failed (will retry next start): {e}");
         }
     }
     // 所有索引统一放在**补列逻辑之后**创建。
@@ -383,12 +414,102 @@ fn book_from_row(r: &Row) -> rusqlite::Result<BookRow> {
         total_chars: r.get(11)?,
         total_text_chars: r.get(12)?,
         cover_ver: r.get(13)?,
+        read_pct: r.get(14)?,
+        read_state: r.get(15)?,
+        last_opened: r.get(16)?,
     })
 }
 
 /// `last_read`（下标 10）= 普通持久列 `books.last_read`（由写入路径维护）。
 /// 不再跨表 JOIN progress 计算，故所有列表/单查询都不需要 `LEFT JOIN progress`。
-const BOOK_COLS: &str = "b.id, b.path, b.title, b.author, b.format, b.size, b.mtime, b.added_at, b.cover_path, b.meta_done, b.last_read, COALESCE(b.total_chars, 0), COALESCE(b.total_text_chars, 0), b.cover_ver";
+/// read_pct（14）/ read_state（15）/ last_opened（16）为阅读状态相关列（红线 5 + 状态推导）。
+const BOOK_COLS: &str = "b.id, b.path, b.title, b.author, b.format, b.size, b.mtime, b.added_at, b.cover_path, b.meta_done, b.last_read, COALESCE(b.total_chars, 0), COALESCE(b.total_text_chars, 0), b.cover_ver, COALESCE(b.read_pct, 0), COALESCE(b.read_state, 0), COALESCE(b.last_opened, 0)";
+
+/// 阅读进度「已满」阈值（量纲 0–100，见 §0 第 1 条：progress.pct 为百分数）。
+/// 取 99.5 以吸收浮点；SQL（build_book_filter）与前端 effectiveState 必须逐字同源使用同一阈值。
+pub const READ_FULL_PCT: f64 = 99.5;
+
+/// 生成「有效阅读状态」的 SQL CASE 表达式（与前端 effectiveState(row) 同一套映射）：
+///   read_state==1 -> 'read'；read_state==2 -> 'unread'；
+///   last_opened==0 -> 'unread'；read_pct>=READ_FULL_PCT -> 'read'；else 'reading'。
+/// 用于 build_book_filter 拼接过滤条件；所有字段名为字面量、阈值为数值字面量，无用户输入拼接。
+fn effective_state_case_sql() -> String {
+    format!(
+        "CASE \
+         WHEN COALESCE(read_state,0)=1 THEN 'read' \
+         WHEN COALESCE(read_state,0)=2 THEN 'unread' \
+         WHEN COALESCE(last_opened,0)=0 THEN 'unread' \
+         WHEN COALESCE(read_pct,0)>={READ_FULL_PCT} THEN 'read' \
+         ELSE 'reading' END"
+    )
+}
+
+/// 【红线 3 落地】书库过滤子句的唯一来源：`order_index_ids` 与 `list_books_page` 都必须
+/// 拼接本函数返回的同一 fragment、绑同一批 params，从结构上杜绝两处 WHERE 不同源、
+/// 避免 rank→id 与取行错位。
+///
+/// - 返回 `(where_sql_fragment, params)`：fragment **不含** 前导 `WHERE`/`AND`，
+///   由调用方与其它条件（如搜索 LIKE）用 `AND` 组合；无任何条件时返回空串。
+/// - 格式维度：`format IN (?,?,…)`，占位符数量随选中项变化，值一律走参数化绑定。
+/// - 状态维度：`(effective_read_state) IN (?,…)`，状态字符串走绑定（白名单校验后）。
+/// - 空数组 / None 语义（红线 & Task D）：**不追加该维度条件**（回到完整书库），
+///   绝不翻成 `IN ()` 或恒假条件。
+pub fn build_book_filter(
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+) -> (String, Vec<Value>) {
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(fs) = formats {
+        if !fs.is_empty() {
+            let ph = std::iter::repeat("?").take(fs.len()).collect::<Vec<_>>().join(",");
+            conds.push(format!("b.format IN ({ph})"));
+            for f in fs {
+                params.push(Value::Text(f.clone()));
+            }
+        }
+    }
+    if let Some(ss) = states {
+        // 仅保留白名单值（read/unread/reading），过滤脏数据；空则不追加条件。
+        let valid: Vec<&str> = ss
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| matches!(*s, "read" | "unread" | "reading"))
+            .collect();
+        if !valid.is_empty() {
+            let ph = std::iter::repeat("?").take(valid.len()).collect::<Vec<_>>().join(",");
+            conds.push(format!("({}) IN ({ph})", effective_state_case_sql()));
+            for s in valid {
+                params.push(Value::Text(s.to_string()));
+            }
+        }
+    }
+    (conds.join(" AND "), params)
+}
+
+/// 书库中实际存在的格式列表（Task B）：`SELECT DISTINCT format`，
+/// 排序固定 `COUNT(*) DESC, format ASC`（写死，避免每次刷新顺序跳动）。
+pub fn list_formats(conn: &Connection) -> Vec<String> {
+    let mut stmt = match conn
+        .prepare("SELECT format FROM books GROUP BY format ORDER BY COUNT(*) DESC, format ASC")
+    {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 手动设置阅读状态覆盖（Task F）：state=1 已读 / 2 未读 / 0 自动。仅写 read_state，不动 read_pct（真实进度不破坏）。
+pub fn set_read_state(conn: &Connection, book_id: i64, state: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE books SET read_state=?2 WHERE id=?1",
+        params![book_id, state],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 /// 记录「最近打开」时间（不改动阅读进度）。打开失败的书也能出现在「按最近阅读」里。
 /// 同步维护 last_read（取大），保证秩可寻址分页的排序键与显示一致。
@@ -450,7 +571,8 @@ fn escape_like(s: &str) -> String {
 }
 
 /// 超大书库分页查询：过滤/排序全部下推 SQLite（带索引），只返回窗口 rows + total。
-/// - query 为空不施加过滤；否则按 title/author 模糊匹配（LIKE 对 ASCII 不区分大小写）。
+/// - query 为空不施加搜索过滤；否则按 title/author 模糊匹配（LIKE 对 ASCII 不区分大小写）。
+/// - formats/states 走 `build_book_filter` 下推（红线 3 同源）；空数组/None = 不约束该维度。
 /// - sort 走白名单，绝不拼接用户输入。
 /// - limit 上限保护 500，offset 非负。
 pub fn list_books_page(
@@ -459,6 +581,8 @@ pub fn list_books_page(
     sort: &str,
     offset: i64,
     limit: i64,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
 ) -> crate::models::BookPage {
     let order = match sort {
         "lastread" => "b.last_read DESC, b.id DESC",
@@ -470,56 +594,53 @@ pub fn list_books_page(
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let q = query.trim();
-    let pat = if q.is_empty() {
-        None
+
+    // 组合 WHERE：搜索 LIKE（若有）+ build_book_filter fragment（红线 3 同源）。
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    if !q.is_empty() {
+        conds.push("(b.title LIKE ? ESCAPE '\\' OR b.author LIKE ? ESCAPE '\\')".to_string());
+        let pat = format!("%{}%", escape_like(q));
+        params.push(Value::Text(pat.clone()));
+        params.push(Value::Text(pat));
+    }
+    let (frag, fparams) = build_book_filter(formats, states);
+    if !frag.is_empty() {
+        conds.push(frag);
+        params.extend(fparams);
+    }
+    let where_sql = if conds.is_empty() {
+        String::new()
     } else {
-        Some(format!("%{}%", escape_like(q)))
-    };
-    let where_sql = if pat.is_some() {
-        " WHERE (b.title LIKE ?1 ESCAPE '\\' OR b.author LIKE ?1 ESCAPE '\\')"
-    } else {
-        ""
+        format!(" WHERE {}", conds.join(" AND "))
     };
 
     let total: i64 = {
         let sql = format!("SELECT COUNT(*) FROM books b{where_sql}");
-        match &pat {
-            Some(p) => conn.query_row(&sql, params![p], |r| r.get(0)).unwrap_or(0),
-            None => conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0),
-        }
+        conn.query_row(&sql, params_from_iter(params.iter()), |r| r.get(0))
+            .unwrap_or(0)
     };
 
-    let sql = if pat.is_some() {
-        format!(
-            "SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT ?2 OFFSET ?3"
-        )
-    } else {
-        format!(
-            "SELECT {BOOK_COLS} FROM books b ORDER BY {order} LIMIT ?1 OFFSET ?2"
-        )
-    };
+    let sql = format!("SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT ? OFFSET ?");
+    let mut page_params = params;
+    page_params.push(Value::Integer(limit));
+    page_params.push(Value::Integer(offset));
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => {
             return crate::models::BookPage { total, rows: vec![] };
         }
     };
-    let rows: Vec<BookRow> = match &pat {
-        Some(p) => stmt
-            .query_map(params![p, limit, offset], book_from_row)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        None => stmt
-            .query_map(params![limit, offset], book_from_row)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-    };
+    let rows: Vec<BookRow> = stmt
+        .query_map(params_from_iter(page_params.iter()), book_from_row)
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
     crate::models::BookPage { total, rows }
 }
 
-/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` 过滤，返回**有序 books.id 序列**。
-/// - `query` 非空时施加与 `list_books_page` **逐字同源**的 WHERE（title/author LIKE，同 escape_like +
-///   `ESCAPE '\'`），保证搜索档 rank→id 与 `list_books_by_ids` 取到的行严格对齐；
+/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` / `formats` / `states` 过滤，返回**有序 books.id 序列**。
+/// - `query`/`formats`/`states` 施加与 `list_books_page` **逐字同源**的 WHERE（后者由 `build_book_filter` 保证，红线 3），
+///   保证 rank→id 与 `books_by_ids_aligned` 取到的行严格对齐；
 /// - 不 JOIN progress；ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
 /// - 边收集边计数：超过 `max_rows` 立即中止并返回 `Err("order_index_too_large:N")`（禁止静默截断），
 ///   避免为超大结果集构建巨大 Vec。
@@ -528,31 +649,41 @@ pub fn order_index_ids(
     sort: &str,
     query: &str,
     max_rows: usize,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
 ) -> Result<Vec<i64>, String> {
-    // 白名单 → 字面量 ORDER BY；未知一律回落 "added"。
+    // 白名单 → 字面量 ORDER BY；未知一律回落 "added"。表别名 b 与 list_books_page 一致，
+    // 令 build_book_filter 的 `b.format` 片段两处通用。
     let order = match sort {
-        "lastread" => "last_read DESC, id DESC",
-        "title" => "title COLLATE NOCASE ASC, id ASC",
-        "recent" => "mtime DESC, id DESC",
-        _ => "added_at DESC, id DESC",
+        "lastread" => "b.last_read DESC, b.id DESC",
+        "title" => "b.title COLLATE NOCASE ASC, b.id ASC",
+        "recent" => "b.mtime DESC, b.id DESC",
+        _ => "b.added_at DESC, b.id DESC",
     };
     let q = query.trim();
-    // WHERE 与 list_books_page 同源：title/author LIKE，escape_like + ESCAPE '\'。
-    let (where_sql, pat) = if q.is_empty() {
-        ("", None)
+    // WHERE 与 list_books_page 同源：搜索 LIKE + build_book_filter fragment。
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    if !q.is_empty() {
+        conds.push("(b.title LIKE ? ESCAPE '\\' OR b.author LIKE ? ESCAPE '\\')".to_string());
+        let pat = format!("%{}%", escape_like(q));
+        params.push(Value::Text(pat.clone()));
+        params.push(Value::Text(pat));
+    }
+    let (frag, fparams) = build_book_filter(formats, states);
+    if !frag.is_empty() {
+        conds.push(frag);
+        params.extend(fparams);
+    }
+    let where_sql = if conds.is_empty() {
+        String::new()
     } else {
-        (
-            " WHERE (title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\')",
-            Some(format!("%{}%", escape_like(q))),
-        )
+        format!(" WHERE {}", conds.join(" AND "))
     };
-    let sql = format!("SELECT id FROM books{where_sql} ORDER BY {order}");
+    let sql = format!("SELECT b.id FROM books b{where_sql} ORDER BY {order}");
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut ids: Vec<i64> = Vec::new();
-    let mut rows = match &pat {
-        Some(p) => stmt.query(params![p]).map_err(|e| e.to_string())?,
-        None => stmt.query([]).map_err(|e| e.to_string())?,
-    };
+    let mut rows = stmt.query(params_from_iter(params.iter())).map_err(|e| e.to_string())?;
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         if ids.len() >= max_rows {
             return Err(format!("order_index_too_large:{max_rows}"));
@@ -853,20 +984,23 @@ pub fn set_progress(conn: &Connection, book_id: i64, p: &Progress) -> Result<(),
     )
     .map_err(|e| e.to_string())?;
     // 同步维护 books.last_read（取大）：秩可寻址分页「按最近阅读」的排序键。
+    // 同步维护 books.read_pct（反规范化，红线 5）：所有写 progress.pct 的路径都经由本函数，
+    // 故这一处覆盖 §0 第 4 条列出的全部写入点（save_progress / webdav 合并回写）。
     conn.execute(
-        "UPDATE books SET last_read=MAX(last_read, ?2) WHERE id=?1",
-        params![book_id, p.updated_at],
+        "UPDATE books SET last_read=MAX(last_read, ?2), read_pct=?3 WHERE id=?1",
+        params![book_id, p.updated_at, p.pct],
     )
     .ok();
     Ok(())
 }
 
-/// 进度重置/清除时调用：把 last_read 回落到 last_opened（不再受已删进度影响）。
+/// 进度重置/清除时调用：把 last_read 回落到 last_opened（不再受已删进度影响），
+/// 并同步清 0 反规范化的 read_pct（红线 5：进度重置路径同步清 0）。
 /// 当前无「重置进度」命令，保留供将来接入；书籍删除走整行删除，不需调用本函数。
 #[allow(dead_code)]
 pub fn reset_last_read(conn: &Connection, book_id: i64) {
     conn.execute(
-        "UPDATE books SET last_read=COALESCE(last_opened, 0) WHERE id=?1",
+        "UPDATE books SET last_read=COALESCE(last_opened, 0), read_pct=0 WHERE id=?1",
         params![book_id],
     )
     .ok();

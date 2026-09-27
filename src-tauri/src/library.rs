@@ -1081,11 +1081,13 @@ pub async fn list_books_page(
     sort: String,
     offset: i64,
     limit: i64,
+    formats: Option<Vec<String>>,
+    states: Option<Vec<String>>,
 ) -> Result<BookPage, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
-        db::list_books_page(&conn, &query, &sort, offset, limit)
+        db::list_books_page(&conn, &query, &sort, offset, limit, &formats, &states)
     })
     .await
     .map_err(|e| e.to_string())
@@ -1104,6 +1106,8 @@ pub async fn list_order_index(
     state: State<'_, Arc<AppState>>,
     sort: String,
     query: Option<String>,
+    formats: Option<Vec<String>>,
+    states: Option<Vec<String>>,
 ) -> Result<tauri::ipc::Response, String> {
     // 白名单归一（未知回落 added），避免把任意字符串带入下游。
     let sort = match sort.as_str() {
@@ -1115,7 +1119,7 @@ pub async fn list_order_index(
     let bytes: Vec<u8> = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let conn = st.db.0.lock().unwrap();
         // 边收集边计数：越限立即 Err（禁止静默截断），不为超大结果集构建巨大 Vec。
-        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize)?;
+        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize, &formats, &states)?;
         let mut buf = Vec::with_capacity(ids.len() * 8);
         for id in ids {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -1125,6 +1129,41 @@ pub async fn list_order_index(
     .await
     .map_err(|e| e.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Task B：书库当前实际存在的格式列表（去重、固定排序）。供前端「分类」面板动态生成格式标签。
+#[tauri::command]
+pub async fn list_formats(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_formats(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Task F：手动设置阅读状态覆盖。stateStr 取 "read" / "unread" / "auto"（read→1，unread→2，auto→0）。
+/// 只写 read_state，不动 read_pct（真实进度不破坏）。前端据是否处于状态筛选决定 reload / 就地刷新。
+#[tauri::command]
+pub async fn set_read_state(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    state_str: String,
+) -> Result<(), String> {
+    let v: i64 = match state_str.as_str() {
+        "read" => 1,
+        "unread" => 2,
+        "auto" => 0,
+        _ => return Err(format!("unknown read_state: {state_str}")),
+    };
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::set_read_state(&conn, book_id, v)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 命令 2（秩可寻址分页）：按 `ids` 批量取行。返回长度/顺序恒等于 `ids`，
@@ -4183,30 +4222,30 @@ mod refresh_tests {
             db::upsert_book(&conn, &sp(&p), title, "txt", 1, mtime).unwrap();
         }
 
-        let p1 = db::list_books_page(&conn, "", "recent", 0, 500);
+        let p1 = db::list_books_page(&conn, "", "recent", 0, 500, &None, &None);
         assert_eq!(p1.total, 7);
         assert_eq!(p1.rows.len(), 7);
         assert_eq!(p1.rows[0].title, "zeta", "mtime DESC 最新在前");
 
-        let p2 = db::list_books_page(&conn, "", "recent", 2, 3);
+        let p2 = db::list_books_page(&conn, "", "recent", 2, 3, &None, &None);
         assert_eq!((p2.total, p2.rows.len()), (7, 3));
         assert_eq!(p2.rows[0].title, "delta", "offset=2 应从第三新开始");
 
-        let p3 = db::list_books_page(&conn, "", "added", 0, 9999);
+        let p3 = db::list_books_page(&conn, "", "added", 0, 9999, &None, &None);
         assert_eq!(p3.rows.len(), 7, "limit 超上限被 clamp 到 500，本应有 7 行");
 
-        let p4 = db::list_books_page(&conn, "epsilon", "title", 0, 10);
+        let p4 = db::list_books_page(&conn, "epsilon", "title", 0, 10, &None, &None);
         assert_eq!((p4.total, p4.rows.len()), (1, 1), "标题搜索应大小写不敏感");
         assert_eq!(p4.rows[0].title, "Epsilon");
 
-        let p5 = db::list_books_page(&conn, "%_marker", "title", 0, 10);
+        let p5 = db::list_books_page(&conn, "%_marker", "title", 0, 10, &None, &None);
         assert_eq!(p5.total, 1, "% 与 _ 必须按字面匹配");
         assert_eq!(p5.rows[0].title, "100%_marker");
 
-        let p6 = db::list_books_page(&conn, "%", "title", 0, 10);
+        let p6 = db::list_books_page(&conn, "%", "title", 0, 10, &None, &None);
         assert_eq!(p6.total, 1, "纯通配符不得匹配全部");
 
-        let p7 = db::list_books_page(&conn, "", "title", 0, 10);
+        let p7 = db::list_books_page(&conn, "", "title", 0, 10, &None, &None);
         assert_eq!(p7.rows[0].title, "100%_marker", "title COLLATE NOCASE 升序");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4240,31 +4279,31 @@ mod refresh_tests {
         }
 
         let t = Instant::now();
-        let p1 = db::list_books_page(&conn, "", "added", 0, 500);
+        let p1 = db::list_books_page(&conn, "", "added", 0, 500, &None, &None);
         println!("[perf160k] added page0: {:?} total={} rows={}", t.elapsed(), p1.total, p1.rows.len());
 
         let t = Instant::now();
-        let p2 = db::list_books_page(&conn, "", "title", 0, 500);
+        let p2 = db::list_books_page(&conn, "", "title", 0, 500, &None, &None);
         println!("[perf160k] title page0: {:?} rows={}", t.elapsed(), p2.rows.len());
 
         let t = Instant::now();
-        let p3 = db::list_books_page(&conn, "", "recent", 159_000, 500);
+        let p3 = db::list_books_page(&conn, "", "recent", 159_000, 500, &None, &None);
         println!("[perf160k] recent offset=159000: {:?} rows={}", t.elapsed(), p3.rows.len());
 
         let t = Instant::now();
-        let p3b = db::list_books_page(&conn, "", "added", 159_000, 500);
+        let p3b = db::list_books_page(&conn, "", "added", 159_000, 500, &None, &None);
         println!("[perf160k] added offset=159000: {:?} rows={}", t.elapsed(), p3b.rows.len());
 
         let t = Instant::now();
-        let p3c = db::list_books_page(&conn, "", "title", 159_000, 500);
+        let p3c = db::list_books_page(&conn, "", "title", 159_000, 500, &None, &None);
         println!("[perf160k] title offset=159000: {:?} rows={}", t.elapsed(), p3c.rows.len());
 
         let t = Instant::now();
-        let p3d = db::list_books_page(&conn, "", "lastread", 0, 500);
+        let p3d = db::list_books_page(&conn, "", "lastread", 0, 500, &None, &None);
         println!("[perf160k] lastread page0: {:?} rows={}", t.elapsed(), p3d.rows.len());
 
         let t = Instant::now();
-        let p4 = db::list_books_page(&conn, "Book 159", "title", 0, 500);
+        let p4 = db::list_books_page(&conn, "Book 159", "title", 0, 500, &None, &None);
         println!("[perf160k] search 'Book 159': {:?} total={} rows={}", t.elapsed(), p4.total, p4.rows.len());
 
         assert_eq!(p1.total, 160_000);
@@ -4294,34 +4333,34 @@ mod refresh_tests {
 
         // 每个 sort：order_index_ids 的序列必须与 list_books_page 全量窗口逐行 id 一致。
         for sort in ["added", "recent", "title", "lastread"] {
-            let idx = db::order_index_ids(&conn, sort, "", 1_000_000).unwrap();
-            let page = db::list_books_page(&conn, "", sort, 0, 500);
+            let idx = db::order_index_ids(&conn, sort, "", 1_000_000, &None, &None).unwrap();
+            let page = db::list_books_page(&conn, "", sort, 0, 500, &None, &None);
             let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
             assert_eq!(idx, page_ids, "order_index_ids 与 list_books_page 不同源: sort={sort}");
         }
 
         // 未知 sort 回落 added。
         assert_eq!(
-            db::order_index_ids(&conn, "bogus", "", 1_000_000).unwrap(),
-            db::order_index_ids(&conn, "added", "", 1_000_000).unwrap(),
+            db::order_index_ids(&conn, "bogus", "", 1_000_000, &None, &None).unwrap(),
+            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None).unwrap(),
             "未知 sort 必须回落 added"
         );
 
         // 过滤档：order_index_ids(query) 必须与 list_books_page(query) 逐行同源（rank→id 对齐）。
         for (sort, q) in [("title", "delta"), ("added", "a"), ("recent", "e")] {
-            let idx = db::order_index_ids(&conn, sort, q, 1_000_000).unwrap();
-            let page = db::list_books_page(&conn, q, sort, 0, 500);
+            let idx = db::order_index_ids(&conn, sort, q, 1_000_000, &None, &None).unwrap();
+            let page = db::list_books_page(&conn, q, sort, 0, 500, &None, &None);
             let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
             assert_eq!(idx, page_ids, "过滤档不同源: sort={sort} q={q}");
             assert_eq!(idx.len() as i64, page.total, "过滤档条数应等于 total");
         }
 
         // 越限：max_rows 限制触发 Err，不静默截断。
-        let err = db::order_index_ids(&conn, "added", "", 2).unwrap_err();
+        let err = db::order_index_ids(&conn, "added", "", 2, &None, &None).unwrap_err();
         assert!(err.starts_with("order_index_too_large:"), "越限必须报错: {err}");
 
         // books_by_ids_aligned：长度/顺序恒等于入参，缺行补 None。
-        let idx = db::order_index_ids(&conn, "title", "", 1_000_000).unwrap();
+        let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &None, &None).unwrap();
         let missing = 424242i64; // 不存在
         let query_ids = vec![idx[2], missing, idx[0], idx[0]]; // 含重复与缺失
         let rows = db::books_by_ids_aligned(&conn, &query_ids);
@@ -4333,6 +4372,88 @@ mod refresh_tests {
 
         // 空入参返回空。
         assert!(db::books_by_ids_aligned(&conn, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 分类筛选（格式 + 阅读状态）：build_book_filter 下推后 order_index_ids 与 list_books_page 仍逐行同源；
+    /// 空数组=不约束；状态语义（未读/在读/已读 + 手动覆盖）与 effectiveState 一致。
+    #[test]
+    fn book_filter_states_and_formats_align() {
+        let root = tmp_root("bookfilter");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        // 造 4 本：不同格式 + 不同状态。
+        let mk = |name: &str, fmt: &str| {
+            let p = root.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            db::upsert_book(&conn, &sp(&p), name, fmt, 1, 100).unwrap()
+        };
+        let id_unread = mk("u.txt", "txt"); // 从未打开 → unread
+        let id_reading = mk("r.epub", "epub"); // 打开过 + 进度未满 → reading
+        let id_read = mk("d.epub", "epub"); // 进度已满 → read
+        let id_manual = mk("m.mobi", "mobi"); // 手动已读（从未打开）→ read
+
+        db::touch_book_opened(&conn, id_reading);
+        let mut p = crate::models::Progress { updated_at: db::now_ms(), ..Default::default() };
+        p.pct = 42.0;
+        db::set_progress(&conn, id_reading, &p).unwrap();
+
+        db::touch_book_opened(&conn, id_read);
+        let mut p2 = crate::models::Progress { updated_at: db::now_ms(), ..Default::default() };
+        p2.pct = 100.0;
+        db::set_progress(&conn, id_read, &p2).unwrap();
+
+        db::set_read_state(&conn, id_manual, 1).unwrap(); // 手动已读
+
+        // 逐状态断言（用 order_index_ids 结果集合判定）。
+        let ids_of = |states: Option<Vec<String>>| -> Vec<i64> {
+            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &states).unwrap()
+        };
+        let has = |v: &[i64], id: i64| v.contains(&id);
+
+        let unread = ids_of(Some(vec!["unread".into()]));
+        assert!(has(&unread, id_unread) && !has(&unread, id_reading) && !has(&unread, id_read) && !has(&unread, id_manual), "unread 集合错误: {unread:?}");
+
+        let reading = ids_of(Some(vec!["reading".into()]));
+        assert!(has(&reading, id_reading) && !has(&reading, id_unread) && !has(&reading, id_read) && !has(&reading, id_manual), "reading 集合错误: {reading:?}");
+
+        let read = ids_of(Some(vec!["read".into()]));
+        assert!(has(&read, id_read) && has(&read, id_manual) && !has(&read, id_unread) && !has(&read, id_reading), "read 集合错误: {read:?}");
+
+        // 多状态取「或」。
+        let ru = ids_of(Some(vec!["read".into(), "unread".into()]));
+        assert_eq!(ru.len(), 3, "read+unread 应 3 本: {ru:?}");
+
+        // 空数组 = 不约束（回完整库 4 本）。
+        assert_eq!(ids_of(Some(vec![])).len(), 4, "空状态数组必须不约束");
+        assert_eq!(db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None).unwrap().len(), 4);
+
+        // 格式过滤：epub 2 本。
+        let epub = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &None).unwrap();
+        assert_eq!(epub.len(), 2, "epub 应 2 本");
+
+        // 格式 + 状态取「且」：epub 且 read → 仅 id_read。
+        let epub_read = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &Some(vec!["read".into()])).unwrap();
+        assert_eq!(epub_read, vec![id_read], "epub∩read 应仅 id_read");
+
+        // 红线 3：任意过滤组合下 order_index_ids 与 list_books_page 逐行同源。
+        for (fmts, sts) in [
+            (Some(vec!["epub".into()]), None),
+            (None, Some(vec!["read".into(), "reading".into()])),
+            (Some(vec!["epub".into(), "mobi".into()]), Some(vec!["read".into()])),
+        ] {
+            let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &fmts, &sts).unwrap();
+            let page = db::list_books_page(&conn, "", "title", 0, 500, &fmts, &sts);
+            let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+            assert_eq!(idx, page_ids, "过滤组合不同源: fmts={fmts:?} sts={sts:?}");
+            assert_eq!(idx.len() as i64, page.total, "total 应等于索引长度");
+        }
+
+        // list_formats：3 种格式（txt/epub/mobi）。
+        let formats = db::list_formats(&conn);
+        assert_eq!(formats.len(), 3, "格式种类应为 3: {formats:?}");
+        assert!(formats.contains(&"epub".to_string()));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4349,18 +4470,18 @@ mod refresh_tests {
             ids.push(db::upsert_book(&conn, &sp(&p), name, "txt", 1, 1).unwrap());
         }
         // 初始 last_read 全 0 → 顺序按 id DESC。
-        let idx0 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
+        let idx0 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
         assert_eq!(idx0.len(), 3);
 
         // 打开中间那本 → 它的 last_read 变大，应排到最前。
         db::touch_book_opened(&conn, ids[1]);
-        let idx1 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
+        let idx1 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
         assert_eq!(idx1[0], ids[1], "打开的书应排在按最近阅读的最前");
 
         // 保存另一本的进度（更大的 updated_at）→ 它应排到最前。
         let p = crate::models::Progress { updated_at: db::now_ms() + 10_000, ..Default::default() };
         db::set_progress(&conn, ids[2], &p).unwrap();
-        let idx2 = db::order_index_ids(&conn, "lastread", "", 1_000_000).unwrap();
+        let idx2 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
         assert_eq!(idx2[0], ids[2], "刚更新进度的书应排在最前");
 
         // 该档不得出现 TEMP B-TREE（走 idx_books_lastread_id）。

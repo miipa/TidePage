@@ -18,6 +18,15 @@ pub struct BookRow {
     /// 该书自己的封面版本：每次提取/更换封面 +1，令 per-book 封面 URL 缓存失效。
     #[serde(default)]
     pub cover_ver: i64,
+    /// 反规范化的阅读进度（0–100）：由 set_progress 写入路径维护（红线 5），供封面进度环渲染与状态过滤。
+    #[serde(default)]
+    pub read_pct: f64,
+    /// 手动状态覆盖：0=自动推导 / 1=手动已读 / 2=手动未读。
+    #[serde(default)]
+    pub read_state: i64,
+    /// 最近打开时间（打开动作写入）：状态推导的「打开」列（open_col），供前端 effectiveState 与 SQL 同源。
+    #[serde(default)]
+    pub last_opened: i64,
 }
 
 /// 超大书库（16 万本）分页返回：total 为满足条件的总数（前端状态栏/虚拟滚动用），

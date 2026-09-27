@@ -13,6 +13,7 @@
     IconSettings,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
+  import ProgressRing from "./ProgressRing.svelte";
   import type { BookRow } from "../lib/types";
 
   // ===== 超大书库（实测 16 万本）：秩可寻址分页（id 有序索引 + 有界窗口取行）=====
@@ -123,6 +124,92 @@
   function saveSort() {
     try { localStorage.setItem("flowread.lib.sort", sortKey); } catch { /* ignore */ }
   }
+
+  // ===== 分类筛选（格式 + 阅读状态）=====
+  // 进度「已满」阈值：与后端 db::READ_FULL_PCT 逐字同源（progress.pct 量纲 0–100）。
+  const READ_FULL_PCT = 99.5;
+  type ReadState = "unread" | "reading" | "read";
+  const ALL_STATES: ReadState[] = ["unread", "reading", "read"];
+  const STATE_LABELS: Record<ReadState, string> = { unread: "未读", reading: "在读", read: "已读" };
+
+  // 从 localStorage 恢复筛选（key 与 flowread.lib.sort 同款）；脏值过滤。
+  const _initFilter = (() => {
+    try {
+      const raw = localStorage.getItem("flowread.lib.filter");
+      if (raw) {
+        const o = JSON.parse(raw);
+        return {
+          formats: Array.isArray(o.formats) ? o.formats.filter((x: unknown) => typeof x === "string") : [],
+          states: Array.isArray(o.states)
+            ? o.states.filter((x: unknown) => x === "unread" || x === "reading" || x === "read")
+            : [],
+        };
+      }
+    } catch { /* ignore */ }
+    return { formats: [] as string[], states: [] as string[] };
+  })();
+  let availableFormats = $state<string[]>([]);
+  let filterFormats = $state<string[]>(_initFilter.formats);
+  let filterStates = $state<string[]>(_initFilter.states as ReadState[]);
+  let filterPanelOpen = $state(false);
+  // 任一维度有选中即视为「已筛选」。空数组=不约束（回完整书库）。
+  const hasFilter = $derived(filterFormats.length > 0 || filterStates.length > 0);
+
+  function saveFilter() {
+    try {
+      localStorage.setItem("flowread.lib.filter", JSON.stringify({ formats: filterFormats, states: filterStates }));
+    } catch { /* ignore */ }
+  }
+
+  /** 有效阅读状态：与后端 build_book_filter 的 CASE 表达式逐字同源（§0.3 红线 3）。 */
+  function effectiveState(b: BookRow): ReadState {
+    if (b.read_state === 1) return "read";
+    if (b.read_state === 2) return "unread";
+    if (!b.last_opened) return "unread";
+    if ((b.read_pct || 0) >= READ_FULL_PCT) return "read";
+    return "reading";
+  }
+
+  /** 进度环显示信息：显示条件统一为 effective_read_state != 'unread'（Task E）。 */
+  function ringInfo(b: BookRow): { show: boolean; full: boolean; pct: number } {
+    const st = effectiveState(b);
+    if (st === "unread") return { show: false, full: false, pct: 0 };
+    const full = b.read_state === 1; // 手动已读 → 满环 + ✓，不显示真实 read_pct
+    return { show: true, full, pct: full ? 100 : b.read_pct || 0 };
+  }
+
+  function toggleFormat(f: string) {
+    filterFormats = filterFormats.includes(f) ? filterFormats.filter((x) => x !== f) : [...filterFormats, f];
+    saveFilter();
+    reload();
+  }
+  function toggleState(s: ReadState) {
+    filterStates = filterStates.includes(s) ? filterStates.filter((x) => x !== s) : [...filterStates, s];
+    saveFilter();
+    reload();
+  }
+  function clearFilter() {
+    if (!hasFilter) return;
+    filterFormats = [];
+    filterStates = [];
+    saveFilter();
+    reload();
+  }
+
+  /** 拉取库内实际格式并动态生成标签；顺带清理「已选中但已不存在」的格式（失效清理）。 */
+  async function loadFormats() {
+    try {
+      availableFormats = await api.listFormats();
+      const set = new Set(availableFormats);
+      const kept = filterFormats.filter((f) => set.has(f));
+      if (kept.length !== filterFormats.length) {
+        filterFormats = kept;
+        saveFilter();
+        reload(); // 死选中被清后回到正确结果集
+      }
+    } catch { /* ignore */ }
+  }
+
 
   let swipeStartX = 0;
   let swipeStartT = 0;
@@ -281,7 +368,7 @@
   async function loadRange(offset: number) {
     const seq = ++generation;
     try {
-      const r = await api.listBooksPage(query, sortKey, offset, FETCH);
+      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates);
       if (seq !== generation) return;
       total = r.total;
       rangeStart = offset;
@@ -422,7 +509,7 @@
     const seq = ++generation;
     loading = true;
     try {
-      const buf = await api.listOrderIndex(sortKey, query);
+      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates);
       if (seq !== generation) return;
       idIndex = new BigInt64Array(buf);
       total = idIndex.length;
@@ -747,6 +834,24 @@
     convertState.open = true;
   }
 
+  /** Task F：右键标记阅读状态。state=read/unread/auto。
+   *  一致性：idIndex 是后端秩快照。若当前有状态筛选生效，标记后该书 effective 状态会变，
+   *  应从结果里出现/消失 → 必须 reload()（rebuildIndex 重算 idIndex/total）；否则仅就地刷新。 */
+  async function markReadState(b: BookRow, state: "read" | "unread" | "auto") {
+    try {
+      await api.setReadState(b.id, state);
+      b.read_state = state === "read" ? 1 : state === "unread" ? 2 : 0;
+      if (filterStates.length > 0) {
+        await reloadWindow(); // 状态筛选生效：重建秩索引，令该书按新状态出现/消失
+      } else {
+        touchWindow(); // 无状态筛选：就地刷新该行（参考 setCover/reextract 模式）
+      }
+      toast(state === "auto" ? "已恢复自动状态" : state === "read" ? "已标记为已读" : "已标记为未读");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
   function fmtSize(n: number): string {
     if (n > 1048576) return (n / 1048576).toFixed(1) + " MB";
     if (n > 1024) return (n / 1024).toFixed(0) + " KB";
@@ -798,6 +903,7 @@
       };
     }
     loadFolders();
+    loadFormats();
     reload();
     // 启动竞态修复：首次 `meta-progress` 常在 webview 挂载前发出而丢失，仅靠事件会让底栏空着。
     // 挂载后主动拉一次当前进度快照初始化（若已有事件先到则保留更新值；后续帧仍由 meta-progress 事件更新）。
@@ -817,6 +923,8 @@
       bumpCoverBust();
       // 增删书改变 N 与顺序：索引档按锚点重建，回落档重拉窗口。
       reloadWindow();
+      // 格式可能新增/消失：刷新格式列表并清理失效选中。
+      loadFormats();
     });
     const u2 = listen("library-meta", () => {
       // 仅封面/元数据（不改顺序）：索引档只刷新可见行，回落档重拉窗口。
@@ -894,6 +1002,19 @@
       <option value="title">按书名</option>
       <option value="recent">按文件时间</option>
     </select>
+    <div class="filter-wrap">
+      <button
+        class="cat-btn"
+        class:active={filterPanelOpen || hasFilter}
+        aria-expanded={filterPanelOpen}
+        onclick={() => (filterPanelOpen = !filterPanelOpen)}
+      >分类{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
+      {#if hasFilter}
+        <button class="filter-chip" title="清除全部筛选" onclick={clearFilter}>
+          已筛选 <span class="fx">×</span>
+        </button>
+      {/if}
+    </div>
     <div class="spacer"></div>
     <div class="lib-tb-group" use:dragSort={{ onDrop: libDrop }}>
       {#each orderedLibBtns as b (b.id)}
@@ -910,6 +1031,35 @@
       {/each}
     </div>
   </div>
+
+  {#if filterPanelOpen}
+    <div class="filter-panel">
+      <div class="fp-group">
+        <span class="fp-label">格式</span>
+        <div class="fp-tags">
+          {#each availableFormats as f (f)}
+            <button class="tag" class:active={filterFormats.includes(f)} onclick={() => toggleFormat(f)}>
+              {f.toUpperCase()}
+            </button>
+          {/each}
+          {#if !availableFormats.length}<span class="fp-empty">（暂无）</span>{/if}
+        </div>
+      </div>
+      <div class="fp-group">
+        <span class="fp-label">阅读状态</span>
+        <div class="fp-tags">
+          {#each ALL_STATES as s (s)}
+            <button class="tag" class:active={filterStates.includes(s)} onclick={() => toggleState(s)}>
+              {STATE_LABELS[s]}
+            </button>
+          {/each}
+        </div>
+      </div>
+      {#if hasFilter}
+        <button class="fp-clear" onclick={clearFilter}>清除筛选</button>
+      {/if}
+    </div>
+  {/if}
 
   {#if folders.length}
     <div class="folders">
@@ -946,6 +1096,7 @@
               {#if abs < total}
                 {@const b = bookAt(abs)}
                 {#if b}
+                  {@const ri = ringInfo(b)}
                   <div
                     class="card"
                     style="max-width:{CARD_MAX}px;"
@@ -955,6 +1106,9 @@
                     <div class="cover" style="height:{coverH}px;">
                       <img src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
                       <span class="fmt">{b.format.toUpperCase()}</span>
+                      {#if ri.show}
+                        <ProgressRing pct={ri.pct} full={ri.full} />
+                      {/if}
                     </div>
                     <div class="meta">
                       <div class="t" title={b.title}>{b.title}</div>
@@ -977,13 +1131,19 @@
         {#each lRows as i (i)}
           {@const b = bookAt(i)}
           {#if b}
+            {@const ri = ringInfo(b)}
             <div
               class="row"
               style="top:{i * ROW_H}px"
               ondblclick={() => tryOpenBook(b)}
               oncontextmenu={(e) => openCtx(e, b)}
             >
-              <img class="row-cover" src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" />
+              <div class="row-cover-wrap">
+                <img class="row-cover" src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" />
+                {#if ri.show}
+                  <ProgressRing pct={ri.pct} full={ri.full} size={22} />
+                {/if}
+              </div>
               <div class="row-meta">
                 <div class="t">{b.title}</div>
                 <div class="a">{b.author}</div>
@@ -1027,6 +1187,9 @@
         {/if}
         <button onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}>🖼 设置封面</button>
         <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}>🔄 重新提取封面</button>
+        <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}>✓ 标记为已读</button>
+        <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}>○ 标记为未读</button>
+        <button onclick={() => { markReadState(ctxMenu!.book, "auto"); ctxMenu = null; }}>↺ 恢复自动</button>
         <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}>📂 所在文件夹</button>
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}>↩ 仅移出书库</button>
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除本地文件</button>
@@ -1081,6 +1244,101 @@
   }
 
   .spacer { flex: 1; }
+
+  /* ---------- 分类筛选 ---------- */
+  .filter-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2, 8px);
+  }
+
+  .cat-btn.active {
+    background: var(--accent-soft, var(--hover-bg));
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--accent-soft, var(--hover-bg));
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    border-radius: var(--radius-pill, 999px);
+    padding: 4px 10px;
+    font-size: var(--fs-xs, 12px);
+    cursor: pointer;
+  }
+  .filter-chip .fx {
+    font-weight: 700;
+    line-height: 1;
+    opacity: 0.85;
+  }
+  .filter-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+
+  .filter-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3, 12px);
+    padding: var(--sp-3, 12px) var(--sp-4, 16px);
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
+    animation: ctx-in 0.12s cubic-bezier(0, 0, 0.2, 1);
+  }
+
+  .fp-group {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-3, 12px);
+  }
+
+  .fp-label {
+    flex-shrink: 0;
+    width: 56px;
+    padding-top: 5px;
+    font-size: var(--fs-xs, 12px);
+    color: var(--fg2);
+    user-select: none;
+  }
+
+  .fp-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2, 8px);
+  }
+
+  .fp-empty { color: var(--fg2); font-size: var(--fs-xs, 12px); padding-top: 5px; }
+
+  .fp-tags .tag {
+    border: 1px solid var(--line);
+    background: var(--panel2);
+    color: var(--fg2);
+    border-radius: var(--radius-pill, 999px);
+    padding: 4px 12px;
+    font-size: var(--fs-xs, 12px);
+    cursor: pointer;
+    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
+  }
+  .fp-tags .tag:hover { background: var(--hover-bg); color: var(--fg); }
+  .fp-tags .tag.active {
+    background: var(--accent-soft, var(--hover-bg));
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+
+  .fp-clear {
+    align-self: flex-start;
+    border: none;
+    background: transparent;
+    color: var(--fg2);
+    font-size: var(--fs-xs, 12px);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm, 8px);
+    cursor: pointer;
+  }
+  .fp-clear:hover { background: var(--hover-bg); color: var(--fg); }
 
   /* ---------- 文件夹胶囊 ---------- */
   .folders {
@@ -1284,6 +1542,15 @@
     outline: 1px solid var(--line);
     outline-offset: -1px;
     box-shadow: var(--shadow-sm);
+  }
+
+  /* 列表行封面容器：为进度环提供定位上下文（不改变 34×48 布局尺寸）。 */
+  .row-cover-wrap {
+    position: relative;
+    flex-shrink: 0;
+    width: 34px;
+    height: 48px;
+    display: block;
   }
 
   .row-meta { flex: 1; min-width: 0; }

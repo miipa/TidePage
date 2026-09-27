@@ -379,6 +379,8 @@ pub fn run() {
             library::list_books,
             library::list_books_page,
             library::list_order_index,
+            library::list_formats,
+            library::set_read_state,
             library::list_books_by_ids,
             library::rescan,
             library::refresh_library,

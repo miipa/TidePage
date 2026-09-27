@@ -6,13 +6,19 @@ export const api = {
   addFolder: (path: string) => invoke<void>("add_folder", { path }),
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
-  listBooksPage: (query: string, sort: string, offset: number, limit: number) =>
-    invoke<BookPage>("list_books_page", { query, sort, offset, limit }),
+  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[]) =>
+    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
    *  query 为空=全量；非空=与 list_books_page 同源的 title/author 过滤（搜索档同样 O(W)）。
+   *  formats/states：分类筛选（格式取「或」、状态取「或」、两组取「且」），空/省略=不约束该维度。
    *  结果超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
-  listOrderIndex: (sort: string, query: string) =>
-    invoke<ArrayBuffer>("list_order_index", { sort, query }),
+  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[]) =>
+    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null }),
+  /** Task B：书库当前实际存在的格式列表（去重、固定排序 count DESC, format ASC）。 */
+  listFormats: () => invoke<string[]>("list_formats"),
+  /** Task F：手动设置阅读状态覆盖。state 取 "read" | "unread" | "auto"。只写 read_state，不动真实进度。 */
+  setReadState: (bookId: number, state: "read" | "unread" | "auto") =>
+    invoke<void>("set_read_state", { bookId, stateStr: state }),
   /** 秩可寻址分页命令 2：按 ids 批量取行，返回长度/顺序恒等于 ids，缺行为 null。ids.len()>4096 抛错。 */
   listBooksByIds: (ids: number[]) => invoke<(BookRow | null)[]>("list_books_by_ids", { ids }),
   rescan: () => invoke<void>("rescan"),
