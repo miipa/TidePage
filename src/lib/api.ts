@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { coverTheme } from "./stores.svelte";
+import { coverTheme, defaultCoverBust } from "./stores.svelte";
 import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
@@ -220,7 +220,10 @@ export function coverUrl(book: Pick<BookRow, "id" | "cover_path" | "cover_ver">)
     const q =
       `&g1=${encodeURIComponent(t.g1)}&g2=${encodeURIComponent(t.g2)}` +
       `&g3=${encodeURIComponent(t.g3)}&tc=${encodeURIComponent(t.tc)}`;
-    return `http://flowread.localhost/cover-default/${book.id}?v=${v}${q}`;
+    // 追加默认底图缓存破坏分量（仅此端点）：换/恢复默认底图时 bumpDefaultCoverBust() 自增，
+    // 内部读 defaultCoverBust.n 建立响应式依赖，令无内嵌封面的 <img> 即时重取新底图。
+    // /book-cover/ 端点不追加此参数，故有内嵌封面的书不受换底图影响、不闪白。
+    return `http://flowread.localhost/cover-default/${book.id}?v=${v}${q}&db=${defaultCoverBust.n}`;
   }
   // 有内嵌封面 → per-book 端点（/book-cover/<id>），按 id + coverVer 缓存破坏。
   return `http://flowread.localhost/book-cover/${book.id}?v=${v}`;

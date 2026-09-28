@@ -516,6 +516,10 @@
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  // 用户是否已在本次打开中「真实翻页/滚动」过：仅用户主动移动时置真，
+  // 用于在保存真实进度时释放手动状态覆盖（read_state!==0）。初次打开的定位保存不置真，
+  // 避免仅「打开」就把手动「未读/已读」覆盖误清除。
+  let progressUserMoved = false;
   let measureRaf = 0;
   let openError = $state("");
   let handledNonce = 0;
@@ -642,6 +646,7 @@
       loadGeneration++;
       bookImages = null;
       viewerIndex = null;
+      progressUserMoved = false; // 新书打开：清空「用户已移动」标记（打开本身不释放手动状态覆盖）
       book = await api.openBook(bookId);
       ui.currentBookId = book.book.id;
       if (book.encoding_warning) console.log(book.encoding_warning);
@@ -898,7 +903,7 @@
       );
     } catch { /* ignore */ }
     maybeAutoAi();
-    saveProgressDebounced();
+    saveProgressDebounced(false); // 章节定位/初次打开：保存进度但不算「用户移动」，不释放手动状态覆盖
   }
 
   async function fontsReady() {
@@ -969,7 +974,9 @@
     }
   }
 
-  function saveProgressDebounced() {
+  function saveProgressDebounced(userMoved = true) {
+    // 除「初次打开/换章定位」外的调用都视为用户真实移动，记入标记以便释放手动状态覆盖。
+    if (userMoved) progressUserMoved = true;
     clearTimeout(progressSaveTimer);
     progressSaveTimer = setTimeout(doSaveProgress, 1200);
   }
@@ -998,6 +1005,14 @@
     };
     try {
       await api.saveProgress(book.book.id, p);
+      // 用户产生真实阅读进度后，若该书存在手动状态覆盖（已读/未读），释放为「自动」，
+      // 使有效状态回归由真实进度推导（不再需要手动「恢复自动」）。
+      if (progressUserMoved && book.book.read_state !== 0) {
+        book.book.read_state = 0;
+        try {
+          await api.setReadState(book.book.id, "auto");
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
 

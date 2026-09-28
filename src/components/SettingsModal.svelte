@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, bumpCoverBust } from "../lib/api";
+  import { api } from "../lib/api";
   import {
     config,
     saveConfig,
@@ -26,6 +26,7 @@
     applyUiTheme,
     UI_SKINS,
     coverTheme,
+    bumpDefaultCoverBust,
     createReaderScheme,
     overwriteReaderScheme,
     renameReaderScheme,
@@ -43,6 +44,7 @@
   import {
     IconCloud,
     IconColorSwatch,
+    IconAdjustments,
     IconKeyboard,
     IconPhoto,
     IconScissors,
@@ -52,49 +54,66 @@
     IconVolume,
   } from "@tabler/icons-svelte";
   import ColorPicker from "./ColorPicker.svelte";
+  import { dragSort } from "../lib/dragSort";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { OnlineVoice } from "../lib/tts.svelte";
   import type { TocEntry } from "../lib/types";
 
-  type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "other";
-  let { initialTab = "reader" as SettingsTab }: { initialTab?: SettingsTab } = $props();
-  let tab = $state<SettingsTab>(initialTab);
+  type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
+  // 默认不硬编码分区：initialTab 不传时用「排序后的第一项」，以区分调用方显式指定与未指定。
+  let { initialTab = undefined as SettingsTab | undefined }: { initialTab?: SettingsTab } = $props();
 
-  /** 设置导航分组（左侧列表；含分组标题与线性图标）。 */
-  const NAV: { group: string; items: { id: SettingsTab; label: string; icon: TablerIcon }[] }[] = [
-    { group: "外观", items: [
-      { id: "reader", label: "阅读排版", icon: IconTypography },
-      { id: "appearance", label: "界面外观", icon: IconColorSwatch },
-      { id: "manga", label: "漫画模式", icon: IconPhoto },
-    ] },
-    { group: "内容", items: [
-      { id: "tts", label: "语音朗读", icon: IconVolume },
-      { id: "split", label: "分章规则", icon: IconScissors },
-      { id: "ai", label: "AI 助手", icon: IconSparkles },
-    ] },
-    { group: "系统", items: [
-      { id: "keys", label: "按键与手势", icon: IconKeyboard },
-      { id: "webdav", label: "WebDAV", icon: IconCloud },
-      { id: "other", label: "其他与关于", icon: IconSettings },
-    ] },
-  ];
+  /** 设置各分区的元信息（扁平列表，无分组）：标签 + 线性图标。 */
+  const TAB_META: Record<SettingsTab, { label: string; icon: TablerIcon }> = {
+    reader: { label: "阅读排版", icon: IconTypography },
+    appearance: { label: "界面外观", icon: IconColorSwatch },
+    manga: { label: "漫画模式", icon: IconPhoto },
+    tts: { label: "语音朗读", icon: IconVolume },
+    split: { label: "分章规则", icon: IconScissors },
+    ai: { label: "AI 助手", icon: IconSparkles },
+    keys: { label: "按键与手势", icon: IconKeyboard },
+    webdav: { label: "WebDAV", icon: IconCloud },
+    prefs: { label: "首选项", icon: IconAdjustments },
+    other: { label: "关于", icon: IconSettings },
+  };
+
+  /** 按持久化顺序排列的扁平分区列表（settingsOrder 已归一化，含全部合法 id）。 */
+  const navItems = $derived(
+    config.settingsOrder
+      .filter((id): id is SettingsTab => id in TAB_META)
+      .map((id) => ({ id, label: TAB_META[id].label, icon: TAB_META[id].icon })),
+  );
+
+  // 打开机制：+page.svelte 两处入口都在 {#if ui.settingsOpen} 内，每次打开重新挂载，
+  // 故此初始化即按当前 settingsOrder 生效——显式传入（如 AI 入口 initialTab="ai"）优先，
+  // 否则取排序后的第一项；orderedTabs 为空时兜底 "reader"。
+  let tab = $state<SettingsTab>(initialTab ?? navItems[0]?.id ?? "reader");
 
   /** 当前标签的显示名（用于头部面包屑）。 */
-  const tabLabel = $derived(
-    NAV.flatMap((g) => g.items).find((i) => i.id === tab)?.label ?? "设置",
-  );
+  const tabLabel = $derived(TAB_META[tab]?.label ?? "设置");
 
   /** 导航搜索过滤（空则全部显示）。 */
   let navQuery = $state("");
   const navFiltered = $derived(
     navQuery.trim()
-      ? NAV.map((g) => ({
-          ...g,
-          items: g.items.filter((i) => i.label.includes(navQuery.trim())),
-        })).filter((g) => g.items.length)
-      : NAV,
+      ? navItems.filter((i) => i.label.includes(navQuery.trim()))
+      : navItems,
   );
+
+  /** 分区拖拽排序：把 from 插入到 target 之前/之后，持久化到 config.settingsOrder（与顶栏图标同款 dragSort）。 */
+  function navDrop(from: string, target: string, place: "before" | "after") {
+    if (!from || from === target) return;
+    const arr = [...config.settingsOrder];
+    const fi = arr.indexOf(from);
+    if (fi < 0) return;
+    arr.splice(fi, 1);
+    const ti = arr.indexOf(target);
+    if (ti < 0) return;
+    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
+    config.settingsOrder = arr;
+    saveConfig();
+  }
   let webdavTesting = $state(false);
   let webdavStatus = $state("");
   let regexText = $state(config.regex || "");
@@ -142,7 +161,10 @@
     try {
       await api.setDefaultCover(p);
       hasDefaultCover = true;
-      bumpCoverBust();
+      bumpDefaultCoverBust();
+      // 触发书库既有封面刷新链路：重拉可见窗口行数据（新对象身份），
+      // 与 {#key coverUrl} 一起确保无内嵌封面的书立即重挂 <img> 换新底图，无需滚动。
+      ui.coverTick++;
       coverPreviewBust++;
       toast("默认封面已更新");
     } catch (e) {
@@ -157,7 +179,9 @@
     try {
       await api.clearDefaultCover();
       hasDefaultCover = false;
-      bumpCoverBust();
+      bumpDefaultCoverBust();
+      // 同 pickDefaultCover：触发书库可见窗口重拉行数据，配合 {#key coverUrl} 即时重挂封面。
+      ui.coverTick++;
       coverPreviewBust++;
       toast("已恢复内置默认封面");
     } catch (e) {
@@ -389,7 +413,7 @@
   });
 
   $effect(() => {
-    if (tab !== "other") return;
+    if (tab !== "prefs") return;
     api
       .getSetting("mobi.encoding")
       .then((v) => (mobiEnc = v && v.trim() ? v.trim().toLowerCase() : "auto"))
@@ -449,7 +473,7 @@
   }
 
   $effect(() => {
-    if (tab !== "other") return;
+    if (tab !== "prefs") return;
     loadStorage();
   });
 
@@ -894,17 +918,17 @@
   </header>
 
   <div class="set-main">
-    <!-- 左侧导航：分组 + 搜索 -->
+    <!-- 左侧导航：扁平分区列表（无分组）+ 搜索；分区可拖拽排序（复用 dragSort，特效同顶栏图标）。 -->
     <aside class="set-nav">
       <div class="set-search">
         <input placeholder="搜索设置…" bind:value={navQuery} aria-label="搜索设置" />
       </div>
-      {#each navFiltered as g (g.group)}
-        <div class="set-nav-group">{g.group}</div>
-        {#each g.items as it (it.id)}
+      <div class="set-nav-list" use:dragSort={{ onDrop: navDrop, axis: "y" }}>
+        {#each navFiltered as it (it.id)}
           {@const Icon = it.icon}
           <button
             class="set-nav-item"
+            data-drag-id={it.id}
             class:active={tab === it.id}
             onclick={() => { tab = it.id; if (it.id === "tts") refreshVoices(); }}
           >
@@ -912,7 +936,7 @@
             <span class="set-nav-label">{it.label}</span>
           </button>
         {/each}
-      {/each}
+      </div>
       {#if !navFiltered.length}
         <div class="set-nav-empty">无匹配项</div>
       {/if}
@@ -1095,13 +1119,6 @@
       </div>
     </details>
 
-    <div class="field">
-      <label class="check">
-        <input type="checkbox" bind:checked={config.reader.multiWindow} onchange={saveConfig} />
-        多窗口同时打开多本书
-      </label>
-      <p class="tip">开启后主窗口保留在书库，双击书籍用新窗口打开。</p>
-    </div>
     <div class="field">
       <div class="scheme-head">
         <label>阅读配色方案</label>
@@ -1997,8 +2014,38 @@
     </div>
 
     <p class="tip">{"{chapter}"} 为章节内容，{"{title}"} 为章节名；AI 面板在阅读界面点「AI」按钮打开，提示词芯片点击即执行，F1–F9 快捷键全局有效。</p>
-  {:else if tab === "other"}
-    <p class="sec-title">存储空间</p>
+  {:else if tab === "prefs"}
+    <p class="sec-title">通用</p>
+    <div class="field">
+      <label>界面语言</label>
+      <select bind:value={config.language} onchange={saveConfig}>
+        <option value="auto">自动</option>
+        <option value="zh-CN">简体中文</option>
+      </select>
+      <p class="tip">仅记录偏好，暂未接入界面翻译，当前界面语言不随此项变化。</p>
+    </div>
+
+    <div class="field">
+      <label class="check">
+        <input type="checkbox" bind:checked={config.reader.multiWindow} onchange={saveConfig} />
+        多窗口同时打开多本书
+      </label>
+      <p class="tip">开启后主窗口保留在书库，双击书籍用新窗口打开。</p>
+    </div>
+
+    <div class="field">
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={!config.library.showCoverProgress}
+          onchange={(e) => { config.library.showCoverProgress = !(e.currentTarget as HTMLInputElement).checked; saveConfig(); }}
+        />
+        关闭封面进度环
+      </label>
+      <p class="tip">关闭后书库封面左下角不再显示阅读进度环角标（网格与列表视图均隐藏）。</p>
+    </div>
+
+    <p class="sec-title" style="margin-top:18px">存储空间</p>
     {#if storage}
       <div class="storage-card">
         <div class="st-row">
@@ -2055,8 +2102,8 @@
         <option value="windows-1252">Windows-1252</option>
       </select>
     </div>
-
-    <p class="sec-title" style="margin-top:18px">关于</p>
+  {:else if tab === "other"}
+    <p class="sec-title">关于</p>
     <div class="field">
       <label>版本</label>
       <div class="sec-val">FlowRead · {APP_VERSION}</div>

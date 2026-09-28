@@ -645,6 +645,22 @@
     else booksWindow = booksWindow.slice();
   }
 
+  /** 用「新对象身份」替换窗口内某本书（id 不变，属性来自 patch）。
+   *  必须换新对象：bookAt() 从非响应式 rowMap / $state.raw booksWindow 取值，
+   *  就地改属性对象身份不变 → 模板中 {@const b = bookAt()} 引用不变 →
+   *  下游 ringInfo(b) / coverUrl(b) 不重算，角标与封面不刷新。换新对象后才会重求值、即时刷新。 */
+  function replaceBook(id: number, patch: Partial<BookRow>) {
+    if (indexMode) {
+      const cur = rowMap.get(id);
+      if (cur) {
+        rowMap.set(id, { ...cur, ...patch });
+        winVersion++;
+      }
+    } else {
+      booksWindow = booksWindow.map((x) => (x && x.id === id ? { ...x, ...patch } : x));
+    }
+  }
+
   async function loadFolders() {
     try { folders = await api.listFolders(); } catch { /* ignore */ }
   }
@@ -808,9 +824,8 @@
     if (!p) return;
     try {
       await api.setCustomCover(b.id, p);
-      b.cover_path = `custom-${b.id}.png`;
-      b.cover_ver = (b.cover_ver ?? 0) + 1;
-      touchWindow();
+      // 换新对象身份（不就地改属性），令 coverUrl 重算并触发封面 <img> 重挂即时刷新。
+      replaceBook(b.id, { cover_path: `custom-${b.id}.png`, cover_ver: (b.cover_ver ?? 0) + 1 });
       toast("封面已更新");
     } catch (e) {
       toast(String(e), "error");
@@ -820,9 +835,8 @@
   async function reextract(b: BookRow) {
     try {
       const name = await api.reextractCover(b.id);
-      b.cover_path = name;
-      b.cover_ver = (b.cover_ver ?? 0) + 1;
-      touchWindow();
+      // 换新对象身份（不就地改属性），令封面 <img> 重挂即时刷新。
+      replaceBook(b.id, { cover_path: name, cover_ver: (b.cover_ver ?? 0) + 1 });
       toast("封面已重新提取");
     } catch (e) {
       toast(String(e), "error");
@@ -834,19 +848,51 @@
     convertState.open = true;
   }
 
-  /** Task F：右键标记阅读状态。state=read/unread/auto。
+  /** Task F：右键标记阅读状态。state=read/unread。
    *  一致性：idIndex 是后端秩快照。若当前有状态筛选生效，标记后该书 effective 状态会变，
-   *  应从结果里出现/消失 → 必须 reload()（rebuildIndex 重算 idIndex/total）；否则仅就地刷新。 */
-  async function markReadState(b: BookRow, state: "read" | "unread" | "auto") {
+   *  应从结果里出现/消失 → 必须 reload()（rebuildIndex 重算 idIndex/total）；否则仅就地刷新。
+   *  联动进度：
+   *   - 标记已读：read_state=1（角标✓、effectiveState=read），并把真实进度写到末尾（打开定位到末尾、显示 100%）。
+   *   - 标记未读：read_state=2（无角标、effectiveState=unread），并把进度重置为开头（打开回到开头）。
+   *  之后用户真实阅读时，Reader 保存进度会自动释放手动覆盖（read_state→0），状态随进度推导。 */
+  async function markReadState(b: BookRow, state: "read" | "unread") {
     try {
       await api.setReadState(b.id, state);
-      b.read_state = state === "read" ? 1 : state === "unread" ? 2 : 0;
+      const newState = state === "read" ? 1 : 2;
+      let newPct = b.read_pct;
+      if (state === "read") {
+        // 需要章节数才能把进度定位到「最后一章末尾」；Library 手里没有 toc，故用 openBook 取。
+        let lastChapter = 0;
+        try {
+          const r = await api.openBook(b.id);
+          lastChapter = Math.max(0, r.toc.length - 1);
+        } catch { /* 取不到章节数则退化为把当前章置末尾（chapter 0） */ }
+        await api.saveProgress(b.id, {
+          chapter_index: lastChapter,
+          chapter_ratio: 1,
+          pct: 100,
+          updated_at: Date.now(),
+          device: "pc",
+        });
+        newPct = 100;
+      } else {
+        // 未读：进度重置到开头（chapter 0 / ratio 0 / pct 0），保证 Reader 再打开定位到开头。
+        await api.saveProgress(b.id, {
+          chapter_index: 0,
+          chapter_ratio: 0,
+          pct: 0,
+          updated_at: Date.now(),
+          device: "pc",
+        });
+        newPct = 0;
+      }
       if (filterStates.length > 0) {
         await reloadWindow(); // 状态筛选生效：重建秩索引，令该书按新状态出现/消失
       } else {
-        touchWindow(); // 无状态筛选：就地刷新该行（参考 setCover/reextract 模式）
+        // 换新对象身份刷新该行：就地改属性不会被追踪，角标环不会重算（问题根因）。
+        replaceBook(b.id, { read_state: newState, read_pct: newPct });
       }
-      toast(state === "auto" ? "已恢复自动状态" : state === "read" ? "已标记为已读" : "已标记为未读");
+      toast(state === "read" ? "已标记为已读" : "已标记为未读");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1097,6 +1143,7 @@
                 {@const b = bookAt(abs)}
                 {#if b}
                   {@const ri = ringInfo(b)}
+                  {@const cu = coverUrl(b)}
                   <div
                     class="card"
                     style="max-width:{CARD_MAX}px;"
@@ -1104,9 +1151,14 @@
                     oncontextmenu={(e) => openCtx(e, b)}
                   >
                     <div class="cover" style="height:{coverH}px;">
-                      <img src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
+                      <!-- 用 {#key cu} 让封面 URL 变化时 <img> 整体重挂（webview 对已挂载自定义协议 img 换 src 不可靠重绘）：
+                           换默认底图（仅无内嵌封面书的 URL 含 &db= 变化）或换/重提取封面（cover_ver 变化）即时生效；
+                           有内嵌封面书 URL 不变、不重挂、不闪白。 -->
+                      {#key cu}
+                        <img src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
+                      {/key}
                       <span class="fmt">{b.format.toUpperCase()}</span>
-                      {#if ri.show}
+                      {#if ri.show && config.library.showCoverProgress}
                         <ProgressRing pct={ri.pct} full={ri.full} />
                       {/if}
                     </div>
@@ -1132,6 +1184,7 @@
           {@const b = bookAt(i)}
           {#if b}
             {@const ri = ringInfo(b)}
+            {@const cu = coverUrl(b)}
             <div
               class="row"
               style="top:{i * ROW_H}px"
@@ -1139,8 +1192,10 @@
               oncontextmenu={(e) => openCtx(e, b)}
             >
               <div class="row-cover-wrap">
-                <img class="row-cover" src={coverUrl(b)} alt="《{b.title}》封面" loading="lazy" decoding="async" />
-                {#if ri.show}
+                {#key cu}
+                  <img class="row-cover" src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" />
+                {/key}
+                {#if ri.show && config.library.showCoverProgress}
                   <ProgressRing pct={ri.pct} full={ri.full} size={22} />
                 {/if}
               </div>
@@ -1187,9 +1242,12 @@
         {/if}
         <button onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}>🖼 设置封面</button>
         <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}>🔄 重新提取封面</button>
-        <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}>✓ 标记为已读</button>
-        <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}>○ 标记为未读</button>
-        <button onclick={() => { markReadState(ctxMenu!.book, "auto"); ctxMenu = null; }}>↺ 恢复自动</button>
+        {#if effectiveState(ctxMenu.book) !== "read"}
+          <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}>✓ 标记为已读</button>
+        {/if}
+        {#if effectiveState(ctxMenu.book) !== "unread"}
+          <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}>○ 标记为未读</button>
+        {/if}
         <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}>📂 所在文件夹</button>
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}>↩ 仅移出书库</button>
         <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除本地文件</button>

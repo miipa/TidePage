@@ -554,6 +554,8 @@ export interface TtsConfig {
 export interface LibraryConfig {
   /** 书库顶栏图标按钮顺序（拖动排序后持久化） */
   topbarOrder: string[];
+  /** 是否在封面上显示阅读进度环角标（默认开启，可在「首选项」关闭） */
+  showCoverProgress: boolean;
 }
 
 /** 应用外壳界面配色（仅影响书库/设置/面板等外壳，与阅读正文完全独立）。 */
@@ -758,6 +760,37 @@ export interface AppConfig {
   uiSkinDark: string;
   /** 阅读配色方案库（全局共享）。 */
   readerSchemes: ReaderScheme[];
+  /** 界面语言（仅存储，暂不接入 i18n）：auto=跟随系统 / zh-CN=简体中文。 */
+  language: string;
+  /** 设置面板分区（扁平列表）显示顺序；可在设置里拖拽排序。id 取 SETTINGS_TABS。 */
+  settingsOrder: string[];
+}
+
+/** 设置面板全部分区 id（扁平列表默认顺序，去分组后的唯一顺序来源）。 */
+export const SETTINGS_TABS = [
+  "reader",
+  "appearance",
+  "manga",
+  "tts",
+  "split",
+  "ai",
+  "keys",
+  "webdav",
+  "prefs",
+  "other",
+] as const;
+
+/** 归一化设置分区顺序：过滤失效 id、去重，把新增分区补到末尾（增删分区不崩）。 */
+export function normSettingsOrder(v: any): string[] {
+  const all = SETTINGS_TABS as readonly string[];
+  const out: string[] = [];
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      if (typeof x === "string" && all.includes(x) && !out.includes(x)) out.push(x);
+    }
+  }
+  for (const id of all) if (!out.includes(id)) out.push(id);
+  return out;
 }
 
 const DEFAULTS: AppConfig = {
@@ -893,6 +926,7 @@ p {
   },
   library: {
     topbarOrder: [...LIBRARY_TOPBAR_IDS],
+    showCoverProgress: true,
   },
   webdav: {
     enabled: false,
@@ -977,6 +1011,8 @@ p {
   uiSkinLight: "cream",
   uiSkinDark: "nocturne",
   readerSchemes: [],
+  language: "auto",
+  settingsOrder: [...SETTINGS_TABS],
 };
 // 注：readerSchemes 默认空，由 load() 用内置方案补齐（见 builtinSchemes）。
 
@@ -1457,6 +1493,8 @@ function load(): AppConfig {
       uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
       uiSkinDark: resolveSkinId(saved.uiSkinDark, "dark"),
       readerSchemes: normalizeSchemes(saved.readerSchemes),
+      language: typeof saved.language === "string" ? saved.language : "auto",
+      settingsOrder: normSettingsOrder(saved.settingsOrder),
     };
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
     if (merged.reader.fontFamily === '"Microsoft YaHei", "Segoe UI", serif') {
@@ -1540,6 +1578,15 @@ export function activeUiSkin(): UiSkin {
  *  仅用于「无内嵌封面」书籍的默认封面（有封面的书不受影响）；coverUrl 读取它拼进 URL，
  *  故切换主题会即时重算这些字段 → 默认封面 URL 变化 → 自动重取、颜色随主题更新。 */
 export const coverTheme = $state({ g1: "#36485c", g2: "#212d3c", g3: "#141c26", tc: "#f4ecdc" });
+
+/** 默认封面底图缓存破坏版本（对象包裹以保证跨模块响应式，照搬 coverTheme 模式）。
+ *  仅用于「无内嵌封面」书籍的 /cover-default/ 端点：换/恢复默认底图后自增，
+ *  coverUrl 在模板中读取 defaultCoverBust.n 建立响应式依赖 → 无内嵌封面的 <img> 立即重取新底图；
+ *  有内嵌封面的书走 /book-cover/ 端点、不读此值，故完全不受影响、不闪白。 */
+export const defaultCoverBust = $state({ n: 0 });
+export function bumpDefaultCoverBust(): void {
+  defaultCoverBust.n++;
+}
 
 /** sRGB 线性插值混合两个 #rrggbb（t=0 取 a，t=1 取 b）。 */
 function mixHex(a: string, b: string, t: number): string {
@@ -1734,6 +1781,8 @@ export function applyConfigJson(json: string) {
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");
     obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
+    obj.language = typeof obj.language === "string" ? obj.language : "auto";
+    obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
