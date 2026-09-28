@@ -1,5 +1,6 @@
 <script lang="ts">
   import { normalizeColor, parseColor, toHex, toRgbString } from "../lib/color";
+  import { portal } from "../lib/portal";
 
   let {
     value = $bindable(""),
@@ -112,7 +113,7 @@
 </button>
 
 {#if open}
-  <div class="cp-pop" bind:this={popEl} style="left:{pos.x}px; top:{pos.y}px;">
+  <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{pos.x}px; top:{pos.y}px;">
     <div class="cp-title">{title}</div>
     <div class="cp-grid">
       {#each presets as p (p)}

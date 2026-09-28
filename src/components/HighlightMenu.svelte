@@ -33,7 +33,10 @@
 
   $effect(() => {
     const h = (e: PointerEvent) => {
-      if (menuEl && !menuEl.contains(e.target as Node)) onclose();
+      const t = e.target as Element | null;
+      // 取色框已 portal 到 body（在 menuEl 之外）：点其内部不应关闭本菜单。
+      if (t?.closest?.("[data-cp-pop]")) return;
+      if (menuEl && !menuEl.contains(t as Node)) onclose();
     };
     window.addEventListener("pointerdown", h, true);
     return () => window.removeEventListener("pointerdown", h, true);

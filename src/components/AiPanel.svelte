@@ -1203,13 +1203,18 @@ ${readerStyle.extra}
   .ai-actions {
     display: flex;
     gap: 6px;
-    row-gap: 6px;
     align-items: center;
-    flex-wrap: wrap;
-    justify-content: flex-start; /* 动作按钮整行左对齐、换行规律，不甩尾 */
+    /* 单行显示：不再换行到第二排；极窄时整行可横向滑动（隐藏滚动条）作为安全阀。 */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
   }
 
-  /* 统一动作区各控件高度，消除换行锯齿；控件不收缩（flex:0 0 auto），窄宽整块折行不裁切 */
+  .ai-actions::-webkit-scrollbar { width: 0; height: 0; }
+
+  /* 统一动作区各控件高度，消除锯齿；按钮不收缩，端点下拉可收缩以让整行尽量单行放下 */
   .ai-actions > * {
     height: 26px;
     box-sizing: border-box;
@@ -1217,6 +1222,11 @@ ${readerStyle.extra}
     align-items: center;
     justify-content: center;
     flex: 0 0 auto;
+  }
+
+  .ai-actions .ep-sel {
+    flex: 0 1 auto;
+    min-width: 62px;
   }
 
   .mini {

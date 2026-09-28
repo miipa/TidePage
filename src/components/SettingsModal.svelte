@@ -1078,11 +1078,17 @@
       </div>
       <div class="field">
         <label>信息文字色</label>
-        <input placeholder="自动" title="如 #333；留空则跟随主题" bind:value={config.reader.statusColor} oninput={saveConfig} />
+        <div class="color-row">
+          <input placeholder="自动" title="如 #333；留空则跟随主题" bind:value={config.reader.statusColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.statusColor} allowEmpty emptyLabel="跟随主题" title="信息文字色" onchange={saveConfig} />
+        </div>
       </div>
       <div class="field">
         <label>顶栏背景色</label>
-        <input placeholder="自动" title="留空则跟随主题" bind:value={config.reader.topbarColor} oninput={saveConfig} />
+        <div class="color-row">
+          <input placeholder="自动" title="留空则跟随主题" bind:value={config.reader.topbarColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.topbarColor} allowEmpty emptyLabel="跟随主题" title="顶栏背景色" onchange={saveConfig} />
+        </div>
       </div>
     </div>
 
@@ -3049,5 +3055,42 @@
   .field:focus-within {
     border-color: color-mix(in srgb, var(--accent) 45%, transparent);
     background: var(--panel);
+  }
+
+  /* 窄窗口（如弹出的 AI 独立窗内打开设置）：
+     侧栏改为顶部横向导航条，内容占满整宽，杜绝横向滚动条并优化排版。
+     判据用视口宽度：主窗口视口很大不会命中；AI 独立窗视口窄才命中。 */
+  @media (max-width: 620px) {
+    .settings-root {
+      width: 100vw;
+      height: 100vh;
+    }
+    .set-main {
+      flex-direction: column;
+      min-width: 0;
+    }
+    .set-nav {
+      width: auto;
+      flex-shrink: 0;
+      border-right: none;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+    }
+    .set-nav-list {
+      flex-direction: row;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      gap: 6px;
+      scrollbar-width: none;
+    }
+    .set-nav-list::-webkit-scrollbar { height: 0; }
+    .set-nav-item {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+    .set-content {
+      padding: 16px 16px 20px;
+      overflow-x: hidden;
+    }
   }
 </style>

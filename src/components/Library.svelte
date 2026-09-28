@@ -11,6 +11,16 @@
     IconDice,
     IconNotebook,
     IconSettings,
+    IconBook2,
+    IconInfoCircle,
+    IconArrowsExchange,
+    IconPhoto,
+    IconRefresh,
+    IconCircleCheck,
+    IconCircle,
+    IconFolder,
+    IconArrowBackUp,
+    IconTrash,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
   import ProgressRing from "./ProgressRing.svelte";
@@ -1235,22 +1245,24 @@
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
       <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
-        <button onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}>📖 打开</button>
-        <button onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}>ℹ️ 详细信息</button>
+        <button onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={17} stroke={1.75} /></span>打开</button>
+        <button onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={17} stroke={1.75} /></span>详细信息</button>
         {#if ctxMenu.book.format === "txt"}
-          <button onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}>⇄ 转换为 EPUB</button>
+          <button onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={17} stroke={1.75} /></span>转换为 EPUB</button>
         {/if}
-        <button onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}>🖼 设置封面</button>
-        <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}>🔄 重新提取封面</button>
+        <div class="ctx-sep"></div>
+        <button onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={17} stroke={1.75} /></span>设置封面</button>
+        <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={17} stroke={1.75} /></span>重新提取封面</button>
         {#if effectiveState(ctxMenu.book) !== "read"}
-          <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}>✓ 标记为已读</button>
+          <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={17} stroke={1.75} /></span>标记为已读</button>
         {/if}
         {#if effectiveState(ctxMenu.book) !== "unread"}
-          <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}>○ 标记为未读</button>
+          <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={17} stroke={1.75} /></span>标记为未读</button>
         {/if}
-        <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}>📂 所在文件夹</button>
-        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}>↩ 仅移出书库</button>
-        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}>🗑 删除本地文件</button>
+        <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={17} stroke={1.75} /></span>所在文件夹</button>
+        <div class="ctx-sep"></div>
+        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={17} stroke={1.75} /></span>仅移出书库</button>
+        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>删除本地文件</button>
       </div>
     </div>
   {/if}
@@ -1757,12 +1769,13 @@
     position: fixed;
     display: flex;
     flex-direction: column;
+    gap: 1px;
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: var(--radius, 12px);
     box-shadow: var(--shadow-lg), var(--edge-hi-soft);
-    padding: 4px;
-    min-width: 190px;
+    padding: 6px;
+    min-width: 208px;
     z-index: 101;
     transform-origin: top left;
     animation: ctx-in 0.2s var(--ease-premium);
@@ -1777,14 +1790,36 @@
     border: none;
     background: transparent;
     text-align: left;
-    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px 7px 10px;
     border-radius: var(--radius-sm, 8px);
     font-size: var(--fs-sm, 13px);
     color: var(--fg);
-    transition: background var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
   }
 
-  .ctx button:hover { background: var(--hover-bg, rgba(0, 0, 0, 0.06)); }
+  /* 图标统一列宽（Tabler 线性图标，与顶栏同款），文字左边缘对齐，观感整齐 */
+  .ctx .ci {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+  }
+
+  /* 分组分隔线：把「打开/信息」「封面/状态」「删除」三组轻轻分开 */
+  .ctx-sep {
+    height: 1px;
+    margin: 5px 8px;
+    background: var(--line);
+  }
+
+  .ctx button:hover { background: var(--accent-soft, var(--hover-bg)); }
+  .ctx button:active { transform: none; }
   .ctx button.danger { color: var(--danger); }
-  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
 </style>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { normalizeColor, parseColor, toHex, toRgbString } from "../lib/color";
+  import { portal } from "../lib/portal";
 
   let {
     colors = $bindable([] as string[]),
@@ -17,6 +18,7 @@
   } = $props();
 
   let wrapEl: HTMLDivElement | undefined = $state();
+  let popEl: HTMLDivElement | undefined = $state();
   let editIdx = $state(-1);
   let hexText = $state("");
   let rgbText = $state("");
@@ -96,7 +98,10 @@
   $effect(() => {
     if (editIdx < 0) return;
     const h = (e: PointerEvent) => {
-      if (wrapEl && !wrapEl.contains(e.target as Node)) closeEditor();
+      const t = e.target as Node;
+      // 取色框已 portal 到 body，需同时排除 wrapEl 与 popEl，否则点框内会误关。
+      if (wrapEl?.contains(t) || popEl?.contains(t)) return;
+      closeEditor();
     };
     window.addEventListener("pointerdown", h, true);
     return () => window.removeEventListener("pointerdown", h, true);
@@ -113,14 +118,21 @@
       class:active={activeHex && activeHex === normalizeColor(c)}
       data-ci={i}
       style="background:{c};"
-      title="点击设置该颜色"
-      onclick={() => openEditor(i)}
+      title="左键选用此颜色 · 右键修改/删除"
+      onclick={() => onapply(c)}
+      oncontextmenu={(e) => { e.preventDefault(); openEditor(i); }}
     ></button>
   {/each}
-  <button type="button" class="cp-add" title="添加颜色" onclick={addColor}>＋</button>
+  <button
+    type="button"
+    class="cp-add"
+    title="新增颜色"
+    onclick={addColor}
+    oncontextmenu={(e) => e.preventDefault()}
+  >＋</button>
 
   {#if editIdx >= 0}
-    <div class="cp-pop" style="left:{popPos.x}px; top:{popPos.y}px;">
+    <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{popPos.x}px; top:{popPos.y}px;">
       <div class="cp-row">
         <label>HEX</label>
         <input bind:value={hexText} oninput={onHex} placeholder="#rrggbb" spellcheck="false" />
@@ -156,14 +168,17 @@
   }
 
   .cp-swatch {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
+    width: 30px;
+    height: 18px;
+    border-radius: 6px;
     border: 1px solid rgba(128, 128, 128, 0.4);
     padding: 0;
     cursor: pointer;
     flex-shrink: 0;
+    transition: transform var(--dur, 0.2s) var(--ease-premium, ease), box-shadow var(--dur, 0.2s) var(--ease);
   }
+
+  .cp-swatch:hover { transform: translateY(-1px); }
 
   .cp-swatch.active {
     outline: 2px solid var(--accent, #4a6b8a);
@@ -171,9 +186,9 @@
   }
 
   .cp-add {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
+    width: 30px;
+    height: 18px;
+    border-radius: 6px;
     border: 1px dashed rgba(128, 128, 128, 0.6);
     background: transparent;
     color: inherit;

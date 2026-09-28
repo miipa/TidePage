@@ -25,7 +25,10 @@
 
   $effect(() => {
     const h = (e: PointerEvent) => {
-      if (menuEl && !menuEl.contains(e.target as Node)) onclose();
+      const t = e.target as Element | null;
+      // 取色框已 portal 到 body（在 menuEl 之外）：点其内部不应关闭本菜单。
+      if (t?.closest?.("[data-cp-pop]")) return;
+      if (menuEl && !menuEl.contains(t as Node)) onclose();
     };
     window.addEventListener("pointerdown", h, true);
     return () => window.removeEventListener("pointerdown", h, true);
@@ -61,11 +64,12 @@
       onpalette={saveConfig}
     />
   </div>
+  <div class="sel-sep"></div>
   <div class="act-row">
     <button class="hl-main" onclick={() => onhighlight(config.reader.highlightStyle || "underline", activeColor)} title="按默认样式与当前颜色划线">划线</button>
     <button onclick={onsearch} title="在本书中搜索选中文字">全文</button>
     <button onclick={onbrowser} title="用浏览器搜索选中文字">浏览器</button>
-    <button onclick={onai} title="AI 翻译 / 释义">AI 释义</button>
+    <button class="ai" onclick={onai} title="AI 翻译 / 释义">AI 释义</button>
   </div>
 </div>
 
@@ -76,12 +80,13 @@
     background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 88%, #202020 12%);
     color: var(--rdr-fg, #2c2c2c);
     border: 1px solid rgba(128, 128, 128, 0.28);
-    border-radius: 10px;
+    border-radius: 12px;
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
-    padding: 6px 8px;
+    padding: 8px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
+    min-width: 208px;
     user-select: none;
     animation: sel-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
   }
@@ -91,27 +96,38 @@
     to { opacity: 1; transform: none; }
   }
 
+  /* 组间细分隔线，层次更清晰 */
+  .sel-sep {
+    height: 1px;
+    margin: 1px 2px;
+    background: rgba(128, 128, 128, 0.2);
+  }
+
   .hl-row {
     display: flex;
-    gap: 5px;
+    gap: 6px;
     align-items: center;
   }
 
   .sw {
-    width: 26px;
-    height: 22px;
+    width: 28px;
+    height: 24px;
     padding: 0;
     display: grid;
     place-items: center;
-    border-radius: 6px;
+    border-radius: 7px;
     background: transparent;
     border: 1px solid rgba(128, 128, 128, 0.25);
     cursor: pointer;
+    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), transform var(--dur, 0.2s) var(--ease-premium, ease);
   }
 
   .sw:hover {
     background: rgba(128, 128, 128, 0.16);
+    border-color: rgba(128, 128, 128, 0.4);
   }
+
+  .sw:active { transform: scale(0.92); }
 
   .sw-line {
     display: block;
@@ -151,12 +167,48 @@
 
   .act-row {
     display: flex;
-    gap: 4px;
+    gap: 6px;
   }
 
   .act-row button {
+    flex: 1;
     font-size: 12px;
-    padding: 3px 9px;
-    border-radius: 7px;
+    padding: 5px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    background: transparent;
+    color: inherit;
+    white-space: nowrap;
+    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease), transform var(--dur, 0.2s) var(--ease-premium, ease);
+  }
+
+  .act-row button:hover {
+    background: rgba(128, 128, 128, 0.14);
+    border-color: rgba(128, 128, 128, 0.42);
+  }
+
+  .act-row button:active { transform: scale(0.96); }
+
+  /* 主操作「划线」用主色实底，AI 用主色描边，强调层次 */
+  .act-row .hl-main {
+    background: var(--accent, #4a6b8a);
+    border-color: transparent;
+    color: #fff;
+    font-weight: 600;
+  }
+
+  .act-row .hl-main:hover {
+    background: color-mix(in srgb, var(--accent, #4a6b8a) 88%, #000);
+    border-color: transparent;
+  }
+
+  .act-row .ai {
+    color: var(--accent, #4a6b8a);
+    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 42%, transparent);
+  }
+
+  .act-row .ai:hover {
+    background: color-mix(in srgb, var(--accent, #4a6b8a) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 55%, transparent);
   }
 </style>

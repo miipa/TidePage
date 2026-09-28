@@ -264,10 +264,10 @@
     { id: "highlight", label: "划线 / 批注", title: "划线 / 批注", icon: () => IconHighlight, visible: () => true, run: () => setRight("highlights") },
     { id: "ai", label: "AI 助手", title: "AI 助手", icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
     { id: "stats", label: "本书统计", title: "本书统计", icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
-    { id: "toc", label: "目录", title: "目录 (F3)", icon: () => IconList, visible: () => true, run: () => (tocOpen = !tocOpen) },
+    { id: "toc", label: "目录", title: "目录 (F3)", icon: () => IconList, visible: () => true, run: () => toggleToc() },
     { id: "manga", label: "漫画模式", title: () => (isMangaMode() ? "退出漫画模式（本书）" : "切换到漫画模式（本书）"), icon: () => (isMangaMode() ? IconLayoutGrid : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
-    { id: "manager", label: "顶栏按钮管理", title: "顶栏按钮管理（显示/隐藏、拖动排序）", icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => (tbManagerOpen = !tbManagerOpen) },
-    { id: "images", label: "本书图片", title: "本书图片显示（仅当前书）", icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => (imgMenuOpen = !imgMenuOpen) },
+    { id: "manager", label: "顶栏按钮管理", title: "顶栏按钮管理", icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => toggleManager() },
+    { id: "images", label: "本书图片", title: "本书图片显示", icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => toggleImgMenu() },
     { id: "css", label: "全局样式开关", title: "使用阅读器全局样式（覆盖书籍排版，仅当前书）", icon: () => IconPalette, visible: () => true, run: () => toggleCss() },
     { id: "settings", label: "设置", title: "设置", icon: () => IconSettings, visible: () => true, run: () => (ui.settingsOpen = true) },
   ];
@@ -435,13 +435,54 @@
    * 左侧目录 tocOpen（left:0）为独立 $state，不参与本互斥。
    * 抽屉显隐彻底不读 ui.aiOpen，也不再有任何监听 ui.aiOpen 的 $effect。 */
   function setRight(panel: "bookmarks" | "highlights" | "stats" | "ai") {
+    // 互斥：打开任一右侧面板/AI 时，关闭顶栏浮层面板（管理/图片/已屏蔽/漫画引导）。
+    closeTbPanels();
     rightPanel = rightPanel === panel ? null : panel;
+  }
+
+  /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / 已屏蔽图片 / 漫画引导）。 */
+  function closeTbPanels() {
+    tbManagerOpen = false;
+    imgMenuOpen = false;
+    blockedListOpen = false;
+    mangaGuideOpen = false;
+  }
+
+  /** 顶栏「按钮管理」开合：打开时关闭其它面板（右侧面板 / 目录 / 其它顶栏浮层），互斥。 */
+  function toggleManager() {
+    const willOpen = !tbManagerOpen;
+    closeTbPanels();
+    if (willOpen) {
+      rightPanel = null;
+      tocOpen = false;
+      tbManagerOpen = true;
+    }
+  }
+
+  /** 顶栏「本书图片」开合：互斥同上。 */
+  function toggleImgMenu() {
+    const willOpen = !imgMenuOpen;
+    closeTbPanels();
+    if (willOpen) {
+      rightPanel = null;
+      tocOpen = false;
+      imgMenuOpen = true;
+    }
+  }
+
+  /** 目录开合：打开目录时关闭顶栏浮层面板，互斥。 */
+  function toggleToc() {
+    const willOpen = !tocOpen;
+    closeTbPanels();
+    tocOpen = willOpen;
   }
 
   /** AI 抽屉/独立窗切换：drawer 模式并入右侧互斥（rightPanel==='ai'）；
    *  window 模式交由 store.toggleAi() 管理独立窗，建窗失败(返回 false)时直接 setRight('ai') 回退抽屉，
    *  不经 ui.aiOpen 中转、不靠 effect 拉起。 */
   async function toggleAiPanel() {
+    // 互斥：打开 AI 时关闭顶栏浮层面板。
+    closeTbPanels();
     let mode: string | null = null;
     try { mode = localStorage.getItem("fr.ai.mode"); } catch { /* ignore */ }
     if (mode === "window") {
@@ -3181,25 +3222,26 @@ ${effCssExtra() || ""}
   </div>
 
   {#if tbManagerOpen}
-    <div class="tb-panel" role="dialog" aria-label="顶栏按钮管理">
+    <div class="tb-panel tb-manager" role="dialog" aria-label="顶栏按钮管理">
       <div class="tb-panel-head"><span>顶栏按钮</span><button class="icon" title="关闭" onclick={() => (tbManagerOpen = false)}>×</button></div>
       <div class="tb-panel-body">
-        {#each config.reader.topbarOrder as id (id)}
-          {#if topbarBtn(id)}
-            {@const b = topbarBtn(id)!}
-            <label class="tb-row">
-              <input
-                type="checkbox"
-                checked={id === "manager" || !config.reader.topbarHidden.includes(id)}
-                disabled={id === "manager"}
-                onchange={(e) => toggleTopbarHidden(id, e.currentTarget.checked)}
-              />
-              <span class="tb-row-label">{b.label}</span>
-              {#if id === "manager"}<span class="tb-row-dim">（固定显示，避免无法再打开本面板）</span>
-              {:else if !b.visible()}<span class="tb-row-dim">（当前不可用）</span>{/if}
-            </label>
-          {/if}
-        {/each}
+        <div class="tb-chip-grid">
+          {#each config.reader.topbarOrder as id (id)}
+            {#if topbarBtn(id)}
+              {@const b = topbarBtn(id)!}
+              {@const shown = id === "manager" || !config.reader.topbarHidden.includes(id)}
+              <label class="tb-chip" class:on={shown} class:fixed={id === "manager"} class:na={id !== "manager" && !b.visible()}>
+                <input
+                  type="checkbox"
+                  checked={shown}
+                  disabled={id === "manager"}
+                  onchange={(e) => toggleTopbarHidden(id, e.currentTarget.checked)}
+                />
+                <span class="tb-chip-label">{b.label}</span>
+              </label>
+            {/if}
+          {/each}
+        </div>
         <p class="tb-panel-hint">在顶栏直接拖动按钮可调整顺序；隐藏的按钮重新显示后回到其保存的顺序位置。</p>
       </div>
     </div>
@@ -3690,19 +3732,38 @@ ${effCssExtra() || ""}
 
   .tb-panel-body { display: flex; flex-direction: column; gap: 2px; }
 
-  .tb-row {
+  /* 顶栏按钮管理：横排芯片式（替代竖排清单），窄面板自动换行；比清单更紧凑直观 */
+  .tb-manager { width: 340px; }
+  .tb-chip-grid {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 5px 6px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 13px;
+    flex-wrap: wrap;
+    gap: 7px;
+    padding: 2px 2px 4px;
   }
-
-  .tb-row:hover { background: rgba(128, 128, 128, 0.12); }
-  .tb-row-label { flex: 1; }
-  .tb-row-dim { opacity: 0.5; font-size: 12px; }
+  .tb-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px 5px 9px;
+    border-radius: var(--radius-pill, 999px);
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    background: transparent;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), opacity var(--dur, 0.2s) var(--ease);
+  }
+  .tb-chip:hover { background: rgba(128, 128, 128, 0.12); }
+  .tb-chip.on {
+    background: color-mix(in srgb, var(--accent, #4a6b8a) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 42%, transparent);
+    color: var(--accent, #4a6b8a);
+  }
+  .tb-chip.fixed { cursor: default; opacity: 0.75; }
+  .tb-chip.na { opacity: 0.42; }
+  .tb-chip input { width: 13px; height: 13px; margin: 0; flex-shrink: 0; }
+  .tb-chip-label { white-space: nowrap; }
 
   .tb-menu-item {
     text-align: left;

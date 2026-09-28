@@ -462,7 +462,7 @@ dialog::backdrop {
 
 .modal-body {
   padding: 18px 22px;
-  min-width: 440px;
+  min-width: min(440px, 92vw);
   max-width: 720px;
   max-height: 80vh;
   overflow: auto;
@@ -505,6 +505,7 @@ p, .tip, .hint, .empty {
 
 .row-inline > * {
   flex: 1;
+  min-width: 0;
 }
 
 .tip {
