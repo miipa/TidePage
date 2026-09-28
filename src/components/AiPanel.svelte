@@ -1086,7 +1086,7 @@ ${readerStyle.extra}
     height: 11px;
     border-radius: 50%;
     background: var(--accent, #4a6b8a);
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 1px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.35);
     opacity: 0;
     transition: opacity 0.15s;
     pointer-events: none;
@@ -1142,8 +1142,8 @@ ${readerStyle.extra}
     z-index: 45;
     display: flex;
     flex-direction: column;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.1);
-    animation: slide-in 0.18s ease;
+    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
+    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
   }
 
   .ai-panel.standalone {
@@ -1161,7 +1161,7 @@ ${readerStyle.extra}
   }
 
   @keyframes slide-in {
-    from { transform: translateX(28px); opacity: 0; }
+    from { transform: translateX(24px); opacity: 0; }
     to { transform: translateX(0); opacity: 1; }
   }
 

@@ -25,6 +25,7 @@
     HIGHLIGHT_STYLES,
     applyUiTheme,
     UI_SKINS,
+    coverTheme,
     createReaderScheme,
     overwriteReaderScheme,
     renameReaderScheme,
@@ -124,9 +125,12 @@
     } catch { /* ignore */ }
   }
 
-  /** 预览：用共享端点渲染一张样例封面（底图 + 实时叠字）；未设底图时即内置渐变。 */
+  /** 预览：用共享端点渲染一张样例封面（底图 + 实时叠字）；未设底图时即主题渐变。
+   *  带上主题配色参数，预览与书库默认封面完全一致，且切主题即时更新。 */
   const coverPreviewUrl = $derived(
-    `http://flowread.localhost/cover-default/0?v=${coverPreviewBust}`,
+    `http://flowread.localhost/cover-default/0?v=${coverPreviewBust}` +
+      `&g1=${encodeURIComponent(coverTheme.g1)}&g2=${encodeURIComponent(coverTheme.g2)}` +
+      `&g3=${encodeURIComponent(coverTheme.g3)}&tc=${encodeURIComponent(coverTheme.tc)}`,
   );
 
   async function pickDefaultCover() {
@@ -2965,7 +2969,8 @@
     height: 2px;
     border-radius: 1px;
     background: var(--accent);
-    animation: tab-in 0.25s ease;
+    transform-origin: left center;
+    animation: tab-in 0.3s cubic-bezier(0.32, 0.72, 0, 1) both;
   }
 
   @keyframes tab-in {

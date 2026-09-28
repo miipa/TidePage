@@ -156,8 +156,8 @@
     z-index: 40;
     display: flex;
     flex-direction: column;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.1);
-    animation: slide-in 0.18s ease;
+    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
+    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
   }
 
   @keyframes slide-in {

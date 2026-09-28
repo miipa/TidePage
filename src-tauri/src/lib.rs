@@ -53,6 +53,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 从 cover URL 查询串解析外壳主题配色（g1/g2/g3/tc），供默认封面按主题上色。
+fn parse_dc_theme(query: Option<&str>) -> library::DcTheme {
+    let mut t = library::DcTheme::default();
+    let Some(q) = query else { return t };
+    for pair in q.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let val = percent_decode(v);
+        match k {
+            "g1" => t.g1 = val,
+            "g2" => t.g2 = val,
+            "g3" => t.g3 = val,
+            "tc" => t.tc = val,
+            _ => {}
+        }
+    }
+    t
+}
+
 fn sniff_mime(b: &[u8]) -> &'static str {
     if b.starts_with(&[0x89, b'P', b'N', b'G']) {
         "image/png"
@@ -213,6 +231,7 @@ pub fn run() {
             use tauri::Manager;
             let path = request.uri().path().trim_start_matches('/');
             let dir = covers::covers_dir(ctx.app_handle());
+            let dc_theme = parse_dc_theme(request.uri().query());
 
             let (mime, bytes) = if let Some(raw) = path.strip_prefix("epubimg/") {
                 // EPUB 正文插图按需读取：epubimg/<book_id>/<b64url(zip内路径)>
@@ -246,7 +265,7 @@ pub fn run() {
                     .try_state::<std::sync::Arc<library::AppState>>()
                 {
                     Some(st) => {
-                        let svg = library::render_default_cover(&st, bid);
+                        let svg = library::render_default_cover(&st, bid, &dc_theme);
                         ("image/svg+xml".to_string(), svg.into_bytes())
                     }
                     None => (
@@ -283,7 +302,7 @@ pub fn run() {
                         match served {
                             Some(v) => v,
                             None => {
-                                let svg = library::render_default_cover(&st, bid);
+                                let svg = library::render_default_cover(&st, bid, &dc_theme);
                                 ("image/svg+xml".to_string(), svg.into_bytes())
                             }
                         }

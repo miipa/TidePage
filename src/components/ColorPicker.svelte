@@ -194,8 +194,14 @@
     color: var(--fg);
     border: 1px solid var(--line);
     border-radius: 10px;
-    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14), 0 20px 44px rgba(0, 0, 0, 0.22);
     padding: 10px;
+    animation: cp-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes cp-in {
+    from { opacity: 0; transform: translateY(5px) scale(0.97); }
+    to { opacity: 1; transform: none; }
   }
 
   .cp-title {

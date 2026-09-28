@@ -51,12 +51,18 @@
     color: var(--rdr-fg, #2c2c2c);
     border: 1px solid rgba(128, 128, 128, 0.3);
     border-radius: 10px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
     padding: 8px;
     display: flex;
     flex-direction: column;
     gap: 6px;
     min-width: 150px;
+    animation: ts-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes ts-in {
+    from { opacity: 0; transform: translateY(5px) scale(0.97); }
+    to { opacity: 1; transform: none; }
   }
 
   .ts-title {

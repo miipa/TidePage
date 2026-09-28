@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { coverTheme } from "./stores.svelte";
 import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
@@ -213,7 +214,13 @@ export function coverUrl(book: Pick<BookRow, "id" | "cover_path" | "cover_ver">)
   const v = `${_coverBust}-${book.cover_ver ?? 0}`;
   if (!book.cover_path) {
     // 无内嵌封面 → 共享默认封面端点（底图 + 实时叠字）。
-    return `http://flowread.localhost/cover-default/${book.id}?v=${v}`;
+    // 追加外壳主题配色（g1/g2/g3/tc）：读 coverTheme（响应式）——切主题即改 URL、自动重取、
+    // 默认封面颜色随主题变化；且这些参数令 URL 随主题唯一，规避 webview 对自定义协议的旧缓存。
+    const t = coverTheme;
+    const q =
+      `&g1=${encodeURIComponent(t.g1)}&g2=${encodeURIComponent(t.g2)}` +
+      `&g3=${encodeURIComponent(t.g3)}&tc=${encodeURIComponent(t.tc)}`;
+    return `http://flowread.localhost/cover-default/${book.id}?v=${v}${q}`;
   }
   // 有内嵌封面 → per-book 端点（/book-cover/<id>），按 id + coverVer 缓存破坏。
   return `http://flowread.localhost/book-cover/${book.id}?v=${v}`;

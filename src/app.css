@@ -45,11 +45,14 @@
   --dur: 0.2s;                                /* 常规过渡 */
   --dur-fast: 0.12s;                          /* 极短反馈（仍 >100ms）*/
   --dur-page: 0.22s;                          /* 翻页位移 */
+  --dur-lift: 0.34s;                          /* 悬停抬升/落位（更从容的高级感）*/
   --ease: cubic-bezier(0.4, 0, 0.2, 1);       /* 屏内位移 */
   --ease-in: cubic-bezier(0, 0, 0.2, 1);      /* 入场：减速落位 */
   --ease-out: cubic-bezier(0.4, 0, 1, 1);     /* 出场：加速离开 */
   --ease-page: cubic-bezier(0.22, 1, 0.36, 1);/* 翻页：快速起步、缓停落位 */
   --ease-spring: cubic-bezier(0.34, 1.35, 0.64, 1); /* 轻微回弹（拖拽落位）*/
+  /* премиум落位：快速起步、极缓停靠——卡片抬升/弹窗入场用它模拟真实质量感 */
+  --ease-premium: cubic-bezier(0.32, 0.72, 0, 1);
 
   /* 中文优先：微软雅黑承担中文字形，Segoe UI 仅兜底拉丁/符号，
      避免中英混排时中英字形风格割裂。 */
@@ -89,9 +92,14 @@ html[data-theme="light"] {
   /* 列表/表格整行悬停只加 4% 底（规范第 8 节） */
   --hover-row: color-mix(in srgb, var(--fg) 4%, transparent);
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.08);
-  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.16);
+  /* 分层柔和阴影：近距细影 + 远距扩散影双层叠加，替代单层硬阴影，
+     制造「物件浮在托盘上」的漫反射体积感（skill: diffused ambient shadow）。 */
+  --shadow-sm: 0 1px 1.5px rgba(23, 25, 30, 0.04), 0 1px 2px rgba(23, 25, 30, 0.05);
+  --shadow-md: 0 2px 6px rgba(23, 25, 30, 0.05), 0 10px 26px rgba(23, 25, 30, 0.09);
+  --shadow-lg: 0 4px 14px rgba(23, 25, 30, 0.08), 0 28px 64px rgba(23, 25, 30, 0.18);
+  /* 顶缘高光：让控件/卡片上沿透出一道极细亮线，像被顶光打到的实体边缘 */
+  --edge-hi: inset 0 1px 0 rgba(255, 255, 255, 0.75);
+  --edge-hi-soft: inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
 html[data-theme="dark"] {
@@ -117,9 +125,11 @@ html[data-theme="dark"] {
   --active-bg: color-mix(in srgb, var(--fg) 14%, transparent);
   --hover-row: color-mix(in srgb, var(--fg) 4%, transparent);
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --shadow-lg: 0 18px 52px rgba(0, 0, 0, 0.6);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28), 0 1px 1px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.34), 0 12px 30px rgba(0, 0, 0, 0.46);
+  --shadow-lg: 0 6px 18px rgba(0, 0, 0, 0.4), 0 30px 66px rgba(0, 0, 0, 0.62);
+  --edge-hi: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --edge-hi-soft: inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
 
 /* 深浅色由 data-theme 决定原生控件外观 */
@@ -158,7 +168,7 @@ button {
   cursor: pointer;
   font-size: var(--fs-sm);
   font-family: inherit;
-  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+  transition: transform var(--dur) var(--ease-premium), box-shadow var(--dur) var(--ease),
     background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 
@@ -168,7 +178,7 @@ button:hover:not(:disabled) {
 }
 
 button:active:not(:disabled) {
-  transform: translateY(1px);
+  transform: translateY(0.5px) scale(0.985);
 }
 
 button:disabled {
@@ -178,15 +188,21 @@ button:disabled {
 }
 
 button.primary {
-  background: var(--accent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 92%, #fff) 0%, var(--accent) 62%);
   border-color: transparent;
   color: var(--accent-fg);
   font-weight: 600;
+  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 button.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 96%, #fff) 0%, var(--accent-hover) 100%);
   border-color: transparent;
+  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.32);
+}
+
+button.primary:active:not(:disabled) {
+  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 
 button.danger {
@@ -209,6 +225,7 @@ button.icon {
   border-color: transparent;
   color: var(--fg);
   opacity: 0.82;
+  box-shadow: none;
 }
 
 button.icon:hover:not(:disabled) {
@@ -216,6 +233,12 @@ button.icon:hover:not(:disabled) {
   border-color: transparent;
   color: var(--fg);
   opacity: 1;
+  box-shadow: none;
+}
+
+button.icon:active:not(:disabled) {
+  transform: scale(0.9);
+  box-shadow: none;
 }
 
 /* ===================== 表单控件 ===================== */
@@ -280,6 +303,7 @@ input[type="range"] {
   cursor: pointer;
   padding: 0;
   border: none;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.14);
   transition: background var(--dur) var(--ease);
   flex-shrink: 0;
 }
@@ -293,8 +317,8 @@ input[type="range"] {
   height: 18px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: var(--shadow-sm);
-  transition: transform var(--dur) var(--ease);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28), 0 1px 1px rgba(0, 0, 0, 0.16);
+  transition: transform var(--dur) var(--ease-spring);
 }
 
 .fr-switch:checked {
@@ -303,6 +327,10 @@ input[type="range"] {
 
 .fr-switch:checked::after {
   transform: translateX(18px);
+}
+
+.fr-switch:hover:not(:disabled) {
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.14);
 }
 
 .fr-switch:focus-visible {
@@ -329,33 +357,43 @@ input[type="range"] {
   padding: 3px 12px;
   font-size: var(--fs-xs);
   color: var(--fg2);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
 .fr-seg button:hover:not(:disabled) {
   background: transparent;
   color: var(--fg);
+  box-shadow: none;
+}
+
+.fr-seg button:active:not(:disabled) {
+  transform: none;
 }
 
 .fr-seg button.active {
   background: var(--bg-elev);
   color: var(--fg);
   font-weight: 600;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-sm), var(--edge-hi-soft);
 }
 
 /* ===================== 滚动条 ===================== */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 11px;
+  height: 11px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--line-strong);
-  border-radius: 5px;
+  background: color-mix(in srgb, var(--fg2) 34%, transparent);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  transition: background var(--dur) var(--ease);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--fg2) 60%, transparent);
+  background: color-mix(in srgb, var(--fg2) 62%, transparent);
+  background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-track {
@@ -378,7 +416,7 @@ dialog {
   background: var(--bg-elev);
   color: var(--fg);
   padding: 0;
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-lg), var(--edge-hi-soft);
 }
 
 .settings {
@@ -393,10 +431,33 @@ dialog[open] {
   height: fit-content;
   max-height: 88vh;
   z-index: 1000;
+  animation: fr-dialog-in 0.32s var(--ease-premium) both;
+}
+
+/* 弹窗入场：轻微放大 + 上浮 + 去模糊落位，模拟从景深里浮现（skill: heavy fade-up） */
+@keyframes fr-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
 }
 
 dialog::backdrop {
-  background: rgba(0, 0, 0, 0.42);
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(3px) saturate(1.1);
+  -webkit-backdrop-filter: blur(3px) saturate(1.1);
+  animation: fr-backdrop-in 0.3s var(--ease-in) both;
+}
+
+@keyframes fr-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .modal-body {
@@ -474,7 +535,7 @@ p, .tip, .hint, .empty {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   padding: var(--sp-4);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-sm), var(--edge-hi-soft);
 }
 
 /* ===================== 顶栏按钮真实拖拽排序 ===================== */

@@ -722,12 +722,28 @@ fn default_cover_data_url(app: &AppHandle) -> Option<String> {
     Some(format!("data:{};base64,{}", mime, covers::b64(&bytes)))
 }
 
+/// 外壳主题传入的默认封面配色（来自 cover URL 查询串；空则回落内置观感）。
+#[derive(Default, Clone)]
+pub struct DcTheme {
+    pub g1: String,
+    pub g2: String,
+    pub g3: String,
+    /// 书名字色。
+    pub tc: String,
+}
+
+fn nonempty(v: &str, fallback: &str) -> String {
+    if v.trim().is_empty() { fallback.to_string() } else { v.trim().to_string() }
+}
+
 /// F2：渲染共享默认封面（底图 + 实时叠字）。
 /// 书名/作者取 DB 实时值（无则用文件名解析），文字不落盘、不缓存。
-pub fn render_default_cover(state: &Arc<AppState>, book_id: i64) -> String {
-    let (title, author) = {
+/// `theme` 为外壳主题配色：无自定义底图时决定渐变/字色（随主题变化、保证易读）；
+/// 有自定义底图时字色改用「设置底图时分析出的自适应色」（读书名区亮度定深/浅）。
+pub fn render_default_cover(state: &Arc<AppState>, book_id: i64, theme: &DcTheme) -> String {
+    let (title, author, dc_text, dc_light) = {
         let conn = state.db.0.lock().unwrap();
-        match db::get_book(&conn, book_id) {
+        let (t, a) = match db::get_book(&conn, book_id) {
             Some(b) => {
                 let t = if b.title.trim().is_empty() {
                     parse_filename(&b.path).0
@@ -742,10 +758,41 @@ pub fn render_default_cover(state: &Arc<AppState>, book_id: i64) -> String {
                 (t, a)
             }
             None => ("未命名".to_string(), String::new()),
+        };
+        let dc_text = db::get_setting(&conn, "dc_text").filter(|s| !s.trim().is_empty());
+        let dc_light = db::get_setting(&conn, "dc_text_light").map(|s| s == "1");
+        (t, a, dc_text, dc_light)
+    };
+
+    let base = default_cover_data_url(&state.app);
+    let style = if base.is_some() {
+        // 自定义底图：字色用「设置时分析出的自适应色」；缺失则回落柔和浅色 + 压暗遮罩。
+        let text = dc_text.unwrap_or_else(|| "#EFEBE4".to_string());
+        let text_is_light = dc_light.unwrap_or(true);
+        covers::CoverStyle {
+            base_href: base,
+            g1: String::new(),
+            g2: String::new(),
+            g3: String::new(),
+            accent: text.clone(),
+            text,
+            text_is_light,
+        }
+    } else {
+        // 主题渐变：字色/渐变随外壳主题变化；遮罩方向按字色明暗自适应。
+        let text = nonempty(&theme.tc, "#f4ecdc");
+        let text_is_light = covers::hex_is_light(&text);
+        covers::CoverStyle {
+            base_href: None,
+            g1: nonempty(&theme.g1, "#36485c"),
+            g2: nonempty(&theme.g2, "#212d3c"),
+            g3: nonempty(&theme.g3, "#141c26"),
+            accent: text.clone(),
+            text,
+            text_is_light,
         }
     };
-    let base = default_cover_data_url(&state.app);
-    covers::default_cover_svg(&title, &author, base.as_deref())
+    covers::default_cover_svg_styled(&title, &author, &style)
 }
 
 /// 封面提取来源（单一事实源）：容器格式 → 具体提取分支；其余 → None（非容器，不读文件）。
@@ -1994,13 +2041,41 @@ fn write_default_cover_atomic(out: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置默认封面底图（校验 + 原子替换；失败不破坏旧底图）。
+/// 设置默认封面底图（校验 + 缩放到封面尺寸 + 分析书名区亮度 + 原子替换）。
+///
+/// 关键：把用户底图**下采样到 320×480 PNG** 再落盘——
+///   1) 修复「设置大图后书库封面全部空白（需重启）」：默认封面是把底图整张 base64 内嵌进
+///      每本书的 SVG，大图会让每张封面 SVG 体积暴涨（几 MB），可见网格一次并发几十张时
+///      webview 内存/解码顶不住而渲染空白；缩到 320×480 后单张 SVG 仅几十 KB，秒开不空白。
+///   2) 同时分析底图「书名显示区域」（底部 42%）平均亮度，自动决定叠字用深色还是浅色，
+///      结果存入 settings（dc_text / dc_text_light），渲染时直接取用（无需每次重解码大图）。
 #[tauri::command]
 pub fn set_default_cover(state: State<'_, Arc<AppState>>, image_path: String) -> Result<(), String> {
     let data = std::fs::read(&image_path).map_err(|e| format!("读取图片失败: {e}"))?;
+    let img = image::load_from_memory(&data).map_err(|e| format!("不是有效图片: {e}"))?;
+    // 下采样到封面比例（2:3 居中裁切填满），再编码为 PNG。
+    let cover = img.resize_to_fill(320, 480, image::imageops::FilterType::Lanczos3);
+    let rgba = cover.to_rgba8();
+    let mut png: Vec<u8> = Vec::new();
+    cover
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("编码封面失败: {e}"))?;
+
     let out = covers::default_cover_path(&state.app);
-    write_default_cover_atomic(&out, &data)?;
-    // 底图已成功落盘，才失效缓存。
+    write_default_cover_atomic(&out, &png)?;
+
+    // 分析书名区亮度 → 自适应字色（偏亮配柔和深色、偏暗配柔和浅色；非纯黑纯白、护眼）。
+    let region_light = covers::region_is_light(&rgba);
+    let (text, is_light) = if region_light {
+        ("#2A2723", false)
+    } else {
+        ("#EFEBE4", true)
+    };
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::set_setting(&conn, "dc_text", text);
+        db::set_setting(&conn, "dc_text_light", if is_light { "1" } else { "0" });
+    }
     invalidate_covers_after_base_change(state.inner());
     Ok(())
 }
@@ -2011,6 +2086,12 @@ pub fn clear_default_cover(state: State<'_, Arc<AppState>>) -> Result<(), String
     let out = covers::default_cover_path(&state.app);
     if out.exists() {
         std::fs::remove_file(&out).map_err(|e| format!("移除底图失败: {e}"))?;
+    }
+    {
+        // 清掉自适应字色记录：回到主题渐变后由主题字色接管。
+        let conn = state.db.0.lock().unwrap();
+        db::set_setting(&conn, "dc_text", "");
+        db::set_setting(&conn, "dc_text_light", "");
     }
     invalidate_covers_after_base_change(state.inner());
     Ok(())

@@ -188,7 +188,7 @@
     color: var(--rdr-fg, #2c2c2c);
     border: 1px solid rgba(128, 128, 128, 0.3);
     border-radius: 22px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 48px rgba(0, 0, 0, 0.26);
     flex-wrap: wrap;
   }
 

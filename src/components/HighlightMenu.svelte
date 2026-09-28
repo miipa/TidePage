@@ -103,12 +103,18 @@
     color: var(--rdr-fg, #2c2c2c);
     border: 1px solid rgba(128, 128, 128, 0.3);
     border-radius: 10px;
-    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
     padding: 8px;
     display: flex;
     flex-direction: column;
     gap: 7px;
     max-width: 340px;
+    animation: hm-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes hm-in {
+    from { opacity: 0; transform: translateY(4px) scale(0.96); }
+    to { opacity: 1; transform: none; }
   }
 
   .hm-text {

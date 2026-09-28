@@ -252,8 +252,14 @@
     color: var(--rdr-fg, #2c2c2c);
     border: 1px solid rgba(128, 128, 128, 0.3);
     border-radius: 12px;
-    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 24px 52px rgba(0, 0, 0, 0.26);
     overflow: hidden;
+    animation: qa-in 0.2s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes qa-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.97); }
+    to { opacity: 1; transform: none; }
   }
 
   .qa-head {

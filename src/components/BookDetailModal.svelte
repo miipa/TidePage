@@ -220,10 +220,18 @@
     position: fixed;
     inset: 0;
     background: rgba(20, 20, 24, 0.42);
+    backdrop-filter: blur(3px) saturate(1.08);
+    -webkit-backdrop-filter: blur(3px) saturate(1.08);
     z-index: 1200;
     display: grid;
     place-items: center;
     padding: 24px;
+    animation: bd-overlay-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
+  }
+
+  @keyframes bd-overlay-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .bd-panel {
@@ -233,10 +241,16 @@
     color: var(--fg);
     border: 1px solid var(--line);
     border-radius: 14px;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    box-shadow: var(--shadow-lg), var(--edge-hi-soft);
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    animation: bd-panel-in 0.32s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes bd-panel-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.97); filter: blur(6px); }
+    to { opacity: 1; transform: none; filter: blur(0); }
   }
 
   .bd-head {
@@ -262,7 +276,7 @@
     aspect-ratio: 2 / 3;
     object-fit: cover;
     border-radius: 8px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+    box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.14);
     background: var(--panel2);
   }
 

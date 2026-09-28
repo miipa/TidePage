@@ -1227,15 +1227,18 @@
     padding: var(--sp-3, 12px) var(--sp-4, 16px);
     background: var(--panel);
     border-bottom: 1px solid var(--line);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02), 0 6px 16px -12px rgba(23, 25, 30, 0.35);
     flex-shrink: 0;
+    position: relative;
+    z-index: 5;
   }
 
   .logo {
-    font-weight: 600;
+    font-weight: 700;
     font-size: var(--fs-lg, 16px);
     color: var(--accent);
     margin-right: var(--sp-3, 12px);
-    letter-spacing: -0.015em;
+    letter-spacing: -0.02em;
     user-select: none;
   }
 
@@ -1414,20 +1417,21 @@
     cursor: pointer;
     border-radius: var(--radius, 12px);
     padding: var(--sp-2, 8px);
-    /* 悬停抬升：≥8% 亮度差 + 柔和阴影；位移 -2px（规范第 7 节） */
-    transition: background var(--dur, 0.2s) var(--ease),
-      transform var(--dur, 0.2s) var(--ease),
-      box-shadow var(--dur, 0.2s) var(--ease);
+    /* 悬停抬升：柔和抬起 + 分层扩散阴影；用 премиум落位曲线模拟质量感（skill: haptic depth） */
+    transition: background var(--dur-lift, 0.34s) var(--ease-premium),
+      transform var(--dur-lift, 0.34s) var(--ease-premium),
+      box-shadow var(--dur-lift, 0.34s) var(--ease-premium);
   }
 
   .card:hover {
     background: var(--hover-bg);
-    transform: translateY(-2px);
+    transform: translateY(-4px);
     box-shadow: var(--shadow-md);
   }
 
   .card:active {
-    transform: translateY(0);
+    transform: translateY(-1px) scale(0.99);
+    transition-duration: var(--dur-fast, 0.12s);
   }
 
   /* 未加载完成的占位槽：只占位保持列对齐，不响应交互、无悬停效果 */
@@ -1441,7 +1445,7 @@
     box-shadow: none;
   }
 
-  /* 封面：外层 8px 圆角容器，内层图片裁切；用极淡描边替代重阴影 */
+  /* 封面：外层 8px 圆角容器，内层图片裁切；极淡描边 + 顶缘高光营造嵌入托盘的实体感 */
   .cover {
     position: relative;
     width: 100%;
@@ -1450,7 +1454,12 @@
     background: var(--panel2);
     outline: 1px solid var(--line);
     outline-offset: -1px;
-    box-shadow: var(--shadow-sm);
+    box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    transition: box-shadow var(--dur-lift, 0.34s) var(--ease-premium);
+  }
+
+  .card:hover .cover {
+    box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.14);
   }
 
   .cover img {
@@ -1458,27 +1467,29 @@
     height: 100%;
     object-fit: cover;
     display: block;
-    transition: transform var(--dur, 0.2s) var(--ease);
+    transition: transform var(--dur-lift, 0.34s) var(--ease-premium);
   }
 
   .card:hover .cover img {
-    transform: scale(1.03);
+    transform: scale(1.055);
   }
 
-  /* 格式角标：半透明深底 + 白色小字，10px 字距 +0.015em */
+  /* 格式角标：半透明深底 + 白色小字，10px 字距 +0.015em。
+     注意：不用 backdrop-blur —— 卡片处于虚拟滚动网格内，滚动中模糊层会持续触发 GPU 重绘、
+     在低端机上掉帧（perf: 禁止对滚动内容用 backdrop-filter）。改用实心半透明底达到同等观感。 */
   .fmt {
     position: absolute;
     right: 8px;
     top: 8px;
-    background: rgba(0, 0, 0, 0.6);
+    background: rgba(0, 0, 0, 0.55);
     color: #fff;
     font-size: var(--fs-2xs, 10px);
+    font-weight: 500;
     line-height: 1;
     padding: 4px 8px;
     border-radius: var(--radius-sm, 8px);
     letter-spacing: var(--ls-wide, 0.015em);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
   }
 
   /* 固定块高（与脚本 META_H=52 一致）：标题 20 + 间距 1 + 作者 18 + 上内边距 8 + 余量 5，
@@ -1691,15 +1702,16 @@
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: var(--radius, 12px);
-    box-shadow: var(--shadow-lg);
+    box-shadow: var(--shadow-lg), var(--edge-hi-soft);
     padding: 4px;
     min-width: 190px;
     z-index: 101;
-    animation: ctx-in var(--dur-fast, 0.12s) var(--ease-in, cubic-bezier(0, 0, 0.2, 1));
+    transform-origin: top left;
+    animation: ctx-in 0.2s var(--ease-premium);
   }
 
   @keyframes ctx-in {
-    from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+    from { opacity: 0; transform: translateY(-6px) scale(0.96); }
     to { opacity: 1; transform: none; }
   }
 

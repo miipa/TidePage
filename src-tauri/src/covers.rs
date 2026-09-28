@@ -129,9 +129,11 @@ pub struct CoverLayout {
 pub fn layout_cover(title: &str, author: &str, w: usize, h: usize) -> CoverLayout {
     const MARGIN_X: usize = 22;
     let max_w = w.saturating_sub(MARGIN_X * 2).max(40);
-    // 文字区：底部 ~42% 高，底部留边 14px
+    // 文字区改到「顶部」：书名放封面上方，避开左下角进度环。
+    // 顶部留白 62px：封面在网格里会缩放，而格式角标/角标是固定尺寸的 HTML 叠层，
+    // 留足 62px 才能保证最小封面缩放后首行仍落在右上角格式角标下方、不被遮挡。
+    let area_top = 62;
     let area_h = ((h as f64) * 0.42).round() as usize;
-    let area_top = h.saturating_sub(area_h + 14);
 
     let title = if title.trim().is_empty() { "未命名" } else { title.trim() };
     let author = author.trim();
@@ -190,33 +192,123 @@ pub fn layout_cover(title: &str, author: &str, w: usize, h: usize) -> CoverLayou
     })
 }
 
-/// 生成默认封面 SVG（F2 架构）：共享底图 + 底部渐变遮罩 + 底部白字（渲染时实时叠）。
+/// 解析 `#rgb` / `#rrggbb` 为 (r,g,b)；失败返回 None。
+fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
+    let h = hex.trim().trim_start_matches('#');
+    let full = match h.len() {
+        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
+        6 => h.to_string(),
+        _ => return None,
+    };
+    let r = u8::from_str_radix(&full[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&full[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&full[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+fn srgb_chan(c: u8) -> f64 {
+    let s = c as f64 / 255.0;
+    if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+}
+
+/// WCAG 相对亮度（0=黑, 1=白）。
+fn rel_lum(r: u8, g: u8, b: u8) -> f64 {
+    0.2126 * srgb_chan(r) + 0.7152 * srgb_chan(g) + 0.0722 * srgb_chan(b)
+}
+
+/// 十六进制色是否偏亮（用于决定叠字用深/浅、以及遮罩方向）。
+pub fn hex_is_light(hex: &str) -> bool {
+    parse_hex(hex).map(|(r, g, b)| rel_lum(r, g, b) > 0.45).unwrap_or(false)
+}
+
+/// 分析已缩放底图「书名显示区域」（底部 42%）的平均亮度，判断该区偏亮还是偏暗。
+/// 返回 true=偏亮（应配深色字），false=偏暗（应配浅色字）。带 alpha 加权，透明像素不计。
+pub fn region_is_light(img: &image::RgbaImage) -> bool {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let y0 = ((h as f64) * 0.58) as u32; // 下部 42%（与文字区一致）
+    let sx = (w / 80).max(1);
+    let sy = ((h - y0) / 80).max(1);
+    let mut sum = 0f64;
+    let mut wsum = 0f64;
+    let mut y = y0;
+    while y < h {
+        let mut x = 0u32;
+        while x < w {
+            let p = img.get_pixel(x, y);
+            let a = p[3] as f64 / 255.0;
+            sum += rel_lum(p[0], p[1], p[2]) * a;
+            wsum += a;
+            x += sx;
+        }
+        y += sy;
+    }
+    if wsum <= 0.0 {
+        return false;
+    }
+    sum / wsum > 0.5
+}
+
+/// 默认封面的可主题化样式（外壳主题驱动 / 自定义底图自适应）。
+pub struct CoverStyle {
+    /// 用户自定义底图（`data:` URL）；None=用主题渐变。
+    pub base_href: Option<String>,
+    /// 渐变三档色（仅在无底图时使用）。
+    pub g1: String,
+    pub g2: String,
+    pub g3: String,
+    /// 左侧强调竖线颜色。
+    pub accent: String,
+    /// 书名/作者字色。
+    pub text: String,
+    /// 字色是否偏亮：决定底部遮罩方向（浅字→压暗，深字→提亮）与文字投影颜色。
+    pub text_is_light: bool,
+}
+
+impl CoverStyle {
+    /// 内置默认观感（深蓝渐变 + 暖白字 + 金线），兼容旧行为。
+    pub fn builtin(base_href: Option<&str>) -> Self {
+        CoverStyle {
+            base_href: base_href.map(|s| s.to_string()),
+            g1: "#36485c".into(),
+            g2: "#212d3c".into(),
+            g3: "#141c26".into(),
+            accent: "#c8a86a".into(),
+            text: "#f4ecdc".into(),
+            text_is_light: true,
+        }
+    }
+}
+
+/// 生成默认封面 SVG：共享底图/主题渐变 + 自适应遮罩 + 叠字（渲染时实时叠，不落盘）。
 ///
-/// 明确结构，不做任何"检测图片明暗自动切字色"：
-///   1) 底图按 2:3 居中裁切填满（`xMidYMid slice`，不变形、不留边）；
-///   2) 底部线性渐变遮罩（上方透明 → 底部黑 0.75），压住文字区，底图不整体变灰；
-///   3) 文字固定白色，放底部。
-///
-/// `base_href` 为内置渐变时传 None；为用户底图时传其 `data:` URL。
-pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> String {
+/// 结构：
+///   1) 底图按 2:3 居中裁切填满（`xMidYMid slice`），或主题三档渐变；
+///   2) 底部线性遮罩——浅字压暗、深字提亮，保证书名区永远与字色拉开对比；
+///   3) 文字带轻投影（feDropShadow）增强清晰度；字色/竖线色由样式给定。
+pub fn default_cover_svg_styled(title: &str, author: &str, style: &CoverStyle) -> String {
     const W: usize = 320;
     const H: usize = 480;
     const MARGIN: usize = 22;
     const ACCENT_X: usize = MARGIN - 9;
-    let max_w = W - MARGIN * 2; // 276
 
     let lay = layout_cover(title, author, W, H);
     let n = lay.lines.len();
     let author_h = if lay.author.is_some() { lay.font_size + 8 } else { 0 };
     let block_h = n * lay.line_h + author_h;
+    // 顶部对齐：书名块贴着文字区顶边排（放在封面上方）。
+    let block_top = lay.area_top;
 
-    // 文字块在下部区内垂直居中
-    let block_top = lay.area_top + lay.area_h.saturating_sub(block_h) / 2;
+    let text_fill = escape(&style.text);
+    let accent_fill = escape(&style.accent);
+
     let mut text = String::new();
     for (i, l) in lay.lines.iter().enumerate() {
         let y = block_top + i * lay.line_h + lay.font_size;
         text.push_str(&format!(
-            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{}\" font-weight=\"700\" fill=\"#f4ecdc\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
+            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{}\" font-weight=\"700\" fill=\"{text_fill}\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
             lay.font_size,
             escape(l)
         ));
@@ -225,13 +317,13 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
         let afs = (lay.font_size * 62 / 100).max(13);
         let y = block_top + n * lay.line_h + afs;
         text.push_str(&format!(
-            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{afs}\" fill=\"#f4ecdc\" fill-opacity=\"0.62\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
+            "<text x=\"{MARGIN}\" y=\"{y}\" font-size=\"{afs}\" fill=\"{text_fill}\" fill-opacity=\"0.62\" letter-spacing=\"0.6\" font-family=\"Microsoft YaHei, Segoe UI, sans-serif\">{}</text>",
             escape(a)
         ));
     }
 
-    // 底图：用户底图（href）或内置渐变。
-    let base = match base_href {
+    // 底图：用户底图（href）或主题渐变。
+    let base = match &style.base_href {
         Some(href) => format!(
             "<image href=\"{}\" x=\"0\" y=\"0\" width=\"{W}\" height=\"{H}\" preserveAspectRatio=\"xMidYMid slice\"/>",
             escape(href)
@@ -239,22 +331,40 @@ pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> 
         None => format!("<rect width=\"{W}\" height=\"{H}\" fill=\"url(#cvbg)\"/>"),
     };
 
+    // 遮罩与投影随字色明暗切换：浅字→底部压黑 0.75 + 黑投影；深字→底部提白 0.72 + 白投影。
+    let (shade_color, shade_op, shadow_color) = if style.text_is_light {
+        ("#000000", "0.75", "#000000")
+    } else {
+        ("#ffffff", "0.72", "#ffffff")
+    };
+
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" viewBox="0 0 {W} {H}">
 <defs>
-<linearGradient id="cvbg" x1="0" y1="0" x2="0.85" y2="1"><stop offset="0" stop-color="#36485c"/><stop offset="0.55" stop-color="#212d3c"/><stop offset="1" stop-color="#141c26"/></linearGradient>
+<linearGradient id="cvbg" x1="0" y1="0" x2="0.85" y2="1"><stop offset="0" stop-color="{g1}"/><stop offset="0.55" stop-color="{g2}"/><stop offset="1" stop-color="{g3}"/></linearGradient>
 <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="#000000" stop-opacity="0"/>
-<stop offset="0.55" stop-color="#000000" stop-opacity="0"/>
-<stop offset="1" stop-color="#000000" stop-opacity="0.75"/>
+<stop offset="0" stop-color="{shade_color}" stop-opacity="{shade_op}"/>
+<stop offset="0.42" stop-color="{shade_color}" stop-opacity="0"/>
+<stop offset="1" stop-color="{shade_color}" stop-opacity="0"/>
 </linearGradient>
+<filter id="tsh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="1" stdDeviation="1.1" flood-color="{shadow_color}" flood-opacity="0.45"/></filter>
 </defs>
 {base}
 <rect width="{W}" height="{H}" fill="url(#shade)"/>
-<rect x="{ACCENT_X}" y="{block_top}" width="3" height="{block_h}" rx="1.5" fill="#c8a86a" fill-opacity="0.85"/>
+<rect x="{ACCENT_X}" y="{block_top}" width="3" height="{block_h}" rx="1.5" fill="{accent_fill}" fill-opacity="0.85"/>
+<g filter="url(#tsh)">
 {text}
-</svg>"##
+</g>
+</svg>"##,
+        g1 = escape(&style.g1),
+        g2 = escape(&style.g2),
+        g3 = escape(&style.g3),
     )
+}
+
+/// 兼容旧调用：内置观感 + 可选底图。
+pub fn default_cover_svg(title: &str, author: &str, base_href: Option<&str>) -> String {
+    default_cover_svg_styled(title, author, &CoverStyle::builtin(base_href))
 }
 
 /// 兼容旧调用：无底图版本的默认封面。

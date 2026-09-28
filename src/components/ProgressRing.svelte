@@ -42,11 +42,11 @@
     align-items: center;
     justify-content: center;
     border-radius: var(--radius-pill, 999px);
-    /* 半透明底衬 + 模糊，保证深浅色主题下环心数字都清晰、不遮封面主体 */
-    background: color-mix(in srgb, var(--panel) 62%, transparent);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
-    box-shadow: var(--shadow-sm);
+    /* 实心半透明底衬（不用 backdrop-blur）：进度环随封面渲染在虚拟滚动网格里，
+       模糊层会在滚动时对每个可见环持续触发 GPU 重绘、低端机掉帧。
+       用较高不透明度的底达到同等「数字清晰不遮封面」效果。 */
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.14);
     pointer-events: none;
   }
 

@@ -281,12 +281,12 @@
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    background: #26282cee;
+    background: #26282cf2;
     color: #fff;
-    border-radius: 10px;
+    border-radius: 12px;
     padding: 10px 10px 10px 14px;
-    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
-    animation: toast-in 0.2s ease;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22), 0 18px 44px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    animation: toast-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
     max-width: 100%;
     min-width: 0;
     box-sizing: border-box;
@@ -321,7 +321,7 @@
   }
 
   @keyframes toast-in {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0; transform: translateY(12px) scale(0.98); }
     to { opacity: 1; transform: none; }
   }
   .layout-root {
@@ -371,7 +371,15 @@
     position: fixed;
     inset: 0;
     background: rgba(20, 20, 24, 0.35);
+    backdrop-filter: blur(3px) saturate(1.08);
+    -webkit-backdrop-filter: blur(3px) saturate(1.08);
     z-index: 990;
+    animation: overlay-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
+  }
+
+  @keyframes overlay-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .ai-window-root {
@@ -391,14 +399,14 @@
     color: var(--fg);
     border-left: 1px solid var(--line);
     box-shadow: -10px 0 32px rgba(0, 0, 0, 0.22);
-    animation: wd-in 0.2s ease;
+    animation: wd-in 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
 
   @keyframes wd-in {
-    from { transform: translateX(40px); opacity: 0; }
+    from { transform: translateX(24px); opacity: 0; }
     to { transform: translateX(0); opacity: 1; }
   }
 

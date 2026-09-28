@@ -585,53 +585,75 @@ export interface UiSkin {
 }
 
 /**
- * 外壳可选皮肤：3 浅 + 1 深 + 1 近黑（共 5 套）。
- * - Cream Island / Nocturne：取自用户提供的设计稿（仅提取配色与"细线/平板"气质，不引入衬线标题）。
- * - 麻布 / 冷雾 / 石墨：在保留 4px 栅格与对比度规范下做性格化扩展。
+ * 外壳可选皮肤：5 浅 + 5 深（共 10 套）。仅影响外壳（书库/设置/阅读器工具栏/面板/弹窗），
+ * 与阅读正文配色（THEMES / reader.*）完全解耦——切换皮肤不改动任何阅读界面颜色设置。
+ *
+ * 选色约束（依据用户需求）：
+ *  1) 易读：正文 fg 与 bg 对比 ≥ 12:1；次要 fg2 ≥ 4.5:1；accent 作彩色文字/主按钮均过 AA。
+ *  2) 区分度：十套主色分布在色谱不同区段——
+ *     浅色 = 中性咖 / 赤陶橙 / 松林绿 / 湖光蓝 / 紫藤紫；
+ *     深色 = 石墨青 / 琥珀金 / 深海蓝 / 绯夜红 / 夜行紫。
+ *  3) 全窗口：所有令牌经 applyUiTheme() 注入 :root，books/reader/面板/弹窗共享同一套变量。
  */
 export const UI_SKINS: UiSkin[] = [
-  // ===== 浅色 =====
+  // ===================== 浅色 5 套 =====================
+  // 奶油（保留 · 微调）：暖奶油纸底 + 中性深咖主色，作为「中性暖」一极，与其余彩色皮肤区分。
   {
     id: "cream",
     name: "奶油",
     mode: "light",
-    bg: "#FFF0DF", panel: "#FFFFFF", panel2: "#FBEBDA",
-    fg: "#292524", fg2: "#78716C", line: "rgba(41,37,36,0.10)",
-    accent: "#1C1917", accentFg: "#FFF0DF",
-    success: "#2D6A4F", warning: "#FF6900", danger: "#9F1239",
-    radiusCard: "16px", shadow: "0 1px 2px rgba(41,37,36,0.06)",
+    bg: "#FFF1E2", panel: "#FFFFFF", panel2: "#FBEADA",
+    fg: "#292320", fg2: "#7A6E64", line: "rgba(41,35,32,0.10)",
+    accent: "#3A2A20", accentFg: "#FFF1E2",
+    success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
+    radiusCard: "16px", shadow: "0 1px 2px rgba(41,35,32,0.06), 0 1px 2px rgba(41,35,32,0.04)",
   },
+  // 赤陶：暖陶土橙（~20°），温润手作气质。
   {
-    id: "linen",
-    name: "麻布",
+    id: "clay",
+    name: "赤陶",
     mode: "light",
-    bg: "#F5F1E8", panel: "#FFFDF9", panel2: "#ECE6D9",
-    fg: "#2E2A24", fg2: "#7A7367", line: "rgba(46,42,36,0.11)",
-    accent: "#8C5A2B", accentFg: "#FFFDF9",
-    success: "#3F7A4E", warning: "#B07A1E", danger: "#A8453C",
-    radiusCard: "10px", shadow: "0 1px 3px rgba(46,42,36,0.08), 0 1px 2px rgba(46,42,36,0.05)",
+    bg: "#FBF3EC", panel: "#FFFFFF", panel2: "#F3E6DB",
+    fg: "#2C2622", fg2: "#756759", line: "rgba(44,38,34,0.10)",
+    accent: "#A9482A", accentFg: "#FFF7F2",
+    success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(44,38,34,0.06), 0 6px 20px rgba(44,38,34,0.06)",
   },
+  // 松林：沉静森绿（~155°），清新自然。
   {
-    id: "mist",
-    name: "冷雾",
+    id: "pine",
+    name: "松林",
     mode: "light",
-    bg: "#F3F6FA", panel: "#FFFFFF", panel2: "#E8EEF6",
-    fg: "#20242C", fg2: "#5F6975", line: "rgba(32,36,44,0.09)",
-    accent: "#3B6FB0", accentFg: "#FFFFFF",
-    success: "#2F7D5B", warning: "#A9761B", danger: "#B4433C",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(32,36,44,0.05), 0 6px 20px rgba(32,36,44,0.06)",
+    bg: "#EFF5F0", panel: "#FFFFFF", panel2: "#E2EDE5",
+    fg: "#1F2622", fg2: "#63726A", line: "rgba(31,38,34,0.10)",
+    accent: "#1E7A55", accentFg: "#F3FBF6",
+    success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(31,38,34,0.05), 0 6px 20px rgba(31,38,34,0.06)",
   },
-  // ===== 深色 =====
+  // 湖光：清爽湖蓝（~205°），冷静专注。
   {
-    id: "nocturne",
-    name: "夜行",
-    mode: "dark",
-    bg: "#13111C", panel: "#1C1A28", panel2: "#0B0B0F",
-    fg: "#F7F7F8", fg2: "#A1A0AB", line: "#33323E",
-    accent: "#59497A", accentFg: "#F7F7F8",
-    success: "#428A72", warning: "#B08A3E", danger: "#F9A8D4",
-    radiusCard: "12px", shadow: "none",
+    id: "lagoon",
+    name: "湖光",
+    mode: "light",
+    bg: "#EDF3F9", panel: "#FFFFFF", panel2: "#E0E9F3",
+    fg: "#1E252E", fg2: "#5E6975", line: "rgba(30,37,46,0.09)",
+    accent: "#2E6CB0", accentFg: "#F2F7FC",
+    success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(30,37,46,0.05), 0 6px 20px rgba(30,37,46,0.06)",
   },
+  // 紫藤：柔雅紫红（~315°），优雅有格调。
+  {
+    id: "lilac",
+    name: "紫藤",
+    mode: "light",
+    bg: "#F7F1F6", panel: "#FFFFFF", panel2: "#EEE2EC",
+    fg: "#2A2430", fg2: "#726A78", line: "rgba(42,36,48,0.10)",
+    accent: "#9C3A80", accentFg: "#FBF3F8",
+    success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(42,36,48,0.05), 0 6px 20px rgba(42,36,48,0.06)",
+  },
+  // ===================== 深色 5 套 =====================
+  // 石墨（保留）：中性冷灰底 + 薄荷青主色（~168°）。
   {
     id: "graphite",
     name: "石墨",
@@ -639,18 +661,65 @@ export const UI_SKINS: UiSkin[] = [
     bg: "#16181D", panel: "#1E2126", panel2: "#252932",
     fg: "#E6E8EC", fg2: "#9AA0A8", line: "rgba(255,255,255,0.10)",
     accent: "#4FAE95", accentFg: "#0F1115",
-    success: "#46B47C", warning: "#D4A72C", danger: "#E06B62",
+    success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
     radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.35)",
+  },
+  // 琥珀：暖褐底 + 琥珀金主色（~42°），温暖夜读。
+  {
+    id: "amber",
+    name: "琥珀",
+    mode: "dark",
+    bg: "#1A1712", panel: "#221E17", panel2: "#2B261D",
+    fg: "#ECE6DA", fg2: "#ADA491", line: "rgba(255,246,230,0.10)",
+    accent: "#D6A845", accentFg: "#201A0C",
+    success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.35)",
+  },
+  // 深海：冷蓝黑底 + 亮蓝主色（~215°），深邃沉浸。
+  {
+    id: "abyss",
+    name: "深海",
+    mode: "dark",
+    bg: "#121620", panel: "#1A1F2B", panel2: "#222839",
+    fg: "#E4E8F0", fg2: "#949DB0", line: "rgba(210,224,255,0.10)",
+    accent: "#5B93E6", accentFg: "#0A1020",
+    success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
+  },
+  // 绯夜：暖黑底 + 绯红主色（~353°），醒目而不刺眼。
+  {
+    id: "crimson",
+    name: "绯夜",
+    mode: "dark",
+    bg: "#1C1418", panel: "#241A1F", panel2: "#2E2129",
+    fg: "#EEE2E6", fg2: "#AE9BA2", line: "rgba(255,230,238,0.10)",
+    accent: "#E77080", accentFg: "#2A0E12",
+    success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
+  },
+  // 夜行（保留 id · 主色提亮）：紫黑底 + 紫水晶主色（~272°）。
+  {
+    id: "nocturne",
+    name: "夜行",
+    mode: "dark",
+    bg: "#16121F", panel: "#1E1A2A", panel2: "#262138",
+    fg: "#ECE8F5", fg2: "#A29BB4", line: "rgba(228,220,255,0.10)",
+    accent: "#A98BE0", accentFg: "#17102A",
+    success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
+    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
   },
 ];
 
 /** 旧皮肤 id → 新皮肤 id（升级时迁移，避免用户所选失效）。 */
 export const UI_SKIN_ALIAS: Record<string, string> = {
-  mist: "mist",
-  cool: "mist",
-  eye: "linen",
+  cream: "cream",
+  linen: "clay",   // 旧「麻布」暖棕 → 赤陶
+  eye: "clay",
+  mist: "lagoon",  // 旧「冷雾」冷蓝 → 湖光
+  cool: "lagoon",
   graphite: "graphite",
   ink: "nocturne",
+  nocturne: "nocturne",
 };
 
 /** 解析皮肤 id（含旧 id 迁移），找不到时按明暗返回该组第一套。 */
@@ -1467,6 +1536,45 @@ export function activeUiSkin(): UiSkin {
   return UI_SKINS.find((s) => s.id === id) ?? UI_SKINS.find((s) => s.mode === mode) ?? UI_SKINS[0];
 }
 
+/** 默认封面配色（随外壳主题变化）：g1/g2/g3=渐变三档，tc=书名字色。
+ *  仅用于「无内嵌封面」书籍的默认封面（有封面的书不受影响）；coverUrl 读取它拼进 URL，
+ *  故切换主题会即时重算这些字段 → 默认封面 URL 变化 → 自动重取、颜色随主题更新。 */
+export const coverTheme = $state({ g1: "#36485c", g2: "#212d3c", g3: "#141c26", tc: "#f4ecdc" });
+
+/** sRGB 线性插值混合两个 #rrggbb（t=0 取 a，t=1 取 b）。 */
+function mixHex(a: string, b: string, t: number): string {
+  const p = (h: string) => {
+    const x = h.replace("#", "");
+    return [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2, 4), 16), parseInt(x.slice(4, 6), 16)];
+  };
+  const [r1, g1, b1] = p(a);
+  const [r2, g2, b2] = p(b);
+  const m = (u: number, v: number) => Math.round(u + (v - u) * t).toString(16).padStart(2, "0");
+  return `#${m(r1, r2)}${m(g1, g2)}${m(b1, b2)}`;
+}
+
+/** 由外壳皮肤推导默认封面配色。
+ *  设计：默认封面是「与外壳同源的柔和浅色卡片」，不是高饱和色块——
+ *  以主题表面色（panel2/bg）为底，只掺入极少量主色作为暖调，气质轻淡、与浅色主题相衬。
+ *  书名字色统一：浅色主题=柔和深色、深色主题=柔和浅色（非纯黑纯白，护眼易读），不随主色变化。 */
+function computeCoverTheme(s: UiSkin): { g1: string; g2: string; g3: string; tc: string } {
+  let g1: string, g2: string, g3: string;
+  if (s.mode === "dark") {
+    // 深色：柔和深卡片，顶部透一点主色微光，底部略沉。
+    g1 = mixHex(s.panel2, s.accent, 0.14);
+    g2 = s.panel2;
+    g3 = mixHex(s.bg, "#000000", 0.22);
+  } else {
+    // 浅色：清浅纸感卡片，仅 10–22% 主色着色，避免厚重。
+    g1 = mixHex(s.panel2, "#ffffff", 0.4);
+    g2 = mixHex(s.panel2, s.accent, 0.1);
+    g3 = mixHex(s.panel2, s.accent, 0.22);
+  }
+  // 书名字色：浅色主题柔和深色，深色主题柔和浅色（避免纯黑/纯白刺眼）。
+  const tc = s.mode === "dark" ? "#EFEBE4" : "#2A2723";
+  return { g1, g2, g3, tc };
+}
+
 /** 把外壳皮肤写进 <html> 的 CSS 变量，供全局样式生效。 */
 export function applyUiTheme(): void {
   if (typeof document === "undefined") return;
@@ -1481,7 +1589,8 @@ export function applyUiTheme(): void {
   root.style.setProperty("--fg", s.fg);
   root.style.setProperty("--fg2", s.fg2);
   root.style.setProperty("--line", s.line);
-  root.style.setProperty("--line-strong", s.line);
+  // 更清晰的强调描边（按钮/控件 hover、分隔）：由前景色按模式派生，保证各皮肤下都有足够可见度。
+  root.style.setProperty("--line-strong", `color-mix(in srgb, ${s.fg} ${mode === "dark" ? 22 : 18}%, transparent)`);
   root.style.setProperty("--accent", s.accent);
   root.style.setProperty("--accent-fg", s.accentFg);
   root.style.setProperty("--success", s.success);
@@ -1489,12 +1598,21 @@ export function applyUiTheme(): void {
   root.style.setProperty("--danger", s.danger);
   root.style.setProperty("--radius-card", s.radiusCard);
   root.style.setProperty("--shadow-card", s.shadow);
-  // 阴影按皮肤前景色「着色」而非纯黑：更融于背景、不显脏（深色皮肤用更低透明度）。
+  // 分层柔和阴影（近影 + 远影双层），并按皮肤前景色「着色」而非纯黑：更融于背景、不显脏。
+  // 深色皮肤整体加深（乘 1.0），浅色减淡（乘 0.55），与外壳既有观感一致。
   const tint = s.fg;
-  const a = (v: number) => (mode === "dark" ? v * 1.0 : v * 0.55);
-  root.style.setProperty("--shadow-sm", `0 1px 2px color-mix(in srgb, ${tint} ${Math.round(a(10))}%, transparent)`);
-  root.style.setProperty("--shadow-md", `0 6px 20px color-mix(in srgb, ${tint} ${Math.round(a(16))}%, transparent)`);
-  root.style.setProperty("--shadow-lg", `0 16px 48px color-mix(in srgb, ${tint} ${Math.round(a(28))}%, transparent)`);
+  const a = (v: number) => Math.round(mode === "dark" ? v : v * 0.55);
+  const mix = (pct: number) => `color-mix(in srgb, ${tint} ${pct}%, transparent)`;
+  root.style.setProperty("--shadow-sm", `0 1px 1.5px ${mix(a(8))}, 0 1px 2px ${mix(a(10))}`);
+  root.style.setProperty("--shadow-md", `0 2px 6px ${mix(a(10))}, 0 10px 26px ${mix(a(16))}`);
+  root.style.setProperty("--shadow-lg", `0 4px 14px ${mix(a(16))}, 0 28px 64px ${mix(a(30))}`);
+
+  // 默认封面配色随主题更新（供 coverUrl 拼进默认封面 URL；仅影响无内嵌封面书）。
+  const ct = computeCoverTheme(s);
+  coverTheme.g1 = ct.g1;
+  coverTheme.g2 = ct.g2;
+  coverTheme.g3 = ct.g3;
+  coverTheme.tc = ct.tc;
 }
 
 // 界面主题响应式生效：uiTheme / 皮肤变化即更新；system 时监听系统切换。

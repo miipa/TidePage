@@ -413,11 +413,10 @@
     padding: 4px 8px;
     border-radius: var(--radius-sm, 8px);
     letter-spacing: var(--ls-wide, 0.015em);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
     white-space: nowrap;
   }
-  .tag-hl { right: 8px; top: 8px; background: rgba(0, 0, 0, 0.6); color: #fff; }
+  .tag-hl { right: 8px; top: 8px; background: rgba(0, 0, 0, 0.62); color: #fff; }
   .tag-note { right: 8px; top: 32px; background: color-mix(in srgb, var(--accent) 88%, transparent); color: var(--accent-fg, #fff); }
   .tag-del { left: 8px; top: 8px; background: color-mix(in srgb, var(--danger) 86%, transparent); color: #fff; }
 
@@ -520,7 +519,20 @@
   }
 
   /* ---------- 划线明细抽屉 ---------- */
-  .drawer-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 1090; }
+  .drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(3px) saturate(1.08);
+    -webkit-backdrop-filter: blur(3px) saturate(1.08);
+    z-index: 1090;
+    animation: nd-backdrop-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
+  }
+
+  @keyframes nd-backdrop-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
 
   .drawer {
     position: fixed;
@@ -531,9 +543,15 @@
     z-index: 1091;
     background: var(--bg-elev);
     border-left: 1px solid var(--line);
-    box-shadow: -10px 0 32px rgba(0, 0, 0, 0.25);
+    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.14), -20px 0 52px rgba(0, 0, 0, 0.22);
     display: flex;
     flex-direction: column;
+    animation: nd-drawer-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+
+  @keyframes nd-drawer-in {
+    from { transform: translateX(24px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
   }
 
   .drawer-head {

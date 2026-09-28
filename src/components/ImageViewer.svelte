@@ -115,7 +115,7 @@
     align-items: center;
     justify-content: center;
     outline: none;
-    animation: iv-in 0.14s ease;
+    animation: iv-in 0.22s cubic-bezier(0, 0, 0.2, 1) both;
   }
 
   @keyframes iv-in {
@@ -141,7 +141,7 @@
     cursor: zoom-in;
     user-select: none;
     border-radius: 4px;
-    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4), 0 24px 70px rgba(0, 0, 0, 0.5);
   }
 
   .iv-stage img.zoomed {
