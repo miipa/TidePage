@@ -830,6 +830,7 @@
   async function webdavPush() {
     if (!book || !chapter || !config.webdav.enabled || !config.webdav.syncOnOpen) return;
     const w = config.webdav;
+    if (!w.base || !w.user || !w.pass) return; // 配置不完整：视为不执行同步，静默跳过
     const bid = book.book.id;
     const bpath = book.book.path;
     const p: Progress = {
@@ -841,7 +842,10 @@
     };
     try {
       await api.webdavSyncProgress(w.base, w.user, w.pass, bid, bpath, p);
-    } catch { /* ignore */ }
+      toast("退出时已同步进度到云端");
+    } catch (e) {
+      toast(`退出时同步进度失败：${e}`, "error");
+    }
   }
 
   async function webdavSync(localP: Progress | null): Promise<boolean> {
