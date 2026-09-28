@@ -106,10 +106,3 @@ export interface BookmarkRow {
   excerpt: string;
   created_at: number;
 }
-
-export interface MoonProgress {
-  file: string;
-  title: string;
-  chapter: string | null;
-  pct: number | null;
-}

@@ -1,6 +1,3 @@
-use crate::models::MoonProgress;
-use crate::txt::decode_bytes;
-
 pub struct DavClient {
     base: String,
     user: String,
@@ -42,7 +39,10 @@ impl DavClient {
     pub fn new(base: &str, user: &str, pass: &str) -> Self {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(45))
+            // 不设 client 级总超时：总超时会把整段请求（含 body 传输）一并计时，
+            // 大文件流式下载/上传会中途 abort。改用 read_timeout（两次收到字节的最大间隔）
+            // 捕获死连接而不限制总时长；连接超时与连接池策略保持不变。
+            .read_timeout(std::time::Duration::from_secs(45))
             .connect_timeout(std::time::Duration::from_secs(20))
             // 后端边缘机 keep-alive 不稳，每次请求新建连接更稳
             .pool_max_idle_per_host(0)
@@ -110,17 +110,45 @@ impl DavClient {
 
     pub async fn test(&self) -> Result<bool, String> {
         let resp = self.raw("PROPFIND", &self.base, Some("0"), None).await?;
-        Ok(resp.status().is_success() || resp.status().as_u16() == 207)
+        let code = resp.status().as_u16();
+        // 成功：2xx / 207(Multi-Status)。405 多因部分服务器不允许对根做 PROPFIND，视为可连通。
+        if resp.status().is_success() || code == 207 || code == 405 {
+            return Ok(true);
+        }
+        // 失败：给出可读中文原因（命令签名保持 Result<bool, String> 不变，前端 catch 直接显示）。
+        Err(match code {
+            401 | 403 => "账号或密码错误 (HTTP 401/403)".to_string(),
+            404 => "服务器地址或路径不存在 (HTTP 404)".to_string(),
+            _ => format!("服务器返回 HTTP {code}"),
+        })
     }
 
     pub async fn ensure_dir(&self, path: &str) -> Result<(), String> {
-        let resp = self.raw("MKCOL", &join_url(&self.base, path), Some("0"), None).await?;
-        let code = resp.status().as_u16();
-        if code == 201 || code == 405 {
-            Ok(())
-        } else {
-            Err(format!("MKCOL {path} -> {code}"))
+        // 逐级创建父目录：把 path 按 '/' 切成累积前缀（"a"、"a/b"、"a/b/c"…），
+        // 对每一级做 MKCOL。201(已创建)/405(已存在)视为成功，其它码报错。
+        // 空段（连续斜杠/前后导斜杠）跳过。深路径 PUT 前先建全父级，避免严格服务器 409。
+        let mut prefix = String::new();
+        for seg in path.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            if prefix.is_empty() {
+                prefix.push_str(seg);
+            } else {
+                prefix.push('/');
+                prefix.push_str(seg);
+            }
+            let resp = self
+                .raw("MKCOL", &join_url(&self.base, &prefix), Some("0"), None)
+                .await?;
+            let code = resp.status().as_u16();
+            if code == 201 || code == 405 {
+                continue;
+            } else {
+                return Err(format!("MKCOL {prefix} -> {code}"));
+            }
         }
+        Ok(())
     }
 
     pub async fn put(&self, path: &str, data: Vec<u8>) -> Result<(), String> {
@@ -168,15 +196,30 @@ impl DavClient {
             return Err(format!("PROPFIND {path} -> {}", resp.status()));
         }
         let body = resp.text().await.map_err(|e| e.to_string())?;
-        let re = regex::Regex::new(r"(?is)<(?:d:)?response>(.*?)</(?:d:)?response>").unwrap();
-        let href_re = regex::Regex::new(r"(?is)<(?:d:)?href>\s*(.*?)\s*</(?:d:)?href>").unwrap();
-        let coll_re = regex::Regex::new(r"(?is)<(?:d:)?collection\s*/?>").unwrap();
-        let size_re =
+        // 5 个正则只在首次使用时编译一次并复用（避免每次 list 重新编译）。
+        use std::sync::OnceLock;
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        static HREF_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static COLL_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static SIZE_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static LASTMOD_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"(?is)<(?:d:)?response>(.*?)</(?:d:)?response>").unwrap()
+        });
+        let href_re = HREF_RE.get_or_init(|| {
+            regex::Regex::new(r"(?is)<(?:d:)?href>\s*(.*?)\s*</(?:d:)?href>").unwrap()
+        });
+        let coll_re = COLL_RE.get_or_init(|| {
+            regex::Regex::new(r"(?is)<(?:d:)?collection\s*/?>").unwrap()
+        });
+        let size_re = SIZE_RE.get_or_init(|| {
             regex::Regex::new(r"(?is)<(?:d:)?getcontentlength>\s*(\d+)\s*</(?:d:)?getcontentlength>")
-                .unwrap();
-        let lastmod_re =
+                .unwrap()
+        });
+        let lastmod_re = LASTMOD_RE.get_or_init(|| {
             regex::Regex::new(r"(?is)<(?:d:)?getlastmodified>\s*(.*?)\s*</(?:d:)?getlastmodified>")
-                .unwrap();
+                .unwrap()
+        });
         let mut out = Vec::new();
         for c in re.captures_iter(&body) {
             let seg = &c[1];
@@ -275,76 +318,65 @@ fn percent_decode_path(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn decode_progress_content(data: &[u8]) -> String {
-    let (s, _) = decode_bytes(data);
-    s
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn parse_moonreader_content(s: &str) -> Vec<MoonProgress> {
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let e = parse_moonreader_line(line);
-        if e.file.is_empty() && e.title.is_empty() {
-            continue;
-        }
-        out.push(e);
+    #[test]
+    fn test_encode_path() {
+        // 空格 → %20
+        assert_eq!(encode_path("a b"), "a%20b");
+        // '+' → %2B（不被当作空格）
+        assert_eq!(encode_path("a+b"), "a%2Bb");
+        // 中文按 UTF-8 逐字节编码："中" = E4 B8 AD
+        assert_eq!(encode_path("中"), "%E4%B8%AD");
+        // 多字中文
+        assert_eq!(encode_path("中文"), "%E4%B8%AD%E6%96%87");
+        // '/' 分隔保留，段内空格照常编码
+        assert_eq!(encode_path("a/b c"), "a/b%20c");
+        // 字母数字与 -_.~ 保持不变
+        assert_eq!(encode_path("aZ9-_.~"), "aZ9-_.~");
     }
-    out
-}
 
-/// 解析静读天下 .po 进度文件单行：`<时间戳>*<章节>@<偏移>#<ID>:<百分比>%`
-pub fn parse_po_line(line: &str) -> (Option<f64>, String, i64) {
-    let line = line.trim();
-    let mut pct = None;
-    let mut chapter_at = String::new();
-    let mut updated_at: i64 = 0;
-    let parts: Vec<&str> = line.split('*').collect();
-    if let Some(ts) = parts.first() {
-        updated_at = ts.trim().parse().unwrap_or(0);
+    #[test]
+    fn test_join_url() {
+        // base 带尾斜杠：去掉尾斜杠后拼接
+        assert_eq!(join_url("http://h/dav/", "a/b"), "http://h/dav/a/b");
+        // base 不带尾斜杠
+        assert_eq!(join_url("http://h/dav", "a"), "http://h/dav/a");
+        // path 带前导斜杠：编码后去掉前导斜杠
+        assert_eq!(join_url("http://h/dav", "/a"), "http://h/dav/a");
+        // path 为空 → base + "/"
+        assert_eq!(join_url("http://h/dav", ""), "http://h/dav/");
+        assert_eq!(join_url("http://h/dav/", ""), "http://h/dav/");
     }
-    if parts.len() > 1 {
-        let rest = parts[1];
-        if let Some(hash_idx) = rest.find('#') {
-            chapter_at = rest[..hash_idx].to_string();
-            let tail = &rest[hash_idx + 1..];
-            if let Some(col) = tail.find(':') {
-                let p = tail[col + 1..].trim_end_matches('%');
-                pct = p.trim().parse::<f64>().ok();
-                if let Some(p) = pct {
-                    pct = Some(if p <= 1.0 { p * 100.0 } else { p });
-                }
-            }
-        }
-    }
-    (pct, chapter_at, updated_at)
-}
 
-pub fn parse_moonreader_line(line_in: &str) -> MoonProgress {
-    let line = line_in.trim();
-    let mut file = String::new();
-    let mut title = String::new();
-    let mut chapter: Option<String> = None;
-    let mut pct: Option<f64> = None;
-    for part in line.split('*') {
-        if let Some(v) = part.strip_prefix("file=") {
-            file = v.to_string();
-        } else if let Some(v) = part.strip_prefix("book.title=") {
-            title = v.to_string();
-        } else if let Some(v) = part.strip_prefix("chapter.title=") {
-            chapter = Some(v.to_string());
-        } else if let Some(v) = part.strip_prefix("book.percent=") {
-            pct = v.replace(',', ".").parse::<f64>().ok();
-        }
+    #[test]
+    fn test_percent_decode_path() {
+        // "%20" → 空格
+        assert_eq!(percent_decode_path("a%20b"), "a b");
+        // 连续中文 %XX 还原为原中文
+        assert_eq!(percent_decode_path("%E4%B8%AD%E6%96%87"), "中文");
+        // 混合路径
+        assert_eq!(percent_decode_path("/dav/%E4%B8%AD/x"), "/dav/中/x");
+        // 结尾残缺 '%' 不 panic，原样保留
+        assert_eq!(percent_decode_path("abc%"), "abc%");
+        assert_eq!(percent_decode_path("ab%2"), "ab%2");
     }
-    // 静读天下进度常见 0..1 百分比，统一换算为 0..100
-    if let Some(p) = pct {
-        let p = if p <= 1.0 { p * 100.0 } else { p };
-        pct = Some(p);
-    }
-    MoonProgress {
-        file,
-        title,
-        chapter,
-        pct,
+
+    #[test]
+    fn test_parse_rfc822() {
+        // "Sun, 06 Sep 2026 15:01:53 GMT" → 按函数公式自算的确定 epoch 秒。
+        // days(1970..=2025)=20454，2026 前 8 个月(Jan..Aug)=243 天，+ (6-1)=5 天 → 20702 天；
+        // 20702*86400 + 15*3600 + 1*60 + 53 = 1_788_706_913
+        assert_eq!(parse_rfc822("Sun, 06 Sep 2026 15:01:53 GMT"), 1_788_706_913);
+        // 非法：字段不足
+        assert_eq!(parse_rfc822("Sun, 06 Sep"), 0);
+        // 非法：月名错误
+        assert_eq!(parse_rfc822("Sun, 06 Xxx 2026 15:01:53 GMT"), 0);
+        // 非法：星期错误
+        assert_eq!(parse_rfc822("Xxx, 06 Sep 2026 15:01:53 GMT"), 0);
+        // 非法：空串
+        assert_eq!(parse_rfc822(""), 0);
     }
 }

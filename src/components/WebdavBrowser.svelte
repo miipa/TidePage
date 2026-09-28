@@ -9,51 +9,92 @@
 
   const EXT_BOOK = ["txt", "epub", "mobi", "azw3", "prc"];
 
-  let connected = $state(false);
   let path = $state("");
   let entries = $state<Entry[]>([]);
   let loading = $state(false);
   let error = $state("");
+  // 是否已完成至少一次列目录尝试（用于区分「首帧未加载」与「真·空目录」，避免闪现空态）。
+  let attempted = $state(false);
 
   const downloads = $state<DlItem[]>([]);
   let dlUnlisteners: Record<string, () => void> = {};
   let dlSeq = 0;
 
+  // 三要素齐全才认为可连接；否则展示「去设置」空状态。
+  const configReady = $derived(!!(config.webdav.base && config.webdav.user && config.webdav.pass));
+  // 仅统计真正在下载中的项来判断并发上限（已完成/失败项会在列表停留 2.6s，不应计入）。
+  const activeDownloads = $derived(downloads.filter((d) => d.state === "downloading").length);
+
+  // ---- 排序：字段 / 升降 / 文件夹置顶，三者持久化到 localStorage ----
+  function lsGet(k: string, fallback: string): string {
+    try { return localStorage.getItem(k) ?? fallback; } catch { return fallback; }
+  }
+  const sb0 = lsGet("flowread.wd.sortBy", "time");
+  const sd0 = lsGet("flowread.wd.sortDir", "desc");
+  let sortBy = $state<"name" | "time" | "size">(sb0 === "name" || sb0 === "size" ? sb0 : "time");
+  let sortDir = $state<"asc" | "desc">(sd0 === "asc" ? "asc" : "desc");
+  let foldersFirst = $state(lsGet("flowread.wd.foldersFirst", "1") !== "0");
+
+  // 任一排序状态变化即写回（首次运行写入默认值，无害）。
+  $effect(() => {
+    try {
+      localStorage.setItem("flowread.wd.sortBy", sortBy);
+      localStorage.setItem("flowread.wd.sortDir", sortDir);
+      localStorage.setItem("flowread.wd.foldersFirst", foldersFirst ? "1" : "0");
+    } catch { /* ignore */ }
+  });
+
+  // 展示用的有序列表：先按「文件夹置顶」分组（与升降无关），再按所选字段+方向比较。
+  const sortedEntries = $derived.by(() => {
+    const list = [...entries];
+    list.sort((a, b) => {
+      if (foldersFirst && a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+      let cmp = 0;
+      if (sortBy === "name") cmp = a.name.localeCompare(b.name, "zh");
+      else if (sortBy === "time") cmp = (a.mtime || 0) - (b.mtime || 0);
+      else cmp = (a.size || 0) - (b.size || 0);
+      // 同值时用名称兜底，保证顺序稳定
+      if (cmp === 0) cmp = a.name.localeCompare(b.name, "zh");
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return list;
+  });
+
   function rememberedPath(): string {
     try { return localStorage.getItem("flowread.wd.path") ?? ""; } catch { return ""; }
   }
 
-  async function connect() {
-    if (!config.webdav.base || !config.webdav.user || !config.webdav.pass) {
-      toast("请先在 设置→WebDAV 填写服务器并启用", "error");
-      return;
-    }
-    connected = true;
-    const p = rememberedPath();
-    await load(p);
-  }
-
-  async function load(p?: string) {
+  /// 列目录：成功返回 true。失败只置 error（保留 path、不回连接页），交由界面展示错误+重试。
+  async function load(p?: string): Promise<boolean> {
     if (p !== undefined) {
       path = p;
       try { localStorage.setItem("flowread.wd.path", p); } catch { /* ignore */ }
     }
     loading = true;
     error = "";
+    let ok = false;
     try {
       const w = config.webdav;
       const items = await api.webdavList(w.base, w.user, w.pass, path);
-      entries = items
-        .filter((e) => e.name !== "" && e.name !== "." && e.name !== "..")
-        .sort((a, b) => {
-          if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-          return (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name, "zh");
-        });
+      entries = items.filter((e) => e.name !== "" && e.name !== "." && e.name !== "..");
+      ok = true;
     } catch (e) {
       error = String(e);
       entries = [];
     } finally {
       loading = false;
+      attempted = true;
+    }
+    return ok;
+  }
+
+  /// 面板挂载即自动连接；首次失败约 600ms 后自动再试一次，仍失败才展示错误+重试。
+  async function autoConnect() {
+    if (!configReady) return;
+    const ok = await load(rememberedPath());
+    if (!ok) {
+      await new Promise((r) => setTimeout(r, 600));
+      await load();
     }
   }
 
@@ -138,51 +179,83 @@
   }
 
   const hasUp = $derived(path.split("/").filter(Boolean).length > 0);
+
+  onMount(() => {
+    if (configReady) autoConnect();
+  });
 </script>
 
 <div class="wd-browse">
   <div class="wd-head">
     <span class="wd-title">WebDAV 文件管理</span>
-    <button class="icon" title="关闭" onclick={() => (ui.webdavOpen = false)}>×</button>
+    <button class="icon" title="关闭" aria-label="关闭" onclick={() => (ui.webdavOpen = false)}>×</button>
   </div>
 
-  {#if !connected}
-    <div class="wd-connect">
-      <p>连接 {config.webdav.base || "未配置服务器"}<br />
-      账号：{config.webdav.user || "—"}</p>
-      <button class="primary big" onclick={connect} disabled={!config.webdav.base}>
-        🔗 连接并访问
-      </button>
-      <p class="tip">WebDAV 服务器与账号密码在 设置→WebDAV 里填写。</p>
+  {#if !configReady}
+    <div class="wd-empty-cfg">
+      <div class="wd-empty-ico">🔌</div>
+      <p class="wd-empty-t">尚未配置 WebDAV 服务器</p>
+      <p class="wd-empty-d">请先在 <b>设置 → WebDAV</b> 中填写服务器地址与账号密码并启用，之后打开本面板即可自动连接。</p>
     </div>
   {:else}
-    <div class="row-inline" style="margin-bottom:8px">
-      <button onclick={() => load("")} disabled={!path}>根目录</button>
-      <button onclick={up} disabled={!hasUp}>↑ 上级</button>
-      <button onclick={() => load()} title="刷新当前目录">⟳</button>
-      <span class="wd-path">{path || "/"}</span>
+    <!-- 工具行：导航 + 当前路径 + 排序控件（窄抽屉下自动换行，路径省略号不撑破） -->
+    <div class="wd-tools">
+      <button class="wd-btn" onclick={() => load("")} disabled={!path} title="根目录" aria-label="根目录">⌂</button>
+      <button class="wd-btn" onclick={up} disabled={!hasUp} title="上级目录" aria-label="上级目录">↑</button>
+      <button class="wd-btn" onclick={() => load()} title="刷新当前目录" aria-label="刷新">⟳</button>
+      <span class="wd-path" title={path || "/"}>{path || "/"}</span>
+      <span class="wd-tools-gap"></span>
+      <select class="wd-sel" bind:value={sortBy} title="排序方式" aria-label="排序方式">
+        <option value="name">名称</option>
+        <option value="time">时间</option>
+        <option value="size">大小</option>
+      </select>
+      <button
+        class="wd-btn"
+        onclick={() => (sortDir = sortDir === "asc" ? "desc" : "asc")}
+        title={sortDir === "asc" ? "升序（点击改降序）" : "降序（点击改升序）"}
+        aria-label="切换升降序"
+      >{sortDir === "asc" ? "↑" : "↓"}</button>
+      <label class="wd-check" title="目录始终排在文件前面">
+        <input type="checkbox" bind:checked={foldersFirst} /> 文件夹置顶
+      </label>
     </div>
+
     <div class="wd-info">
-      <span>下载目录：{config.webdav.downloadDir || "未设置"}</span>
-      <button onclick={pickDir}>选择…</button>
+      <span class="wd-info-label">下载目录</span>
+      <span class="wd-info-val" title={config.webdav.downloadDir || "未设置"}>{config.webdav.downloadDir || "未设置"}</span>
+      <button class="wd-btn" onclick={pickDir}>选择…</button>
     </div>
-    {#if loading}<p class="tip">加载中…</p>{/if}
-    {#if error}<p class="tip" style="color:var(--danger)">{error}</p>{/if}
-<div class="wd-list">
-      {#each entries as e (path + "/" + e.name + String(e.size))}
-        {#if e.is_dir}
-          <div class="wd-row" onclick={() => openEntry(e)}>
-            <span class="wd-name">📁 {e.name}</span>
-          </div>
-        {:else}
-          <div class="wd-row">
-            <span class="wd-name">📄 {e.name} <span class="wd-size">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span></span>
-            <button onclick={() => download(e)} disabled={downloads.length >= 3}>{isBook(e) ? "下载入书库" : "下载"}</button>
-          </div>
-        {/if}
+
+    <div class="wd-list">
+      {#if loading || (!attempted && !error)}
+        <div class="wd-state"><span class="wd-spin">⟳</span> 加载中…</div>
+      {:else if error}
+        <div class="wd-state wd-state-error">
+          <div class="wd-err-msg">列目录失败：{error}</div>
+          <button class="wd-btn wd-retry" onclick={() => load()}>重试</button>
+        </div>
+      {:else if sortedEntries.length === 0}
+        <div class="wd-state">空目录或无权限</div>
       {:else}
-        {#if !loading && !error}<p class="tip">空目录或无权限</p>{/if}
-      {/each}
+        {#each sortedEntries as e (path + "/" + e.name + String(e.size))}
+          {#if e.is_dir}
+            <button class="wd-row wd-dir" onclick={() => openEntry(e)}>
+              <span class="wd-ico">📁</span>
+              <span class="wd-name">{e.name}</span>
+            </button>
+          {:else}
+            <div class="wd-row">
+              <span class="wd-ico">📄</span>
+              <span class="wd-name">{e.name}</span>
+              <span class="wd-meta">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span>
+              <button class="wd-dl-btn" onclick={() => download(e)} disabled={activeDownloads >= 3}>
+                {isBook(e) ? "下载入书库" : "下载"}
+              </button>
+            </div>
+          {/if}
+        {/each}
+      {/if}
     </div>
 
     {#if downloads.length}
@@ -214,27 +287,6 @@
     box-sizing: border-box;
   }
 
-  .wd-connect {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    text-align: center;
-  }
-
-  .wd-connect p {
-    margin: 0;
-    font-size: 13px;
-    word-break: break-all;
-  }
-
-  .wd-connect .big {
-    padding: 10px 26px;
-    font-size: 16px;
-  }
-
   .wd-head {
     display: flex;
     align-items: center;
@@ -247,27 +299,132 @@
     font-size: 16px;
   }
 
+  /* ---- 未配置空状态 ---- */
+  .wd-empty-cfg {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    text-align: center;
+    padding: 0 24px;
+  }
+
+  .wd-empty-ico {
+    font-size: 34px;
+    opacity: 0.7;
+  }
+
+  .wd-empty-t {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .wd-empty-d {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--fg2);
+    max-width: 320px;
+  }
+
+  /* ---- 工具行 ---- */
+  .wd-tools {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .wd-tools-gap {
+    flex: 1;
+    min-width: 0;
+  }
+
   .wd-path {
     font-family: Consolas, monospace;
     font-size: 12px;
-    opacity: 0.75;
+    color: var(--fg2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
-    text-align: right;
+    max-width: 100%;
+    flex: 1 1 120px;
+    min-width: 0;
   }
 
+  .wd-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel2);
+    color: var(--fg);
+    cursor: pointer;
+  }
+
+  .wd-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+
+  .wd-btn:disabled {
+    opacity: 0.42;
+    cursor: default;
+  }
+
+  .wd-sel {
+    padding: 4px 8px;
+    font-size: 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel2);
+    color: var(--fg);
+    cursor: pointer;
+  }
+
+  .wd-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--fg2);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .wd-check input {
+    margin: 0;
+    cursor: pointer;
+  }
+
+  /* ---- 下载目录行 ---- */
   .wd-info {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 8px;
     font-size: 12px;
     margin-bottom: 10px;
-    opacity: 0.9;
   }
 
+  .wd-info-label {
+    color: var(--fg2);
+    flex: 0 0 auto;
+  }
+
+  .wd-info-val {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg);
+  }
+
+  /* ---- 列表 ---- */
   .wd-list {
     flex: 1;
     min-height: 0;
@@ -280,9 +437,20 @@
   .wd-row {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 6px 8px;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 8px;
     border-radius: 6px;
+    text-align: left;
+  }
+
+  /* 目录行为 <button>：清除按钮默认样式，保留可点击观感 */
+  button.wd-row {
+    border: none;
+    background: none;
+    color: var(--fg);
+    font: inherit;
     cursor: pointer;
   }
 
@@ -290,24 +458,88 @@
     border-top: 1px solid rgba(128, 128, 128, 0.12);
   }
 
+  .wd-row:hover {
+    background: var(--panel2);
+  }
+
+  .wd-dir:hover .wd-name {
+    color: var(--accent);
+  }
+
+  .wd-ico {
+    flex: 0 0 auto;
+    font-size: 14px;
+  }
+
   .wd-name {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .wd-size {
+  .wd-meta {
+    flex: 0 0 auto;
     opacity: 0.5;
     font-size: 12px;
-    margin-left: 6px;
+    white-space: nowrap;
   }
 
-  .wd-info button {
+  .wd-dl-btn {
+    flex: 0 0 auto;
     padding: 3px 10px;
     font-size: 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel2);
+    color: var(--fg);
+    cursor: pointer;
   }
 
+  .wd-dl-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+
+  .wd-dl-btn:disabled {
+    opacity: 0.42;
+    cursor: default;
+  }
+
+  /* ---- 三态：加载 / 空 / 错误 ---- */
+  .wd-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 120px;
+    padding: 20px;
+    font-size: 13px;
+    color: var(--fg2);
+    text-align: center;
+  }
+
+  .wd-state-error .wd-err-msg {
+    color: var(--danger);
+    word-break: break-all;
+    max-width: 100%;
+  }
+
+  .wd-retry {
+    padding: 5px 18px;
+  }
+
+  .wd-spin {
+    display: inline-block;
+    animation: wd-rotate 1s linear infinite;
+  }
+
+  @keyframes wd-rotate {
+    to { transform: rotate(360deg); }
+  }
+
+  /* ---- 下载进度 ---- */
   .wd-dlbox {
     margin-top: 10px;
     display: flex;

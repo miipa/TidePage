@@ -1768,8 +1768,8 @@
   {:else if tab === "webdav"}
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>
-      <label><input type="checkbox" bind:checked={config.webdav.syncOnOpen} onchange={saveConfig} /> 打开/退出书籍时自动同步进度</label>
-      <label><input type="checkbox" bind:checked={config.webdav.uploadBooks} onchange={saveConfig} /> 打开书籍时上传书文件</label>
+      <label><input type="checkbox" bind:checked={config.webdav.syncOnOpen} onchange={saveConfig} /> 打开/退出书籍时自动同步进度（关闭后仍可手动同步）</label>
+      <label><input type="checkbox" bind:checked={config.webdav.uploadBooks} onchange={saveConfig} /> 打开书籍时自动上传书文件</label>
     </div>
 
     <div class="field">
@@ -1802,8 +1802,9 @@
     </div>
 
     <p class="tip">
-      进度存于 <code>FlowRead/progress/</code> 下每本书一个文件：进入书籍时拉取、退出书籍时上传、阅读页「⇅ 手动同步」按钮也可随时同步，本地与云端以时间新的一方为准。
-      WebDAV 文件管理在书库页（左上「☁ 云盘」或向左滑）进入，点「连接并列出」后浏览整盘，下载书籍到上面的目录并自动入书库。
+      进度存于 <code>FlowRead/progress/</code> 下每本书一个文件，本地与云端以时间新的一方为准；关闭上面的自动同步后，进入/退出书籍不再自动同步，但阅读页顶栏仍可手动操作。
+      手动入口在<strong>阅读页顶栏</strong>：短按「☁↑」按钮同步进度（会先对比本地与云端并弹框确认）、长按弹出「上传/下载书籍」菜单；独立的「☁↓ 下载进度」按钮从云端恢复进度。
+      WebDAV 文件管理在书库页（左上「☁ 云盘」或向左滑）进入，打开即自动连接并列出整盘，可下载书籍到上面的目录并自动入书库。
     </p>
   {:else if tab === "ai"}
     <div class="checks" style="margin-bottom:12px">
@@ -2933,25 +2934,6 @@
   @keyframes pulse {
     50% { opacity: 0.55; }
   }
-
-  .moonlist {
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    max-height: 180px;
-    overflow-y: auto;
-  }
-
-  .moonrow {
-    display: flex;
-    justify-content: space-between;
-    padding: 5px 12px;
-    font-size: 13px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .moonrow:last-child { border-bottom: none; }
-  .mt { font-weight: 500; }
-  .mc { color: var(--fg2); }
 
   .tip {
     font-size: 12px;

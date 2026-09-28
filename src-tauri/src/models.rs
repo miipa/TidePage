@@ -133,11 +133,3 @@ pub struct HighlightRow {
     pub note: String,
     pub created_at: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoonProgress {
-    pub file: String,
-    pub title: String,
-    pub chapter: Option<String>,
-    pub pct: Option<f64>,
-}

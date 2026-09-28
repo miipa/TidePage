@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { coverTheme, defaultCoverBust } from "./stores.svelte";
-import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, MoonProgress, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 export const api = {
   listFolders: () => invoke<string[]>("list_folders"),
@@ -85,20 +85,16 @@ export const api = {
     base: string, user: string, pass: string,
     bookId: number, bookPath: string, local: Progress | null,
   ) => invoke<Progress>("webdav_sync_progress", { base, user, pass, bookId, bookPath, local }),
+  /** 只读：拉取云端本书进度（FlowRead/progress/{path_id}.json），不写库、不 PUT。无则 null。 */
+  webdavReadProgress: (base: string, user: string, pass: string, bookPath: string) =>
+    invoke<Progress | null>("webdav_read_progress", { base, user, pass, bookPath }),
   webdavUploadBook: (base: string, user: string, pass: string, bookPath: string) =>
     invoke<string>("webdav_upload_book", { base, user, pass, bookPath }),
   webdavDownloadBooks: (base: string, user: string, pass: string, targetDir: string) =>
     invoke<string[]>("webdav_download_books", { base, user, pass, targetDir }),
-  webdavMoonProgress: (base: string, user: string, pass: string) =>
-    invoke<MoonProgress[]>("webdav_moon_progress", { base, user, pass }),
-  webdavMoonWrite: (base: string, user: string, pass: string, bookPath: string, title: string, chapterTitle: string, pct: number) =>
-    invoke<boolean>("webdav_moon_write", { base, user, pass, bookPath: bookPath, title, chapterTitle, pct }),
-  webdavMoonReadPo: (base: string, user: string, pass: string, bookPath: string, title: string) =>
-    invoke<{ found: boolean; percent: number; chapter_at: string; updated_at: number }>("webdav_moon_read_po", { base, user, pass, bookPath, title }),
-  webdavMoonWritePo: (base: string, user: string, pass: string, bookPath: string, title: string, chapterAt: string, pct: number, charOffset: number) =>
-    invoke<boolean>("webdav_moon_write_po", { base, user, pass, bookPath, title, chapterAt, pct, charOffset }),
-  webdavMoonPoCount: (base: string, user: string, pass: string) =>
-    invoke<number>("webdav_moon_po_count", { base, user, pass }),
+  /** 单本书从云端 FlowRead/books/ 下载到 targetDir，并按扩展名自动加入书库。 */
+  webdavDownloadBook: (base: string, user: string, pass: string, bookPath: string, targetDir: string) =>
+    invoke<string>("webdav_download_book", { base, user, pass, bookPath, targetDir }),
   webdavList: (base: string, user: string, pass: string, path: string) =>
     invoke<{ name: string; is_dir: boolean; size: number; mtime: number }[]>("webdav_list", { base, user, pass, path }),
   webdavDownloadFile: (base: string, user: string, pass: string, remotePath: string, targetDir: string) =>

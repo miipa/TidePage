@@ -67,6 +67,7 @@
     IconBookmarkPlus,
     IconBookmarks,
     IconChartBar,
+    IconCloudDownload,
     IconCloudUp,
     IconHighlight,
     IconLayoutGrid,
@@ -252,10 +253,13 @@
     on?: () => boolean;
     visible: () => boolean;
     run: () => void;
+    /** 可选：长按（约 550ms）触发（如弹出菜单）；长按已触发则不再执行短按 run。 */
+    longPress?: () => void;
   }
   const tbTitle = (b: TbBtn): string => (typeof b.title === "function" ? b.title() : b.title);
   const TOPBAR_BTNS: TbBtn[] = [
-    { id: "webdav", label: "WebDAV 同步", title: "手动同步进度到 WebDAV", icon: () => IconCloudUp, visible: () => config.webdav.enabled, run: () => webdavSync(null).then(() => toast("进度已同步")).catch((e) => toast(String(e), "error")) },
+    { id: "webdav", label: "上传进度", title: "短按上传进度到云端，长按更多（上传书籍文件）", icon: () => IconCloudUp, visible: () => config.webdav.enabled, longPress: () => toggleWdMenu(), run: () => uploadProgress() },
+    { id: "webdavDownload", label: "下载进度", title: "从云端更新阅读进度（需确认）", icon: () => IconCloudDownload, visible: () => config.webdav.enabled, run: () => webdavDownload() },
     { id: "convert", label: "转换格式", title: "转换格式", icon: () => IconArrowsExchange, visible: () => book?.book.format === "txt", run: () => convertThis() },
     { id: "bookmarkAdd", label: "添加书签", title: "添加书签", icon: () => IconBookmarkPlus, visible: () => true, run: () => addBookmark() },
     { id: "bookmarkList", label: "书签列表", title: "书签列表", icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
@@ -413,6 +417,11 @@
   // 顶栏按钮管理 / 图片开关 / 漫画引导 / 拖拽排序
   let tbManagerOpen = $state(false);
   let imgMenuOpen = $state(false);
+  let wdMenuOpen = $state(false);
+  // WebDAV 长按菜单的 fixed 定位（相对视口），打开时按被长按按钮的 rect 计算。
+  let wdMenuPos = $state({ top: 52, right: 12 });
+  // 菜单根元素引用：用于外点判定（点击菜单之外即关闭）。
+  let wdMenuEl = $state<HTMLElement | undefined>(undefined);
   let blockedListOpen = $state(false);
   let blockPickMode = $state(false);
   let mangaGuideOpen = $state(false);
@@ -440,10 +449,11 @@
     rightPanel = rightPanel === panel ? null : panel;
   }
 
-  /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / 已屏蔽图片 / 漫画引导）。 */
+  /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / WebDAV 同步菜单 / 已屏蔽图片 / 漫画引导）。 */
   function closeTbPanels() {
     tbManagerOpen = false;
     imgMenuOpen = false;
+    wdMenuOpen = false;
     blockedListOpen = false;
     mangaGuideOpen = false;
   }
@@ -468,6 +478,60 @@
       tocOpen = false;
       imgMenuOpen = true;
     }
+  }
+
+  /** 顶栏 WebDAV 按钮长按弹出的「上传书籍」菜单开合：互斥同上；打开时定位到按钮正下方。 */
+  function toggleWdMenu() {
+    const willOpen = !wdMenuOpen;
+    closeTbPanels();
+    if (willOpen) {
+      rightPanel = null;
+      tocOpen = false;
+      // 取被长按的按钮 rect 做定位（不给按钮加包裹层，避免破坏 dragSort 的 parentElement 约束）。
+      const btn = document.querySelector<HTMLElement>('.tb-r [data-drag-id="webdav"]');
+      if (btn) {
+        const r = btn.getBoundingClientRect();
+        wdMenuPos = { top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) };
+      }
+      wdMenuOpen = true;
+    }
+  }
+
+  // 菜单外点关闭：窗口捕获阶段监听 pointerdown，点击菜单之外即关闭（项目既有弹层范式，无需遮罩元素）。
+  // 以 wdMenuOpen 为依赖：无关状态变化不会重复绑定；关闭/卸载时移除监听。
+  $effect(() => {
+    if (!wdMenuOpen) return;
+    const h = (e: PointerEvent) => {
+      if (wdMenuEl && !wdMenuEl.contains(e.target as Node)) wdMenuOpen = false;
+    };
+    window.addEventListener("pointerdown", h, true);
+    return () => window.removeEventListener("pointerdown", h, true);
+  });
+
+  // 顶栏按钮长按识别（约 550ms）：仅长按已触发的按钮跳过其短按动作，与 Library 刷新按钮同款模式。
+  let tbLpTimer: ReturnType<typeof setTimeout> | undefined;
+  let tbLpFired = false;
+  function tbPointerDown(b: TbBtn, e: PointerEvent) {
+    if (!b.longPress || e.button !== 0) return;
+    tbLpFired = false;
+    if (tbLpTimer !== undefined) clearTimeout(tbLpTimer);
+    tbLpTimer = setTimeout(() => {
+      tbLpFired = true;
+      b.longPress!();
+    }, 550);
+  }
+  function tbPointerUp() {
+    if (tbLpTimer !== undefined) {
+      clearTimeout(tbLpTimer);
+      tbLpTimer = undefined;
+    }
+  }
+  function tbClick(b: TbBtn) {
+    if (tbLpFired) {
+      tbLpFired = false; // 长按已触发菜单，不再执行短按动作
+      return;
+    }
+    b.run();
   }
 
   /** 目录开合：打开目录时关闭顶栏浮层面板，互斥。 */
@@ -733,7 +797,9 @@
         if (document.visibilityState === "visible") flushSession();
       }, 30_000);
       if (config.webdav.enabled && config.webdav.syncOnOpen) {
-        webdavSync(restore).catch(() => {});
+        webdavSync(restore)
+          .then((restored) => { if (restored) toast("已从 WebDAV 恢复阅读进度"); })
+          .catch(() => {});
       }
     } catch (e) {
       const s = String(e);
@@ -778,19 +844,95 @@
     } catch { /* ignore */ }
   }
 
-  async function webdavSync(localP: Progress | null) {
-    if (!book) return;
+  async function webdavSync(localP: Progress | null): Promise<boolean> {
+    if (!book) return false;
     const w = config.webdav;
     const remote = await api.webdavSyncProgress(
       w.base, w.user, w.pass, book.book.id, book.book.path, localP,
     );
+    let restored = false;
     if (remote.chapter_index !== chapterNum && remote.chapter_index < book.toc.length) {
-      toast("已从 WebDAV 恢复阅读进度");
       await loadChapter(remote.chapter_index, remote);
+      restored = true;
     }
     if (config.webdav.uploadBooks) {
       api.webdavUploadBook(w.base, w.user, w.pass, book.book.path).catch(() => {});
     }
+    return restored;
+  }
+
+  /** 当前内存中的本地进度快照（用于同步/对比）。 */
+  function localProgress(): Progress {
+    return {
+      chapter_index: chapterNum,
+      chapter_ratio: currentRatio(),
+      pct: totalPct(),
+      updated_at: Date.now(),
+      device: "pc",
+    };
+  }
+
+  /** 「上传进度」：直接把当前本地进度上传云端（本地 updated_at=now 必为较新，等价于直接上传）。 */
+  async function uploadProgress() {
+    if (!book) return;
+    if (!config.webdav.enabled) { toast("未启用 WebDAV", "error"); return; }
+    const w = config.webdav;
+    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    try {
+      await api.webdavSyncProgress(w.base, w.user, w.pass, book.book.id, book.book.path, localProgress());
+      toast("进度已上传");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  /** 「下载进度」：要先弹确认框（会改动本地），再从云端更新本地进度。 */
+  async function webdavDownload() {
+    if (!book) return;
+    if (!config.webdav.enabled) { toast("未启用 WebDAV", "error"); return; }
+    const w = config.webdav;
+    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    let remote: Progress | null = null;
+    try {
+      remote = await api.webdavReadProgress(w.base, w.user, w.pass, book.book.path);
+    } catch (e) {
+      toast(String(e), "error");
+      return;
+    }
+    if (!remote) { toast("云端暂无进度"); return; }
+    const ok = await appConfirm(
+      `云端进度：第 ${remote.chapter_index + 1} 章 ${remote.pct.toFixed(0)}%（${fmtProgressTime(remote.updated_at)}）\n本地进度：第 ${chapterNum + 1} 章 ${totalPct().toFixed(0)}%（${fmtProgressTime(Date.now())}）\n\n确定用云端进度更新本地吗？`,
+    );
+    if (!ok) return;
+    try {
+      if (remote.chapter_index < book.toc.length) {
+        await loadChapter(remote.chapter_index, remote);
+      }
+      toast("已从云端更新进度");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  /** 长按菜单：上传当前书籍文件到云端（手动，不受 uploadBooks 自动开关影响）。 */
+  async function uploadBook() {
+    wdMenuOpen = false;
+    if (!book) return;
+    const w = config.webdav;
+    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    try {
+      await api.webdavUploadBook(w.base, w.user, w.pass, book.book.path);
+      toast("已上传书籍到云端");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  function fmtProgressTime(ms: number): string {
+    if (!ms) return "无";
+    const d = new Date(ms);
+    const p = (x: number) => String(x).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
   function aiCtxHtml(h: string): string {
@@ -3213,7 +3355,11 @@ ${effCssExtra() || ""}
           data-drag-id={b.id}
           aria-label={label}
           data-tip={label}
-          onclick={b.run}
+          onpointerdown={(e) => tbPointerDown(b, e)}
+          onpointerup={tbPointerUp}
+          onpointerleave={tbPointerUp}
+          onpointercancel={tbPointerUp}
+          onclick={() => tbClick(b)}
         >
           <Icon size={20} stroke={1.75} />
         </button>
@@ -3254,6 +3400,16 @@ ${effCssExtra() || ""}
         <button class="tb-menu-item" onclick={toggleAllImages}>{effShowImages() ? "全部关闭图片" : "全部开启图片"}</button>
         <button class="tb-menu-item" onclick={startBlockPick}>屏蔽选中图片</button>
         <button class="tb-menu-item" onclick={() => { imgMenuOpen = false; blockedListOpen = true; }}>已屏蔽图片（{blockedImages().length}）</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if wdMenuOpen}
+    <!-- 关闭依赖窗口捕获阶段的外点监听（见下方 $effect），不再使用全屏遮罩元素。 -->
+    <div class="tb-panel wd-menu" bind:this={wdMenuEl} role="menu" aria-label="WebDAV 上传书籍" style="top:{wdMenuPos.top}px; right:{wdMenuPos.right}px">
+      <div class="tb-panel-head"><span>WebDAV（本书）</span><button class="icon" title="关闭" aria-label="关闭" onclick={() => (wdMenuOpen = false)}>×</button></div>
+      <div class="tb-panel-body">
+        <button class="tb-menu-item" onclick={uploadBook} disabled={!book}>上传书籍到云端</button>
       </div>
     </div>
   {/if}
@@ -3719,6 +3875,13 @@ ${effCssExtra() || ""}
   @keyframes tb-panel-in {
     from { opacity: 0; transform: translateY(-8px) scale(0.97); }
     to { opacity: 1; transform: none; }
+  }
+
+  /* WebDAV 长按菜单：覆盖 .tb-panel 的 absolute，改用内联 fixed top/right 定位到按钮正下方 */
+  .wd-menu {
+    position: fixed;
+    width: 240px;
+    max-height: 60vh;
   }
 
   .tb-panel-head {

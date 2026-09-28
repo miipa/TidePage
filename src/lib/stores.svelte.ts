@@ -154,7 +154,7 @@ export const SCROLL_BOUNCE_PRESETS: Record<
 
 /** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
 export const READER_TOPBAR_IDS = [
-  "webdav", "convert", "bookmarkAdd", "bookmarkList", "ttsPlay", "ttsStop",
+  "webdav", "webdavDownload", "convert", "bookmarkAdd", "bookmarkList", "ttsPlay", "ttsStop",
   "highlight", "ai", "stats", "toc", "manga", "manager", "images", "css", "settings",
 ] as const;
 

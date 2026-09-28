@@ -2121,6 +2121,8 @@ pub async fn webdav_sync_progress(
 ) -> Result<Progress, String> {
     let c = crate::dav::DavClient::new(&base, &user, &pass);
     c.ensure_dir("FlowRead").await.ok();
+    // 确保自有同步进度子目录存在（严格服务器对未建父目录的深路径 PUT 会 409）。
+    c.ensure_dir("FlowRead/progress").await.ok();
     let remote_key = format!("FlowRead/progress/{}.json", db::path_id(&book_path));
     let local_p = local.filter(|p| p.updated_at > 0);
 
@@ -2152,6 +2154,24 @@ pub async fn webdav_sync_progress(
         db::set_progress(&conn, book_id, &merged)?;
     }
     Ok(merged)
+}
+
+/// 只读：从云端读取本书进度（FlowRead/progress/{path_id}.json），仅供「同步前对比」使用。
+/// **绝不写库、绝不 PUT、绝不 set_progress**；文件不存在（404）或解析失败一律返回 None。
+#[tauri::command]
+pub async fn webdav_read_progress(
+    base: String,
+    user: String,
+    pass: String,
+    book_path: String,
+) -> Result<Option<Progress>, String> {
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let remote_key = format!("FlowRead/progress/{}.json", db::path_id(&book_path));
+    // get()：404 → Ok(None)，传输错误 → Err；两种失败都按「云端无进度」处理。
+    Ok(match c.get(&remote_key).await {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+        _ => None,
+    })
 }
 
 #[tauri::command]
@@ -2209,99 +2229,24 @@ pub async fn webdav_download_books(
     Ok(imported)
 }
 
+/// 单本书从云端下载到本地：远端键为 FlowRead/books/{file_name}，复用 webdav_download_file
+/// 的「下载 → 按扩展名 upsert_book → emit library-changed」逻辑。返回落地路径。
 #[tauri::command]
-pub async fn webdav_moon_progress(
-    base: String,
-    user: String,
-    pass: String,
-) -> Result<Vec<MoonProgress>, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let mut out = Vec::new();
-    for cand in [
-        "MoonReader/progress.data",
-        "moonreader/progress.data",
-        "Books/progress.data",
-    ] {
-        if let Ok(Some(data)) = c.get(cand).await {
-            let text = crate::dav::decode_progress_content(&data);
-            out = crate::dav::parse_moonreader_content(&text);
-            if !out.is_empty() {
-                break;
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-pub async fn webdav_moon_write(
+pub async fn webdav_download_book(
+    state: State<'_, Arc<AppState>>,
     base: String,
     user: String,
     pass: String,
     book_path: String,
-    title: String,
-    chapter_title: String,
-    pct: f64,
-) -> Result<bool, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let candidates = [
-        "MoonReader/progress.data",
-        "moonreader/progress.data",
-        "Books/progress.data",
-    ];
-    let mut target = String::from("MoonReader/progress.data");
-    let mut content = String::new();
-    for cand in candidates {
-        if let Ok(Some(data)) = c.get(cand).await {
-            content = crate::dav::decode_progress_content(&data);
-            target = cand.to_string();
-            break;
-        }
-    }
-    let book_name = Path::new(&book_path)
+    target_dir: String,
+) -> Result<String, String> {
+    let name = Path::new(&book_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let book_stem = book_name
-        .rsplit_once('.')
-        .map(|(s, _)| s.to_string())
-        .unwrap_or_else(|| book_name.clone());
-    let pct_frac = format!("{:.6}", (pct.clamp(0.0, 100.0) / 100.0));
-    let book_low = book_stem.to_lowercase();
-    let mut lines: Vec<String> = Vec::new();
-    let mut updated = false;
-    for line in content.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let e = crate::dav::parse_moonreader_line(t);
-        let ef = e.file.rsplit(['/', '\\']).next().unwrap_or(&e.file).to_lowercase();
-        let es = ef.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_else(|| ef.clone());
-        let matched = e.title.trim() == title.trim()
-            || ef == book_name.to_lowercase()
-            || es == book_low
-            || (es.len() >= 3 && book_low.contains(&es));
-        if matched {
-            let file_s = if e.file.is_empty() { book_name.clone() } else { e.file.clone() };
-            let title_s = if e.title.is_empty() { title.clone() } else { e.title.clone() };
-            lines.push(format!(
-                "file={file_s}*book.title={title_s}*chapter.title={chapter_title}*book.percent={pct_frac}"
-            ));
-            updated = true;
-        } else {
-            lines.push(t.to_string());
-        }
-    }
-    if !updated {
-        lines.push(format!(
-            "file={book_name}*book.title={title}*chapter.title={chapter_title}*book.percent={pct_frac}"
-        ));
-    }
-    let out = lines.join("\n");
-    c.ensure_dir("MoonReader").await?;
-    c.put(&target, out.into_bytes()).await?;
-    Ok(true)
+        .ok_or("路径无效")?;
+    let remote_path = format!("FlowRead/books/{name}");
+    let mut files = webdav_download_file(state, base, user, pass, remote_path, target_dir).await?;
+    Ok(if files.is_empty() { String::new() } else { files.remove(0) })
 }
 
 #[derive(serde::Serialize)]
@@ -2325,212 +2270,6 @@ pub async fn webdav_list(
         .into_iter()
         .map(|(name, is_dir, size, mtime)| DavEntry { name, is_dir, size, mtime })
         .collect())
-}
-
-const MOON_CACHE_DIRS: [&str; 4] = [
-    "Apps/books/.Moon+/Cache",
-    "Apps/Books/.Moon+/Cache",
-    "Apps/books",
-    "Apps/Books",
-];
-
-fn moon_norm(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace() && *c != '.' && *c != '_' && *c != '，' && *c != ',')
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// 在静读天下目录中为某本书查找对应的 .po 进度文件，返回其 WebDAV 路径
-async fn find_moon_po(
-    c: &crate::dav::DavClient,
-    book_path: &str,
-    title: &str,
-) -> Option<String> {
-    let book_name = Path::new(book_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let book_stem = book_name
-        .rsplit_once('.')
-        .map(|(s, _)| s.to_string())
-        .unwrap_or_else(|| book_name.clone());
-    let bn = moon_norm(&book_name);
-    let bs = moon_norm(&book_stem);
-    let tt = moon_norm(title);
-    let mut best: Option<(u32, String)> = None;
-    for dir in MOON_CACHE_DIRS {
-        let items = match c.list(dir).await {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-        for (name, is_dir, _size, _mtime) in items {
-            if is_dir || !name.ends_with(".po") {
-                continue;
-            }
-            let base = &name[..name.len() - 3];
-            let b = moon_norm(base);
-            let score: u32 = if b == bn || base == book_name {
-                100
-            } else if b == bs {
-                90
-            } else if bn.contains(&b) && b.len() >= 4 {
-                50
-            } else if b.starts_with(&bs) && bs.len() >= 3 {
-                40
-            } else if tt.len() >= 4 && (b.contains(&tt) || tt.contains(&b)) {
-                30
-            } else {
-                0
-            };
-            if score == 0 {
-                continue;
-            }
-            let path = format!("{dir}/{name}");
-            if best.as_ref().map(|(s, _)| *s) < Some(score) {
-                best = Some((score, path));
-            }
-        }
-        if let Some((s, _)) = &best {
-            if *s >= 90 {
-                break;
-            }
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-#[derive(serde::Serialize)]
-pub struct MoonPoRead {
-    pub found: bool,
-    pub percent: f64,
-    pub chapter_at: String,
-    pub updated_at: i64,
-}
-
-#[tauri::command]
-pub async fn webdav_moon_read_po(
-    base: String,
-    user: String,
-    pass: String,
-    book_path: String,
-    title: String,
-) -> Result<MoonPoRead, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let empty = || MoonPoRead {
-        found: false,
-        percent: 0.0,
-        chapter_at: String::new(),
-        updated_at: 0,
-    };
-    let po_path = match find_moon_po(&c, &book_path, &title).await {
-        Some(p) => p,
-        None => return Ok(empty()),
-    };
-    let data = match c.get(&po_path).await {
-        Ok(Some(d)) => d,
-        _ => return Ok(empty()),
-    };
-    let text = crate::dav::decode_progress_content(&data);
-    let line = text.lines().next().unwrap_or("");
-    let (pct, chapter_at, updated_at) = crate::dav::parse_po_line(line);
-    Ok(MoonPoRead {
-        found: pct.is_some(),
-        percent: pct.unwrap_or(0.0),
-        chapter_at,
-        updated_at,
-    })
-}
-
-fn fnv1a(b: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &x in b {
-        h ^= x as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-#[tauri::command]
-pub async fn webdav_moon_write_po(
-    base: String,
-    user: String,
-    pass: String,
-    book_path: String,
-    title: String,
-    chapter_at: String,
-    pct: f64,
-    char_offset: i64,
-) -> Result<bool, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let book_name = Path::new(&book_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let existing = find_moon_po(&c, &book_path, &title).await;
-    let default_dir = "Apps/books/.Moon+/Cache".to_string();
-    let mut po_path = existing.clone().unwrap_or_else(|| {
-        format!("{default_dir}/{book_name}.po")
-    });
-
-    // 若重名书籍已在别处，读取它的 id 以便保留
-    let mut book_id = String::new();
-    if let Some(p) = &existing {
-        if let Ok(Some(data)) = c.get(p).await {
-            let text = crate::dav::decode_progress_content(&data);
-            if let Some(line) = text.lines().next() {
-                if let Some(hash_idx) = line.find('#') {
-                    let tail = &line[hash_idx + 1..];
-                    if let Some(col) = tail.find(':') {
-                        book_id = tail[..col].to_string();
-                    }
-                }
-            }
-        }
-        // 与现有文件同目录，避免新建到默认目录造成重复
-        if let Some(stripped) = p.strip_suffix(&format!("/{book_name}.po")) {
-            po_path = format!("{stripped}/{book_name}.po");
-        }
-    }
-    if book_id.is_empty() {
-        book_id = format!("{:x}", fnv1a(book_name.as_bytes()));
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let pct_c = pct.clamp(0.0, 100.0);
-    let line = format!(
-        "{now_ms}*{chapter_at}@{char_offset}#{book_id}:{pct_c:.2}%"
-    );
-    let dir = po_path
-        .rsplit_once('/')
-        .map(|(d, _)| d.to_string())
-        .unwrap_or_else(|| "Apps/books/.Moon+/Cache".to_string());
-    c.ensure_dir(&dir).await?;
-    c.put(&po_path, line.into_bytes()).await?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub async fn webdav_moon_po_count(
-    base: String,
-    user: String,
-    pass: String,
-) -> Result<i64, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    for dir in MOON_CACHE_DIRS {
-        if let Ok(items) = c.list(dir).await {
-            let n = items
-                .iter()
-                .filter(|(name, is_dir, _, _)| !is_dir && name.ends_with(".po"))
-                .count() as i64;
-            if n > 0 {
-                return Ok(n);
-            }
-        }
-    }
-    Ok(0)
 }
 
 #[tauri::command]
