@@ -40,6 +40,8 @@
     type ZoneAction,
     type StatusItemId,
     STATUS_ITEM_DEFS,
+    AI_GROUPS,
+    type AiGroup,
   } from "../lib/stores.svelte";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
   import {
@@ -56,6 +58,8 @@
   } from "@tabler/icons-svelte";
   import ColorPicker from "./ColorPicker.svelte";
   import { dragSort } from "../lib/dragSort";
+  import { slide } from "svelte/transition";
+  import { onMount, tick } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { OnlineVoice } from "../lib/tts.svelte";
@@ -101,6 +105,60 @@
       ? navItems.filter((i) => i.label.includes(navQuery.trim()))
       : navItems,
   );
+
+  /* ---------- 具体设置项搜索：索引 / 结果 / 定位 ---------- */
+  type SearchHit = { tab: SettingsTab; text: string; el: HTMLElement };
+  let searchIndex = $state<SearchHit[]>([]);
+  const sq = (s: string) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+  /** 全文设置索引：各 pane 常驻 DOM（含隐藏的），以每个 <label> 文本为条目。 */
+  function buildSearchIndex() {
+    const root = document.querySelector(".set-content");
+    if (!root) return;
+    const hits: SearchHit[] = [];
+    root.querySelectorAll<HTMLElement>(".set-pane[data-pane]").forEach((pane) => {
+      const t = pane.dataset.pane as SettingsTab;
+      pane.querySelectorAll<HTMLElement>("label").forEach((lb) => {
+        const text = (lb.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text) return;
+        const el = (lb.closest(".field") as HTMLElement | null) ?? lb.parentElement ?? lb;
+        hits.push({ tab: t, text, el });
+      });
+    });
+    searchIndex = hits;
+  }
+
+  // 组件每次打开都重挂载，onMount 重建索引，正好覆盖 AI 分类默认展开的状态。
+  onMount(buildSearchIndex);
+
+  /** 搜索结果：仅取匹配的具体设置项（上限 80 条）。 */
+  const searchResults = $derived.by(() => {
+    const q = sq(navQuery);
+    if (!q) return [];
+    return searchIndex.filter((h) => sq(h.text).includes(q)).slice(0, 80);
+  });
+
+  /** 点结果：切大项 → 展开 AI 分类 → 滚动到该项并短暂高亮。 */
+  async function locateSetting(h: SearchHit) {
+    tab = h.tab;
+    // AI 分类若被折叠过，先展开，保证字段在 DOM 中
+    if (h.tab === "ai") aiOpen = { node: true, window: true, prompt: true };
+    await tick();
+    let el: HTMLElement | null = h.el;
+    if (!el.isConnected) {
+      // 索引建立后节点被重建（如折叠/条件变化）→ 按文本回退查找
+      const pane = document.querySelector<HTMLElement>(`.set-pane[data-pane="${h.tab}"]`);
+      const target = sq(h.text);
+      el =
+        (Array.from(pane?.querySelectorAll<HTMLElement>("label") ?? [])
+          .find((lb) => sq(lb.textContent || "") === target)
+          ?.closest(".field") as HTMLElement | null) ?? null;
+    }
+    if (!el) return;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.classList.add("fr-locate");
+    setTimeout(() => el?.classList.remove("fr-locate"), 1000);
+  }
 
   /** 分区拖拽排序：把 from 插入到 target 之前/之后，持久化到 config.settingsOrder（与顶栏图标同款 dragSort）。 */
   function navDrop(from: string, target: string, place: "before" | "after") {
@@ -716,6 +774,35 @@
   );
   const apMeta = $derived(aiProviderMeta(ap?.provider ?? "openai"));
 
+  /** AI 设置三个分类的标题（显示顺序由 config.ai.groupOrder 决定）。 */
+  const AI_GROUP_TITLES: Record<string, string> = {
+    node: "AI 节点设置",
+    window: "AI 窗口",
+    prompt: "提示词",
+  };
+  /** 分类开合状态；本组件每次打开重挂载，故每次默认全展开（折叠态不持久化）。 */
+  let aiOpen = $state<Record<string, boolean>>({ node: true, window: true, prompt: true });
+  /** 按 config.ai.groupOrder 排列后的分类列表（过滤非法 id）。 */
+  const aiGroups = $derived(
+    (config.ai.groupOrder ?? [...AI_GROUPS])
+      .filter((id): id is AiGroup => (AI_GROUPS as readonly string[]).includes(id))
+      .map((id) => ({ id, title: AI_GROUP_TITLES[id] })),
+  );
+
+  /** 分类拖拽排序：把 from 插入到 target 之前/之后，持久化到 config.ai.groupOrder（同 navDrop）。 */
+  function aiGroupDrop(from: string, target: string, place: "before" | "after") {
+    if (!from || from === target) return;
+    const arr = [...config.ai.groupOrder];
+    const fi = arr.indexOf(from);
+    if (fi < 0) return;
+    arr.splice(fi, 1);
+    const ti = arr.indexOf(target);
+    if (ti < 0) return;
+    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
+    config.ai.groupOrder = arr;
+    saveConfig();
+  }
+
   function addProfile() {
     const provider: AiProvider = ap?.provider ?? "openai";
     const created = newAiProfile(config.ai.profiles, provider);
@@ -1001,7 +1088,10 @@
     <!-- 左侧导航：扁平分区列表（无分组）+ 搜索；分区可拖拽排序（复用 dragSort，特效同顶栏图标）。 -->
     <aside class="set-nav">
       <div class="set-search">
-        <input placeholder="搜索设置…" bind:value={navQuery} aria-label="搜索设置" />
+        <input placeholder="搜索设置…" bind:value={navQuery} aria-label="搜索设置" onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
+        {#if navQuery}
+          <button class="set-search-clear" title="清除" aria-label="清除搜索" onclick={() => (navQuery = "")}>×</button>
+        {/if}
       </div>
       <div class="set-nav-list" use:dragSort={{ onDrop: navDrop, axis: "y" }}>
         {#each navFiltered as it (it.id)}
@@ -1017,14 +1107,26 @@
           </button>
         {/each}
       </div>
-      {#if !navFiltered.length}
-        <div class="set-nav-empty">无匹配项</div>
+      {#if navQuery.trim()}
+        <div class="set-nav-group">具体设置</div>
+        {#if searchResults.length}
+          <div class="set-nav-results">
+            {#each searchResults as h, i (h.tab + "|" + h.text + "|" + i)}
+              <button class="set-result" onclick={() => locateSetting(h)} title={h.text}>
+                <span class="set-result-label">{h.text}</span>
+                <span class="set-result-tab">{TAB_META[h.tab].label}</span>
+              </button>
+            {/each}
+          </div>
+        {:else if !navFiltered.length}
+          <div class="set-nav-empty">无匹配项</div>
+        {/if}
       {/if}
     </aside>
 
-    <!-- 右侧内容 -->
+    <!-- 右侧内容：全部 pane 常驻渲染、按需 hidden，使搜索可索引并定位到任意设置项。 -->
     <section class="set-content">
-  {#if tab === "appearance"}
+  <div class="set-pane" data-pane="appearance" hidden={tab !== "appearance"}>
 
     <div class="field">
       <label>明暗模式</label>
@@ -1099,7 +1201,8 @@
       <p class="tip">支持 PNG / JPG / JPEG / WebP；底图会按封面比例居中裁切填满，不变形。更换后书库封面立即刷新。</p>
     </div>
 
-  {:else if tab === "reader"}
+  </div>
+  <div class="set-pane" data-pane="reader" hidden={tab !== "reader"}>
     <div class="field">
       <label>翻页模式</label>
       <select bind:value={config.reader.mode} onchange={saveConfig}>
@@ -1493,7 +1596,8 @@
     <div class="close-row" style="margin-top:12px">
       <button onclick={resetReader}>恢复阅读设置默认…</button>
     </div>
-  {:else if tab === "manga"}
+  </div>
+  <div class="set-pane" data-pane="manga" hidden={tab !== "manga"}>
     <p class="tip">以下设置只影响漫画模式（自动识别的漫画书，或用顶栏「漫/文」按钮手动切换为漫画的书）；普通书不受影响。阅读界面右下角「图−/图＋/适宽」可按单本覆盖，并可超过此处默认值。</p>
 
     <div class="grid3">
@@ -1571,7 +1675,8 @@
       </div>
       <p class="tip">独立于普通阅读主题，仅在漫画模式下生效。</p>
     </div>
-  {:else if tab === "split"}
+  </div>
+  <div class="set-pane" data-pane="split" hidden={tab !== "split"}>
     <p class="tip">
       TXT 按正则划分章节：匹配到的每一行将作为章节标题，到下一个标题之间为章节内容。支持前后查找断言（lookbehind / lookahead）。留空使用内置默认规则。
     </p>
@@ -1612,7 +1717,8 @@
     <div class="close-row">
       <button class="primary" onclick={saveRegex}>保存规则</button>
     </div>
-  {:else if tab === "keys"}
+  </div>
+  <div class="set-pane" data-pane="keys" hidden={tab !== "keys"}>
     <p class="tip">
       一个功能可以绑定多个按键。点「记录」后按下任意键（可含 Ctrl/Alt/Shift 组合）即添加；点按键标签删除。
     </p>
@@ -1662,7 +1768,8 @@
     <div class="close-row">
       <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast("已恢复默认"); }}>恢复默认</button>
     </div>
-  {:else if tab === "tts"}
+  </div>
+  <div class="set-pane" data-pane="tts" hidden={tab !== "tts"}>
     <div class="field">
       <label>朗读引擎</label>
       <select bind:value={config.tts.engine} onchange={saveConfig}>
@@ -1833,7 +1940,8 @@
       <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
       <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
     </div>
-  {:else if tab === "webdav"}
+  </div>
+  <div class="set-pane" data-pane="webdav" hidden={tab !== "webdav"}>
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>
       <label><input type="checkbox" bind:checked={config.webdav.syncOnOpen} onchange={saveConfig} /> 打开/退出书籍时自动同步进度（关闭后仍可手动同步）</label>
@@ -1874,222 +1982,247 @@
       手动入口在<strong>阅读页顶栏</strong>：短按「☁↑」按钮同步进度（会先对比本地与云端并弹框确认）、长按弹出「上传/下载书籍」菜单；独立的「☁↓ 下载进度」按钮从云端恢复进度。
       WebDAV 文件管理在书库页（左上「☁ 云盘」或向左滑）进入，打开即自动连接并列出整盘，可下载书籍到上面的目录并自动入书库。
     </p>
-  {:else if tab === "ai"}
+  </div>
+  <div class="set-pane" data-pane="ai" hidden={tab !== "ai"}>
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.ai.enabled} onchange={saveConfig} /> 启用 AI 助手</label>
       <label><input type="checkbox" bind:checked={config.ai.autoOnChapter} onchange={saveConfig} /> 打开新章节自动执行第一个提示词</label>
     </div>
 
-    <div class="field" style="margin-bottom:12px">
-      <label>AI 窗口样式</label>
-      <select bind:value={config.ai.display} onchange={saveConfig}>
-        <option value="chat">对话样式</option>
-        <option value="reader">阅读样式</option>
-      </select>
-      <p class="tip">阅读样式：AI 内容按阅读版式分栏分页，←/→ 或滚轮翻页，新回复自动翻到最新页；可单独设置 AI 窗口版式，也可完全跟随阅读界面。TXT/ePub 导出按钮在 AI 窗口顶部。</p>
-    </div>
+    <!-- 三个可折叠、可拖拽排序的分类；折叠态不持久化（本组件每次打开重挂载，天然全展开）。 -->
+    <div class="ai-groups" use:dragSort={{ onDrop: aiGroupDrop, axis: "y" }}>
+      {#each aiGroups as g (g.id)}
+        <section class="ai-group" data-drag-id={g.id}>
+          <div class="ai-group-head" class:open={aiOpen[g.id]} onclick={() => (aiOpen[g.id] = !aiOpen[g.id])}>
+            {g.title}
+          </div>
+          {#if aiOpen[g.id]}
+            <!-- 分类体阻止 pointerdown 冒泡：拖滑块 / 文本框选字不会误触发整组排序。 -->
+            <div class="ai-group-body" transition:slide={{ duration: 200 }} onpointerdown={(e) => e.stopPropagation()}>
+              {#if g.id === "node"}
+                <div class="field">
+                  <label>当前端点</label>
+                  <div class="row-inline">
+                    <select bind:value={config.ai.active} onchange={saveConfigNow}>
+                      {#each config.ai.profiles as p, i (p.id)}
+                        <option value={i}>{p.name || `端点${i + 1}`}</option>
+                      {/each}
+                    </select>
+                    <button class="icon" title="新增端点" onclick={addProfile}>＋ 新增</button>
+                    <button class="icon" title="删除当前端点" onclick={delProfile}>✕ 删除</button>
+                  </div>
+                  <p class="tip">阅读界面 AI 面板也可快速切换；故障转移按此列表顺序依次尝试，当前端点优先。</p>
+                </div>
 
-    {#if config.ai.display === "reader"}
-      <div class="field" style="margin-bottom:12px">
-        <label class="check">
-          <input type="checkbox" bind:checked={config.ai.style.followReader} onchange={saveConfig} />
-          跟随阅读界面设置
-        </label>
-      </div>
-      {#if !config.ai.style.followReader}
-        <div class="field" style="margin-bottom:10px">
-          <div class="row-inline">
-            <button onclick={copyReaderStyleToAi} title="把「阅读」页当前字体/字号/颜色等复制为 AI 窗口专用设置">复制当前阅读设置 →</button>
-            <span class="tip" style="align-self:center">不跟随时可单独调 AI 窗口版式</span>
-          </div>
-        </div>
-        <div class="grid2">
-          <div class="field">
-            <label>字体</label>
-            <input bind:value={config.ai.style.fontFamily} onchange={saveConfig} placeholder={config.reader.fontFamily} />
-          </div>
-          <div class="field">
-            <label>字号 {config.ai.style.fontSize || config.reader.fontSize}px</label>
-            <input type="range" min="0" max="64" bind:value={config.ai.style.fontSize} oninput={saveConfig} />
-          </div>
-        </div>
-        <div class="grid2">
-          <div class="field">
-            <label>行距 {config.ai.style.lineHeight || config.reader.lineHeight}</label>
-            <input type="range" min="0" max="3" step="0.05" bind:value={config.ai.style.lineHeight} oninput={saveConfig} />
-          </div>
-          <div class="field">
-            <label>段距 {config.ai.style.paraSpacing || config.reader.paraSpacing}em</label>
-            <input type="range" min="0" max="2" step="0.1" bind:value={config.ai.style.paraSpacing} oninput={saveConfig} />
-          </div>
-        </div>
-        <div class="grid2">
-          <div class="field">
-            <label>左右边距 {config.ai.style.marginH || config.reader.marginH}px</label>
-            <input type="range" min="0" max="560" bind:value={config.ai.style.marginH} oninput={saveConfig} />
-          </div>
-          <div class="field">
-            <label>上下边距 {config.ai.style.marginV || config.reader.marginV}px</label>
-            <input type="range" min="0" max="400" bind:value={config.ai.style.marginV} oninput={saveConfig} />
-          </div>
-        </div>
-        <p class="tip">以上数值为 0 时跟随阅读界面设置。</p>
-        <div class="grid2">
-          <div class="field">
-            <label>背景颜色</label>
-            <div class="color-row">
-              <input placeholder="如 #f5f1e8 / rgb(245,241,232)" title="留空则跟随阅读配色" bind:value={config.ai.style.bgColor} oninput={saveConfig} />
-              <ColorPicker bind:value={config.ai.style.bgColor} allowEmpty emptyLabel="跟随阅读" title="AI 背景颜色" onchange={saveConfig} />
+                <div class="grid2">
+                  <div class="field">
+                    <label>端点名称</label>
+                    <input bind:value={ap.name} onchange={saveConfig} />
+                  </div>
+                  <div class="field">
+                    <label for="ai-provider-sel">服务商</label>
+                    <select id="ai-provider-sel" bind:value={ap.provider} onchange={saveConfig}>
+                      {#each AI_PROVIDERS as prov (prov.id)}
+                        <option value={prov.id}>{prov.label}</option>
+                      {/each}
+                    </select>
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label>API 地址</label>
+                  <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={apMeta.baseUrlHint} title={apMeta.id === "ollama" ? "Ollama 服务地址" : apMeta.azure ? "Azure 资源端点" : apMeta.id === "gemini" ? "Google 生成式语言 API 域名" : apMeta.id === "anthropic" ? "Anthropic 域名" : "填到域名即可，自动补 /v1"} />
+                  <p class="tip">{apMeta.id === "ollama" ? "Ollama 服务地址。" : apMeta.azure ? "填 Azure 资源端点。" : apMeta.id === "gemini" ? "填 Google 生成式语言 API 域名。" : apMeta.id === "anthropic" ? "填 Anthropic 域名。" : "填到域名即可，自动补 /v1。"}</p>
+                </div>
+
+                {#if apMeta.azure}
+                  <div class="grid2">
+                    <div class="field">
+                      <label>部署名</label>
+                      <input bind:value={ap.deployment} onchange={saveConfig} placeholder="gpt-4o-deploy" title="Azure 部署名 deployment" />
+                    </div>
+                    <div class="field">
+                      <label>API 版本</label>
+                      <input bind:value={ap.apiVersion} onchange={saveConfig} placeholder="2024-06-01" title="Azure api-version" />
+                    </div>
+                  </div>
+                {/if}
+
+                <div class="grid2">
+                  <div class="field">
+                    <label>模型</label>
+                    <input bind:value={ap.model} onchange={saveConfig} placeholder={apMeta.modelHint} />
+                  </div>
+                  {#if apMeta.needsKey}
+                    <div class="field">
+                      <label>API Key</label>
+                      <input type="password" bind:value={ap.apiKey} onchange={saveConfig} />
+                    </div>
+                  {/if}
+                </div>
+
+                <div class="grid2">
+                  <div class="field">
+                    <label>网络代理</label>
+                    <select bind:value={ap.proxyMode} onchange={saveConfig}>
+                      <option value="auto">自动</option>
+                      <option value="direct">强制直连</option>
+                      <option value="custom">自定义代理</option>
+                    </select>
+                  </div>
+                  {#if ap.proxyMode === "custom"}
+                    <div class="field">
+                      <label>代理地址</label>
+                      <input bind:value={ap.proxyUrl} onchange={saveConfig} placeholder="http://127.0.0.1:7897" />
+                    </div>
+                  {/if}
+                </div>
+
+                <div class="field">
+                  <label class="check">
+                    <input type="checkbox" bind:checked={config.ai.failover} onchange={saveConfigNow} />
+                    端点失败时自动切换下一个端点并重跑刚才的操作
+                  </label>
+                </div>
+
+                <div class="row-inline">
+                  <button onclick={testAi} disabled={aiTesting}>{aiTesting ? "测试中…" : "测试当前端点"}</button>
+                  <div class="flex1"></div>
+                </div>
+                {#if aiTestResult}
+                  <div class="ai-test-result" class:ok={aiTestResult.startsWith("✓")} class:bad={aiTestResult.startsWith("✗")}>{aiTestResult}</div>
+                {/if}
+
+                <p class="tip">端点顺序即故障转移优先级，按列表顺序最多尝试全部端点；测试结果会显示实际命中的链路与各链路失败原因。自动代理：优先环境变量，其次 Windows 系统代理，不解析 PAC；强制直连：忽略环境变量与系统代理，TUN 模式选此项。</p>
+              {:else if g.id === "window"}
+                <div class="field">
+                  <label>AI 窗口样式</label>
+                  <select bind:value={config.ai.display} onchange={saveConfig}>
+                    <option value="chat">对话样式</option>
+                    <option value="reader">阅读样式</option>
+                  </select>
+                  <p class="tip">阅读样式：AI 内容按阅读版式分栏分页，←/→ 或滚轮翻页，新回复自动翻到最新页；可单独设置 AI 窗口版式，也可完全跟随阅读界面。TXT/ePub 导出按钮在 AI 窗口顶部。</p>
+                </div>
+
+                {#if config.ai.display === "reader"}
+                  <div class="field">
+                    <label class="check">
+                      <input type="checkbox" bind:checked={config.ai.style.followReader} onchange={saveConfig} />
+                      跟随阅读界面设置
+                    </label>
+                  </div>
+                  {#if !config.ai.style.followReader}
+                    <div class="field">
+                      <div class="row-inline">
+                        <button onclick={copyReaderStyleToAi} title="把「阅读」页当前字体/字号/颜色等复制为 AI 窗口专用设置">复制当前阅读设置 →</button>
+                        <span class="tip" style="align-self:center">不跟随时可单独调 AI 窗口版式</span>
+                      </div>
+                    </div>
+                    <div class="grid2">
+                      <div class="field">
+                        <label>字体</label>
+                        <input bind:value={config.ai.style.fontFamily} onchange={saveConfig} placeholder={config.reader.fontFamily} />
+                      </div>
+                      <div class="field">
+                        <label>字号 {config.ai.style.fontSize || config.reader.fontSize}px</label>
+                        <input type="range" min="0" max="64" bind:value={config.ai.style.fontSize} oninput={saveConfig} />
+                      </div>
+                    </div>
+                    <div class="grid2">
+                      <div class="field">
+                        <label>行距 {config.ai.style.lineHeight || config.reader.lineHeight}</label>
+                        <input type="range" min="0" max="3" step="0.05" bind:value={config.ai.style.lineHeight} oninput={saveConfig} />
+                      </div>
+                      <div class="field">
+                        <label>段距 {config.ai.style.paraSpacing || config.reader.paraSpacing}em</label>
+                        <input type="range" min="0" max="2" step="0.1" bind:value={config.ai.style.paraSpacing} oninput={saveConfig} />
+                      </div>
+                    </div>
+                    <div class="grid2">
+                      <div class="field">
+                        <label>左右边距 {config.ai.style.marginH || config.reader.marginH}px</label>
+                        <input type="range" min="0" max="560" bind:value={config.ai.style.marginH} oninput={saveConfig} />
+                      </div>
+                      <div class="field">
+                        <label>上下边距 {config.ai.style.marginV || config.reader.marginV}px</label>
+                        <input type="range" min="0" max="400" bind:value={config.ai.style.marginV} oninput={saveConfig} />
+                      </div>
+                    </div>
+                    <p class="tip">以上数值为 0 时跟随阅读界面设置。</p>
+                    <div class="grid2">
+                      <div class="field">
+                        <label>背景颜色</label>
+                        <div class="color-row">
+                          <input placeholder="如 #f5f1e8 / rgb(245,241,232)" title="留空则跟随阅读配色" bind:value={config.ai.style.bgColor} oninput={saveConfig} />
+                          <ColorPicker bind:value={config.ai.style.bgColor} allowEmpty emptyLabel="跟随阅读" title="AI 背景颜色" onchange={saveConfig} />
+                        </div>
+                      </div>
+                      <div class="field">
+                        <label>文字颜色</label>
+                        <div class="color-row">
+                          <input placeholder="如 #3b3630 / rgb(59,54,48)" title="留空则跟随阅读配色" bind:value={config.ai.style.fgColor} oninput={saveConfig} />
+                          <ColorPicker bind:value={config.ai.style.fgColor} allowEmpty emptyLabel="跟随阅读" title="AI 文字颜色" onchange={saveConfig} />
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field">
+                      <label>首行缩进</label>
+                      <select bind:value={config.ai.style.indent} onchange={saveConfig}>
+                        <option value="0em">不缩进</option>
+                        <option value="1em">缩进 1 字</option>
+                        <option value="2em">缩进 2 字</option>
+                        <option value="3em">缩进 3 字</option>
+                      </select>
+                    </div>
+                  {/if}
+                  <div class="field">
+                    <label>AI 窗口自定义 CSS</label>
+                    <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark { color: #333; }"}></textarea>
+                    <p class="tip">仅阅读样式生效，作用于正文 .ai-mark；勾选「跟随阅读界面」时，字号、行距、边距、缩进与正文完全一致，取消勾选后可单独设置。</p>
+                  </div>
+                {/if}
+              {:else if g.id === "prompt"}
+                <div class="field">
+                  <label>System 提示词</label>
+                  <input bind:value={config.ai.system} onchange={saveConfig} title="全局生效的系统提示词" />
+                </div>
+
+                <div class="field">
+                  <label>划词翻译 / 释义提示词</label>
+                  <textarea rows="3" bind:value={config.ai.quickPrompt} oninput={saveConfig}></textarea>
+                  <p class="tip">阅读界面选中文字点「AI 释义」小窗执行，{"{selection}"} 为选中文字；独立于下方「我的提示词」，不影响 AI 面板的按钮与快捷键。</p>
+                </div>
+
+                <div class="field">
+                  <label>我的提示词</label>
+                  {#each config.ai.prompts as p, i (p.id)}
+                    <div class="prompt-edit">
+                      <div class="row-inline" style="margin-bottom:4px">
+                        <input class="pname" placeholder="名称" bind:value={p.name} onchange={saveConfig} />
+                        <button class="key-chip-inline" class:cap={capPromptIdx === i} title="绑定快捷键"
+                          onclick={() => (capPromptIdx = capPromptIdx === i ? null : i)}>
+                          {p.key || "绑定快捷键"}{capPromptIdx === i ? "…" : ""}
+                        </button>
+                        {#if capPromptIdx === i}
+                          <button class="icon" onclick={() => (capPromptIdx = null)}>取消</button>
+                        {/if}
+                        <button class="icon" title="删除此提示词" onclick={() => delPrompt(i)}>×</button>
+                      </div>
+                      <textarea rows="3" bind:value={p.text} oninput={saveConfig}></textarea>
+                    </div>
+                  {/each}
+                  <button onclick={addPrompt} style="margin-top:6px">＋ 添加提示词</button>
+                </div>
+
+                <p class="tip">{"{chapter}"} 为章节内容，{"{title}"} 为章节名；AI 面板在阅读界面点「AI」按钮打开，提示词芯片点击即执行，F1–F9 快捷键全局有效。</p>
+              {/if}
             </div>
-          </div>
-          <div class="field">
-            <label>文字颜色</label>
-            <div class="color-row">
-              <input placeholder="如 #3b3630 / rgb(59,54,48)" title="留空则跟随阅读配色" bind:value={config.ai.style.fgColor} oninput={saveConfig} />
-              <ColorPicker bind:value={config.ai.style.fgColor} allowEmpty emptyLabel="跟随阅读" title="AI 文字颜色" onchange={saveConfig} />
-            </div>
-          </div>
-        </div>
-        <div class="field" style="margin-bottom:10px">
-          <label>首行缩进</label>
-          <select bind:value={config.ai.style.indent} onchange={saveConfig}>
-            <option value="0em">不缩进</option>
-            <option value="1em">缩进 1 字</option>
-            <option value="2em">缩进 2 字</option>
-            <option value="3em">缩进 3 字</option>
-          </select>
-        </div>
-      {/if}
-      <div class="field" style="margin-bottom:12px">
-        <label>AI 窗口自定义 CSS</label>
-        <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark { color: #333; }"}></textarea>
-        <p class="tip">仅阅读样式生效，作用于正文 .ai-mark；勾选「跟随阅读界面」时，字号、行距、边距、缩进与正文完全一致，取消勾选后可单独设置。</p>
-      </div>
-    {/if}
-
-    <div class="field">
-      <label>当前端点</label>
-      <div class="row-inline">
-        <select bind:value={config.ai.active} onchange={saveConfigNow}>
-          {#each config.ai.profiles as p, i (p.id)}
-            <option value={i}>{p.name || `端点${i + 1}`}</option>
-          {/each}
-        </select>
-        <button class="icon" title="新增端点" onclick={addProfile}>＋ 新增</button>
-        <button class="icon" title="删除当前端点" onclick={delProfile}>✕ 删除</button>
-      </div>
-      <p class="tip">阅读界面 AI 面板也可快速切换；故障转移按此列表顺序依次尝试，当前端点优先。</p>
-    </div>
-
-    <div class="grid2">
-      <div class="field">
-        <label>端点名称</label>
-        <input bind:value={ap.name} onchange={saveConfig} />
-      </div>
-      <div class="field">
-        <label for="ai-provider-sel">服务商</label>
-        <select id="ai-provider-sel" bind:value={ap.provider} onchange={saveConfig}>
-          {#each AI_PROVIDERS as prov (prov.id)}
-            <option value={prov.id}>{prov.label}</option>
-          {/each}
-        </select>
-      </div>
-    </div>
-    <div class="field">
-      <label>API 地址</label>
-      <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={apMeta.baseUrlHint} title={apMeta.id === "ollama" ? "Ollama 服务地址" : apMeta.azure ? "Azure 资源端点" : apMeta.id === "gemini" ? "Google 生成式语言 API 域名" : apMeta.id === "anthropic" ? "Anthropic 域名" : "填到域名即可，自动补 /v1"} />
-      <p class="tip">{apMeta.id === "ollama" ? "Ollama 服务地址。" : apMeta.azure ? "填 Azure 资源端点。" : apMeta.id === "gemini" ? "填 Google 生成式语言 API 域名。" : apMeta.id === "anthropic" ? "填 Anthropic 域名。" : "填到域名即可，自动补 /v1。"}</p>
-    </div>
-    {#if apMeta.azure}
-      <div class="grid2">
-        <div class="field">
-          <label>部署名</label>
-          <input bind:value={ap.deployment} onchange={saveConfig} placeholder="gpt-4o-deploy" title="Azure 部署名 deployment" />
-        </div>
-        <div class="field">
-          <label>API 版本</label>
-          <input bind:value={ap.apiVersion} onchange={saveConfig} placeholder="2024-06-01" title="Azure api-version" />
-        </div>
-      </div>
-    {/if}
-    <div class="grid2">
-      <div class="field">
-        <label>模型</label>
-        <input bind:value={ap.model} onchange={saveConfig} placeholder={apMeta.modelHint} />
-      </div>
-      {#if apMeta.needsKey}
-        <div class="field">
-          <label>API Key</label>
-          <input type="password" bind:value={ap.apiKey} onchange={saveConfig} />
-        </div>
-      {/if}
-    </div>
-    <div class="field">
-      <label class="check">
-        <input type="checkbox" bind:checked={config.ai.failover} onchange={saveConfigNow} />
-        端点失败时自动切换下一个端点并重跑刚才的操作
-      </label>
-    </div>
-    <div class="grid2">
-      <div class="field">
-        <label>网络代理</label>
-        <select bind:value={ap.proxyMode} onchange={saveConfig}>
-          <option value="auto">自动</option>
-          <option value="direct">强制直连</option>
-          <option value="custom">自定义代理</option>
-        </select>
-      </div>
-      {#if ap.proxyMode === "custom"}
-        <div class="field">
-          <label>代理地址</label>
-          <input bind:value={ap.proxyUrl} onchange={saveConfig} placeholder="http://127.0.0.1:7897" />
-        </div>
-      {/if}
-    </div>
-    <p class="tip">端点顺序即故障转移优先级，按列表顺序最多尝试全部端点；测试结果会显示实际命中的链路与各链路失败原因。自动代理：优先环境变量，其次 Windows 系统代理，不解析 PAC；强制直连：忽略环境变量与系统代理，TUN 模式选此项。</p>
-
-    <div class="row-inline" style="margin-bottom:10px">
-      <button onclick={testAi} disabled={aiTesting}>{aiTesting ? "测试中…" : "测试当前端点"}</button>
-      <div class="flex1"></div>
-    </div>
-    {#if aiTestResult}
-      <div class="ai-test-result" class:ok={aiTestResult.startsWith("✓")} class:bad={aiTestResult.startsWith("✗")}>{aiTestResult}</div>
-    {/if}
-
-    <div class="field" style="margin-top:12px">
-      <label>System 提示词</label>
-      <input bind:value={config.ai.system} onchange={saveConfig} title="全局生效的系统提示词" />
-    </div>
-
-    <div class="field">
-      <label>划词翻译 / 释义提示词</label>
-      <textarea rows="3" bind:value={config.ai.quickPrompt} oninput={saveConfig}></textarea>
-      <p class="tip">阅读界面选中文字点「AI 释义」小窗执行，{"{selection}"} 为选中文字；独立于下方「我的提示词」，不影响 AI 面板的按钮与快捷键。</p>
-    </div>
-
-    <div class="field">
-      <label>我的提示词</label>
-      {#each config.ai.prompts as p, i (p.id)}
-        <div class="prompt-edit">
-          <div class="row-inline" style="margin-bottom:4px">
-            <input class="pname" placeholder="名称" bind:value={p.name} onchange={saveConfig} />
-            <button class="key-chip-inline" class:cap={capPromptIdx === i} title="绑定快捷键"
-              onclick={() => (capPromptIdx = capPromptIdx === i ? null : i)}>
-              {p.key || "绑定快捷键"}{capPromptIdx === i ? "…" : ""}
-            </button>
-            {#if capPromptIdx === i}
-              <button class="icon" onclick={() => (capPromptIdx = null)}>取消</button>
-            {/if}
-            <button class="icon" title="删除此提示词" onclick={() => delPrompt(i)}>×</button>
-          </div>
-          <textarea rows="3" bind:value={p.text} oninput={saveConfig}></textarea>
-        </div>
+          {/if}
+        </section>
       {/each}
-      <button onclick={addPrompt} style="margin-top:6px">＋ 添加提示词</button>
     </div>
-
-    <p class="tip">{"{chapter}"} 为章节内容，{"{title}"} 为章节名；AI 面板在阅读界面点「AI」按钮打开，提示词芯片点击即执行，F1–F9 快捷键全局有效。</p>
-  {:else if tab === "prefs"}
+  </div>
+  <div class="set-pane" data-pane="prefs" hidden={tab !== "prefs"}>
     <p class="sec-title">通用</p>
     <div class="field">
       <label>界面语言</label>
@@ -2177,13 +2310,14 @@
         <option value="windows-1252">Windows-1252</option>
       </select>
     </div>
-  {:else if tab === "other"}
+  </div>
+  <div class="set-pane" data-pane="other" hidden={tab !== "other"}>
     <p class="sec-title">关于</p>
     <div class="field">
       <label>版本</label>
       <div class="sec-val">FlowRead · {APP_VERSION}</div>
     </div>
-  {/if}
+  </div>
     </section>
   </div>
 
@@ -2245,8 +2379,37 @@
     overflow-y: auto;
   }
 
-  .set-search { margin-bottom: 10px; }
-  .set-search input { width: 100%; min-height: 30px; font-size: var(--fs-xs, 12px); }
+  .set-search { position: relative; margin-bottom: 10px; }
+  .set-search input {
+    width: 100%;
+    min-height: 30px;
+    font-size: var(--fs-xs, 12px);
+    padding-right: 26px;
+    box-sizing: border-box;
+  }
+  .set-search-clear {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--fg2);
+    cursor: pointer;
+    border-radius: 50%;
+    font-size: 14px;
+    line-height: 1;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  }
+  .set-search-clear:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--fg);
+  }
 
   .set-nav-group {
     font-size: 11px;
@@ -2299,6 +2462,41 @@
   .set-nav-label { flex: 1; }
   .set-nav-empty { padding: 16px 10px; color: var(--fg2); font-size: var(--fs-xs, 12px); }
 
+  /* 搜索命中的「具体设置」结果列表 */
+  .set-nav-results {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .set-result {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--fg);
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: var(--fs-xs, 12px);
+    cursor: pointer;
+    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
+  }
+  .set-result:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .set-result-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-result-tab { flex-shrink: 0; color: var(--fg2); font-size: 11px; opacity: 0.8; }
+
+  /* 定位高亮：类名由 JS 运行时添加，必须用 :global，否则会被 Svelte 当作未用选择器删除。
+     box-shadow 用于画强调色光环（.field 未设 box-shadow，不冲突）；
+     transition 用 !important 覆盖 .field 自带的 transition，使光环淡入淡出。 */
+  :global(.fr-locate) {
+    border-radius: 10px;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 65%, transparent) !important;
+    transition: box-shadow 0.35s var(--ease) !important;
+  }
+
   /* 右侧内容 */
   .set-content {
     flex: 1;
@@ -2306,6 +2504,9 @@
     overflow-y: auto;
     padding: 20px 24px;
   }
+
+  /* pane 常驻渲染、按需 hidden：normal 流下隐藏即可（显式声明防止被其它 display 规则覆盖）。 */
+  .set-pane[hidden] { display: none; }
 
   /* 底栏 */
   .set-foot {
@@ -2377,6 +2578,39 @@
   details.adv[open] > summary::before { transform: rotate(90deg); }
   details.adv > summary:hover { color: var(--fg); }
   details.adv > .field { padding: 0 12px 10px; margin-bottom: 0; }
+
+  /* AI 设置分类：可折叠 + 可拖拽排序（视觉对齐 details.adv，间距节奏同 .field）。 */
+  .ai-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .ai-group {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm, 8px);
+    background: var(--panel2);
+  }
+  .ai-group-head {
+    cursor: pointer;
+    padding: 8px 12px;
+    font-size: var(--fs-sm, 13px);
+    color: var(--fg2);
+    user-select: none;
+  }
+  .ai-group-head::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform var(--dur, 0.2s) var(--ease);
+  }
+  .ai-group-head.open::before { transform: rotate(90deg); }
+  .ai-group-head:hover { color: var(--fg); }
+  .ai-group-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 0 12px 12px;
+  }
 
   .stat-grid {
     display: grid;
@@ -3137,6 +3371,11 @@
     .set-nav-item {
       flex: 0 0 auto;
       white-space: nowrap;
+    }
+    /* 窄窗口下结果列表限高，避免撑高横向导航条。 */
+    .set-nav-results {
+      max-height: 40vh;
+      overflow-y: auto;
     }
     .set-content {
       padding: 16px 16px 20px;

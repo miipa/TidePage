@@ -377,6 +377,8 @@ export interface AiConfig {
   failover: boolean;
   /** 划词翻译/释义小窗提示词，{selection} 为选中文字 */
   quickPrompt: string;
+  /** AI 设置页三个分类的显示顺序（可在设置里拖拽排序）。id 取 AI_GROUPS。 */
+  groupOrder: string[];
 }
 
 // “关闭思考”功能已于 v0.1.24 后彻底移除（UI/发送链/存储三层都无残留）：
@@ -901,6 +903,23 @@ export function normSettingsOrder(v: any): string[] {
   return out;
 }
 
+/** AI 设置页三个分类 id（默认顺序：节点 → 窗口 → 提示词）。 */
+export const AI_GROUPS = ["node", "window", "prompt"] as const;
+export type AiGroup = (typeof AI_GROUPS)[number];
+
+/** 归一化 AI 分类顺序：过滤非法 id、去重，把缺失分类补到末尾（旧配置无 groupOrder 也不崩）。 */
+export function normAiGroupOrder(v: any): string[] {
+  const all = AI_GROUPS as readonly string[];
+  const out: string[] = [];
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      if (typeof x === "string" && all.includes(x) && !out.includes(x)) out.push(x);
+    }
+  }
+  for (const id of all) if (!out.includes(id)) out.push(id);
+  return out;
+}
+
 const DEFAULTS: AppConfig = {
   reader: {
     mode: "page",
@@ -1094,6 +1113,7 @@ p {
     failover: true,
     quickPrompt:
       "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
+    groupOrder: [...AI_GROUPS],
   },
   tts: {
     engine: "online",
@@ -1443,6 +1463,7 @@ function migrateAi(savedAi: any): AiConfig {
     ...(savedAi || {}),
     style: { ...structuredClone(DEFAULTS.ai.style), ...(savedAi?.style || {}) },
   } as AiConfig;
+  base.groupOrder = normAiGroupOrder(base.groupOrder);
   if (base.display !== "reader") base.display = "chat";
   stripReasoningArtifacts(base);
   const hasNew = Array.isArray(savedAi?.profiles) && savedAi.profiles.length;
@@ -1492,6 +1513,7 @@ function migrateAi(savedAi: any): AiConfig {
     style: structuredClone(DEFAULTS.ai.style),
     failover: savedAi?.failover ?? true,
     quickPrompt: savedAi?.quickPrompt ?? DEFAULTS.ai.quickPrompt,
+    groupOrder: normAiGroupOrder(savedAi?.groupOrder),
   };
 }
 
@@ -1907,6 +1929,7 @@ export function applyConfigJson(json: string) {
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
+    obj.ai.groupOrder = normAiGroupOrder(obj.ai.groupOrder);
     if (obj.ai.failover !== false) obj.ai.failover = true;
     obj.ai.active = Math.min(Math.max((obj.ai.active as number) | 0, 0), obj.ai.profiles.length - 1);
     stripReasoningArtifacts(obj.ai);
