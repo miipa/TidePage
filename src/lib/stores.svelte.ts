@@ -517,26 +517,32 @@ export const DEFAULT_PROMPTS: PromptItem[] = [
 
 export type TtsEngine = "system" | "online";
 
+/** 一条「语音服务配置档案」。对用户只暴露「一个服务地址」：后端按地址自动适配，
+ *  没有协议/类型选项。 */
+export interface TtsService {
+  /** 稳定唯一 id（用于渲染 key 与端点识别；旧配置迁移时补齐） */
+  id: number;
+  name: string;
+  /** 服务地址（后端按地址自动识别服务种类） */
+  baseUrl: string;
+  /** 密钥（本地服务可留空） */
+  apiKey: string;
+  /** 模型（如 tts-1 / omnivoice；留空由后端取默认） */
+  model: string;
+  /** 音色 / 参考音频路径（留空=服务端默认） */
+  voice: string;
+  /** 音频格式（wav/mp3/opus/aac/flac） */
+  format: string;
+}
+
 export interface TtsConfig {
   /** 朗读引擎：system=系统离线语音；online=在线神经语音 */
   engine: TtsEngine;
-  /** 在线语音来源：profile=复用 AI 端点；custom=自定义本地/远程 TTS 服务地址 */
-  onlineSource: "profile" | "custom";
-  /** 自定义 TTS 服务的接口协议：openai=OpenAI 兼容 /v1/audio/speech；dashscope=通义千问 Qwen-TTS；breeze=本地 Breeze-TTS-2 网关 */
-  customProvider: string;
-  /** 自定义 TTS 服务地址（OpenAI 兼容 /v1/audio/speech） */
-  customBaseUrl: string;
-  /** 自定义 TTS 服务密钥（本地服务可留空） */
-  customApiKey: string;
-  /** 在线语音使用的 AI 端点 id（0=使用当前端点） */
-  onlineProfileId: number;
-  /** 在线语音模型（如 tts-1 / gpt-4o-mini-tts） */
-  onlineModel: string;
-  /** 在线语音音色（固定音色 id；留空=服务端默认） */
-  onlineVoice: string;
-  /** 在线语音音频格式 */
-  onlineFormat: string;
-  /** 指定语音（voice.name 或 voiceURI），空=按语言自动选择 */
+  /** 在线语音服务配置档案列表（至少一条） */
+  services: TtsService[];
+  /** 当前使用的服务档案下标 */
+  activeService: number;
+  /** 指定语音（voice.name 或 voiceURI），空=按语言自动选择（系统语音用） */
   voice: string;
   /** 自动选择语音时的语言 */
   lang: string;
@@ -549,6 +555,73 @@ export interface TtsConfig {
   highlight: boolean;
   /** 定时停止（分钟，0=关闭） */
   sleepMinutes: number;
+}
+
+let ttsServiceIdSeq = 1;
+
+/** 补齐缺失/重复的服务 id，保证唯一稳定。 */
+export function ensureTtsServiceIds(list: TtsService[]): void {
+  let max = 0;
+  for (const s of list) {
+    if (typeof s.id === "number" && Number.isFinite(s.id) && s.id > max) max = s.id;
+  }
+  const used = new Set<number>();
+  for (const s of list) {
+    let id = s.id;
+    if (!Number.isFinite(id) || id <= 0 || used.has(id)) id = ++max;
+    used.add(id);
+    s.id = id;
+  }
+  if (max > ttsServiceIdSeq) ttsServiceIdSeq = max;
+}
+
+function nextTtsServiceId(): number {
+  return ++ttsServiceIdSeq;
+}
+
+/** 用默认字段模板补齐单条服务（新增字段缺失时用默认值，不丢用户已填内容）。 */
+export function normalizeTtsService(s: any): TtsService {
+  const src = s && typeof s === "object" ? s : {};
+  return {
+    id: typeof src.id === "number" && Number.isFinite(src.id) && src.id > 0 ? src.id : 0,
+    name: typeof src.name === "string" ? src.name : "",
+    baseUrl: typeof src.baseUrl === "string" ? src.baseUrl : "",
+    apiKey: typeof src.apiKey === "string" ? src.apiKey : "",
+    model: typeof src.model === "string" ? src.model : "",
+    voice: typeof src.voice === "string" ? src.voice : "",
+    format: typeof src.format === "string" && src.format ? src.format : "wav",
+  };
+}
+
+/** 生成不与现有服务重名的名称：优先「新服务」，否则「新服务2/3…」。 */
+export function uniqueTtsServiceName(list: TtsService[]): string {
+  const names = new Set(list.map((s) => (s.name || "").trim()));
+  if (!names.has("新服务")) return "新服务";
+  for (let n = 2; n < 100000; n++) {
+    const cand = `新服务${n}`;
+    if (!names.has(cand)) return cand;
+  }
+  return `新服务${Date.now()}`;
+}
+
+/** 干净的新服务档案：不复制上一条的地址与凭证。 */
+export function newTtsService(list: TtsService[]): TtsService {
+  return {
+    id: nextTtsServiceId(),
+    name: uniqueTtsServiceName(list),
+    baseUrl: "",
+    apiKey: "",
+    model: "",
+    voice: "",
+    format: "wav",
+  };
+}
+
+/** 当前生效的语音服务档案（越界时夹取到有效范围）。 */
+export function activeTtsService(): TtsService | null {
+  const list = config.tts.services;
+  if (!list || !list.length) return null;
+  return list[Math.min(Math.max(config.tts.activeService, 0), list.length - 1)] ?? list[0];
 }
 
 export interface LibraryConfig {
@@ -989,14 +1062,18 @@ p {
   },
   tts: {
     engine: "online",
-    onlineSource: "custom",
-    customProvider: "openai",
-    customBaseUrl: "http://127.0.0.1:3900",
-    customApiKey: "",
-    onlineProfileId: 0,
-    onlineModel: "omnivoice",
-    onlineVoice: "33aa3b77",
-    onlineFormat: "wav",
+    services: [
+      {
+        id: 1,
+        name: "默认语音服务",
+        baseUrl: "http://127.0.0.1:3900",
+        apiKey: "",
+        model: "omnivoice",
+        voice: "33aa3b77",
+        format: "wav",
+      },
+    ],
+    activeService: 0,
     voice: "Microsoft Kangkang - Chinese (Simplified, PRC)",
     lang: "zh-CN",
     rate: 1.4,
@@ -1383,35 +1460,68 @@ let reasoningMigrationDirty = false;
 let readerMigrationDirty = false;
 let ttsMigrationDirty = false;
 
+/** 语音服务配置档案的遗留扁平键（迁移后物理删除，避免导出的配置残留协议概念）。 */
+const LEGACY_TTS_KEYS = [
+  "onlineSource",
+  "onlineProfileId",
+  "customProvider",
+  "customBaseUrl",
+  "customApiKey",
+  "onlineModel",
+  "onlineVoice",
+  "onlineFormat",
+] as const;
+
 /**
- * 归一化 Breeze-TTS-2 网关地址：
- *  - 端口纠偏：上游 C++ 推理服务端口 8080 常被误当成网关地址，网关标准端口为
- *    7863（对外提供 /api/voices、/api/tts/clone）。仅在端口恰为 8080 时改为 7863。
- *  - 去掉 OpenAI 风格的 /v1 尾巴（网关用 /api 前缀，/v1 不适用）。
- * 仅当发生上述纠偏时返回新地址；否则原样返回，避免无谓改写用户输入。
+ * 迁移语音朗读配置到「服务配置档案」模型。
+ *  - 已含 services：逐条归一化并补齐 id。
+ *  - 仅含旧扁平字段：构造一条服务（地址/密钥/模型/音色/格式）；若旧来源是
+ *    「复用 AI 端点」，把当时引用的 AI 端点的地址/密钥/模型灌入该条。
+ *  - 一律删除遗留扁平键；对用户不丢地址/密钥/音色。
  */
-export function normalizeBreezeBaseUrl(raw: string): string {
-  const s = (raw || "").trim();
-  if (!s) return s;
-  const withScheme = /:\/\//.test(s) ? s : `http://${s}`;
-  try {
-    const u = new URL(withScheme);
-    let changed = false;
-    if (u.port === "8080") {
-      u.port = "7863";
-      changed = true;
+function migrateTts(savedTts: any, ai?: { profiles?: any[]; active?: number }): TtsConfig {
+  const base: any = { ...structuredClone(DEFAULTS.tts), ...(savedTts || {}) };
+  const hasServices = Array.isArray(savedTts?.services) && savedTts.services.length > 0;
+  if (hasServices) {
+    const list = savedTts.services.map((s: any) => normalizeTtsService(s));
+    ensureTtsServiceIds(list);
+    base.services = list;
+  } else {
+    const src = savedTts && typeof savedTts === "object" ? savedTts : {};
+    let baseUrl = typeof src.customBaseUrl === "string" ? src.customBaseUrl : "";
+    let apiKey = typeof src.customApiKey === "string" ? src.customApiKey : "";
+    let model = typeof src.onlineModel === "string" ? src.onlineModel : "";
+    let voice = typeof src.onlineVoice === "string" ? src.onlineVoice : "";
+    let format = typeof src.onlineFormat === "string" ? src.onlineFormat : "";
+    // 旧「复用 AI 端点」：把当时使用的 AI 端点灌入这条服务。
+    if (src.onlineSource === "profile") {
+      const list = Array.isArray(ai?.profiles) ? ai.profiles : [];
+      const idx = Math.min(Math.max(((ai?.active as number) | 0) || 0, 0), Math.max(list.length - 1, 0));
+      const p =
+        list.find((x: any) => x && x.id === src.onlineProfileId) ?? list[idx] ?? list[0];
+      if (p) {
+        baseUrl = typeof p.baseUrl === "string" ? p.baseUrl : baseUrl;
+        apiKey = typeof p.apiKey === "string" ? p.apiKey : apiKey;
+        if (!model) model = typeof p.model === "string" ? p.model : "";
+      }
     }
-    let path = u.pathname.replace(/\/+$/, "");
-    if (path.toLowerCase().endsWith("/v1")) {
-      path = path.slice(0, -3);
-      changed = true;
-    }
-    u.pathname = path;
-    if (!changed) return s;
-    return u.toString().replace(/\/+$/, "");
-  } catch {
-    return s;
+    const svc = normalizeTtsService({
+      id: 1,
+      name: "默认语音服务",
+      baseUrl: baseUrl || DEFAULTS.tts.services[0].baseUrl,
+      apiKey,
+      model,
+      voice,
+      format: format || "wav",
+    });
+    base.services = [svc];
   }
+  if (!base.services.length) {
+    base.services = [normalizeTtsService(structuredClone(DEFAULTS.tts.services[0]))];
+  }
+  base.activeService = Math.min(Math.max((base.activeService as number) | 0, 0), base.services.length - 1);
+  for (const k of LEGACY_TTS_KEYS) delete base[k];
+  return base as TtsConfig;
 }
 
 /** 归一化方案库：补齐 id/name，快照用默认配置兜底；空库时注入内置方案。 */
@@ -1466,6 +1576,9 @@ function load(): AppConfig {
     let indent = saved.reader?.indent;
     if (typeof indent === "boolean") indent = indent ? "2em" : "0em";
     if (indent == null) indent = "1em";
+    const migratedAi = migrateAi(saved.ai);
+    // 迁移：语音朗读由「扁平协议字段」改为「服务配置档案」；无 services 时需落盘一次。
+    if (!Array.isArray(saved.tts?.services) || !saved.tts.services.length) ttsMigrationDirty = true;
     const merged: AppConfig = {
       reader: {
         ...DEFAULTS.reader,
@@ -1486,8 +1599,8 @@ function load(): AppConfig {
       },
       library: { ...DEFAULTS.library, ...(saved.library || {}) },
       webdav: { ...DEFAULTS.webdav, ...saved.webdav },
-      ai: migrateAi(saved.ai),
-      tts: { ...DEFAULTS.tts, ...(saved.tts || {}) },
+      ai: migratedAi,
+      tts: migrateTts(saved.tts, migratedAi),
       regex: saved.regex ?? "",
       uiTheme: saved.uiTheme === "light" || saved.uiTheme === "dark" ? saved.uiTheme : "system",
       uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
@@ -1539,15 +1652,6 @@ function load(): AppConfig {
     }
     // 方案库首次为空时会注入内置方案：需要落盘一次，否则刷新前 localStorage 仍为空。
     if (!Array.isArray(saved.readerSchemes) || !saved.readerSchemes.length) readerMigrationDirty = true;
-    // 迁移：Breeze-TTS-2 网关地址纠偏（上游 8080 端口 → 网关 7863、去 /v1 尾巴），
-    // 修正历史误填导致「读不到音色 / unknown endpoint」。仅在协议为 breeze 时处理。
-    if (merged.tts.customProvider === "breeze") {
-      const fixed = normalizeBreezeBaseUrl(merged.tts.customBaseUrl);
-      if (fixed !== merged.tts.customBaseUrl) {
-        merged.tts.customBaseUrl = fixed;
-        ttsMigrationDirty = true;
-      }
-    }
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -1776,7 +1880,7 @@ export function applyConfigJson(json: string) {
     obj.ai.active = Math.min(Math.max((obj.ai.active as number) | 0, 0), obj.ai.profiles.length - 1);
     stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
-    obj.tts = { ...structuredClone(DEFAULTS.tts), ...(obj.tts || {}) };
+    obj.tts = migrateTts(obj.tts, obj.ai);
     obj.uiTheme = obj.uiTheme === "light" || obj.uiTheme === "dark" ? obj.uiTheme : "system";
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");

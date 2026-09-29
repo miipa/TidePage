@@ -1,4 +1,4 @@
-import { config, saveConfig, toast } from "./stores.svelte";
+import { activeTtsService, config, saveConfig, toast } from "./stores.svelte";
 import { api } from "./api";
 
 export interface FlatSegment {
@@ -221,95 +221,52 @@ function voiceLangMatches(voice: OnlineVoice, target: string): boolean {
   return l.startsWith(t.slice(0, 4));
 }
 
-/** 本次请求实际要发送的音色（固定音色的选择在朗读前由 ensureFixedVoice 完成）。 */
+/** 本次请求实际要发送的音色（当前服务档案的音色；固定音色的选择在朗读前由 ensureFixedVoice 完成）。 */
 export function effectiveOnlineVoice(): string {
-  return (config.tts.onlineVoice || "").trim();
+  return (activeTtsService()?.voice || "").trim();
 }
 
 interface TtsEndpoint {
-  provider: string;
   baseUrl: string;
   apiKey: string;
   model: string;
-  deployment: string;
-  apiVersion: string;
+  voice: string;
+  format: string;
   proxyMode: string;
   proxyUrl: string;
   tag: string;
 }
 
-/** 解析在线语音要用的端点：自定义地址，或某个 AI 端点。 */
+/** 解析在线语音要用的端点：当前语音服务配置档案。无地址返回 null。 */
 function resolveEndpoint(): TtsEndpoint | null {
-  if (config.tts.onlineSource === "custom") {
-    const base = (config.tts.customBaseUrl || "").trim();
-    if (!base) return null;
-    const provider = (config.tts.customProvider || "openai").trim() || "openai";
-    const defaultModel =
-      provider === "dashscope"
-        ? "qwen3-tts-flash"
-        : provider === "breeze"
-          ? "breeze-tts-2"
-          : "tts-1";
-    return {
-      provider,
-      baseUrl: base,
-      apiKey: config.tts.customApiKey || "",
-      model: config.tts.onlineModel || defaultModel,
-      deployment: "",
-      apiVersion: "",
-      proxyMode: "auto",
-      proxyUrl: "",
-      tag: `custom:${provider}:${base}`,
-    };
-  }
-  const list = config.ai.profiles;
-  if (!list.length) return null;
-  const p =
-    list.find((x) => x.id === config.tts.onlineProfileId) ??
-    list[Math.min(Math.max(config.ai.active, 0), list.length - 1)] ??
-    list[0];
-  if (!p) return null;
+  const s = activeTtsService();
+  if (!s) return null;
+  const base = (s.baseUrl || "").trim();
+  if (!base) return null;
   return {
-    provider: p.provider,
-    baseUrl: p.baseUrl,
-    apiKey: p.apiKey,
-    model: config.tts.onlineModel || p.model,
-    deployment: p.deployment,
-    apiVersion: p.apiVersion,
-    proxyMode: p.proxyMode,
-    proxyUrl: p.proxyUrl,
-    tag: `profile:${p.id}`,
+    baseUrl: base,
+    apiKey: s.apiKey || "",
+    model: (s.model || "").trim(),
+    voice: (s.voice || "").trim(),
+    format: s.format || "mp3",
+    proxyMode: "auto",
+    proxyUrl: "",
+    tag: `service:${s.id}:${base}`,
   };
 }
 
-/** 自定义源是否为 Breeze-TTS-2 本地网关（自建协议，音色即服务端克隆音色）。 */
-function isBreeze(): boolean {
-  return (
-    config.tts.onlineSource === "custom" &&
-    (config.tts.customProvider || "").trim().toLowerCase() === "breeze"
-  );
-}
-
-/** 自定义源且由服务端提供音色列表（OpenAI 兼容或 Breeze；DashScope 无音色列表接口）。 */
+/** 在线语音服务是否可用：引擎为在线且当前档案填了地址。 */
 function isCustomVoiceService(): boolean {
-  return (
-    config.tts.onlineSource === "custom" &&
-    (config.tts.customProvider || "openai").trim() !== "dashscope"
-  );
-}
-
-/** 支持服务端创建固定音色的协议（VoiceStudio 等）；Breeze 直接使用网关已保存的音色。 */
-function isCustomOpenAiLike(): boolean {
-  return isCustomVoiceService() && !isBreeze();
+  return config.tts.engine === "online" && !!(activeTtsService()?.baseUrl || "").trim();
 }
 
 function cacheKey(text: string): string {
   const ep = resolveEndpoint();
   return [
     ep?.tag ?? "none",
-    config.tts.onlineModel,
+    ep?.model ?? "",
     effectiveOnlineVoice(),
-    config.tts.onlineFormat,
+    ep?.format ?? "",
     text,
   ].join("\u0001");
 }
@@ -354,20 +311,17 @@ const loading = new Map<string, Promise<string>>();
 
 async function fetchAudio(text: string): Promise<string> {
   const ep = resolveEndpoint();
-  if (!ep) throw new Error("未配置在线语音端点");
-  const fmt = config.tts.onlineFormat || "mp3";
+  if (!ep) throw new Error("未配置语音服务");
+  const fmt = ep.format || "mp3";
   const b64 = await api.ttsSynth({
-    provider: ep.provider,
     baseUrl: ep.baseUrl,
     apiKey: ep.apiKey,
     model: ep.model,
-    deployment: ep.deployment,
-    apiVersion: ep.apiVersion,
-    proxyMode: ep.proxyMode,
-    proxyUrl: ep.proxyUrl,
     voice: effectiveOnlineVoice(),
     format: fmt,
     text,
+    proxyMode: ep.proxyMode,
+    proxyUrl: ep.proxyUrl,
   });
   return base64ToObjectUrl(b64);
 }
@@ -681,7 +635,9 @@ let voiceAutoFixed = false;
 
 /** 只选择「固定音色」，且语言必须匹配正文；绝不拿英文音色顶替中文。 */
 function selectFixedVoice(list: OnlineVoice[]) {
-  const cur = (config.tts.onlineVoice || "").trim();
+  const s = activeTtsService();
+  if (!s) return;
+  const cur = (s.voice || "").trim();
   const isAlias = !cur || OPENAI_VOICE_ALIASES.has(cur.toLowerCase());
   if (!isAlias) return;
   const profiles = list.filter((v) => v.type === "profile");
@@ -689,7 +645,7 @@ function selectFixedVoice(list: OnlineVoice[]) {
   const target = targetLanguageName();
   const match = profiles.find((v) => voiceLangMatches(v, target));
   if (!match) return; // 没有同语言固定音色：保持现状，由 ensureFixedVoice 创建
-  config.tts.onlineVoice = match.id;
+  s.voice = match.id;
   saveConfig();
   if (!voiceAutoFixed) {
     voiceAutoFixed = true;
@@ -711,34 +667,36 @@ let fixedVoicePromise: Promise<boolean> | null = null;
  * 不匹配语言时保持现状，避免以英文音色朗读中文。
  */
 async function ensureFixedVoice(): Promise<boolean> {
-  if (!isCustomOpenAiLike()) return false;
-  const cur = (config.tts.onlineVoice || "").trim();
+  if (!isCustomVoiceService()) return false;
+  const s = activeTtsService();
+  if (!s) return false;
+  const cur = (s.voice || "").trim();
   if (cur && !OPENAI_VOICE_ALIASES.has(cur.toLowerCase())) return true;
   const target = targetLanguageName();
   const match = ttsState.onlineVoices
     .filter((v) => v.type === "profile")
     .find((v) => voiceLangMatches(v, target));
   if (match) {
-    config.tts.onlineVoice = match.id;
+    s.voice = match.id;
     saveConfig();
     return true;
   }
-  const voiceStudioLike = ttsState.onlineVoices.some(
-    (v) => v.type === "openai_alias" || v.type === "profile"
-  );
+  // 仅当服务暴露 OpenAI 别名（VoiceStudio 这类支持 design profile 的服务）时才现场创建，
+  // 避免对不支持创建固定音色的服务（如本地克隆网关）发出无效请求。
+  const voiceStudioLike = ttsState.onlineVoices.some((v) => v.type === "openai_alias");
   if (!voiceStudioLike || !DESIGNABLE_LANGS.has(target)) return false;
   if (!fixedVoicePromise) {
     fixedVoicePromise = (async () => {
       try {
-        const base = (config.tts.customBaseUrl || "").trim();
+        const base = (s.baseUrl || "").trim();
         const res = await api.ttsEnsureFixedVoice(
           base,
-          config.tts.customApiKey || "",
+          s.apiKey || "",
           target,
           FIXED_VOICE_INSTRUCT,
         );
         await refreshOnlineVoices();
-        config.tts.onlineVoice = res.id;
+        s.voice = res.id;
         saveConfig();
         if (res.created) {
           toast(`已为${target === "Chinese" ? "中文" : target}创建固定音色，整章将保持同一说话人`);
@@ -760,18 +718,15 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
     ttsState.onlineVoices = [];
     return [];
   }
-  const base = (config.tts.customBaseUrl || "").trim();
+  const s = activeTtsService();
+  const base = (s?.baseUrl || "").trim();
   if (!base) {
     ttsState.onlineVoices = [];
     return [];
   }
   ttsState.onlineVoiceLoading = true;
   try {
-    const list = await api.ttsVoices(
-      base,
-      config.tts.customApiKey || "",
-      config.tts.customProvider || "openai",
-    );
+    const list = await api.ttsVoices(base, s?.apiKey || "");
     ttsState.onlineVoices = list;
     ttsState.onlineVoiceError = list.length ? "" : "服务未返回音色列表";
     selectFixedVoice(list);

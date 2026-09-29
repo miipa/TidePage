@@ -4,7 +4,7 @@
     config,
     saveConfig,
     saveConfigNow,
-    normalizeBreezeBaseUrl,
+    newTtsService,
     THEMES,
     toast,
     ui,
@@ -366,38 +366,44 @@
     ttsVoiceList.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
 
-  async function loadTtsVoices() {
-    if (config.tts.onlineSource !== "custom") return;
-    // Breeze 网关地址纠偏（上游 8080 → 网关 7863、去 /v1 尾巴），读取前顺手修正。
-    if (config.tts.customProvider === "breeze") {
-      const fixed = normalizeBreezeBaseUrl(config.tts.customBaseUrl);
-      if (fixed !== config.tts.customBaseUrl) {
-        config.tts.customBaseUrl = fixed;
-        saveConfig();
-      }
+  /** 当前语音服务档案。 */
+  const tsvc = $derived(
+    config.tts.services[Math.min(config.tts.activeService, config.tts.services.length - 1)] ??
+      config.tts.services[0]
+  );
+
+  function addTtsService() {
+    const list = config.tts.services;
+    list.push(newTtsService(list));
+    config.tts.activeService = list.length - 1;
+    saveConfigNow();
+    loadTtsVoices();
+  }
+
+  function delTtsService() {
+    const list = config.tts.services;
+    if (list.length <= 1) {
+      toast("至少保留一个语音服务", "error");
+      return;
     }
+    const i = Math.min(Math.max(config.tts.activeService, 0), list.length - 1);
+    list.splice(i, 1);
+    config.tts.activeService = Math.max(0, Math.min(i, list.length - 1));
+    saveConfigNow();
+    loadTtsVoices();
+  }
+
+  async function loadTtsVoices() {
+    const s = tsvc;
+    if (!s || !(s.baseUrl || "").trim()) return;
     ttsVoiceLoading = true;
     ttsVoiceMsg = "";
     try {
       // 列表同时写入 ttsState.onlineVoices，供阅读界面播放条复用。
       ttsVoiceList = await refreshOnlineVoices();
-      const nProfile = ttsVoiceList.filter((v) => v.type === "profile").length;
-      if (ttsVoiceList.length) {
-        ttsVoiceMsg = `共 ${ttsVoiceList.length} 个音色，其中固定音色 ${nProfile} 个；固定音色可保证整章说话人一致`;
-      } else {
-        const err = ttsState.onlineVoiceError || "服务未返回音色列表";
-        const hint =
-          config.tts.customProvider === "breeze"
-            ? "；请确认服务地址填的是网关根地址（默认 http://127.0.0.1:7863），而非上游推理端口 8080"
-            : /404|未找到|未返回/.test(err)
-              ? "；若为 Breeze-TTS-2 网关，请将「接口协议」改为 Breeze-TTS-2 本地网关"
-              : "";
-        ttsVoiceMsg = `读取音色失败：${err}${hint}`;
-      }
-      if (ttsVoiceList.length && !config.tts.onlineVoice) {
-        config.tts.onlineVoice = ttsVoiceList[0].id;
-        saveConfig();
-      }
+      ttsVoiceMsg = ttsVoiceList.length
+        ? `共 ${ttsVoiceList.length} 个音色`
+        : "该服务不支持音色列表，请手动填写音色名";
     } finally {
       ttsVoiceLoading = false;
     }
@@ -405,10 +411,9 @@
 
   $effect(() => {
     if (tab !== "tts") return;
-    // 依赖协议与地址：切换后自动重新读取音色。
-    void config.tts.onlineSource;
-    void config.tts.customProvider;
-    void config.tts.customBaseUrl;
+    // 依赖当前档案与地址：切换服务或改地址后自动重新读取音色。
+    void config.tts.activeService;
+    void tsvc?.baseUrl;
     loadTtsVoices();
   });
 
@@ -1583,74 +1588,54 @@
       <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast("已恢复默认"); }}>恢复默认</button>
     </div>
   {:else if tab === "tts"}
-    <p class="tip">
-      集中管理「语音朗读」的全部设置，与 AI 助手设置相互独立。系统语音离线可用；在线语音更自然，可接入 OpenAI 兼容服务、通义千问 Qwen-TTS 或本地 Breeze-TTS-2 网关。
-    </p>
-
     <div class="field">
       <label>朗读引擎</label>
       <select bind:value={config.tts.engine} onchange={saveConfig}>
         <option value="system">系统语音</option>
         <option value="online">在线语音</option>
       </select>
-      <p class="tip">系统语音离线可用，使用 Windows 语音；在线语音更自然，需一个语音合成服务。</p>
     </div>
 
     {#if config.tts.engine === "online"}
       <div class="field">
-        <label>语音服务来源</label>
-        <select bind:value={config.tts.onlineSource} onchange={saveConfig}>
-          <option value="custom">自定义服务地址</option>
-          <option value="profile">复用 AI 端点</option>
-        </select>
-      </div>
-
-      {#if config.tts.onlineSource === "custom"}
-        <div class="field">
-          <label>接口协议</label>
-          <select bind:value={config.tts.customProvider} onchange={saveConfig}>
-            <option value="openai">OpenAI 兼容（/v1/audio/speech）</option>
-            <option value="dashscope">通义千问 Qwen-TTS（DashScope）</option>
-            <option value="breeze">Breeze-TTS-2 本地网关</option>
-          </select>
-          <p class="tip">
-            OpenAI 兼容：适用于提供 <code>/v1/audio/speech</code> 的服务（VoiceStudio、VoxCPM、GPT-SoVITS、OpenAI 等）；
-            通义千问：阿里云百炼云端 Qwen-TTS，服务地址填 <code>https://dashscope.aliyuncs.com</code>；
-            Breeze-TTS-2：本地网关，服务地址填网关根地址（如 <code>http://127.0.0.1:7863</code>），音色读取网关中已保存的克隆音色。
-          </p>
-        </div>
-        <div class="grid2">
-          <div class="field">
-            <label>服务地址</label>
-            <input bind:value={config.tts.customBaseUrl} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "https://dashscope.aliyuncs.com" : config.tts.customProvider === "breeze" ? "http://127.0.0.1:7863" : "http://127.0.0.1:8000"} title="OpenAI 兼容填 /v1/audio/speech 服务地址；通义千问填 DashScope 根地址；Breeze-TTS-2 填网关根地址" />
-          </div>
-          <div class="field">
-            <label>密钥</label>
-            <input type="password" bind:value={config.tts.customApiKey} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "DashScope API Key (sk-...)" : "本地服务可留空"} title="本地服务可留空；通义千问必填 DashScope API Key" />
-          </div>
-        </div>
-      {:else}
-        <div class="field">
-          <label>使用端点</label>
-          <select bind:value={config.tts.onlineProfileId} onchange={saveConfig}>
-            <option value={0}>当前 AI 端点</option>
-            {#each config.ai.profiles as p (p.id)}
-              <option value={p.id}>{p.name || `端点 ${p.id}`}</option>
+        <label>语音服务</label>
+        <div class="row-inline">
+          <select bind:value={config.tts.activeService} onchange={saveConfig}>
+            {#each config.tts.services as s, i (s.id)}
+              <option value={i}>{s.name || `服务${i + 1}`}</option>
             {/each}
           </select>
+          <button class="icon" title="新增语音服务" onclick={addTtsService}>＋ 新增</button>
+          <button class="icon" title="删除当前语音服务" onclick={delTtsService}>✕ 删除</button>
         </div>
-      {/if}
+      </div>
 
       <div class="grid2">
         <div class="field">
-          <label>语音模型</label>
-          <input bind:value={config.tts.onlineModel} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "qwen3-tts-flash" : config.tts.customProvider === "breeze" ? "breeze-tts-2" : "tts-1"} title="OpenAI 兼容填服务端模型名；通义千问填 qwen3-tts-flash；Breeze-TTS-2 填 breeze-tts-2" />
+          <label>名称</label>
+          <input bind:value={tsvc.name} onchange={saveConfig} placeholder="语音服务" />
         </div>
         <div class="field">
+          <label>服务地址</label>
+          <input bind:value={tsvc.baseUrl} onchange={saveConfig} placeholder="https://… 或 http://127.0.0.1:8000" title="填服务地址即可，自动识别服务类型" />
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label>密钥</label>
+          <input type="password" bind:value={tsvc.apiKey} onchange={saveConfig} placeholder="本地服务可留空" />
+        </div>
+        <div class="field">
+          <label>模型</label>
+          <input bind:value={tsvc.model} onchange={saveConfig} placeholder="留空自动" />
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
           <label>音色</label>
-          {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope"}
-            <div class="row-inline">
-              <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
+          <div class="row-inline">
+            {#if ttsVoiceList.length}
+              <select bind:value={tsvc.voice} onchange={saveConfig}>
                 <option value="">默认</option>
                 {#if ttsVoiceProfiles.length}
                   <optgroup label="固定音色">
@@ -1667,20 +1652,15 @@
                   </optgroup>
                 {/if}
               </select>
-              <button onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
-            </div>
-          {:else}
-            <input bind:value={config.tts.onlineVoice} onchange={saveConfig} placeholder={config.tts.customProvider === "dashscope" ? "如 Cherry / Ethan" : "如 tts-1 / 音色名"} />
-          {/if}
+            {:else}
+              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder="音色名/参考音频路径，留空默认" />
+            {/if}
+            <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
+          </div>
         </div>
-      </div>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider !== "dashscope" && ttsVoiceMsg}
-        <p class="tip">{ttsVoiceMsg}</p>
-      {/if}
-      {#if config.tts.customProvider !== "breeze"}
         <div class="field">
           <label>音频格式</label>
-          <select bind:value={config.tts.onlineFormat} onchange={saveConfig} title="本地 VoxCPM 服务请选 wav">
+          <select bind:value={tsvc.format} onchange={saveConfig}>
             <option value="wav">wav</option>
             <option value="mp3">mp3</option>
             <option value="opus">opus</option>
@@ -1688,24 +1668,9 @@
             <option value="flac">flac</option>
           </select>
         </div>
-      {/if}
-      <p class="tip">
-        OpenAI 兼容需目标服务提供 <code>/v1/audio/speech</code>（OpenAI、Azure OpenAI、vLLM-Omni 的 VoxCPM、GPT-SoVITS 封装等）；
-        通义千问走 DashScope 云端 <code>qwen3-tts-flash</code>；Breeze-TTS-2 走本地网关 <code>/api/tts/clone</code> 克隆音色。
-        某句失败会自动回退系统语音；语速映射为播放速度，音调对在线语音无效。
-      </p>
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "openai"}
-        <p class="tip">
-          使用零样本克隆引擎（如 VoiceStudio + OmniVoice）时，OpenAI 别名（alloy/echo/…）没有固定说话人，
-          逐句请求结果可能不一致。请选择「固定音色」（<code>type=profile</code>）；若列表中没有与正文语言一致的固定音色，
-          朗读时会自动创建一个「FlowRead 中文音色」并固定使用，避免以英文音色朗读中文。
-        </p>
-      {/if}
-      {#if config.tts.onlineSource === "custom" && config.tts.customProvider === "breeze"}
-        <p class="tip">
-          Breeze-TTS-2 使用本地网关中已保存的克隆音色，选择音色后整章保持同一说话人；
-          网关无已保存音色时请先在服务端创建。
-        </p>
+      </div>
+      {#if ttsVoiceMsg}
+        <p class="tip">{ttsVoiceMsg}</p>
       {/if}
     {:else if !ttsState.supported}
       <p class="tip" style="color:var(--danger)">当前环境不支持系统语音朗读。</p>
@@ -1762,9 +1727,6 @@
       <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
       <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
     </div>
-    <p class="tip">
-      在阅读界面点「▶」开始朗读：优先从选中文字开始，否则从当前屏幕顶部开始；播放条可暂停/继续、上一句/下一句、停止，并可设置定时停止与语速。
-    </p>
   {:else if tab === "webdav"}
     <div class="checks" style="margin-bottom:12px">
       <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>

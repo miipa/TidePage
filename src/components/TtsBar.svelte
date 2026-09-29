@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { config, saveConfig, toast } from "../lib/stores.svelte";
+  import { activeTtsService, config, saveConfig, toast } from "../lib/stores.svelte";
   import {
     refreshOnlineVoices,
     refreshVoices,
@@ -31,9 +31,11 @@
   const onlineVoiceOthers = $derived(
     onlineVoices.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
+  // 当前语音服务档案（无档案时退回第一条）。
+  const onlineSvc = $derived(activeTtsService() ?? config.tts.services[0]);
 
   $effect(() => {
-    if (expanded && config.tts.engine === "online" && config.tts.onlineSource === "custom") {
+    if (expanded && config.tts.engine === "online" && (onlineSvc?.baseUrl || "").trim()) {
       void refreshOnlineVoices();
     }
   });
@@ -102,7 +104,7 @@
       <div class="tb-row">
         <label>{config.tts.engine === "online" ? "音色" : "语音"}</label>
         {#if config.tts.engine === "online"}
-          <select bind:value={config.tts.onlineVoice} onchange={saveConfig}>
+          <select bind:value={onlineSvc.voice} onchange={saveConfig}>
             <option value="">默认</option>
             {#if onlineVoiceProfiles.length}
               <optgroup label="固定音色">
@@ -119,14 +121,12 @@
               </optgroup>
             {/if}
           </select>
-          {#if config.tts.onlineSource === "custom"}
-            <button
-              class="tb-mini"
-              title="从服务读取音色"
-              onclick={() => refreshOnlineVoices()}
-              disabled={ttsState.onlineVoiceLoading}
-            >{ttsState.onlineVoiceLoading ? "…" : "↻"}</button>
-          {/if}
+          <button
+            class="tb-mini"
+            title="从服务读取音色"
+            onclick={() => refreshOnlineVoices()}
+            disabled={ttsState.onlineVoiceLoading}
+          >{ttsState.onlineVoiceLoading ? "…" : "↻"}</button>
         {:else}
           <select bind:value={config.tts.voice} onchange={saveConfig}>
             <option value="">自动</option>

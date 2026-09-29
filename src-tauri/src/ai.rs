@@ -987,6 +987,192 @@ pub async fn stream_chat(
 
 /* ============================ 在线语音合成（TTS） ============================ */
 
+/// 语音服务的适配方式。对外没有「协议」概念——仅由服务地址自动识别，
+/// 用户只填一个地址即可。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Adapter {
+    /// OpenAI 兼容 `/v1/audio/speech`（VoiceStudio、Kokoro、LocalAI、speaches、voxcpm 等）
+    OpenAi,
+    /// 阿里云百炼 / DashScope 通义千问 Qwen-TTS
+    DashScope,
+    /// 本地 Breeze-TTS-2 克隆网关（`/api/voices` + `/api/tts/clone`）
+    Breeze,
+    /// GPT-SoVITS 原生 `/tts`
+    GptSoVits,
+    /// Azure OpenAI（部署名在地址或 model 中）
+    Azure,
+    /// MiniMax 语音
+    MiniMax,
+    /// Fish Audio
+    Fish,
+}
+
+/// 适配结果缓存：key = `{base}\n{key}`，避免逐句探测。
+fn tts_adapter_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Adapter>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Adapter>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cache_get_adapter(key: &str) -> Option<Adapter> {
+    tts_adapter_cache().lock().ok().and_then(|m| m.get(key).copied())
+}
+
+fn cache_put_adapter(key: String, a: Adapter) {
+    if let Ok(mut m) = tts_adapter_cache().lock() {
+        m.insert(key, a);
+    }
+}
+
+/// 拆分地址为 (host, path)，均转小写。host 去 userinfo 与端口（IPv6 字面量除外）。
+fn split_host_path(base: &str) -> (String, String) {
+    let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if host_port.starts_with('[') {
+        host_port.to_string()
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+            .to_string()
+    };
+    (host.to_ascii_lowercase(), path.to_ascii_lowercase())
+}
+
+/// 本机 / 私有网段地址：这类服务一律直连，避免系统代理拦截局域网地址。
+fn is_local_host(host: &str) -> bool {
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    if host.starts_with("10.") || host.starts_with("192.168.") {
+        return true;
+    }
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second) = rest.split('.').next().and_then(|x| x.parse::<u8>().ok()) {
+            return (16..=31).contains(&second);
+        }
+    }
+    false
+}
+
+/// 语音服务的根地址：去尾斜杠，并容忍 OpenAI 风格的 `/v1` 尾巴。
+fn tts_root(base: &str) -> String {
+    let b = strip_trailing_slash(base);
+    match b.strip_suffix("/v1") {
+        Some(s) if !s.is_empty() => s.trim_end_matches('/').to_string(),
+        _ => b.to_string(),
+    }
+}
+
+/// 本机 / 局域网地址用直连客户端探测，其余沿用调用方客户端（可走代理）。
+fn tts_local_client(http: &reqwest::Client, base: &str) -> reqwest::Client {
+    let (host, _) = split_host_path(base);
+    if is_local_host(&host) {
+        build_client("direct", "").unwrap_or_else(|_| http.clone())
+    } else {
+        http.clone()
+    }
+}
+
+async fn http_get_ok(http: &reqwest::Client, url: &str, api_key: &str) -> bool {
+    let mut req = http.get(url).timeout(Duration::from_secs(6));
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    matches!(req.send().await, Ok(r) if r.status().is_success())
+}
+
+async fn http_get_text(http: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().await.ok()
+}
+
+/// 按地址识别适配方式：先按域名特征判断远程服务，其余（本地/无法识别的公网地址）
+/// 按顺序探测 本地克隆网关 → GPT-SoVITS → OpenAI 兼容，最后兜底 OpenAI 兼容。
+async fn detect_adapter(http: &reqwest::Client, base: &str, api_key: &str) -> Adapter {
+    let lower = base.to_ascii_lowercase();
+    let (host, path) = split_host_path(base);
+    if lower.contains("dashscope.aliyuncs.com") || lower.contains("bailian") {
+        return Adapter::DashScope;
+    }
+    if host.ends_with(".openai.azure.com")
+        || path.contains("/openai/deployments/")
+        || path.contains("/openai/v1")
+    {
+        return Adapter::Azure;
+    }
+    if lower.contains("api.minimax.io")
+        || lower.contains("api.minimaxi.com")
+        || lower.contains("api.minimax.chat")
+    {
+        return Adapter::MiniMax;
+    }
+    if lower.contains("api.fish.audio") {
+        return Adapter::Fish;
+    }
+    let root = tts_root(base);
+    // a. 本地克隆网关
+    for r in breeze_root_candidates(&root) {
+        if http_get_ok(http, &format!("{r}/api/voices"), api_key).await {
+            return Adapter::Breeze;
+        }
+    }
+    // b. GPT-SoVITS 原生 /tts
+    if let Some(body) = http_get_text(http, &format!("{root}/openapi.json")).await {
+        if body.contains("\"/tts\"") {
+            return Adapter::GptSoVits;
+        }
+    }
+    // c. OpenAI 兼容
+    let v1root = ensure_v1(&root);
+    for url in [
+        format!("{v1root}/audio/voices"),
+        format!("{v1root}/voices"),
+        format!("{v1root}/models"),
+    ] {
+        if http_get_ok(http, &url, api_key).await {
+            return Adapter::OpenAi;
+        }
+    }
+    // d. 兜底
+    Adapter::OpenAi
+}
+
+async fn resolve_adapter(http: &reqwest::Client, base: &str, api_key: &str) -> Adapter {
+    let key = format!("{base}\n{api_key}");
+    if let Some(a) = cache_get_adapter(&key) {
+        return a;
+    }
+    let a = detect_adapter(http, base, api_key).await;
+    cache_put_adapter(key, a);
+    a
+}
+
+/// 发起合成请求并按音频字节返回（非 2xx 转结构化错误）。
+async fn post_audio(req: reqwest::RequestBuilder) -> Result<Vec<u8>, AiError> {
+    let resp = req.send().await.map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        let brief: String = msg.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    if bytes.is_empty() {
+        return Err(AiError::protocol("语音接口返回空音频"));
+    }
+    Ok(bytes.to_vec())
+}
+
 #[derive(serde::Serialize)]
 struct TtsBody {
     model: String,
