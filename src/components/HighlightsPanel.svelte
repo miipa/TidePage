@@ -16,7 +16,7 @@
     bookId: number;
     version?: number;
     onjump: (h: HighlightRow) => void;
-    onclose: () => void;
+    onclose?: () => void;
     onchanged: () => void;
     onpopout?: () => void;
   } = $props();
@@ -91,7 +91,7 @@
     <span>划线 / 批注</span>
     <div style="display:flex; gap:6px; align-items:center;">
       {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      <button class="icon" title="关闭" onclick={onclose}>×</button>
+      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="sp-search">

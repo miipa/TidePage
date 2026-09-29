@@ -272,6 +272,15 @@
     return () => ro.disconnect();
   });
 
+  // 顶栏实测高度写入全局 CSS 变量：供固定在右上角的 WindowControls 让自身高度=顶栏高度，
+  // 按钮垂直居中即与顶栏图标中心线重合，自动对齐（顶栏换行等高度变化时跟随更新）。
+  let tbH = $state(0);
+  $effect(() => {
+    if (tbH > 0) {
+      document.documentElement.style.setProperty("--fr-titlebar-h", tbH + "px");
+    }
+  });
+
   let ctxMenu = $state<{ x: number; y: number; book: BookRow } | null>(null);
   let ctxEl: HTMLDivElement | undefined = $state();
   let ctxPos = $state({ left: 0, top: 0 });
@@ -1031,7 +1040,7 @@
 </script>
 
 <div class="library" onpointerdown={onPtrDown} onpointerup={onPtrUp}>
-  <div class="toolbar">
+  <div class="toolbar" data-tauri-drag-region bind:clientHeight={tbH}>
     <span class="logo">FlowRead</span>
     <button class="primary" onclick={addFolder}>＋ 添加文件夹</button>
     <div class="refresh-wrap">
@@ -1071,7 +1080,7 @@
         </button>
       {/if}
     </div>
-    <div class="spacer"></div>
+    <div class="spacer" data-tauri-drag-region></div>
     <div class="lib-tb-group" use:dragSort={{ onDrop: libDrop }}>
       {#each orderedLibBtns as b (b.id)}
         {@const Icon = b.icon}
@@ -1295,6 +1304,8 @@
     align-items: center;
     gap: var(--sp-2, 8px);
     padding: var(--sp-3, 12px) var(--sp-4, 16px);
+    /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
+    padding-right: 112px;
     background: var(--panel);
     border-bottom: 1px solid var(--line);
     box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02), 0 6px 16px -12px rgba(23, 25, 30, 0.35);

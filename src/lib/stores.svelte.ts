@@ -2126,6 +2126,7 @@ export async function openAiWindow(): Promise<boolean> {
         minWidth: 300,
         minHeight: 260,
         center: true,
+        decorations: false, // 无原生标题栏：与主窗口一致，改用前端自绘窗口控制
         ...extra,
       });
       win.once("tauri://created", () => {
@@ -2181,6 +2182,7 @@ export async function openPanelWindow(panel: PanelKind, bookId: number, title: s
         minWidth: 300,
         minHeight: 260,
         center: true,
+        decorations: false, // 无原生标题栏：与主窗口一致，改用前端自绘窗口控制
         ...extra,
       });
       win.once("tauri://created", () => resolve(true));
@@ -2273,6 +2275,7 @@ export async function openBookInNewWindow(
       minHeight: 480,
       center: true,
       visible: true,
+      decorations: false, // 无原生标题栏：与主窗口一致，改用前端自绘窗口控制
       ...extra,
     });
     ww.once("tauri://error", () => {

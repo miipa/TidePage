@@ -24,17 +24,12 @@
   let curChapter = $state(0);
   let bookmarks: BookmarkRow[] = $state([]);
   let hlVersion = $state(0); // ② 实时刷新：主窗改动 → 本地 version++ 触发 HighlightsPanel 重载
+  let statsVersion = $state(0); // 统计实时刷新：主窗 flushSession → version++ 触发 BookStatsModal 重载
 
   let unHl: UnlistenFn | null = null;
-
-  async function closeWin() {
-    try {
-      const m = await import("@tauri-apps/api/window");
-      await m.getCurrentWindow().close();
-    } catch {
-      try { window.close(); } catch { /* ignore */ }
-    }
-  }
+  let unChap: UnlistenFn | null = null;
+  let unBm: UnlistenFn | null = null;
+  let unStats: UnlistenFn | null = null;
 
   async function loadTitle() {
     try {
@@ -42,6 +37,11 @@
       title = rows?.[0]?.title ?? "";
     } catch { /* ignore */ }
   }
+
+  // 本窗顶部标题栏固定 40px：写入全局变量让右上角 WindowControls 高度=40px、按钮垂直居中对齐。
+  onMount(() => {
+    document.documentElement.style.setProperty("--fr-titlebar-h", "40px");
+  });
 
   onMount(async () => {
     if (panel === "toc") {
@@ -52,19 +52,38 @@
         const p = await api.loadProgress(bookId);
         curChapter = p?.chapter_index ?? 0;
       } catch { /* ignore */ }
+      // 订阅主窗“当前章变化”广播：仅本窗对应 book 生效，TocPanel 会据 current 自动定位/高亮。
+      unChap = await listen<{ bookId: number; index: number }>("flowread-chapter-changed", (e) => {
+        if (e.payload?.bookId === bookId && typeof e.payload.index === "number") {
+          curChapter = e.payload.index;
+        }
+      });
     } else if (panel === "bookmarks") {
       await loadTitle();
       try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
+      // 订阅主窗书签增删：仅本窗对应 book 生效，重新拉取列表。
+      unBm = await listen<{ bookId: number }>("flowread-bookmarks-changed", async (e) => {
+        if (e.payload?.bookId === bookId) {
+          try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
+        }
+      });
     } else if (panel === "highlights") {
       await loadTitle();
       unHl = await listen("flowread-hl-changed", () => { hlVersion++; }); // ② 订阅主窗广播
     } else if (panel === "stats") {
       await loadTitle();
+      // 订阅主窗阅读会话刷新：仅本窗对应 book 生效，version++ 触发 BookStatsModal 重载。
+      unStats = await listen<{ bookId: number }>("flowread-stats-changed", (e) => {
+        if (e.payload?.bookId === bookId) statsVersion++;
+      });
     }
   });
 
   onDestroy(() => {
     unHl?.();
+    unChap?.();
+    unBm?.();
+    unStats?.();
   });
 
   function gotoChapter(index: number) {
@@ -76,11 +95,14 @@
 </script>
 
 <div class="panel-window-root">
+  <!-- 顶部标题栏：无边框窗口的拖拽区（空白处拖动、双击最大化/还原）；
+       右上角自绘窗口控制按钮浮于其上。面板内容整体下移让开这条 40px 的标题栏。 -->
+  <div class="win-titlebar" data-tauri-drag-region></div>
   {#if panel === "toc"}
-    <TocPanel {toc} current={curChapter} onpick={(i) => gotoChapter(i)} onclose={closeWin} />
+    <TocPanel {toc} current={curChapter} onpick={(i) => gotoChapter(i)} />
   {:else if panel === "bookmarks"}
     <div class="sidepanel">
-      <div class="sp-head"><span>书签{title ? ` · ${title}` : ""}</span><button class="icon" title="关闭" onclick={closeWin}>×</button></div>
+      <div class="sp-head"><span>书签{title ? ` · ${title}` : ""}</span></div>
       <div class="sp-list">
         {#each bookmarks as bm (bm.id)}
           <div class="sp-item bm-item">
@@ -95,11 +117,11 @@
       </div>
     </div>
   {:else if panel === "highlights"}
-    <HighlightsPanel {bookId} version={hlVersion} onjump={gotoHighlight} onclose={closeWin} onchanged={() => {}} />
+    <HighlightsPanel {bookId} version={hlVersion} onjump={gotoHighlight} onchanged={() => {}} />
   {:else if panel === "stats"}
-    <BookStatsModal {bookId} bookTitle={title} onclose={closeWin} />
+    <BookStatsModal {bookId} bookTitle={title} version={statsVersion} />
   {:else if panel === "notes"}
-    <NotesPanel />
+    <NotesPanel standalone />
   {:else}
     <div class="pw-empty">未知面板：{panel}</div>
   {/if}
@@ -114,14 +136,32 @@
     overflow: hidden;
   }
 
-  /* 独立窗内的 sidepanel 铺满整窗（覆盖组件内 position:absolute 的右侧贴边定位） */
+  /* 无边框窗口顶部标题栏拖拽区：z-index 高于面板内容(40)、低于窗口控制按钮(100000) */
+  .win-titlebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    z-index: 50;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* 独立窗内的 sidepanel 铺满整窗（覆盖组件内 position:absolute 的右侧贴边定位）；
+     顶部下移 40px 让开标题栏与窗口控制按钮，避免遮挡各面板自己的头部与关闭按钮。 */
   .panel-window-root :global(.sidepanel) {
     position: absolute;
-    inset: 0;
+    inset: 40px 0 0 0;
     width: 100%;
     border: none;
     box-shadow: none;
     animation: none;
+  }
+
+  /* 笔记面板（NotesPanel 根 .nl 为 fixed inset:0）同样下移 40px。 */
+  .panel-window-root :global(.nl) {
+    top: 40px;
   }
 
   .sidepanel {

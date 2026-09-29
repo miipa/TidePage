@@ -1185,9 +1185,12 @@ pub fn add_stats(conn: &Connection, book_id: i64, seconds: i64) -> Result<(), St
 }
 
 pub fn start_session(conn: &Connection, book_id: i64) -> Result<i64, String> {
+    // day 用 SQLite 本地日期 date('now','localtime')，与 get_stats 查询口径一致，
+    // 避免东八区等地在本地凌晨的阅读被 UTC 记到错误日期（原 day_string() 为 UTC）。
     conn.execute(
-        "INSERT INTO reading_sessions(book_id, day, started_at, seconds, chars) VALUES(?1,?2,?3,0,0)",
-        params![book_id, day_string(), now_ms()],
+        "INSERT INTO reading_sessions(book_id, day, started_at, seconds, chars)
+         VALUES(?1, date('now','localtime'), ?2, 0, 0)",
+        params![book_id, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())

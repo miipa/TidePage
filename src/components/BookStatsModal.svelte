@@ -4,18 +4,19 @@
   import { dragOutHandle } from "../lib/windowSnap";
   import type { BookSession } from "../lib/types";
 
-  let { bookId, bookTitle, onclose, onpopout }: {
+  let { bookId, bookTitle, onclose, onpopout, version = 0 }: {
     bookId: number;
     bookTitle: string;
-    onclose: () => void;
+    onclose?: () => void;
     onpopout?: () => void;
+    version?: number;
   } = $props();
 
   let sessions: BookSession[] = $state([]);
   let loaded = $state(false);
   let wc = $state<{ total: number; pure: number } | null>(null);
 
-  onMount(async () => {
+  async function load() {
     try {
       sessions = await api.getBookSessions(bookId);
     } catch { /* ignore */ }
@@ -23,6 +24,13 @@
       wc = await api.bookWordCount(bookId);
     } catch { /* ignore */ }
     loaded = true;
+  }
+
+  onMount(load);
+
+  // 独立“统计”窗口：主窗口 flushSession 后 version++ 触发重载（内嵌调用不传 version，仅首挂载加载）。
+  $effect(() => {
+    if (version > 0) void load();
   });
 
   interface DayGroup {
@@ -82,7 +90,7 @@
     <span>本书统计</span>
     <div style="display:flex; gap:6px; align-items:center;">
       {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      <button class="icon" title="关闭" onclick={onclose}>×</button>
+      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="stats-body">

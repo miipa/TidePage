@@ -14,6 +14,7 @@ mod txt;
 use library::AppState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tauri_plugin_window_state::StateFlags;
 
 /// 应用数据目录（数据库/封面/字体/提取资源）。
 /// 默认使用系统的 app_data_dir；当设置了 `FLOWREAD_DATA_DIR` 时改为该目录，
@@ -91,7 +92,14 @@ fn sniff_mime(b: &[u8]) -> &'static str {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        // 排除 DECORATIONS 标志：window-state 插件默认会持久化并恢复窗口装饰，
+        // 历史保存值为 true 会覆盖 builder 的 .decorations(false) 导致原生标题栏复现。
+        // 仅去掉 DECORATIONS，位置/大小/最大化等其余状态仍正常持久化。
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::all() & !StateFlags::DECORATIONS)
+                .build(),
+        )
         .setup(|app| {
             use tauri::Manager;
             let data_dir = data_dir(app.handle());
@@ -124,6 +132,9 @@ pub fn run() {
                     .title("FlowRead 阅读")
                     .inner_size(1380.0, 880.0)
                     .min_inner_size(940.0, 620.0)
+                    // 去掉系统原生标题栏（大黑边），改为前端自绘窗口控制按钮；
+                    // 无边框窗口在 Windows 上默认仍可拖拽边缘缩放。
+                    .decorations(false)
                     .center()
                     .visible(false);
                 // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项

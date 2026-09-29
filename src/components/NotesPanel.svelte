@@ -7,6 +7,9 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
+  // standalone=true：作为独立面板窗口挂载，隐藏“返回书库”的 ×（改用右上角窗口控件关闭）。
+  let { standalone = false }: { standalone?: boolean } = $props();
+
   type NoteBook = {
     bookId: number; title: string; author: string; deleted: boolean;
     hlCount: number; noteCount: number; lastAt: number;
@@ -155,7 +158,7 @@
     </select>
     <div class="spacer"></div>
     <button class="icon" title="刷新" aria-label="刷新" onclick={load}>⟳</button>
-    <button class="icon" title="返回书库" aria-label="返回书库" onclick={() => (ui.notesOpen = false)}>×</button>
+    {#if !standalone}<button class="icon" title="返回书库" aria-label="返回书库" onclick={() => (ui.notesOpen = false)}>×</button>{/if}
   </div>
 
   <div class="nl-body">

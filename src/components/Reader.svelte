@@ -132,6 +132,22 @@
   });
   onDestroy(() => clearTimeout(idleTimer));
 
+  // 顶栏实测高度写入全局 CSS 变量：供固定在右上角的 WindowControls 让自身高度=顶栏高度，
+  // 按钮垂直居中即与顶栏图标中心线重合，自动对齐（Reader 顶栏比 Library 矮，靠此自适应）。
+  let tbH = $state(0);
+  $effect(() => {
+    if (tbH > 0) {
+      document.documentElement.style.setProperty("--fr-titlebar-h", tbH + "px");
+    }
+  });
+
+  // 当前章变化时向其它窗口广播（带 bookId，供独立目录窗口按 book 过滤后跟随定位）。
+  // 用统一 $effect 广播，避免在 loadChapter 的多个分支里漏发；主窗内嵌抽屉靠 current 已实时、不受影响。
+  $effect(() => {
+    if (!book) return;
+    void emit("flowread-chapter-changed", { bookId: book.book.id, index: chapterNum });
+  });
+
   let scrollTop = $state(0);
   let maxScroll = $state(0);
 
@@ -632,6 +648,10 @@
   let sessionId = 0;
   let lastPos = 0;
   let lastFlushTs = 0;
+  // 最近一次用户活动时间戳（挂机剔除用）：pointermove/pointerdown/keydown/wheel/scroll/touchstart 触发时刷新。
+  let lastActivityTs = Date.now();
+  // 计时是否暂停（窗口隐藏时停表）：tick 与 flushSession 据此跳过累加。
+  let statsPaused = false;
 
   // ===== 章节缓存（LRU）+ 预取 + 竞态控制 =====
   // 目标：翻多快都即时显示——命中缓存零等待；未命中时先显示最接近的已缓存章节，
@@ -792,9 +812,12 @@
         sessionId = await api.startSession(bid);
         lastPos = bookPos();
         lastFlushTs = Date.now();
+        lastActivityTs = Date.now();
+        statsPaused = document.visibilityState !== "visible";
       } catch { sessionId = 0; }
       statsTimer = setInterval(() => {
-        if (document.visibilityState === "visible") flushSession();
+        // 隐藏时已在 visibilitychange 结算并停表；这里再兜底门控一次。
+        if (!statsPaused && document.visibilityState === "visible") flushSession();
       }, 30_000);
       if (config.webdav.enabled && config.webdav.syncOnOpen) {
         webdavSync(restore)
@@ -1211,21 +1234,72 @@
     return before + cur * currentRatio();
   }
 
+  // 跳转类操作完成后对齐统计基准：把 lastPos 设为当前位置，使被跳过的整段字数不进入下次 flush。
+  // 仅用于目录/进度条/书签/划线/搜索等显式跳转；顺序翻章(next/prevChapter)是连续阅读，不调用此函数。
+  function alignStatsBaseline() {
+    lastPos = bookPos();
+  }
+
   async function flushSession(force = false) {
     if (!book || !sessionId) return;
     const now = Date.now();
     const elapsed = (now - lastFlushTs) / 1000;
     if (!force && elapsed < 15) return;
+    // 挂机剔除：距上次用户活动超过 IDLE_LIMIT(120s) 视为放置不读，
+    // 只对齐基准、跳过本次累加；force 结算路径（关闭/隐藏）不受此拦截，保证最后有效片段落库。
+    const IDLE_LIMIT = 120_000;
+    if (!force && now - lastActivityTs > IDLE_LIMIT) {
+      lastFlushTs = now;
+      lastPos = bookPos();
+      return;
+    }
     const pos = bookPos();
-    const dChars = Math.max(0, Math.round(pos - lastPos));
+    const dCharsRaw = Math.max(0, Math.round(pos - lastPos));
+    // 跳读/跳转灌字保护：按本次时长换算，若字数增量超过人类阅读速度上限(MAX_CPM 字/分)，
+    // 判为目录/进度条/搜索等大跳，本次不计字数（时长仍照常计）。连续翻章增量小、不受影响。
+    const MAX_CPM = 3000;
+    const minutes = Math.max(elapsed, 1) / 60;
+    const dChars = dCharsRaw <= MAX_CPM * minutes ? dCharsRaw : 0;
     lastPos = pos;
     lastFlushTs = now;
     const secs = Math.min(Math.round(elapsed), 600);
     if (secs < 3 && dChars === 0) return;
     try {
       await api.updateSession(sessionId, secs, dChars);
+      // 广播给独立“统计”窗口（按 bookId 过滤后重新拉取时长/字数）
+      void emit("flowread-stats-changed", { bookId: book.book.id });
     } catch { /* ignore */ }
   }
+
+  // 活动检测：任何用户交互都刷新 lastActivityTs，供 flushSession 判定挂机。
+  // 与「隐藏 UI」的 idleTimer 相互独立，互不影响。
+  $effect(() => {
+    const bump = () => { lastActivityTs = Date.now(); };
+    const evs: (keyof WindowEventMap)[] = [
+      "pointermove", "pointerdown", "keydown", "wheel", "scroll", "touchstart",
+    ];
+    for (const ev of evs) window.addEventListener(ev, bump, { passive: true });
+    return () => {
+      for (const ev of evs) window.removeEventListener(ev, bump);
+    };
+  });
+
+  // 窗口隐藏/显示：隐藏时立即结算并停表（隐藏期一律不计）；恢复时重置基准并复表，
+  // 消除「恢复瞬间 elapsed 一大段被 600s 截断误计」。用 $effect 管理监听，卸载时清理。
+  $effect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "hidden") {
+        void flushSession(true); // 结算最后有效片段
+        statsPaused = true;       // 停表
+      } else {
+        lastFlushTs = Date.now();     // 从当前时刻重新计
+        lastActivityTs = Date.now();
+        statsPaused = false;          // 复表
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  });
 
   /* ================= scroll mode ================= */
   let lastEdgeAt = 0;
@@ -2438,6 +2512,8 @@ ${effCssExtra() || ""}
     await api.addBookmark(book.book.id, chapterNum, chapter.title, sel);
     toast("书签已添加");
     if (bookmarksOpen) bookmarks = await api.listBookmarks(book.book.id);
+    // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
+    void emit("flowread-bookmarks-changed", { bookId: book.book.id });
   }
 
   async function deleteBookmark(id: number) {
@@ -2445,6 +2521,8 @@ ${effCssExtra() || ""}
       await api.deleteBookmark(id);
       bookmarks = bookmarks.filter((b) => b.id !== id);
       toast("书签已删除");
+      // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
+      if (book) void emit("flowread-bookmarks-changed", { bookId: book.book.id });
     } catch (e) {
       toast(String(e), "error");
     }
@@ -2820,13 +2898,15 @@ ${effCssExtra() || ""}
     await tick();
     paintNow();
     const root = contentRoot();
-    if (!root) return;
+    if (!root) { alignStatsBaseline(); return; }
     const range = findTextRange(root, needle);
     if (!range) {
       toast("已跳转到章节（未精确定位到文字）");
+      alignStatsBaseline(); // 搜索跳转落点：对齐统计基准
       return;
     }
     scrollRangeIntoView(range);
+    alignStatsBaseline(); // 搜索跳转落点：对齐统计基准
   }
 
   async function gotoNavPos(p: NavPos) {
@@ -2835,6 +2915,7 @@ ${effCssExtra() || ""}
       await tick();
     }
     applyRatio(p.ratio);
+    alignStatsBaseline(); // 搜索“返回”跳转落点：对齐统计基准
   }
 
   /** 返回上一次跳转前的位置；已在最初位置则返回搜索开始前的位置。 */
@@ -2867,6 +2948,7 @@ ${effCssExtra() || ""}
     const range = charRangeToRange(root, h.pos_start, h.pos_end);
     if (range) scrollRangeIntoView(range);
     else toast("未定位到划线位置");
+    alignStatsBaseline(); // 划线跳转落点：对齐统计基准
   }
 
   /* ================= 语音朗读（TTS） ================= */
@@ -3144,6 +3226,7 @@ ${effCssExtra() || ""}
     const { idx, cr } = chapterFromRatio(ratio);
     if (idx === chapterNum) {
       applyRatio(cr);
+      alignStatsBaseline(); // 同章内进度条拖拽落点也对齐基准
       return;
     }
     if (progBusy) {
@@ -3158,6 +3241,7 @@ ${effCssExtra() || ""}
       applyRatio(t.cr);
     } while (progReq);
     progBusy = false;
+    alignStatsBaseline(); // 进度条跳转落点：对齐统计基准，避免大跳位移被计为已读字数
   }
 
   function progFromEvent(e: PointerEvent) {
@@ -3320,8 +3404,8 @@ ${effCssExtra() || ""}
   {#if showFsHint}
     <div class="fs-hint" transition:fade={{ duration: 220 }}>按 F11 退出全屏</div>
   {/if}
-  <div class="topbar" class:dim={chromeHidden} style="background:var(--rdr-top);">
-    <div class="tb-zone tb-l">
+  <div class="topbar" class:dim={chromeHidden} style="background:var(--rdr-top);" data-tauri-drag-region bind:clientHeight={tbH}>
+    <div class="tb-zone tb-l" data-tauri-drag-region>
       <button
         class="icon tb-btn tip-right"
         aria-label={standalone ? "关闭" : "返回"}
@@ -3330,11 +3414,12 @@ ${effCssExtra() || ""}
       >
         <IconArrowLeft size={20} stroke={1.75} />
       </button>
-      <div class="btitle">{book?.book.title ?? ""}</div>
+      <div class="btitle" data-tauri-drag-region>{book?.book.title ?? ""}</div>
     </div>
     {#if config.reader.statusPos !== "none" && enabledStatusItems.length}
       <div
         class="tb-zone tb-c"
+        data-tauri-drag-region
         use:dragSort={{ onDrop: statusDrop, axis: "x" }}
         style="justify-content:{config.reader.statusPos === 'left' ? 'flex-start' : config.reader.statusPos === 'right' ? 'flex-end' : 'center'}"
       >
@@ -3344,7 +3429,6 @@ ${effCssExtra() || ""}
             class="stat-item"
             data-drag-id={it.id}
             style="color:var(--rdr-stat)"
-            title="拖动可调整位置"
           >{statusItemText(it.id)}</span>
         {/each}
       </div>
@@ -3534,7 +3618,14 @@ ${effCssExtra() || ""}
         </div>
       </div>
       <div class="footer" class:dim={chromeHidden}>
-        <span class="finfo finfo-l">
+        <span
+          class="finfo finfo-l"
+          role="button"
+          tabindex="0"
+          aria-label="上一章"
+          onclick={() => prevChapter()}
+          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); prevChapter(); } }}
+        >
           {#each footerItems(config.reader.footerLeft) as x, i (x.id)}
             {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
           {/each}
@@ -3557,7 +3648,14 @@ ${effCssExtra() || ""}
           <div class="progress-fill" style="transform:scaleX({totalPct() / 100})"></div>
           <div class="progress-knob" style="left:{totalPct()}%"></div>
         </div>
-        <span class="finfo finfo-r">
+        <span
+          class="finfo finfo-r"
+          role="button"
+          tabindex="0"
+          aria-label="下一章"
+          onclick={() => nextChapter()}
+          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nextChapter(); } }}
+        >
           {#each footerItems(config.reader.footerRight) as x, i (x.id)}
             {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
           {/each}
@@ -3566,7 +3664,7 @@ ${effCssExtra() || ""}
     {/if}
 
     {#if tocOpen && book}
-      <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; loadChapter(i); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
+      <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; void loadChapter(i).then(alignStatsBaseline); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
     {/if}
 
     {#if bookmarksOpen}
@@ -3575,7 +3673,7 @@ ${effCssExtra() || ""}
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
-              <div class="bm-main" onclick={() => { loadChapter(bm.chapter_index); rightPanel = null; }}>
+              <div class="bm-main" onclick={() => { void loadChapter(bm.chapter_index).then(alignStatsBaseline); rightPanel = null; }}>
                 <div class="bm-title">{bm.title || "未命名"}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
@@ -3751,6 +3849,8 @@ ${effCssExtra() || ""}
     align-items: center;
     gap: 6px;
     padding: 7px 12px;
+    /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
+    padding-right: 112px;
     background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 90%, black 10%);
     z-index: 30;
     position: relative;
@@ -4438,7 +4538,20 @@ ${effCssExtra() || ""}
   .finfo {
     white-space: nowrap;
     user-select: none;
-    min-width: 0;
+    /* 空信息时也要有可点热区（左=上一章 / 右=下一章）：给最小宽度与内边距 */
+    min-width: 88px;
+    padding: 2px 8px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+  }
+  .finfo:hover {
+    background: var(--hover-bg);
+    opacity: 1;
+  }
+  .finfo:active {
+    background: var(--active-bg);
+    transform: scale(0.96);
   }
   .finfo-l { text-align: left; }
   .finfo-r { text-align: right; }

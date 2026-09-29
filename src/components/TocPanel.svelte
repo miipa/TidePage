@@ -6,7 +6,7 @@
     toc: TocEntry[];
     current: number;
     onpick: (index: number) => void;
-    onclose: () => void;
+    onclose?: () => void;
     onpopout?: () => void;
   } = $props();
 
@@ -67,7 +67,7 @@
     <span>目录</span>
     <div class="sp-head-acts">
       {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      <button class="icon" title="关闭" onclick={onclose}>×</button>
+      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="sp-search">

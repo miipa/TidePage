@@ -10,6 +10,7 @@
   import StandaloneBook from "../components/StandaloneBook.svelte";
   import StandalonePanel from "../components/StandalonePanel.svelte";
   import NotesPanel from "../components/NotesPanel.svelte";
+  import WindowControls from "../components/WindowControls.svelte";
   import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, openPanelWindow } from "../lib/stores.svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { startSnap, stopSnap } from "../lib/windowSnap";
@@ -247,6 +248,9 @@
     </dialog>
   {/if}
 {/if}
+
+<!-- 自绘窗口控制按钮：放在所有条件分支之外，保证每种窗口（书库/阅读/独立AI/独立书/面板）都渲染一次 -->
+<WindowControls />
 
 <!-- 吸附特效叠层（预吸附虚线 / 吸附命中发光），pointer-events:none 不挡交互 -->
 {#if snapPreview || snapFlash}

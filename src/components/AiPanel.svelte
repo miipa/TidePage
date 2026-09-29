@@ -164,6 +164,16 @@
     }
   }
 
+  // 独立 AI 窗：测标题行高度写入全局变量让右上角 WindowControls 垂直对齐。
+  // ai-head 有 10px 上下内边距，标题行 ai-head-top 从 y=10 起，故容器高度取 saHeadH + 20，
+  // 使控件中心线与标题行中心线重合。仅 standalone 时写入，避免抽屉模式污染主窗顶栏变量。
+  let saHeadH = $state(0);
+  $effect(() => {
+    if (standalone && saHeadH > 0) {
+      document.documentElement.style.setProperty("--fr-titlebar-h", saHeadH + 20 + "px");
+    }
+  });
+
   $effect(() => {
     let done = false;
     const ctrl = listen<{ title: string; html: string }>("flowread-ai-chapter", (e) => {
@@ -821,7 +831,7 @@ ${readerStyle.extra}
      第一行 = 标题 +（standalone: ⇲停靠 / 抽屉: ×）；第二行 = 动作按钮单独成行、左对齐、换行规律。 -->
 {#snippet aiHead()}
   <div class="ai-head">
-    <div class="ai-head-top">
+    <div class="ai-head-top" class:sa-head={standalone} data-tauri-drag-region={standalone ? "" : null} bind:clientHeight={saHeadH}>
       <span class="ai-title">{ctx.title || "AI 助手"}</span>
       {#if standalone}
         <button class="mini" title="停靠回主窗口" onclick={async () => {
@@ -1179,6 +1189,12 @@ ${readerStyle.extra}
     align-items: center;
     justify-content: space-between; /* 标题左、关闭/停靠右 */
     gap: 8px;
+  }
+
+  /* 独立 AI 窗：顶部第一行既是拖拽区，也要给右上角自绘窗口控制按钮留出空间，
+     避免「⇲ 停靠」按钮被覆盖；空白处可拖动窗口、双击最大化/还原。 */
+  .ai-head-top.sa-head {
+    padding-right: 112px;
   }
 
   .ai-panel .ai-actions .mini {
