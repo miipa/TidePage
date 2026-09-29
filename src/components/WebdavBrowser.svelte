@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { IconClipboard, IconCopy, IconCut, IconTrash } from "@tabler/icons-svelte";
   import { api } from "../lib/api";
   import { config, saveConfig, toast, ui } from "../lib/stores.svelte";
 
   interface Entry { name: string; is_dir: boolean; size: number; mtime: number }
   interface DlItem { key: string; name: string; pct: number; state: "downloading" | "done" | "error"; msg: string }
+  /** 剪贴板项：记录来源目录 srcDir 便于判断粘贴目标是否与来源相同。 */
+  interface ClipItem { op: "copy" | "move"; name: string; path: string; is_dir: boolean; srcDir: string }
 
   const EXT_BOOK = ["txt", "epub", "mobi", "azw3", "prc"];
 
@@ -15,6 +18,14 @@
   let error = $state("");
   // 是否已完成至少一次列目录尝试（用于区分「首帧未加载」与「真·空目录」，避免闪现空态）。
   let attempted = $state(false);
+
+  // 右键菜单 / 剪贴板式复制移动 / 面板内删除确认
+  let browseEl: HTMLDivElement | undefined = $state();
+  let ctxMenu = $state<{ x: number; y: number; entry: Entry | null } | null>(null);
+  let ctxEl: HTMLDivElement | undefined = $state();
+  let ctxPos = $state({ left: 0, top: 0 });
+  let clipboard = $state<ClipItem | null>(null);
+  let confirmDel = $state<Entry | null>(null);
 
   const downloads = $state<DlItem[]>([]);
   let dlUnlisteners: Record<string, () => void> = {};
@@ -121,6 +132,102 @@
     return EXT_BOOK.includes(ext);
   }
 
+  /** 当前目录下某条目的完整远端路径。 */
+  function fullPath(e: Entry): string {
+    return path ? `${path}/${e.name}` : e.name;
+  }
+
+  /** 右键菜单：先按指针位置（相对面板）显示，渲染后按菜单尺寸夹取到面板内。
+   *  注意：抽屉 .wd-drawer 带 transform 动画（fill both）会成为 fixed 的包含块，
+   *  故菜单用面板内 absolute 定位 + 按面板尺寸夹取（而非视口 fixed 定位）。 */
+  function openCtx(ev: MouseEvent, entry: Entry | null) {
+    ev.preventDefault();
+    const rect = browseEl?.getBoundingClientRect();
+    const x = ev.clientX - (rect?.left ?? 0);
+    const y = ev.clientY - (rect?.top ?? 0);
+    ctxMenu = { x, y, entry };
+    ctxPos = { left: x, top: y };
+  }
+
+  // 夹取到面板范围内（照 Library 的夹取思路，坐标改为相对面板）。
+  $effect(() => {
+    if (!ctxMenu || !ctxEl) return;
+    const r = ctxEl.getBoundingClientRect();
+    const pr = browseEl?.getBoundingClientRect();
+    const w = pr?.width ?? window.innerWidth;
+    const h = pr?.height ?? window.innerHeight;
+    ctxPos = {
+      left: Math.max(8, Math.min(ctxMenu.x, w - r.width - 8)),
+      top: Math.max(8, Math.min(ctxMenu.y, h - r.height - 8)),
+    };
+  });
+
+  // 菜单外点关闭（窗口捕获阶段监听，项目既有弹层范式）。
+  $effect(() => {
+    if (!ctxMenu) return;
+    const h = (e: PointerEvent) => {
+      if (ctxEl && !ctxEl.contains(e.target as Node)) ctxMenu = null;
+    };
+    window.addEventListener("pointerdown", h, true);
+    return () => window.removeEventListener("pointerdown", h, true);
+  });
+
+  /** 列表空白处右键：仅有剪贴板内容时弹出「粘贴到此处」。 */
+  function onListCtx(ev: MouseEvent) {
+    const t = ev.target as HTMLElement | null;
+    if (t?.closest?.(".wd-row")) return; // 行内右键由行自身处理
+    ev.preventDefault();
+    if (!clipboard) return;
+    openCtx(ev, null);
+  }
+
+  /** 复制/移动到剪贴板（记录来源目录 srcDir，用于判断粘贴目标是否同源）。 */
+  function setClip(op: "copy" | "move", e: Entry) {
+    clipboard = { op, name: e.name, path: fullPath(e), is_dir: e.is_dir, srcDir: path };
+    ctxMenu = null;
+    toast(op === "copy" ? `已复制「${e.name}」到剪贴板` : `已剪切「${e.name}」到剪贴板`);
+  }
+
+  /** 粘贴到当前目录：复制走 webdavCopy，移动走 webdavMove；失败保留剪贴板便于重试。 */
+  async function paste() {
+    ctxMenu = null;
+    if (!clipboard) return;
+    const clip = clipboard;
+    if (path === clip.srcDir) {
+      toast("目标目录与来源相同，未执行");
+      return;
+    }
+    const dst = path ? `${path}/${clip.name}` : clip.name;
+    try {
+      if (clip.op === "copy") {
+        await api.webdavCopy(config.webdav.base, config.webdav.user, config.webdav.pass, clip.path, dst);
+      } else {
+        await api.webdavMove(config.webdav.base, config.webdav.user, config.webdav.pass, clip.path, dst);
+      }
+      toast(clip.op === "copy" ? "已复制" : "已移动");
+      clipboard = null;
+      await load();
+    } catch (e) {
+      const s = String(e);
+      if (s.includes("412") || s.includes("409")) toast("目标位置已有同名项，请先重命名或删除", "error");
+      else toast(s, "error");
+    }
+  }
+
+  /** 确认删除当前条目，成功后刷新目录。 */
+  async function doDelete() {
+    const entry = confirmDel;
+    if (!entry) return;
+    confirmDel = null;
+    try {
+      await api.webdavDelete(config.webdav.base, config.webdav.user, config.webdav.pass, fullPath(entry));
+      toast("已删除");
+      await load();
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
   async function download(e: Entry) {
     if (!config.webdav.downloadDir) {
       toast("请先选择下载目录", "error");
@@ -185,7 +292,7 @@
   });
 </script>
 
-<div class="wd-browse">
+<div class="wd-browse" bind:this={browseEl}>
   <div class="wd-head">
     <span class="wd-title">WebDAV 文件管理</span>
     <button class="icon" title="关闭" aria-label="关闭" onclick={() => (ui.webdavOpen = false)}>×</button>
@@ -203,6 +310,9 @@
       <button class="wd-btn" onclick={() => load("")} disabled={!path} title="根目录" aria-label="根目录">⌂</button>
       <button class="wd-btn" onclick={up} disabled={!hasUp} title="上级目录" aria-label="上级目录">↑</button>
       <button class="wd-btn" onclick={() => load()} title="刷新当前目录" aria-label="刷新">⟳</button>
+      {#if clipboard}
+        <button class="wd-btn" onclick={paste} title={`粘贴「${clipboard.name}」到当前目录`} aria-label="粘贴到当前目录">粘贴</button>
+      {/if}
       <span class="wd-path" title={path || "/"}>{path || "/"}</span>
       <span class="wd-tools-gap"></span>
       <select class="wd-sel" bind:value={sortBy} title="排序方式" aria-label="排序方式">
@@ -227,7 +337,7 @@
       <button class="wd-btn" onclick={pickDir}>选择…</button>
     </div>
 
-    <div class="wd-list">
+    <div class="wd-list" oncontextmenu={onListCtx} role="presentation">
       {#if loading || (!attempted && !error)}
         <div class="wd-state"><span class="wd-spin">⟳</span> 加载中…</div>
       {:else if error}
@@ -240,14 +350,14 @@
       {:else}
         {#each sortedEntries as e (path + "/" + e.name + String(e.size))}
           {#if e.is_dir}
-            <button class="wd-row wd-dir" onclick={() => openEntry(e)}>
+            <button class="wd-row wd-dir" onclick={() => openEntry(e)} oncontextmenu={(ev) => openCtx(ev, e)}>
               <span class="wd-ico">📁</span>
-              <span class="wd-name">{e.name}</span>
+              <span class="wd-name" title={e.name}>{e.name}</span>
             </button>
           {:else}
-            <div class="wd-row">
+            <div class="wd-row" oncontextmenu={(ev) => openCtx(ev, e)} role="presentation">
               <span class="wd-ico">📄</span>
-              <span class="wd-name">{e.name}</span>
+              <span class="wd-name" title={e.name}>{e.name}</span>
               <span class="wd-meta">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span>
               <button class="wd-dl-btn" onclick={() => download(e)} disabled={activeDownloads >= 3}>
                 {isBook(e) ? "下载入书库" : "下载"}
@@ -275,10 +385,40 @@
       </div>
     {/if}
   {/if}
+
+  {#if ctxMenu}
+    <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
+      {#if ctxMenu.entry}
+        <button onclick={() => setClip("copy", ctxMenu!.entry!)}><span class="ci"><IconCopy size={17} stroke={1.75} /></span>复制</button>
+        <button onclick={() => setClip("move", ctxMenu!.entry!)}><span class="ci"><IconCut size={17} stroke={1.75} /></span>移动</button>
+        <div class="ctx-sep"></div>
+        <button class="danger" onclick={() => { confirmDel = ctxMenu!.entry!; ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>删除</button>
+      {:else}
+        <button onclick={paste} disabled={!clipboard}><span class="ci"><IconClipboard size={17} stroke={1.75} /></span>粘贴到此处</button>
+      {/if}
+    </div>
+  {/if}
+
+  {#if confirmDel}
+    <!-- 删除确认：仅覆盖 WebDAV 面板区域（绝对定位在 .wd-browse 内） -->
+    <div class="wd-confirm-wrap" role="dialog" aria-modal="true" aria-label="删除确认">
+      <button type="button" class="wd-confirm-mask" aria-label="取消删除" onclick={() => (confirmDel = null)}></button>
+      <div class="wd-confirm">
+        <p class="wd-confirm-t">确定删除「{confirmDel.name}」？</p>
+        {#if confirmDel.is_dir}<p class="wd-confirm-s">（将连同其中的内容一起删除）</p>{/if}
+        <p class="wd-confirm-s">此操作不可撤销。</p>
+        <div class="wd-confirm-actions">
+          <button class="wd-btn" onclick={() => (confirmDel = null)}>取消</button>
+          <button class="wd-btn danger" onclick={doDelete}>删除</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
   .wd-browse {
+    position: relative; /* 右键菜单与删除确认均按面板内绝对定位 */
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -611,5 +751,127 @@
   @keyframes wd-slide {
     from { background-position: 200% 0; }
     to { background-position: -200% 0; }
+  }
+
+  /* ---------- 右键菜单（观感照 Library 的 .ctx） ---------- */
+  .ctx {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius, 12px);
+    box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.28));
+    padding: 6px;
+    min-width: 168px;
+    z-index: 30;
+    transform-origin: top left;
+    animation: wd-ctx-in 0.18s ease;
+  }
+
+  @keyframes wd-ctx-in {
+    from { opacity: 0; transform: translateY(-6px) scale(0.96); }
+    to { opacity: 1; transform: none; }
+  }
+
+  .ctx button {
+    border: none;
+    background: transparent;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px 7px 10px;
+    border-radius: var(--radius-sm, 8px);
+    font-size: var(--fs-sm, 13px);
+    color: var(--fg);
+    cursor: pointer;
+  }
+
+  .ctx .ci {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+  }
+
+  .ctx-sep {
+    height: 1px;
+    margin: 5px 8px;
+    background: var(--line);
+  }
+
+  .ctx button:hover { background: var(--accent-soft, var(--hover-bg)); }
+  .ctx button:disabled { opacity: 0.42; cursor: default; }
+  .ctx button.danger { color: var(--danger); }
+  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+
+  /* ---------- 面板内删除确认（仅覆盖 webdav 面板区域） ---------- */
+  .wd-confirm-wrap {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    padding: 16px;
+  }
+
+  /* 遮罩做成 <button> 以关闭且不引入 a11y 告警；用 !important 压过全局 button:hover 背景 */
+  .wd-confirm-mask {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    padding: 0;
+    border: none;
+    background: rgba(0, 0, 0, 0.35) !important;
+    cursor: default;
+  }
+
+  .wd-confirm {
+    position: relative;
+    z-index: 1;
+    box-sizing: border-box;
+    width: min(320px, 100%);
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius, 12px);
+    box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.28));
+    padding: 18px;
+  }
+
+  .wd-confirm-t {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-weight: 600;
+    word-break: break-all;
+  }
+
+  .wd-confirm-s {
+    margin: 0 0 4px;
+    font-size: 12px;
+    color: var(--fg2);
+    line-height: 1.6;
+  }
+
+  .wd-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .wd-btn.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
+  }
+
+  .wd-btn.danger:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 </style>

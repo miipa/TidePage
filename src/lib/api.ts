@@ -97,6 +97,15 @@ export const api = {
     invoke<string>("webdav_download_book", { base, user, pass, bookPath, targetDir }),
   webdavList: (base: string, user: string, pass: string, path: string) =>
     invoke<{ name: string; is_dir: boolean; size: number; mtime: number }[]>("webdav_list", { base, user, pass, path }),
+  /** 删除云端文件/目录。 */
+  webdavDelete: (base: string, user: string, pass: string, path: string) =>
+    invoke<void>("webdav_delete", { base, user, pass, path }),
+  /** 复制云端文件/目录（不覆盖同名项）。 */
+  webdavCopy: (base: string, user: string, pass: string, src: string, dst: string) =>
+    invoke<void>("webdav_copy", { base, user, pass, src, dst }),
+  /** 移动/重命名云端文件/目录（不覆盖同名项）。 */
+  webdavMove: (base: string, user: string, pass: string, src: string, dst: string) =>
+    invoke<void>("webdav_move", { base, user, pass, src, dst }),
   webdavDownloadFile: (base: string, user: string, pass: string, remotePath: string, targetDir: string) =>
     invoke<string[]>("webdav_download_file", { base, user, pass, remotePath, targetDir }),
   webdavDownloadProgress: (base: string, user: string, pass: string, remotePath: string, targetDir: string, session: string) =>

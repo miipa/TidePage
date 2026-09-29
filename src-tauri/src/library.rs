@@ -2272,6 +2272,44 @@ pub async fn webdav_list(
         .collect())
 }
 
+/// 删除云端文件/目录（DELETE）。
+#[tauri::command]
+pub async fn webdav_delete(
+    base: String,
+    user: String,
+    pass: String,
+    path: String,
+) -> Result<(), String> {
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    c.delete(&path).await
+}
+
+/// 复制云端文件/目录（COPY，Overwrite: F 不覆盖同名项）。
+#[tauri::command]
+pub async fn webdav_copy(
+    base: String,
+    user: String,
+    pass: String,
+    src: String,
+    dst: String,
+) -> Result<(), String> {
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    c.copy(&src, &dst).await
+}
+
+/// 移动/重命名云端文件/目录（MOVE，Overwrite: F）。
+#[tauri::command]
+pub async fn webdav_move(
+    base: String,
+    user: String,
+    pass: String,
+    src: String,
+    dst: String,
+) -> Result<(), String> {
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    c.move_path(&src, &dst).await
+}
+
 #[tauri::command]
 pub async fn webdav_download_file(
     state: State<'_, Arc<AppState>>,

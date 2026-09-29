@@ -66,13 +66,25 @@ impl DavClient {
         .ok()
     }
 
-    /// 带重试的原始请求（覆盖传输错误与瞬时 429/5xx）
+    /// 带重试的原始请求（仅 Authorization/Depth 的便捷入口）。
     async fn raw(
         &self,
         method: &str,
         url: &str,
         depth: Option<&str>,
         body: Option<Vec<u8>>,
+    ) -> Result<reqwest::Response, String> {
+        self.raw_ex(method, url, depth, body, &[]).await
+    }
+
+    /// 带重试的原始请求（覆盖传输错误与瞬时 429/5xx）；extra_headers 承载 Destination 等自定义头。
+    async fn raw_ex(
+        &self,
+        method: &str,
+        url: &str,
+        depth: Option<&str>,
+        body: Option<Vec<u8>>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response, String> {
         let mut last: Option<String> = None;
         for attempt in 0..3 {
@@ -83,6 +95,9 @@ impl DavClient {
             }
             if let Some(d) = depth {
                 req = req.header("Depth", d);
+            }
+            for (k, v) in extra_headers {
+                req = req.header(*k, *v);
             }
             if let Some(b) = &body {
                 req = req.body(b.clone());
@@ -246,6 +261,57 @@ impl DavClient {
             out.push((name, is_coll, size, mtime));
         }
         Ok(out)
+    }
+
+    /// DELETE：2xx 视为成功。
+    pub async fn delete(&self, path: &str) -> Result<(), String> {
+        let resp = self.raw("DELETE", &join_url(&self.base, path), None, None).await?;
+        let code = resp.status().as_u16();
+        if (200..=299).contains(&code) {
+            Ok(())
+        } else {
+            Err(format!("DELETE -> {code}"))
+        }
+    }
+
+    /// COPY：src → dst（Destination 用绝对 URL），Overwrite: F 不覆盖同名项；2xx 视为成功。
+    pub async fn copy(&self, src: &str, dst: &str) -> Result<(), String> {
+        let dest = join_url(&self.base, dst);
+        let resp = self
+            .raw_ex(
+                "COPY",
+                &join_url(&self.base, src),
+                None,
+                None,
+                &[("Destination", &dest), ("Overwrite", "F")],
+            )
+            .await?;
+        let code = resp.status().as_u16();
+        if (200..=299).contains(&code) {
+            Ok(())
+        } else {
+            Err(format!("COPY -> {code}"))
+        }
+    }
+
+    /// MOVE：同 COPY，用 MOVE 方法（`move` 为 Rust 关键字，故命名 move_path）。
+    pub async fn move_path(&self, src: &str, dst: &str) -> Result<(), String> {
+        let dest = join_url(&self.base, dst);
+        let resp = self
+            .raw_ex(
+                "MOVE",
+                &join_url(&self.base, src),
+                None,
+                None,
+                &[("Destination", &dest), ("Overwrite", "F")],
+            )
+            .await?;
+        let code = resp.status().as_u16();
+        if (200..=299).contains(&code) {
+            Ok(())
+        } else {
+            Err(format!("MOVE -> {code}"))
+        }
     }
 }
 
