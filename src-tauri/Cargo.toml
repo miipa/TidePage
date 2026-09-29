@@ -38,6 +38,7 @@ rfd = "0.15"
 winreg = "0.55"
 base64 = "0.22"
 sha2 = "0.10"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 html5ever = "0.39"
 tendril = "0.5"
 

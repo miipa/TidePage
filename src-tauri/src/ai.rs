@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use std::time::Duration;
 
@@ -987,176 +988,6 @@ pub async fn stream_chat(
 
 /* ============================ 在线语音合成（TTS） ============================ */
 
-/// 语音服务的适配方式。对外没有「协议」概念——仅由服务地址自动识别，
-/// 用户只填一个地址即可。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Adapter {
-    /// OpenAI 兼容 `/v1/audio/speech`（VoiceStudio、Kokoro、LocalAI、speaches、voxcpm 等）
-    OpenAi,
-    /// 阿里云百炼 / DashScope 通义千问 Qwen-TTS
-    DashScope,
-    /// 本地 Breeze-TTS-2 克隆网关（`/api/voices` + `/api/tts/clone`）
-    Breeze,
-    /// GPT-SoVITS 原生 `/tts`
-    GptSoVits,
-    /// Azure OpenAI（部署名在地址或 model 中）
-    Azure,
-    /// MiniMax 语音
-    MiniMax,
-    /// Fish Audio
-    Fish,
-}
-
-/// 适配结果缓存：key = `{base}\n{key}`，避免逐句探测。
-fn tts_adapter_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Adapter>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Adapter>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn cache_get_adapter(key: &str) -> Option<Adapter> {
-    tts_adapter_cache().lock().ok().and_then(|m| m.get(key).copied())
-}
-
-fn cache_put_adapter(key: String, a: Adapter) {
-    if let Ok(mut m) = tts_adapter_cache().lock() {
-        m.insert(key, a);
-    }
-}
-
-/// 拆分地址为 (host, path)，均转小写。host 去 userinfo 与端口（IPv6 字面量除外）。
-fn split_host_path(base: &str) -> (String, String) {
-    let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if host_port.starts_with('[') {
-        host_port.to_string()
-    } else {
-        host_port
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host_port)
-            .to_string()
-    };
-    (host.to_ascii_lowercase(), path.to_ascii_lowercase())
-}
-
-/// 本机 / 私有网段地址：这类服务一律直连，避免系统代理拦截局域网地址。
-fn is_local_host(host: &str) -> bool {
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
-        return true;
-    }
-    if host.starts_with("10.") || host.starts_with("192.168.") {
-        return true;
-    }
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next().and_then(|x| x.parse::<u8>().ok()) {
-            return (16..=31).contains(&second);
-        }
-    }
-    false
-}
-
-/// 语音服务的根地址：去尾斜杠，并容忍 OpenAI 风格的 `/v1` 尾巴。
-fn tts_root(base: &str) -> String {
-    let b = strip_trailing_slash(base);
-    match b.strip_suffix("/v1") {
-        Some(s) if !s.is_empty() => s.trim_end_matches('/').to_string(),
-        _ => b.to_string(),
-    }
-}
-
-/// 本机 / 局域网地址用直连客户端探测，其余沿用调用方客户端（可走代理）。
-fn tts_local_client(http: &reqwest::Client, base: &str) -> reqwest::Client {
-    let (host, _) = split_host_path(base);
-    if is_local_host(&host) {
-        build_client("direct", "").unwrap_or_else(|_| http.clone())
-    } else {
-        http.clone()
-    }
-}
-
-async fn http_get_ok(http: &reqwest::Client, url: &str, api_key: &str) -> bool {
-    let mut req = http.get(url).timeout(Duration::from_secs(6));
-    if !api_key.trim().is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
-    }
-    matches!(req.send().await, Ok(r) if r.status().is_success())
-}
-
-async fn http_get_text(http: &reqwest::Client, url: &str) -> Option<String> {
-    let resp = http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.text().await.ok()
-}
-
-/// 按地址识别适配方式：先按域名特征判断远程服务，其余（本地/无法识别的公网地址）
-/// 按顺序探测 本地克隆网关 → GPT-SoVITS → OpenAI 兼容，最后兜底 OpenAI 兼容。
-async fn detect_adapter(http: &reqwest::Client, base: &str, api_key: &str) -> Adapter {
-    let lower = base.to_ascii_lowercase();
-    let (host, path) = split_host_path(base);
-    if lower.contains("dashscope.aliyuncs.com") || lower.contains("bailian") {
-        return Adapter::DashScope;
-    }
-    if host.ends_with(".openai.azure.com")
-        || path.contains("/openai/deployments/")
-        || path.contains("/openai/v1")
-    {
-        return Adapter::Azure;
-    }
-    if lower.contains("api.minimax.io")
-        || lower.contains("api.minimaxi.com")
-        || lower.contains("api.minimax.chat")
-    {
-        return Adapter::MiniMax;
-    }
-    if lower.contains("api.fish.audio") {
-        return Adapter::Fish;
-    }
-    let root = tts_root(base);
-    // a. 本地克隆网关
-    for r in breeze_root_candidates(&root) {
-        if http_get_ok(http, &format!("{r}/api/voices"), api_key).await {
-            return Adapter::Breeze;
-        }
-    }
-    // b. GPT-SoVITS 原生 /tts
-    if let Some(body) = http_get_text(http, &format!("{root}/openapi.json")).await {
-        if body.contains("\"/tts\"") {
-            return Adapter::GptSoVits;
-        }
-    }
-    // c. OpenAI 兼容
-    let v1root = ensure_v1(&root);
-    for url in [
-        format!("{v1root}/audio/voices"),
-        format!("{v1root}/voices"),
-        format!("{v1root}/models"),
-    ] {
-        if http_get_ok(http, &url, api_key).await {
-            return Adapter::OpenAi;
-        }
-    }
-    // d. 兜底
-    Adapter::OpenAi
-}
-
-async fn resolve_adapter(http: &reqwest::Client, base: &str, api_key: &str) -> Adapter {
-    let key = format!("{base}\n{api_key}");
-    if let Some(a) = cache_get_adapter(&key) {
-        return a;
-    }
-    let a = detect_adapter(http, base, api_key).await;
-    cache_put_adapter(key, a);
-    a
-}
-
 /// 发起合成请求并按音频字节返回（非 2xx 转结构化错误）。
 async fn post_audio(req: reqwest::RequestBuilder) -> Result<Vec<u8>, AiError> {
     let resp = req.send().await.map_err(|e| classify_req(&e))?;
@@ -1555,86 +1386,640 @@ async fn synthesize_breeze(
     Err(last_err.unwrap_or_else(|| AiError::config("未配置 Breeze 网关地址")))
 }
 
-/// 调用在线语音合成接口，返回音频字节（如 mp3/wav）。
-/// 支持 OpenAI 兼容 / Azure OpenAI 的 `/audio/speech`、
-/// 阿里云百炼 DashScope 的通义千问 Qwen-TTS，以及本地 Breeze-TTS-2 网关。
-pub async fn synthesize(
+/// 一次在线语音合成的全部参数（按 provider 显式分派到具体协议实现）。
+pub struct TtsParams<'a> {
+    pub provider: &'a str,
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    pub secret_key: &'a str,
+    pub app_id: &'a str,
+    pub cluster: &'a str,
+    pub model: &'a str,
+    pub voice: &'a str,
+    pub format: &'a str,
+    /// 正文语言标签（config.tts.lang），仅 GPT-SoVITS 等协议使用。
+    pub lang: &'a str,
+}
+
+/// 按用户显式选择的接口协议分派合成；不做事先的地址探测。
+/// 协议：openai / azure / dashscope / minimax / fish / gptsovits / breeze /
+/// volcano / baidu / edge，未知一律按 OpenAI 兼容处理。
+pub async fn synthesize_tts(
     http: reqwest::Client,
-    cfg: AiConfig,
-    voice: &str,
-    format: &str,
+    p: &TtsParams<'_>,
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
-    let p = Provider::parse(&cfg.provider);
-    let base = strip_trailing_slash(&cfg.base_url);
+    let base = strip_trailing_slash(p.base_url);
+    match p.provider.trim().to_ascii_lowercase().as_str() {
+        "azure" => synth_azure(&http, p, base, text).await,
+        "dashscope" => synth_dashscope(&http, p, base, text).await,
+        "minimax" => synth_minimax(&http, p, base, text).await,
+        "fish" => synth_fish(&http, p, base, text).await,
+        "gptsovits" => synth_gptsovits(&http, p, base, text).await,
+        "breeze" => synth_breeze_dispatch(&http, p, base, text).await,
+        "volcano" => synth_volcano(&http, p, text).await,
+        "baidu" => synth_baidu(&http, p, text).await,
+        "edge" => synth_edge(p, text).await,
+        _ => synth_openai(&http, p, base, text).await,
+    }
+}
+
+/// OpenAI 兼容：POST {ensure_v1(base)}/audio/speech，Bearer 鉴权。
+async fn synth_openai(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未配置语音端点地址"));
+        return Err(AiError::config("未填写服务地址"));
     }
-    // Breeze-TTS-2 为本地自建协议（先取音色参考音频再克隆合成），单独处理。
-    // 本机 / 局域网服务一律直连，避免系统代理拦截局域网地址。
-    if is_breeze_provider(&cfg.provider) {
-        let local = breeze_client().unwrap_or(http);
-        return synthesize_breeze(local, &cfg, base, voice, text).await;
-    }
-    // DashScope 协议与 OpenAI 不同（JSON 回包 + 二次下载），单独处理。
-    if p == Provider::DashScope {
-        return synthesize_dashscope(http, &cfg, base, voice, text).await;
-    }
-    let (url, headers) = match p {
-        Provider::OpenAi | Provider::Ollama => {
-            // Ollama 无 /audio/speech，最终会返回 4xx，这里统一按 OpenAI 兼容路径尝试
-            let b = ensure_v1(base);
-            (format!("{b}/audio/speech"), bearer_headers(&cfg.api_key))
-        }
-        Provider::Azure => {
-            let dep = cfg.deployment.trim();
-            if dep.is_empty() {
-                return Err(AiError::config("Azure OpenAI 语音需要填写部署名（deployment）"));
-            }
-            let ver = if cfg.api_version.trim().is_empty() {
-                "2024-06-01"
-            } else {
-                cfg.api_version.trim()
-            };
-            let mut h: Vec<(String, String)> = Vec::new();
-            if !cfg.api_key.trim().is_empty() {
-                h.push(("api-key".into(), cfg.api_key.clone()));
-            }
-            (
-                format!("{base}/openai/deployments/{dep}/audio/speech?api-version={ver}"),
-                h,
-            )
-        }
-        _ => {
-            return Err(AiError::config(
-                "在线语音仅支持 OpenAI 兼容 / Azure OpenAI / 通义千问(DashScope) 端点；请改用系统语音",
-            ))
-        }
-    };
-    let fmt = if format.trim().is_empty() { "mp3" } else { format.trim() };
-    let voice = if voice.trim().is_empty() { "alloy" } else { voice.trim() };
+    let url = format!("{}/audio/speech", ensure_v1(base));
+    let model = if p.model.trim().is_empty() { "tts-1" } else { p.model.trim() };
+    let voice = if p.voice.trim().is_empty() { "alloy" } else { p.voice.trim() };
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
     let body = TtsBody {
-        model: cfg.model.clone(),
+        model: model.to_string(),
         input: text.to_string(),
         voice: voice.to_string(),
         response_format: fmt.to_string(),
     };
     let mut req = http.post(&url).json(&body);
-    for (k, v) in headers {
+    for (k, v) in bearer_headers(p.api_key) {
+        req = req.header(k, v);
+    }
+    post_audio(req).await
+}
+
+/// Azure OpenAI：地址含 deployments/{dep}/ 时直用该 URL；否则用 model 当部署名。
+async fn synth_azure(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let url = if base.contains("/deployments/") {
+        base.to_string()
+    } else {
+        if p.model.trim().is_empty() {
+            return Err(AiError::config("Azure OpenAI 语音需要填写部署名（模型）"));
+        }
+        format!("{base}/openai/v1/audio/speech?api-version=preview")
+    };
+    let voice = if p.voice.trim().is_empty() { "alloy" } else { p.voice.trim() };
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
+    let body = TtsBody {
+        model: p.model.trim().to_string(),
+        input: text.to_string(),
+        voice: voice.to_string(),
+        response_format: fmt.to_string(),
+    };
+    let mut req = http.post(&url).json(&body);
+    if !p.api_key.trim().is_empty() {
+        req = req.header("api-key", p.api_key.trim());
+    }
+    post_audio(req).await
+}
+
+/// DashScope 通义千问：复用 synthesize_dashscope（JSON 回包 + 二次下载）。
+async fn synth_dashscope(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let cfg = AiConfig {
+        provider: "dashscope".into(),
+        base_url: base.to_string(),
+        api_key: p.api_key.to_string(),
+        model: p.model.to_string(),
+        deployment: String::new(),
+        api_version: p.lang.to_string(),
+    };
+    synthesize_dashscope(http.clone(), &cfg, base, p.voice, text).await
+}
+
+/// MiniMax：POST {base}/v1/t2a_v2；音频在 data.audio（base64 或 hex）。
+async fn synth_minimax(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let model = if p.model.trim().is_empty() { "speech-2.6-hd" } else { p.model.trim() };
+    let voice = if p.voice.trim().is_empty() { "male-qn-qingse" } else { p.voice.trim() };
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
+    let url = format!("{base}/v1/t2a_v2");
+    let body = json!({
+        "model": model,
+        "text": text,
+        "voice_setting": { "voice_id": voice },
+        "audio_setting": { "format": fmt },
+    });
+    let mut req = http.post(&url).json(&body);
+    for (k, v) in bearer_headers(p.api_key) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| classify_req(&e))?;
     let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        let brief: String = msg.chars().take(300).collect();
+        let brief: String = txt.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), brief));
     }
-    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
-    if bytes.is_empty() {
-        return Err(AiError::protocol("语音接口返回空音频"));
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+    let data = v
+        .get("data")
+        .and_then(|d| d.get("audio"))
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+    if data.is_empty() {
+        let msg = v
+            .get("base_resp")
+            .and_then(|b| b.get("status_msg"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("响应中未找到音频数据");
+        return Err(AiError::protocol(format!("MiniMax 合成失败：{msg}")));
     }
-    Ok(bytes.to_vec())
+    decode_audio_b64_or_hex(data)
+}
+
+/// Fish Audio：POST {base}/v1/tts，请求头带 model，返回音频字节。
+async fn synth_fish(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let model = if p.model.trim().is_empty() { "s1" } else { p.model.trim() };
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
+    let url = format!("{base}/v1/tts");
+    let body = json!({ "text": text, "reference_id": p.voice, "format": fmt });
+    let mut req = http.post(&url).header("model", model).json(&body);
+    for (k, v) in bearer_headers(p.api_key) {
+        req = req.header(k, v);
+    }
+    post_audio(req).await
+}
+
+/// GPT-SoVITS 原生 /tts：参考音频路径由 voice 给出。
+async fn synth_gptsovits(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let lang = map_gptsovits_lang(p.lang);
+    let fmt = if p.format.trim().is_empty() { "wav" } else { p.format.trim() };
+    let url = format!("{base}/tts");
+    let body = json!({
+        "text": text,
+        "text_lang": lang,
+        "ref_audio_path": p.voice,
+        "prompt_text": "",
+        "prompt_lang": lang,
+        "media_type": fmt,
+    });
+    post_audio(http.post(&url).json(&body)).await
+}
+
+/// 把 config.tts.lang 映射为 GPT-SoVITS 的语种代码。
+fn map_gptsovits_lang(lang: &str) -> &'static str {
+    let l = lang.trim().to_ascii_lowercase();
+    if l.starts_with("ja") || l.starts_with("jp") {
+        "ja"
+    } else if l.starts_with("ko") {
+        "ko"
+    } else if l.starts_with("yue") || l.starts_with("cantonese") {
+        "yue"
+    } else if l.starts_with("en") {
+        "en"
+    } else {
+        "zh"
+    }
+}
+
+/// Breeze-TTS-2 本地网关：复用 synthesize_breeze（直连）。
+async fn synth_breeze_dispatch(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    base: &str,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if base.is_empty() {
+        return Err(AiError::config("未填写服务地址"));
+    }
+    let local = breeze_client().unwrap_or_else(|_| http.clone());
+    let cfg = AiConfig {
+        provider: "breeze".into(),
+        base_url: base.to_string(),
+        api_key: p.api_key.to_string(),
+        model: p.model.to_string(),
+        deployment: String::new(),
+        api_version: String::new(),
+    };
+    synthesize_breeze(local, &cfg, base, p.voice, text).await
+}
+
+/// 火山引擎（豆包）V1 HTTP：一次性 JSON + base64 返回。
+async fn synth_volcano(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    const URL: &str = "https://openspeech.bytedance.com/api/v1/tts";
+    if p.app_id.trim().is_empty() {
+        return Err(AiError::config("火山引擎语音需要填写 AppID"));
+    }
+    if p.api_key.trim().is_empty() {
+        return Err(AiError::config("火山引擎语音需要填写 Access Token"));
+    }
+    let voice = if p.voice.trim().is_empty() {
+        "zh_female_cancan_mars_bigtts"
+    } else {
+        p.voice.trim()
+    };
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
+    let cluster = if p.cluster.trim().is_empty() { "volcano_tts" } else { p.cluster.trim() };
+    let body = json!({
+        "app": { "appid": p.app_id.trim(), "token": p.api_key.trim(), "cluster": cluster },
+        "user": { "uid": "flowread" },
+        "audio": { "voice_type": voice, "encoding": fmt, "rate": 24000 },
+        "request": { "reqid": unique_reqid(), "text": text, "text_type": "plain", "operation": "query" },
+    });
+    let resp = http
+        .post(URL)
+        .header("Authorization", format!("Bearer;{}", p.api_key.trim()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let brief: String = txt.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+    let code = v.get("code").map(json_i64).unwrap_or(0);
+    if code != 3000 {
+        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("合成失败");
+        return Err(AiError::protocol(format!("火山引擎返回错误 {code}：{msg}")));
+    }
+    let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+    if data.is_empty() {
+        return Err(AiError::protocol("火山引擎响应中未找到音频数据"));
+    }
+    decode_audio_b64_or_hex(data)
+}
+
+/// 百度语音：先取 token（进程内缓存），再调短文本在线合成。
+async fn synth_baidu(
+    http: &reqwest::Client,
+    p: &TtsParams<'_>,
+    text: &str,
+) -> Result<Vec<u8>, AiError> {
+    if p.api_key.trim().is_empty() {
+        return Err(AiError::config("百度语音需要填写 API Key"));
+    }
+    if p.secret_key.trim().is_empty() {
+        return Err(AiError::config("百度语音需要填写 Secret Key"));
+    }
+    let token = baidu_token(http, p.api_key.trim(), p.secret_key.trim()).await?;
+    let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
+    let aue = match fmt.to_ascii_lowercase().as_str() {
+        "wav" => "6",
+        "pcm" => "4",
+        _ => "3",
+    };
+    let per = if p.voice.trim().is_empty() { "0" } else { p.voice.trim() };
+    let form = [
+        ("tex", text),
+        ("tok", token.as_str()),
+        ("cuid", "flowread"),
+        ("ctp", "1"),
+        ("lan", "zh"),
+        ("spd", "5"),
+        ("pit", "5"),
+        ("vol", "5"),
+        ("per", per),
+        ("aue", aue),
+    ];
+    let resp = http
+        .post("https://tsn.baidu.com/text2audio")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    if ctype.starts_with("audio") {
+        if bytes.is_empty() {
+            return Err(AiError::protocol("百度语音返回空音频"));
+        }
+        return Ok(bytes.to_vec());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let err_no = v.get("err_no").map(json_i64).unwrap_or(-1);
+    let err_msg = v.get("err_msg").and_then(|x| x.as_str()).unwrap_or("未知错误");
+    Err(AiError::protocol(format!("百度语音合成失败：err_no={err_no} {err_msg}")))
+}
+
+/// 百度语音 token 缓存：`{apiKey}\x1f{secretKey}` -> (token, 过期时间戳秒)。
+fn baidu_token_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 获取百度语音 access_token；过期前 60 秒复用缓存。
+async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) -> Result<String, AiError> {
+    let key = format!("{api_key}\u{1f}{secret_key}");
+    let now = now_unix_secs();
+    if let Ok(m) = baidu_token_cache().lock() {
+        if let Some((tok, exp)) = m.get(&key) {
+            if *exp > now + 60 {
+                return Ok(tok.clone());
+            }
+        }
+    }
+    let resp = http
+        .post("https://aip.baidubce.com/oauth/2.0/token")
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", api_key),
+            ("client_secret", secret_key),
+        ])
+        .send()
+        .await
+        .map_err(|e| classify_req(&e))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let brief: String = txt.chars().take(300).collect();
+        return Err(AiError::http(status.as_u16(), brief));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+    let tok = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            let desc = v
+                .get("error_description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("未返回 access_token");
+            AiError::protocol(format!("百度语音获取 token 失败：{desc}"))
+        })?
+        .to_string();
+    let expires = v.get("expires_in").map(json_i64).unwrap_or(2_592_000).max(600) as u64;
+    if let Ok(mut m) = baidu_token_cache().lock() {
+        m.insert(key, (tok.clone(), now + expires));
+    }
+    Ok(tok)
+}
+
+/* ------------------------------ Edge TTS ------------------------------ */
+
+const EDGE_TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+/// 伪装成较新的 Edge 稳定版；与 Sec-MS-GEC-Version 后缀保持一致。
+const EDGE_CHROMIUM_VERSION: &str = "143.0.3650.75";
+
+/// Edge TTS 免费接口：走 WebSocket（wss），直连，无需密钥与地址。
+async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let voice = if p.voice.trim().is_empty() {
+        "zh-CN-XiaoxiaoNeural"
+    } else {
+        p.voice.trim()
+    };
+    let connection_id = uuid_v4();
+    let gec = edge_sec_ms_gec();
+    let url = format!(
+        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken={EDGE_TRUSTED_CLIENT_TOKEN}&ConnectionId={connection_id}&Sec-MS-GEC={gec}&Sec-MS-GEC-Version=1-{EDGE_CHROMIUM_VERSION}"
+    );
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| AiError::protocol(format!("Edge 请求构建失败：{e}")))?;
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            "Origin",
+            "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold".parse().unwrap(),
+        );
+        headers.insert(
+            "User-Agent",
+            format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{EDGE_CHROMIUM_VERSION} Safari/537.36 Edg/{EDGE_CHROMIUM_VERSION}"
+            )
+            .parse()
+            .unwrap(),
+        );
+        headers.insert("Pragma", "no-cache".parse().unwrap());
+        headers.insert("Cache-Control", "no-cache".parse().unwrap());
+    }
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| AiError::network(format!("Edge 连接失败：{e}")))?;
+
+    let config_msg = "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}";
+    ws.send(Message::text(config_msg))
+        .await
+        .map_err(|e| AiError::network(format!("Edge 发送失败：{e}")))?;
+
+    let request_id = uuid_v4();
+    let timestamp = rfc3339_utc();
+    let ssml = format!(
+        "<speak version='1.0' xml:lang='zh-CN'><voice name='{voice}'><prosody rate='+0%' volume='+0%' pitch='+0Hz'>{}</prosody></voice></speak>",
+        escape_xml(text)
+    );
+    let ssml_msg = format!(
+        "X-RequestId:{request_id}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:{timestamp}\r\nPath:ssml\r\n\r\n{ssml}"
+    );
+    ws.send(Message::text(ssml_msg))
+        .await
+        .map_err(|e| AiError::network(format!("Edge 发送失败：{e}")))?;
+
+    let mut audio: Vec<u8> = Vec::new();
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => {
+                if t.contains("Path:turn.end") {
+                    break;
+                }
+            }
+            Some(Ok(Message::Binary(b))) => {
+                // 二进制帧：前 2 字节（大端）为 header 长度，其后 header，再其后为音频。
+                if b.len() < 2 {
+                    continue;
+                }
+                let header_len = ((b[0] as usize) << 8) | (b[1] as usize);
+                let start = 2 + header_len;
+                if start <= b.len() {
+                    audio.extend_from_slice(&b[start..]);
+                }
+            }
+            Some(Ok(Message::Close(_))) => break,
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(AiError::network(format!("Edge 接收失败：{e}"))),
+            None => break,
+        }
+    }
+    if audio.is_empty() {
+        return Err(AiError::protocol("Edge TTS 未返回音频"));
+    }
+    Ok(audio)
+}
+
+/// 计算 Edge TTS 的 Sec-MS-GEC：Windows filetime ticks 向下取整到 5 分钟后，
+/// 拼接可信客户端令牌做 SHA-256，取大写十六进制。
+fn edge_sec_ms_gec() -> String {
+    let unix = now_unix_secs() as i64;
+    let ticks = (unix + 11_644_473_600).saturating_mul(10_000_000);
+    let rounded = ticks / 3_000_000_000 * 3_000_000_000;
+    let mut h = Sha256::new();
+    h.update(format!("{rounded}{EDGE_TRUSTED_CLIENT_TOKEN}").as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// XML 转义（SSML 文本节点）。
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+        .replace('"', "&quot;")
+}
+
+/// 生成一个 UUID v4 形态的字符串（时间 + 计数器混合，仅用于请求 id）。
+fn uuid_v4() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut bytes = [0u8; 16];
+    let mut x = nanos ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for b in bytes.iter_mut() {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *b = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 24) as u8;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// 唯一请求 id：时间戳 + 计数器做 SHA-256（十六进制）。
+fn unique_reqid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(nanos.to_le_bytes());
+    h.update(n.to_le_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 当前 Unix 秒（UTC）。
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// UTC RFC3339 时间戳（秒精度），用于 Edge 的 X-Timestamp。
+fn rfc3339_utc() -> String {
+    let (y, mo, d, h, mi, s) = civil_from_unix(now_unix_secs() as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Unix 秒 -> (年, 月, 日, 时, 分, 秒)（Howard Hinnant 算法）。
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, h, mi, s)
+}
+
+/// JSON 数值/字符串统一取 i64。
+fn json_i64(v: &serde_json::Value) -> i64 {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        .unwrap_or(0)
+}
+
+/// 解码服务返回的音频字段：先按 base64；若仅含十六进制字符且长度为偶数则按 hex。
+fn decode_audio_b64_or_hex(s: &str) -> Result<Vec<u8>, AiError> {
+    let t = s.trim();
+    if !t.is_empty() && t.len() % 2 == 0 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = t.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for i in (0..bytes.len()).step_by(2) {
+            let hi = (bytes[i] as char).to_digit(16).unwrap_or(0);
+            let lo = (bytes[i + 1] as char).to_digit(16).unwrap_or(0);
+            out.push((hi * 16 + lo) as u8);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(t)
+        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))
 }
 
 #[cfg(test)]

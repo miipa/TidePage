@@ -35,7 +35,9 @@
   const onlineSvc = $derived(activeTtsService() ?? config.tts.services[0]);
 
   $effect(() => {
-    if (expanded && config.tts.engine === "online" && (onlineSvc?.baseUrl || "").trim()) {
+    const svc = onlineSvc;
+    const ready = ((svc?.baseUrl || "").trim()) || svc?.provider === "edge";
+    if (expanded && config.tts.engine === "online" && ready) {
       void refreshOnlineVoices();
     }
   });

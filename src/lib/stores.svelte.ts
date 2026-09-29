@@ -517,15 +517,16 @@ export const DEFAULT_PROMPTS: PromptItem[] = [
 
 export type TtsEngine = "system" | "online";
 
-/** 一条「语音服务配置档案」。对用户只暴露「一个服务地址」：后端按地址自动适配，
- *  没有协议/类型选项。 */
+/** 一条「语音服务配置档案」：显式保存接口协议与地址/密钥/音色等，可随时切换。 */
 export interface TtsService {
   /** 稳定唯一 id（用于渲染 key 与端点识别；旧配置迁移时补齐） */
   id: number;
   name: string;
-  /** 服务地址（后端按地址自动识别服务种类） */
+  /** 接口协议：openai/azure/dashscope/minimax/fish/gptsovits/breeze/volcano/baidu/edge */
+  provider: string;
+  /** 服务地址（edge 固定接口可留空；火山/百度亦为固定接口） */
   baseUrl: string;
-  /** 密钥（本地服务可留空） */
+  /** 密钥 / API Key（本地服务可留空） */
   apiKey: string;
   /** 模型（如 tts-1 / omnivoice；留空由后端取默认） */
   model: string;
@@ -533,7 +534,27 @@ export interface TtsService {
   voice: string;
   /** 音频格式（wav/mp3/opus/aac/flac） */
   format: string;
+  /** 百度语音专用：Secret Key */
+  secretKey: string;
+  /** 火山引擎专用：AppID */
+  appId: string;
+  /** 火山引擎专用：Cluster（可留空，默认 volcano_tts） */
+  cluster: string;
 }
+
+/** 全部 TTS 接口协议 id（前端下拉与迁移校验共用）。 */
+export const TTS_PROTOCOLS = [
+  "openai",
+  "azure",
+  "dashscope",
+  "minimax",
+  "fish",
+  "gptsovits",
+  "breeze",
+  "volcano",
+  "baidu",
+  "edge",
+] as const;
 
 export interface TtsConfig {
   /** 朗读引擎：system=系统离线语音；online=在线神经语音 */
@@ -579,17 +600,27 @@ function nextTtsServiceId(): number {
   return ++ttsServiceIdSeq;
 }
 
+/** 归一化 TTS 接口协议：未知/缺失一律回退 OpenAI 兼容。 */
+export function sanitizeTtsProvider(v: any): string {
+  const s = typeof v === "string" ? v.toLowerCase().trim() : "";
+  return (TTS_PROTOCOLS as readonly string[]).includes(s) ? s : "openai";
+}
+
 /** 用默认字段模板补齐单条服务（新增字段缺失时用默认值，不丢用户已填内容）。 */
 export function normalizeTtsService(s: any): TtsService {
   const src = s && typeof s === "object" ? s : {};
   return {
     id: typeof src.id === "number" && Number.isFinite(src.id) && src.id > 0 ? src.id : 0,
     name: typeof src.name === "string" ? src.name : "",
+    provider: sanitizeTtsProvider(src.provider),
     baseUrl: typeof src.baseUrl === "string" ? src.baseUrl : "",
     apiKey: typeof src.apiKey === "string" ? src.apiKey : "",
     model: typeof src.model === "string" ? src.model : "",
     voice: typeof src.voice === "string" ? src.voice : "",
     format: typeof src.format === "string" && src.format ? src.format : "wav",
+    secretKey: typeof src.secretKey === "string" ? src.secretKey : "",
+    appId: typeof src.appId === "string" ? src.appId : "",
+    cluster: typeof src.cluster === "string" ? src.cluster : "",
   };
 }
 
@@ -609,11 +640,15 @@ export function newTtsService(list: TtsService[]): TtsService {
   return {
     id: nextTtsServiceId(),
     name: uniqueTtsServiceName(list),
+    provider: "openai",
     baseUrl: "",
     apiKey: "",
     model: "",
     voice: "",
     format: "wav",
+    secretKey: "",
+    appId: "",
+    cluster: "",
   };
 }
 
@@ -1066,11 +1101,15 @@ p {
       {
         id: 1,
         name: "默认语音服务",
+        provider: "openai",
         baseUrl: "http://127.0.0.1:3900",
         apiKey: "",
         model: "omnivoice",
         voice: "33aa3b77",
         format: "wav",
+        secretKey: "",
+        appId: "",
+        cluster: "",
       },
     ],
     activeService: 0,
@@ -1475,11 +1514,11 @@ const LEGACY_TTS_KEYS = [
 /**
  * 迁移语音朗读配置到「服务配置档案」模型。
  *  - 已含 services：逐条归一化并补齐 id。
- *  - 仅含旧扁平字段：构造一条服务（地址/密钥/模型/音色/格式）；若旧来源是
- *    「复用 AI 端点」，把当时引用的 AI 端点的地址/密钥/模型灌入该条。
+ *  - 仅含旧扁平字段：由旧 customProvider/customBaseUrl/customApiKey/onlineModel/
+ *    onlineVoice/onlineFormat 构造一条服务；provider 缺省 openai。
  *  - 一律删除遗留扁平键；对用户不丢地址/密钥/音色。
  */
-function migrateTts(savedTts: any, ai?: { profiles?: any[]; active?: number }): TtsConfig {
+function migrateTts(savedTts: any): TtsConfig {
   const base: any = { ...structuredClone(DEFAULTS.tts), ...(savedTts || {}) };
   const hasServices = Array.isArray(savedTts?.services) && savedTts.services.length > 0;
   if (hasServices) {
@@ -1488,33 +1527,25 @@ function migrateTts(savedTts: any, ai?: { profiles?: any[]; active?: number }): 
     base.services = list;
   } else {
     const src = savedTts && typeof savedTts === "object" ? savedTts : {};
-    let baseUrl = typeof src.customBaseUrl === "string" ? src.customBaseUrl : "";
-    let apiKey = typeof src.customApiKey === "string" ? src.customApiKey : "";
-    let model = typeof src.onlineModel === "string" ? src.onlineModel : "";
-    let voice = typeof src.onlineVoice === "string" ? src.onlineVoice : "";
-    let format = typeof src.onlineFormat === "string" ? src.onlineFormat : "";
-    // 旧「复用 AI 端点」：把当时使用的 AI 端点灌入这条服务。
-    if (src.onlineSource === "profile") {
-      const list = Array.isArray(ai?.profiles) ? ai.profiles : [];
-      const idx = Math.min(Math.max(((ai?.active as number) | 0) || 0, 0), Math.max(list.length - 1, 0));
-      const p =
-        list.find((x: any) => x && x.id === src.onlineProfileId) ?? list[idx] ?? list[0];
-      if (p) {
-        baseUrl = typeof p.baseUrl === "string" ? p.baseUrl : baseUrl;
-        apiKey = typeof p.apiKey === "string" ? p.apiKey : apiKey;
-        if (!model) model = typeof p.model === "string" ? p.model : "";
-      }
-    }
     const svc = normalizeTtsService({
       id: 1,
       name: "默认语音服务",
-      baseUrl: baseUrl || DEFAULTS.tts.services[0].baseUrl,
-      apiKey,
-      model,
-      voice,
-      format: format || "wav",
+      provider:
+        typeof src.customProvider === "string" && src.customProvider
+          ? src.customProvider
+          : "openai",
+      baseUrl: typeof src.customBaseUrl === "string" ? src.customBaseUrl : "",
+      apiKey: typeof src.customApiKey === "string" ? src.customApiKey : "",
+      model: typeof src.onlineModel === "string" ? src.onlineModel : "",
+      voice: typeof src.onlineVoice === "string" ? src.onlineVoice : "",
+      format: typeof src.onlineFormat === "string" ? src.onlineFormat : "",
     });
+    // 仅 OpenAI 兼容在缺省地址时补默认本地服务地址；其它协议地址语义不同，不臆造。
+    if (svc.provider === "openai" && !svc.baseUrl.trim()) {
+      svc.baseUrl = DEFAULTS.tts.services[0].baseUrl;
+    }
     base.services = [svc];
+    base.activeService = 0;
   }
   if (!base.services.length) {
     base.services = [normalizeTtsService(structuredClone(DEFAULTS.tts.services[0]))];
@@ -1600,7 +1631,7 @@ function load(): AppConfig {
       library: { ...DEFAULTS.library, ...(saved.library || {}) },
       webdav: { ...DEFAULTS.webdav, ...saved.webdav },
       ai: migratedAi,
-      tts: migrateTts(saved.tts, migratedAi),
+      tts: migrateTts(saved.tts),
       regex: saved.regex ?? "",
       uiTheme: saved.uiTheme === "light" || saved.uiTheme === "dark" ? saved.uiTheme : "system",
       uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
@@ -1880,7 +1911,7 @@ export function applyConfigJson(json: string) {
     obj.ai.active = Math.min(Math.max((obj.ai.active as number) | 0, 0), obj.ai.profiles.length - 1);
     stripReasoningArtifacts(obj.ai);
     if (obj.ai.display !== "reader") obj.ai.display = "chat";
-    obj.tts = migrateTts(obj.tts, obj.ai);
+    obj.tts = migrateTts(obj.tts);
     obj.uiTheme = obj.uiTheme === "light" || obj.uiTheme === "dark" ? obj.uiTheme : "system";
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");

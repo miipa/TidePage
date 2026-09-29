@@ -2766,26 +2766,32 @@ pub async fn tts_synth(
     provider: String,
     base_url: String,
     api_key: String,
+    secret_key: Option<String>,
+    app_id: Option<String>,
+    cluster: Option<String>,
     model: String,
-    deployment: Option<String>,
-    api_version: Option<String>,
-    proxy_mode: Option<String>,
-    proxy_url: Option<String>,
     voice: String,
     format: String,
     text: String,
+    lang: Option<String>,
+    proxy_mode: Option<String>,
+    proxy_url: Option<String>,
 ) -> Result<String, crate::ai::AiError> {
-    let cfg = crate::ai::AiConfig {
-        provider,
-        base_url,
-        api_key,
-        model,
-        deployment: deployment.unwrap_or_default(),
-        api_version: api_version.unwrap_or_default(),
+    let params = crate::ai::TtsParams {
+        provider: &provider,
+        base_url: &base_url,
+        api_key: &api_key,
+        secret_key: secret_key.as_deref().unwrap_or(""),
+        app_id: app_id.as_deref().unwrap_or(""),
+        cluster: cluster.as_deref().unwrap_or(""),
+        model: &model,
+        voice: &voice,
+        format: &format,
+        lang: lang.as_deref().unwrap_or(""),
     };
     let http = crate::ai::build_client(proxy_mode.as_deref().unwrap_or("auto"), proxy_url.as_deref().unwrap_or(""))
         .map_err(crate::ai::AiError::config)?;
-    let bytes = crate::ai::synthesize(http, cfg, &voice, &format, &text).await?;
+    let bytes = crate::ai::synthesize_tts(http, &params, &text).await?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
@@ -2803,23 +2809,44 @@ pub struct TtsVoiceInfo {
     pub language: String,
 }
 
-/// 读取自定义 TTS 服务提供的音色列表。
-/// OpenAI 兼容服务：GET {base}/v1/audio/voices（兼容 /v1/voices）；
-/// Breeze-TTS-2 本地网关：GET {base}/api/voices。
-/// 返回每个音色的 id/名称/类型/语言，供前端区分「固定音色」与「别名」。
+/// 读取 TTS 服务提供的音色列表，按用户显式选择的协议分派：
+///  - openai：GET {base}/v1/audio/voices（兼容 /v1/voices）；
+///  - breeze：GET {base}/api/voices；
+///  - edge：官方音色清单接口；
+///  - 其余协议不支持音色列表，返回空数组（由前端提示手填）。
 #[tauri::command]
 pub async fn tts_voices(
+    provider: String,
     base_url: String,
     api_key: String,
-    provider: Option<String>,
+    secret_key: Option<String>,
+    app_id: Option<String>,
+    cluster: Option<String>,
 ) -> Result<Vec<TtsVoiceInfo>, String> {
+    let _ = (&secret_key, &app_id, &cluster);
+    let provider = provider.trim().to_ascii_lowercase();
     let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("未填写服务地址".into());
-    }
-    if crate::ai::is_breeze_provider(provider.as_deref().unwrap_or("")) {
+    if crate::ai::is_breeze_provider(&provider) {
+        if base.is_empty() {
+            return Err("未填写服务地址".into());
+        }
         return list_breeze_voices(base, &api_key).await;
     }
+    match provider.as_str() {
+        "edge" => list_edge_voices().await,
+        // 缺省与 openai 一致；未知协议也按 OpenAI 兼容尝试。
+        "" | "openai" => {
+            if base.is_empty() {
+                return Err("未填写服务地址".into());
+            }
+            list_openai_voices(base, &api_key).await
+        }
+        _ => Ok(vec![]),
+    }
+}
+
+/// OpenAI 兼容音色列表：GET {base}/v1/audio/voices（兼容 /v1/voices）。
+async fn list_openai_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInfo>, String> {
     let root = base.strip_suffix("/v1").unwrap_or(base);
     // 兼容常见写法：VoiceStudio 用 /v1/audio/voices，其它服务用 /v1/voices
     let candidates = [
@@ -2899,6 +2926,43 @@ pub async fn tts_voices(
         last_err = "服务未返回音色列表".into();
     }
     Err(last_err)
+}
+
+/// Edge TTS 官方音色清单（无需密钥）：取 ShortName 作 id/name、Locale 作语言。
+async fn list_edge_voices() -> Result<Vec<TtsVoiceInfo>, String> {
+    const URL: &str = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let resp = client.get(URL).send().await.map_err(|e| format!("请求失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let arr: Vec<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out: Vec<TtsVoiceInfo> = Vec::new();
+    for it in &arr {
+        let name = it
+            .get("ShortName")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() || out.iter().any(|x| x.id == name) {
+            continue;
+        }
+        let language = it
+            .get("Locale")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(TtsVoiceInfo {
+            id: name.to_string(),
+            name: name.to_string(),
+            kind: String::new(),
+            language,
+        });
+    }
+    if out.is_empty() {
+        return Err("服务未返回音色列表".into());
+    }
+    Ok(out)
 }
 
 /// 读取 Breeze-TTS-2 本地网关中保存的克隆音色。网关返回

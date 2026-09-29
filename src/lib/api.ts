@@ -164,14 +164,27 @@ export const api = {
     proxyMode: string; proxyUrl: string;
   }) => invoke<string>("ai_test", args),
   ttsSynth: (args: {
-    baseUrl: string; apiKey: string; model: string;
+    provider: string; baseUrl: string; apiKey: string;
+    secretKey?: string; appId?: string; cluster?: string;
+    model: string; voice: string; format: string; text: string;
+    lang?: string;
     proxyMode?: string; proxyUrl?: string;
-    voice: string; format: string; text: string;
   }) => invoke<string>("tts_synth", args),
-  ttsVoices: (baseUrl: string, apiKey: string) =>
+  ttsVoices: (
+    provider: string,
+    baseUrl: string,
+    apiKey: string,
+    secretKey = "",
+    appId = "",
+    cluster = "",
+  ) =>
     invoke<{ id: string; name: string; type: string; language: string }[]>("tts_voices", {
+      provider,
       baseUrl,
       apiKey,
+      secretKey,
+      appId,
+      cluster,
     }),
   ttsEnsureFixedVoice: (baseUrl: string, apiKey: string, language: string, instruct: string) =>
     invoke<{ id: string; created: boolean }>("tts_ensure_fixed_voice", {

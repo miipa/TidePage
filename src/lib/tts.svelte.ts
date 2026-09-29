@@ -227,8 +227,12 @@ export function effectiveOnlineVoice(): string {
 }
 
 interface TtsEndpoint {
+  provider: string;
   baseUrl: string;
   apiKey: string;
+  secretKey: string;
+  appId: string;
+  cluster: string;
   model: string;
   voice: string;
   format: string;
@@ -237,27 +241,34 @@ interface TtsEndpoint {
   tag: string;
 }
 
-/** 解析在线语音要用的端点：当前语音服务配置档案。无地址返回 null。 */
+/** 解析在线语音要用的端点：当前语音服务配置档案。无地址且非 Edge 返回 null。 */
 function resolveEndpoint(): TtsEndpoint | null {
   const s = activeTtsService();
   if (!s) return null;
   const base = (s.baseUrl || "").trim();
-  if (!base) return null;
+  const provider = s.provider || "openai";
+  if (!base && provider !== "edge") return null;
   return {
+    provider,
     baseUrl: base,
     apiKey: s.apiKey || "",
+    secretKey: s.secretKey || "",
+    appId: s.appId || "",
+    cluster: s.cluster || "",
     model: (s.model || "").trim(),
     voice: (s.voice || "").trim(),
     format: s.format || "mp3",
     proxyMode: "auto",
     proxyUrl: "",
-    tag: `service:${s.id}:${base}`,
+    tag: `service:${s.id}:${provider}:${base}`,
   };
 }
 
-/** 在线语音服务是否可用：引擎为在线且当前档案填了地址。 */
+/** 在线语音服务是否可用：引擎为在线，且当前档案填了地址或为 Edge（固定接口）。 */
 function isCustomVoiceService(): boolean {
-  return config.tts.engine === "online" && !!(activeTtsService()?.baseUrl || "").trim();
+  const s = activeTtsService();
+  if (!s) return false;
+  return config.tts.engine === "online" && (!!(s.baseUrl || "").trim() || s.provider === "edge");
 }
 
 function cacheKey(text: string): string {
@@ -314,12 +325,17 @@ async function fetchAudio(text: string): Promise<string> {
   if (!ep) throw new Error("未配置语音服务");
   const fmt = ep.format || "mp3";
   const b64 = await api.ttsSynth({
+    provider: ep.provider,
     baseUrl: ep.baseUrl,
     apiKey: ep.apiKey,
+    secretKey: ep.secretKey,
+    appId: ep.appId,
+    cluster: ep.cluster,
     model: ep.model,
     voice: effectiveOnlineVoice(),
     format: fmt,
     text,
+    lang: config.tts.lang || "",
     proxyMode: ep.proxyMode,
     proxyUrl: ep.proxyUrl,
   });
@@ -670,6 +686,8 @@ async function ensureFixedVoice(): Promise<boolean> {
   if (!isCustomVoiceService()) return false;
   const s = activeTtsService();
   if (!s) return false;
+  // 固定音色创建仅适用于 OpenAI 兼容（VoiceStudio 风格）服务。
+  if (s.provider !== "openai") return false;
   const cur = (s.voice || "").trim();
   if (cur && !OPENAI_VOICE_ALIASES.has(cur.toLowerCase())) return true;
   const target = targetLanguageName();
@@ -714,19 +732,24 @@ async function ensureFixedVoice(): Promise<boolean> {
 }
 
 export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
-  if (!isCustomVoiceService()) {
-    ttsState.onlineVoices = [];
-    return [];
-  }
   const s = activeTtsService();
+  const provider = s?.provider || "openai";
   const base = (s?.baseUrl || "").trim();
-  if (!base) {
+  // Edge 为固定接口，无需地址即可读取；其余协议需地址。
+  if (!isCustomVoiceService() || (!base && provider !== "edge")) {
     ttsState.onlineVoices = [];
     return [];
   }
   ttsState.onlineVoiceLoading = true;
   try {
-    const list = await api.ttsVoices(base, s?.apiKey || "");
+    const list = await api.ttsVoices(
+      provider,
+      base,
+      s?.apiKey || "",
+      s?.secretKey || "",
+      s?.appId || "",
+      s?.cluster || "",
+    );
     ttsState.onlineVoices = list;
     ttsState.onlineVoiceError = list.length ? "" : "服务未返回音色列表";
     selectFixedVoice(list);

@@ -35,6 +35,7 @@
     type UiTheme,
     type ReaderScheme,
     type AiProvider,
+    type TtsService,
     type BindAction,
     type ZoneAction,
     type StatusItemId,
@@ -366,11 +367,44 @@
     ttsVoiceList.filter((v) => v.type !== "profile" && v.type !== "openai_alias")
   );
 
+  /** 各接口协议的文案提示与默认值（切换协议时用于补空字段）。 */
+  interface TtsProviderMeta {
+    id: string;
+    label: string;
+    baseHint: string;
+    modelHint: string;
+    voiceHint: string;
+    defaults: { baseUrl: string; model: string; voice: string; format: string };
+    /** 是否支持从服务读取音色列表（否则音色手填）。 */
+    voiceList: boolean;
+    /** 是否隐藏密钥/模型（Edge 固定接口为在线公共端点，无需二者）。 */
+    hideKeyModel: boolean;
+  }
+
+  const TTS_PROVIDER_METAS: TtsProviderMeta[] = [
+    { id: "openai", label: "OpenAI 兼容", baseHint: "http://127.0.0.1:3900", modelHint: "omnivoice", voiceHint: "音色名/参数，留空默认", defaults: { baseUrl: "http://127.0.0.1:3900", model: "omnivoice", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "azure", label: "Azure OpenAI", baseHint: "https://<资源名>.openai.azure.com", modelHint: "部署名", voiceHint: "如 zh-CN-XiaoxiaoNeural", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "dashscope", label: "通义千问（DashScope）", baseHint: "https://dashscope.aliyuncs.com", modelHint: "qwen3-tts-flash", voiceHint: "Cherry", defaults: { baseUrl: "https://dashscope.aliyuncs.com", model: "qwen3-tts-flash", voice: "Cherry", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "minimax", label: "MiniMax", baseHint: "https://api.minimax.chat", modelHint: "speech-2.6-hd", voiceHint: "male-qn-qingse", defaults: { baseUrl: "https://api.minimax.chat", model: "speech-2.6-hd", voice: "male-qn-qingse", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "fish", label: "Fish Audio", baseHint: "https://api.fish.audio", modelHint: "s1", voiceHint: "reference_id", defaults: { baseUrl: "https://api.fish.audio", model: "s1", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "gptsovits", label: "GPT-SoVITS（本地）", baseHint: "http://127.0.0.1:9880", modelHint: "留空", voiceHint: "参考音频路径", defaults: { baseUrl: "http://127.0.0.1:9880", model: "", voice: "", format: "wav" }, voiceList: false, hideKeyModel: false },
+    { id: "breeze", label: "Breeze（本地）", baseHint: "http://127.0.0.1:7863", modelHint: "留空", voiceHint: "音色 id", defaults: { baseUrl: "http://127.0.0.1:7863", model: "", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "volcano", label: "火山引擎（豆包）", baseHint: "https://openspeech.bytedance.com/api/v1/tts", modelHint: "留空", voiceHint: "zh_female_cancan_mars_bigtts", defaults: { baseUrl: "https://openspeech.bytedance.com/api/v1/tts", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "baidu", label: "百度语音", baseHint: "https://tsn.baidu.com", modelHint: "留空", voiceHint: "音色编号，如 0", defaults: { baseUrl: "https://tsn.baidu.com", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "edge", label: "Edge TTS（免费）", baseHint: "服务地址固定，留空即可", modelHint: "", voiceHint: "如 zh-CN-XiaoxiaoNeural", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: true, hideKeyModel: true },
+  ];
+
+  function ttsProviderMeta(id: string): TtsProviderMeta {
+    return TTS_PROVIDER_METAS.find((m) => m.id === id) ?? TTS_PROVIDER_METAS[0];
+  }
+
   /** 当前语音服务档案。 */
   const tsvc = $derived(
     config.tts.services[Math.min(config.tts.activeService, config.tts.services.length - 1)] ??
       config.tts.services[0]
   );
+
+  const tsvcMeta = $derived(ttsProviderMeta(tsvc?.provider || "openai"));
 
   function addTtsService() {
     const list = config.tts.services;
@@ -393,9 +427,31 @@
     loadTtsVoices();
   }
 
+  /** 切换接口协议：为仍为空的字段补该协议默认值，并即时保存、刷新音色。 */
+  function onTtsProtocolChange(s: TtsService) {
+    const m = ttsProviderMeta(s.provider);
+    if (!s.baseUrl.trim()) s.baseUrl = m.defaults.baseUrl;
+    if (!s.model.trim()) s.model = m.defaults.model;
+    if (!s.voice.trim()) s.voice = m.defaults.voice;
+    if (!s.format.trim()) s.format = m.defaults.format;
+    // 切换协议后旧音色列表不再适用，清空重读。
+    ttsVoiceList = [];
+    ttsVoiceMsg = "";
+    saveConfigNow();
+    loadTtsVoices();
+  }
+
   async function loadTtsVoices() {
     const s = tsvc;
-    if (!s || !(s.baseUrl || "").trim()) return;
+    if (!s) return;
+    const m = ttsProviderMeta(s.provider);
+    if (!m.voiceList) {
+      ttsVoiceList = [];
+      ttsState.onlineVoices = [];
+      ttsVoiceMsg = "该服务不支持音色列表，请手动填写音色名";
+      return;
+    }
+    if (!(s.baseUrl || "").trim() && s.provider !== "edge") return;
     ttsVoiceLoading = true;
     ttsVoiceMsg = "";
     try {
@@ -411,8 +467,9 @@
 
   $effect(() => {
     if (tab !== "tts") return;
-    // 依赖当前档案与地址：切换服务或改地址后自动重新读取音色。
+    // 依赖当前档案、协议与地址：切换服务/协议或改地址后自动重新读取音色。
     void config.tts.activeService;
+    void tsvc?.provider;
     void tsvc?.baseUrl;
     loadTtsVoices();
   });
@@ -1610,6 +1667,15 @@
         </div>
       </div>
 
+      <div class="field">
+        <label>接口协议</label>
+        <select bind:value={tsvc.provider} onchange={() => onTtsProtocolChange(tsvc)}>
+          {#each TTS_PROVIDER_METAS as p (p.id)}
+            <option value={p.id}>{p.label}</option>
+          {/each}
+        </select>
+      </div>
+
       <div class="grid2">
         <div class="field">
           <label>名称</label>
@@ -1617,19 +1683,39 @@
         </div>
         <div class="field">
           <label>服务地址</label>
-          <input bind:value={tsvc.baseUrl} onchange={saveConfig} placeholder="https://… 或 http://127.0.0.1:8000" title="填服务地址即可，自动识别服务类型" />
+          <input bind:value={tsvc.baseUrl} onchange={saveConfig} placeholder={tsvcMeta.baseHint} title={tsvcMeta.baseHint} />
         </div>
       </div>
-      <div class="grid2">
-        <div class="field">
-          <label>密钥</label>
-          <input type="password" bind:value={tsvc.apiKey} onchange={saveConfig} placeholder="本地服务可留空" />
+      {#if !tsvcMeta.hideKeyModel}
+        <div class="grid2">
+          <div class="field">
+            <label>密钥 / API Key</label>
+            <input type="password" bind:value={tsvc.apiKey} onchange={saveConfig} placeholder="本地服务可留空" />
+          </div>
+          <div class="field">
+            <label>模型</label>
+            <input bind:value={tsvc.model} onchange={saveConfig} placeholder={tsvcMeta.modelHint} title="留空由后端取默认" />
+          </div>
         </div>
+      {/if}
+      {#if tsvc.provider === "baidu"}
         <div class="field">
-          <label>模型</label>
-          <input bind:value={tsvc.model} onchange={saveConfig} placeholder="留空自动" />
+          <label>Secret Key</label>
+          <input type="password" bind:value={tsvc.secretKey} onchange={saveConfig} placeholder="百度语音 Secret Key" />
         </div>
-      </div>
+      {/if}
+      {#if tsvc.provider === "volcano"}
+        <div class="grid2">
+          <div class="field">
+            <label>AppID</label>
+            <input bind:value={tsvc.appId} onchange={saveConfig} placeholder="火山引擎 AppID" />
+          </div>
+          <div class="field">
+            <label>Cluster</label>
+            <input bind:value={tsvc.cluster} onchange={saveConfig} placeholder="volcano_tts" />
+          </div>
+        </div>
+      {/if}
       <div class="grid2">
         <div class="field">
           <label>音色</label>
@@ -1653,9 +1739,11 @@
                 {/if}
               </select>
             {:else}
-              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder="音色名/参考音频路径，留空默认" />
+              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder={tsvcMeta.voiceHint} />
             {/if}
-            <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
+            {#if tsvcMeta.voiceList}
+              <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
+            {/if}
           </div>
         </div>
         <div class="field">
