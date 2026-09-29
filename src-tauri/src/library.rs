@@ -2834,8 +2834,8 @@ pub async fn tts_voices(
     }
     match provider.as_str() {
         "edge" => list_edge_voices().await,
-        // 缺省与 openai 一致；未知协议也按 OpenAI 兼容尝试。
-        "" | "openai" => {
+        // 缺省与 openai 一致；VoiceStudio 亦为 OpenAI 兼容；未知协议也按 OpenAI 兼容尝试。
+        "" | "openai" | "voicestudio" => {
             if base.is_empty() {
                 return Err("未填写服务地址".into());
             }

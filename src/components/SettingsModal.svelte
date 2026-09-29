@@ -441,6 +441,7 @@
 
   const TTS_PROVIDER_METAS: TtsProviderMeta[] = [
     { id: "openai", label: "OpenAI 兼容", baseHint: "http://127.0.0.1:3900", modelHint: "omnivoice", voiceHint: "音色名/参数，留空默认", defaults: { baseUrl: "http://127.0.0.1:3900", model: "omnivoice", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "voicestudio", label: "VoiceStudio（本地）", baseHint: "http://127.0.0.1:3900", modelHint: "tts-1（跟随 VoiceStudio 当前引擎）/ omnivoice", voiceHint: "default 或音色档案 ID，留空默认", defaults: { baseUrl: "http://127.0.0.1:3900", model: "tts-1", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
     { id: "azure", label: "Azure OpenAI", baseHint: "https://<资源名>.openai.azure.com", modelHint: "部署名", voiceHint: "如 zh-CN-XiaoxiaoNeural", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
     { id: "dashscope", label: "通义千问（DashScope）", baseHint: "https://dashscope.aliyuncs.com", modelHint: "qwen3-tts-flash", voiceHint: "Cherry", defaults: { baseUrl: "https://dashscope.aliyuncs.com", model: "qwen3-tts-flash", voice: "Cherry", format: "mp3" }, voiceList: false, hideKeyModel: false },
     { id: "minimax", label: "MiniMax", baseHint: "https://api.minimax.chat", modelHint: "speech-2.6-hd", voiceHint: "male-qn-qingse", defaults: { baseUrl: "https://api.minimax.chat", model: "speech-2.6-hd", voice: "male-qn-qingse", format: "mp3" }, voiceList: false, hideKeyModel: false },

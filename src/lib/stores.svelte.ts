@@ -524,7 +524,7 @@ export interface TtsService {
   /** 稳定唯一 id（用于渲染 key 与端点识别；旧配置迁移时补齐） */
   id: number;
   name: string;
-  /** 接口协议：openai/azure/dashscope/minimax/fish/gptsovits/breeze/volcano/baidu/edge */
+  /** 接口协议：openai/voicestudio/azure/dashscope/minimax/fish/gptsovits/breeze/volcano/baidu/edge */
   provider: string;
   /** 服务地址（edge 固定接口可留空；火山/百度亦为固定接口） */
   baseUrl: string;
@@ -547,6 +547,7 @@ export interface TtsService {
 /** 全部 TTS 接口协议 id（前端下拉与迁移校验共用）。 */
 export const TTS_PROTOCOLS = [
   "openai",
+  "voicestudio",
   "azure",
   "dashscope",
   "minimax",

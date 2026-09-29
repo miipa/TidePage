@@ -687,7 +687,7 @@ async function ensureFixedVoice(): Promise<boolean> {
   const s = activeTtsService();
   if (!s) return false;
   // 固定音色创建仅适用于 OpenAI 兼容（VoiceStudio 风格）服务。
-  if (s.provider !== "openai") return false;
+  if (s.provider !== "openai" && s.provider !== "voicestudio") return false;
   const cur = (s.voice || "").trim();
   if (cur && !OPENAI_VOICE_ALIASES.has(cur.toLowerCase())) return true;
   const target = targetLanguageName();

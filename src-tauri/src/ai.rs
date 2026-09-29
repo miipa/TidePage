@@ -1420,6 +1420,7 @@ pub async fn synthesize_tts(
         "volcano" => synth_volcano(&http, p, text).await,
         "baidu" => synth_baidu(&http, p, text).await,
         "edge" => synth_edge(p, text).await,
+        // openai / voicestudio 均为 OpenAI 兼容（VoiceStudio 本地 /v1/audio/speech）。
         _ => synth_openai(&http, p, base, text).await,
     }
 }
