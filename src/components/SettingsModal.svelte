@@ -398,6 +398,15 @@
     return TTS_PROVIDER_METAS.find((m) => m.id === id) ?? TTS_PROVIDER_METAS[0];
   }
 
+  type TtsField = "baseUrl" | "model" | "voice" | "format";
+
+  /** 该字段值是否等于「任一协议的默认值」：若是则视为未自定义（等价于空），
+   *  切换协议时可安全替换为新协议默认值，避免残留旧协议地址/模型/音色。 */
+  function isTtsDefaultValue(field: TtsField, value: string): boolean {
+    const v = (value ?? "").trim();
+    return TTS_PROVIDER_METAS.some((m) => (m.defaults[field] || "").trim() === v);
+  }
+
   /** 当前语音服务档案。 */
   const tsvc = $derived(
     config.tts.services[Math.min(config.tts.activeService, config.tts.services.length - 1)] ??
@@ -427,13 +436,22 @@
     loadTtsVoices();
   }
 
-  /** 切换接口协议：为仍为空的字段补该协议默认值，并即时保存、刷新音色。 */
+  /** 切换接口协议：空值或仍为「某协议默认值」的字段一律替换为新协议默认值；
+   *  固定接口协议（火山/百度/Edge）的地址每次切换都直接写死（Edge 为空串），
+   *  不残留其它协议地址。secretKey/appId/cluster 保持不变。 */
   function onTtsProtocolChange(s: TtsService) {
     const m = ttsProviderMeta(s.provider);
-    if (!s.baseUrl.trim()) s.baseUrl = m.defaults.baseUrl;
-    if (!s.model.trim()) s.model = m.defaults.model;
-    if (!s.voice.trim()) s.voice = m.defaults.voice;
-    if (!s.format.trim()) s.format = m.defaults.format;
+    const fixedBase =
+      s.provider === "volcano" || s.provider === "baidu" || s.provider === "edge";
+    const fill = (field: TtsField): string => {
+      const cur = s[field] ?? "";
+      if (field === "baseUrl" && fixedBase) return m.defaults.baseUrl;
+      return !cur.trim() || isTtsDefaultValue(field, cur) ? m.defaults[field] : cur;
+    };
+    s.baseUrl = fill("baseUrl");
+    s.model = fill("model");
+    s.voice = fill("voice");
+    s.format = fill("format");
     // 切换协议后旧音色列表不再适用，清空重读。
     ttsVoiceList = [];
     ttsVoiceMsg = "";
