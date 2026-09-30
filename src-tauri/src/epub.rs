@@ -1133,12 +1133,10 @@ fn render_doc_html<R: Read + std::io::Seek>(
         }
     }
 
-    let css_link = Regex::new(r#"(?is)<link[^>]+rel\s*=\s*["']?stylesheet["']?[^>]*>"#).unwrap();
-    let mut styled = css_link.replace_all(&body, "").into_owned();
-    let style_re = Regex::new(r#"(?is)<style[^>]*>.*?</style>"#).unwrap();
-    styled = style_re.replace_all(&styled, "").into_owned();
-    let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
-    styled = script_re.replace_all(&styled, "").into_owned();
+    // 统一净化：移除危险标签（连内容，如 script/iframe/object/form/link/style 等）
+    // 与危险属性（on*、javascript: 等），同时保留合法 <img src="...jpg">、<a href>、
+    // style 等，供下方按需图片 URL 改写与 keep_styles 逻辑继续处理。
+    let mut styled = crate::sanitize::sanitize_fragment(&body);
 
     // 先处理整段 <img ...>：改写 src 为按需 URL，并预置 width/height/loading/decoding，
     // 让浏览器在图片解码前就占好位，避免布局跳变与反复重排（卡死根因之一）。

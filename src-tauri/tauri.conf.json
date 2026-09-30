@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://flowread.localhost; font-src 'self' data: http://flowread.localhost; media-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost http://flowread.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {

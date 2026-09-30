@@ -5,7 +5,9 @@
   "windows": ["main", "flowread-ai", "reader-*", "panel-*"],
   "permissions": [
     "core:default",
-    "opener:default",
+    "opener:allow-reveal-item-in-dir",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
     "core:webview:allow-create-webview-window",
     "core:window:allow-close",
     "core:window:allow-create",

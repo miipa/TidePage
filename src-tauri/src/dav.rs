@@ -37,8 +37,10 @@ fn encode_path(path: &str) -> String {
 
 impl DavClient {
     pub fn new(base: &str, user: &str, pass: &str) -> Self {
+        // 仅本机/私有网段（局域网 NAS 常用自签名证书）放宽校验，公网 WebDAV 严格验证。
+        let accept_invalid = crate::ai::is_local_or_private_url(base);
         let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(accept_invalid)
             // 不设 client 级总超时：总超时会把整段请求（含 body 传输）一并计时，
             // 大文件流式下载/上传会中途 abort。改用 read_timeout（两次收到字节的最大间隔）
             // 捕获死连接而不限制总时长；连接超时与连接池策略保持不变。

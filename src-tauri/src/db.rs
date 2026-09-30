@@ -261,6 +261,8 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         CREATE INDEX IF NOT EXISTS idx_books_title_nocase_id ON books(title COLLATE NOCASE, id);
         -- 「按最近阅读」秩可寻址分页：与 ORDER BY last_read DESC, id DESC 逐列一致，含唯一 tiebreaker。
         CREATE INDEX IF NOT EXISTS idx_books_lastread_id ON books(last_read DESC, id DESC);
+        -- 「按文件大小」：与 ORDER BY size DESC, id DESC 逐列一致（反向可用索引回扫）。
+        CREATE INDEX IF NOT EXISTS idx_books_size_id ON books(size DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_highlights_book ON highlights(book_id);
         CREATE INDEX IF NOT EXISTS idx_highlights_created ON highlights(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sessions_book ON reading_sessions(book_id);
@@ -570,10 +572,27 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// 排序 ORDER BY 片段的**唯一来源**（list_books_page / order_index_ids / random_book_filtered
+/// 三处共用，保证逐字同源、rank→id 不错位）。
+/// - 主列走白名单字面量：lastread→b.last_read、title→b.title COLLATE NOCASE、recent→b.mtime、
+///   size→b.size、其余回落 added→b.added_at；方向与列名都不拼接用户文本（红线：白名单）。
+/// - `desc=true` 主列降序、`false` 升序；tiebreaker `b.id` 与主列同向，保证全序稳定。
+pub fn order_by_clause(sort: &str, desc: bool) -> String {
+    let col = match sort {
+        "lastread" => "b.last_read",
+        "title" => "b.title COLLATE NOCASE",
+        "recent" => "b.mtime",
+        "size" => "b.size",
+        _ => "b.added_at",
+    };
+    let d = if desc { "DESC" } else { "ASC" };
+    format!("{col} {d}, b.id {d}")
+}
+
 /// 超大书库分页查询：过滤/排序全部下推 SQLite（带索引），只返回窗口 rows + total。
 /// - query 为空不施加搜索过滤；否则按 title/author 模糊匹配（LIKE 对 ASCII 不区分大小写）。
 /// - formats/states 走 `build_book_filter` 下推（红线 3 同源）；空数组/None = 不约束该维度。
-/// - sort 走白名单，绝不拼接用户输入。
+/// - sort 走白名单，绝不拼接用户输入；desc 决定主列与 tiebreaker 方向。
 /// - limit 上限保护 500，offset 非负。
 pub fn list_books_page(
     conn: &Connection,
@@ -583,14 +602,9 @@ pub fn list_books_page(
     limit: i64,
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
+    desc: bool,
 ) -> crate::models::BookPage {
-    let order = match sort {
-        "lastread" => "b.last_read DESC, b.id DESC",
-        "title" => "b.title COLLATE NOCASE ASC, b.id ASC",
-        "recent" => "b.mtime DESC, b.id DESC",
-        // "added" 为默认
-        _ => "b.added_at DESC, b.id DESC",
-    };
+    let order = order_by_clause(sort, desc);
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let q = query.trim();
@@ -638,6 +652,68 @@ pub fn list_books_page(
     crate::models::BookPage { total, rows }
 }
 
+/// 从「当前筛选结果」中随机取一本书（`query`/`sort`/`formats`/`states` 与 `list_books_page` 同源）。
+/// 先 COUNT 满足条件的行数，再随机 offset + LIMIT 1，避免把整库/整份筛选结果载入内存。
+pub fn random_book_filtered(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+) -> Option<BookRow> {
+    // 随机与顺序无关，方向固定（列仍走白名单）；offset 均匀分布即可。
+    let order = order_by_clause(sort, false);
+    let q = query.trim();
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    if !q.is_empty() {
+        conds.push("(b.title LIKE ? ESCAPE '\\' OR b.author LIKE ? ESCAPE '\\')".to_string());
+        let pat = format!("%{}%", escape_like(q));
+        params.push(Value::Text(pat.clone()));
+        params.push(Value::Text(pat));
+    }
+    let (frag, fparams) = build_book_filter(formats, states);
+    if !frag.is_empty() {
+        conds.push(frag);
+        params.extend(fparams);
+    }
+    let where_sql = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let total: i64 = {
+        let sql = format!("SELECT COUNT(*) FROM books b{where_sql}");
+        conn.query_row(&sql, params_from_iter(params.iter()), |r| r.get(0))
+            .unwrap_or(0)
+    };
+    if total <= 0 {
+        return None;
+    }
+    let offset = (rand::random::<u64>() % (total as u64)) as i64;
+    let sql = format!("SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT 1 OFFSET ?");
+    let mut p = params;
+    p.push(Value::Integer(offset));
+    conn.query_row(&sql, params_from_iter(p.iter()), book_from_row).ok()
+}
+
+/// 全库随机取一本书（轻量：COUNT + 随机 offset，不一次载入整库）。
+pub fn random_book_any(conn: &Connection) -> Option<BookRow> {
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+        .unwrap_or(0);
+    if total <= 0 {
+        return None;
+    }
+    let offset = (rand::random::<u64>() % (total as u64)) as i64;
+    conn.query_row(
+        &format!("SELECT {BOOK_COLS} FROM books b ORDER BY b.id LIMIT 1 OFFSET ?"),
+        params![offset],
+        book_from_row,
+    )
+    .ok()
+}
+
 /// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` / `formats` / `states` 过滤，返回**有序 books.id 序列**。
 /// - `query`/`formats`/`states` 施加与 `list_books_page` **逐字同源**的 WHERE（后者由 `build_book_filter` 保证，红线 3），
 ///   保证 rank→id 与 `books_by_ids_aligned` 取到的行严格对齐；
@@ -651,15 +727,11 @@ pub fn order_index_ids(
     max_rows: usize,
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
+    desc: bool,
 ) -> Result<Vec<i64>, String> {
-    // 白名单 → 字面量 ORDER BY；未知一律回落 "added"。表别名 b 与 list_books_page 一致，
-    // 令 build_book_filter 的 `b.format` 片段两处通用。
-    let order = match sort {
-        "lastread" => "b.last_read DESC, b.id DESC",
-        "title" => "b.title COLLATE NOCASE ASC, b.id ASC",
-        "recent" => "b.mtime DESC, b.id DESC",
-        _ => "b.added_at DESC, b.id DESC",
-    };
+    // 白名单 → 字面量 ORDER BY（与 list_books_page 同一函数，红线 3 同源）；未知一律回落 "added"。
+    // 表别名 b 与 list_books_page 一致，令 build_book_filter 的 `b.format` 片段两处通用。
+    let order = order_by_clause(sort, desc);
     let q = query.trim();
     // WHERE 与 list_books_page 同源：搜索 LIKE + build_book_filter fragment。
     let mut conds: Vec<String> = Vec::new();
@@ -1599,10 +1671,15 @@ mod notes_tests {
         let b = path_id("/x/pure.txt");
         add_hl(&conn, a, "被划线A", "我的感想A");
         add_hl(&conn, b, "被划线B", ""); // 纯划线
+        // 语义：有划线即入列（不要求 note!=''），故两本都出现。
         let books = list_note_books(&conn);
-        assert_eq!(books.len(), 1, "只有带 note 的书进入列表");
-        assert_eq!(books[0].0, a);
-        assert_eq!(books[0].4, 1); // note_count
+        assert_eq!(books.len(), 2, "纯划线书也应入列");
+        // 用 book_id 定位，不依赖返回顺序。
+        let pure = books.iter().find(|x| x.0 == b).expect("纯划线书应在列表中");
+        assert_eq!(pure.5, 0, "纯划线 note_count==0");
+        assert_eq!(pure.4, 1, "纯划线 hl_count==1");
+        let withnote = books.iter().find(|x| x.0 == a).expect("带感想书应在列表中");
+        assert_eq!(withnote.5, 1, "带感想 note_count==1");
     }
 
     #[test]
@@ -1723,9 +1800,15 @@ mod notes_tests {
             .query_row("SELECT COUNT(*) FROM highlights WHERE book_id<0 AND note='A的感想'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "A 的笔记仍在笔记界面");
+        // 有划线即入列：孤儿书A（带感想）与重导的《书B》（纯划线）各一组。
         let books = list_note_books(&conn);
-        assert_eq!(books.len(), 1);
-        assert_eq!(books[0].1, "书A", "笔记界面显示 A 的原书名");
+        assert_eq!(books.len(), 2);
+        let a_grp = books.iter().find(|x| x.0 < 0).expect("孤儿书A分组");
+        assert_eq!(a_grp.1, "书A", "笔记界面显示 A 的原书名");
+        assert!(a_grp.3, "孤儿书A标记为已删除");
+        assert_eq!(a_grp.5, 1, "书A note_count==1");
+        let b_grp = books.iter().find(|x| x.0 >= 0).expect("书B分组");
+        assert_eq!(b_grp.5, 0, "书B 只有纯划线，note_count==0");
     }
 }
 
@@ -1799,5 +1882,43 @@ mod cover_scan_tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], (a, "/x/a.epub".into(), "epub".into()));
         assert_eq!(got[1], (b, "/x/b.txt".into(), "txt".into()));
+    }
+}
+
+#[cfg(test)]
+mod fts_snippet_tests {
+    use super::*;
+
+    /// 校验 search_all_inner 使用的 FTS5 snippet() 查询在 trigram 分词下可用，
+    /// 且用哨兵参数能标出命中（Rust 侧再转义并还原为 <mark>）。
+    #[test]
+    fn snippet_sql_marks_hits_with_sentinels() {
+        let p = std::env::temp_dir().join(format!("fr_ftssnip_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let conn = init(&p).unwrap();
+        if !has_fts(&conn) {
+            let _ = std::fs::remove_file(&p);
+            return;
+        }
+        ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(1,0,'第一章','这是一个用于全局搜索性能验证的中文正文段落')",
+            [],
+        )
+        .unwrap();
+        let sql = "SELECT fts.book_id, fts.chapter_index, fts.title, COALESCE(b.title,''), \
+                   snippet(fts, 3, ?2, ?3, '…', 12) \
+                   FROM fts LEFT JOIN books b ON b.id=fts.book_id \
+                   WHERE fts.body MATCH ?1 LIMIT 80";
+        let mut stmt = conn.prepare(sql).unwrap();
+        let row: (i64, i64, String, String, String) = stmt
+            .query_row(rusqlite::params!["全局搜索", "\u{1}", "\u{2}"], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        assert_eq!(row.0, 1);
+        assert!(row.4.contains('\u{1}'), "snippet 应含起始哨兵: {}", row.4);
+        assert!(row.4.contains('\u{2}'), "snippet 应含结束哨兵: {}", row.4);
+        let _ = std::fs::remove_file(&p);
     }
 }

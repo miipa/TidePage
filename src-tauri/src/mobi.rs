@@ -1244,6 +1244,7 @@ fn decode_entities_text(s: &str) -> (String, usize) {
 ///   并把解码出的 `<`/`>` 再转义防文本变标签
 /// - `<script>`/`<style>` 连内容丢弃；检测到未闭合 RAWTEXT 时改为"去标签留文本"（正文优先）
 pub fn decode_and_sanitize(html: &str) -> String {
+    use crate::sanitize::{is_dangerous_tag, is_dangerous_url, is_url_attr};
     use html5ever::tokenizer::{TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1251,7 +1252,9 @@ pub fn decode_and_sanitize(html: &str) -> String {
     struct St {
         out: String,
         pending_text: String, // tokenizer 在实体边界切分 CharacterTokens，须合并后统一解码
-        drop_raw: Option<String>,
+        /// 已打开的危险容器标签栈（小写）；非空时丢弃其间所有 token。
+        /// 用栈而非单值，保证嵌套危险标签（如 <form><script/>…</form>）不会提前解除丢弃态。
+        drop_stack: Vec<String>,
         dangling: bool,
         drop_tags: usize, // 诊断：丢弃的非法标签名数
         drop_broken: usize, // 诊断：文本中剔除的破碎标签数
@@ -1327,21 +1330,26 @@ pub fn decode_and_sanitize(html: &str) -> String {
                         st.drop_tags += 1;
                         return TokenSinkResult::Continue;
                     }
-                    let is_raw = ln == "script" || ln == "style";
-                    if is_raw {
-                        if matches!(tag.kind, TagKind::StartTag) && !tag.self_closing {
+                    // 危险标签：script/style/iframe/object/applet/form 连内容丢弃，
+                    // meta/base/link/frame/embed 等无内容标签只丢标签本身。
+                    if is_dangerous_tag(&ln) {
+                        let void = matches!(ln.as_str(), "meta" | "base" | "link" | "frame" | "embed");
+                        if matches!(tag.kind, TagKind::EndTag) {
+                            // 从栈顶向下找同名并截断，避免内层结束标签提前解除外层丢弃态。
+                            if let Some(pos) = st.drop_stack.iter().rposition(|t| t == &ln) {
+                                st.drop_stack.truncate(pos);
+                            }
+                            return TokenSinkResult::Continue;
+                        }
+                        if !tag.self_closing && !void {
                             if st.dangling {
                                 return TokenSinkResult::Continue; // 悬空模式：去标签，文本按普通处理
                             }
-                            st.drop_raw = Some(ln);
-                            return TokenSinkResult::Continue;
+                            st.drop_stack.push(ln);
                         }
-                        if matches!(tag.kind, TagKind::EndTag) {
-                            st.drop_raw = None;
-                            return TokenSinkResult::Continue;
-                        }
+                        return TokenSinkResult::Continue;
                     }
-                    if st.drop_raw.is_some() {
+                    if !st.drop_stack.is_empty() {
                         return TokenSinkResult::Continue;
                     }
                     let is_end = matches!(tag.kind, TagKind::EndTag);
@@ -1353,9 +1361,18 @@ pub fn decode_and_sanitize(html: &str) -> String {
                     s.push_str(&name);
                     if !is_end {
                         for a in tag.attrs.iter() {
-                            s.push(' ');
-                            s.push_str(&a.name.local.to_string());
+                            let an = a.name.local.to_string();
+                            let anl = an.to_ascii_lowercase();
+                            // 事件属性（on*）全删；URL 属性遇危险协议整条删除。
+                            if anl.starts_with("on") {
+                                continue;
+                            }
                             let v = a.value.to_string();
+                            if is_url_attr(&anl) && is_dangerous_url(&v) {
+                                continue;
+                            }
+                            s.push(' ');
+                            s.push_str(&an);
                             if !v.is_empty() {
                                 s.push_str("=\"");
                                 self.ser_attr_value(&v, &mut s);
@@ -1372,10 +1389,10 @@ pub fn decode_and_sanitize(html: &str) -> String {
                     st.out.push_str(&s);
                 }
                 Token::CharacterTokens(chars) => {
-                    if st.drop_raw.is_some() {
+                    if !st.drop_stack.is_empty() {
                         return TokenSinkResult::Continue;
                     }
-                    st.pending_text.push_str(&chars.to_string());
+                    st.pending_text.push_str(&chars);
                 }
                 Token::DoctypeToken(dt) => {
                     st.flush();
@@ -1396,7 +1413,7 @@ pub fn decode_and_sanitize(html: &str) -> String {
     let st = Rc::new(RefCell::new(St {
         out: String::with_capacity(html.len() + 1024),
         pending_text: String::new(),
-        drop_raw: None,
+        drop_stack: Vec::new(),
         dangling,
         drop_tags: 0,
         drop_broken: 0,
@@ -2692,6 +2709,37 @@ mod tests {
         // mbp:pagebreak 与 recindex 属性原样保留
         let m = decode_and_sanitize("<p>1</p><mbp:pagebreak/><img recindex=\"0002\" alt=\"0\"/>");
         assert!(m.contains("mbp:pagebreak") && m.contains("recindex=\"0002\""), "{m}");
+    }
+
+    #[test]
+    fn sanitize_strips_event_attrs_and_protocols() {
+        // 事件属性全删；危险协议 URL 整条删除；MOBI 专有标记/图片引用保留。
+        let out = decode_and_sanitize(
+            "<p onclick=\"x()\">a</p><img recindex=\"0002\" onerror=\"alert(1)\"/>\
+             <a href=\"javascript:alert(1)\">y</a><iframe src=\"https://evil\">z</iframe>\
+             <mbp:pagebreak/><img src=\"kindle:embed:0001\"/>",
+        );
+        assert!(!out.contains("onerror"), "{out}");
+        assert!(!out.contains("onclick"), "{out}");
+        assert!(!out.contains("javascript:"), "{out}");
+        assert!(!out.contains("iframe"), "{out}");
+        assert!(!out.contains("evil"), "{out}");
+        assert!(out.contains("recindex=\"0002\""), "recindex 必须保留: {out}");
+        assert!(out.contains("mbp:pagebreak"), "{out}");
+        assert!(out.contains("kindle:embed:0001"), "图片引用必须保留: {out}");
+    }
+
+    #[test]
+    fn sanitize_nested_dangerous_container_drops_whole_outer() {
+        // 嵌套危险标签：内层 </script> 不得提前解除外层 <form> 的丢弃态，
+        // 外层容器内、内层之后的 CCC 及闭合后内容都要整段丢弃。
+        let out = decode_and_sanitize("<form>AAA<script>BBB</script>CCC</form><p>KEEP</p>");
+        assert!(!out.contains("AAA"), "{out}");
+        assert!(!out.contains("BBB"), "{out}");
+        assert!(!out.contains("CCC"), "{out}");
+        assert!(!out.contains("<form"), "{out}");
+        assert!(!out.contains("script"), "{out}");
+        assert!(out.contains("<p>KEEP</p>"), "{out}");
     }
     /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行
     #[test]

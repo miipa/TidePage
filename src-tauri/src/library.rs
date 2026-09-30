@@ -1130,11 +1130,12 @@ pub async fn list_books_page(
     limit: i64,
     formats: Option<Vec<String>>,
     states: Option<Vec<String>>,
+    desc: Option<bool>,
 ) -> Result<BookPage, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
-        db::list_books_page(&conn, &query, &sort, offset, limit, &formats, &states)
+        db::list_books_page(&conn, &query, &sort, offset, limit, &formats, &states, desc.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())
@@ -1155,18 +1156,20 @@ pub async fn list_order_index(
     query: Option<String>,
     formats: Option<Vec<String>>,
     states: Option<Vec<String>>,
+    desc: Option<bool>,
 ) -> Result<tauri::ipc::Response, String> {
     // 白名单归一（未知回落 added），避免把任意字符串带入下游。
     let sort = match sort.as_str() {
-        "added" | "recent" | "title" | "lastread" => sort,
+        "added" | "recent" | "title" | "lastread" | "size" => sort,
         _ => "added".to_string(),
     };
+    let desc = desc.unwrap_or(false);
     let query = query.unwrap_or_default();
     let st = state.inner().clone();
     let bytes: Vec<u8> = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let conn = st.db.0.lock().unwrap();
         // 边收集边计数：越限立即 Err（禁止静默截断），不为超大结果集构建巨大 Vec。
-        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize, &formats, &states)?;
+        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize, &formats, &states, desc)?;
         let mut buf = Vec::with_capacity(ids.len() * 8);
         for id in ids {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -2109,6 +2112,58 @@ pub async fn webdav_test(base: String, user: String, pass: String) -> Result<boo
     c.test().await
 }
 
+/// 上传设置备份到云端 `FlowRead/settings/{name}`（data 为前端组装的 JSON）。
+/// name 必须是单一文件名（非空、不含 `/`、`\`、`..`）；远端只写 FlowRead/settings/ 下文件。
+/// 返回写入的远端完整路径。
+#[tauri::command]
+pub async fn webdav_backup_settings(
+    base: String,
+    user: String,
+    pass: String,
+    name: String,
+    data: String,
+) -> Result<String, String> {
+    if !valid_backup_name(&name) {
+        return Err("备份文件名无效".into());
+    }
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    c.ensure_dir("FlowRead").await?;
+    c.ensure_dir("FlowRead/settings").await?;
+    let path = format!("FlowRead/settings/{name}");
+    c.put(&path, data.into_bytes()).await?;
+    Ok(path)
+}
+
+/// 读取云端指定设置备份；文件不存在（404）返回 None。
+#[tauri::command]
+pub async fn webdav_restore_settings(
+    base: String,
+    user: String,
+    pass: String,
+    name: String,
+) -> Result<Option<String>, String> {
+    if !valid_backup_name(&name) {
+        return Err("备份文件名无效".into());
+    }
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    match c.get(&format!("FlowRead/settings/{name}")).await? {
+        Some(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| "云端设置备份不是合法文本".to_string()),
+        None => Ok(None),
+    }
+}
+
+/// 备份文件名合法性：非空、单一文件名、不含路径穿越。
+fn valid_backup_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+}
+
 #[tauri::command]
 pub async fn webdav_sync_progress(
     state: State<'_, Arc<AppState>>,
@@ -2731,8 +2786,12 @@ pub async fn ai_chat(
         deployment: deployment.unwrap_or_default(),
         api_version: api_version.unwrap_or_default(),
     };
-    let http = crate::ai::build_client(&proxy_mode, proxy_url.as_deref().unwrap_or(""))
-        .map_err(crate::ai::AiError::config)?;
+    let http = crate::ai::build_client(
+        &proxy_mode,
+        proxy_url.as_deref().unwrap_or(""),
+        &cfg.base_url,
+    )
+    .map_err(crate::ai::AiError::config)?;
     crate::ai::stream_chat(app, http, id, cfg, system, messages).await
 }
 
@@ -2789,9 +2848,11 @@ pub async fn tts_synth(
         format: &format,
         lang: lang.as_deref().unwrap_or(""),
     };
-    let http = crate::ai::build_client(proxy_mode.as_deref().unwrap_or("auto"), proxy_url.as_deref().unwrap_or(""))
+    let proxy_mode = proxy_mode.as_deref().unwrap_or("auto");
+    let proxy_url = proxy_url.as_deref().unwrap_or("");
+    let http = crate::ai::build_client(proxy_mode, proxy_url, &base_url)
         .map_err(crate::ai::AiError::config)?;
-    let bytes = crate::ai::synthesize_tts(http, &params, &text).await?;
+    let bytes = crate::ai::synthesize_tts(http, proxy_mode, proxy_url, &params, &text).await?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
@@ -2853,7 +2914,7 @@ async fn list_openai_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInf
         format!("{root}/v1/audio/voices"),
         format!("{root}/v1/voices"),
     ];
-    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", base).map_err(|e| e)?;
     let mut last_err = String::from("未找到音色接口");
     for url in candidates {
         let mut req = client.get(&url);
@@ -2931,7 +2992,7 @@ async fn list_openai_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInf
 /// Edge TTS 官方音色清单（无需密钥）：取 ShortName 作 id/name、Locale 作语言。
 async fn list_edge_voices() -> Result<Vec<TtsVoiceInfo>, String> {
     const URL: &str = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", URL).map_err(|e| e)?;
     let resp = client.get(URL).send().await.map_err(|e| format!("请求失败：{e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -2970,7 +3031,7 @@ async fn list_edge_voices() -> Result<Vec<TtsVoiceInfo>, String> {
 /// 依次尝试候选网关根地址（配置地址 + 7863 回退，修正误填上游 8080 端口）；
 /// 本机 / 局域网服务一律直连（绕过系统代理）。
 async fn list_breeze_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInfo>, String> {
-    let client = crate::ai::breeze_client().map_err(|e| e.message)?;
+    let client = crate::ai::breeze_client(base).map_err(|e| e.message)?;
     let candidates = crate::ai::breeze_root_candidates(base);
     let mut last_err = String::from("服务未返回音色列表");
     for root in &candidates {
@@ -3067,7 +3128,7 @@ pub async fn tts_ensure_fixed_voice(
     if base.is_empty() {
         return Err("未填写服务地址".into());
     }
-    let client = crate::ai::build_client("auto", "").map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", base).map_err(|e| e)?;
     let key = api_key.trim().to_string();
     let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
         if key.is_empty() {
@@ -3165,39 +3226,65 @@ pub async fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Resul
 }
 
 fn search_all_inner(state: &Arc<AppState>, query: String) -> Vec<SearchHit> {
-    let conn = state.db.0.lock().unwrap();
-    if !db::has_fts(&conn) || query.chars().count() < 2 {
-        return vec![];
+    {
+        let conn = state.db.0.lock().unwrap();
+        if !db::has_fts(&conn) || query.chars().count() < 2 {
+            return vec![];
+        }
     }
-    let q = query.replace('"', "\"\"");
-    let sql = "SELECT book_id, chapter_index, title, snippet(fts, 3, '<mark>', '</mark>', '…', 12) FROM fts WHERE body MATCH ?1 LIMIT 80";
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
+    // 直接用 FTS5 snippet() 生成片段：不再逐条 ensure_book_text（整书解析），首次搜索显著变快。
+    // snippet() 不做 HTML 转义，故用正文不会出现的哨兵字符包裹命中，取出后先在 Rust 侧
+    // 按 highlight_snippet 同款规则转义（& < >），再把哨兵还原为 <mark>/</mark>。
+    // 书名用 JOIN 直接取，不再逐条 get_book。
+    let rows: Vec<(i64, i64, String, String, String)> = {
+        let conn = state.db.0.lock().unwrap();
+        let q = query.replace('"', "\"\"");
+        let sql = "SELECT fts.book_id, fts.chapter_index, fts.title, COALESCE(b.title,''), \
+                   snippet(fts, 3, ?2, ?3, '…', 12) \
+                   FROM fts LEFT JOIN books b ON b.id=fts.book_id \
+                   WHERE fts.body MATCH ?1 LIMIT 80";
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![&q, "\u{1}", "\u{2}"], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map(|rs| rs.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     };
-    stmt.query_map([&q], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })
-    .map(|rows| {
-        rows.filter_map(|r| r.ok())
-            .filter_map(|(book_id, chapter_index, title, snippet)| {
-                let book = db::get_book(&conn, book_id)?;
-                Some(SearchHit {
-                    book_id,
-                    book_title: book.title,
-                    chapter_index,
-                    chapter_title: title,
-                    snippet,
-                })
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    rows.into_iter()
+        .map(|(book_id, chapter_index, chapter_title, book_title, raw)| SearchHit {
+            book_id,
+            book_title,
+            chapter_index,
+            chapter_title,
+            snippet: snippet_highlight(&raw),
+        })
+        .collect()
+}
+
+/// 把 FTS5 snippet() 的原始片段转成安全 HTML：先转义 & < >，再把哨兵 \u{1}/\u{2}
+/// 还原为 <mark>/</mark>（哨兵仅在转义之后替换，不会与转义结果冲突）。
+fn snippet_highlight(raw: &str) -> String {
+    let mut s = String::with_capacity(raw.len() + 16);
+    for ch in raw.chars() {
+        match ch {
+            '&' => s.push_str("&amp;"),
+            '<' => s.push_str("&lt;"),
+            '>' => s.push_str("&gt;"),
+            '\u{1}' => s.push_str("<mark>"),
+            '\u{2}' => s.push_str("</mark>"),
+            c => s.push(c),
+        }
+    }
+    s
 }
 
 /// 提取整本书每章的纯文本（章节号、标题、正文文本）。
@@ -3540,15 +3627,27 @@ pub fn write_book_meta(
 pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = st.db.0.lock().unwrap();
-        if !db::has_fts(&conn) {
-            return Err("SQLite 编译未包含 FTS5".into());
+        {
+            let conn = st.db.0.lock().unwrap();
+            if !db::has_fts(&conn) {
+                return Err("SQLite 编译未包含 FTS5".into());
+            }
+            db::ensure_fts(&conn)?;
+            // 先清空索引，再逐本重建（此前只 DELETE 不重建，会把索引清空）。
+            conn.execute("DELETE FROM fts", []).map_err(|e| e.to_string())?;
         }
-        db::ensure_fts(&conn)?;
-        let n = conn
-            .execute("DELETE FROM fts", [])
-            .map_err(|e| e.to_string())?;
-        Ok(n as i64)
+        let ids: Vec<i64> = {
+            let conn = st.db.0.lock().unwrap();
+            db::all_book_paths(&conn).into_iter().map(|(id, _)| id).collect()
+        };
+        let mut total = 0i64;
+        for id in ids {
+            // 单本失败（文件缺失等）跳过，不影响整体重建。
+            if let Ok(n) = index_book_fts_inner(&st, id) {
+                total += n;
+            }
+        }
+        Ok(total)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3620,11 +3719,11 @@ fn index_book_fts_inner(state: &Arc<AppState>, book_id: i64) -> Result<i64, Stri
 #[tauri::command]
 pub fn reveal_in_explorer(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    if let Some(dir) = Path::new(&path).parent() {
-        app.opener()
-            .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
-            .map_err(|e| e.to_string())?;
-    }
+    // 在文件管理器中定位并选中该文件（而非打开父目录），语义更准确，
+    // 也避免使用 opener 的 open_path 打开任意路径。
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3695,19 +3794,34 @@ pub fn clear_background_image(state: State<'_, Arc<AppState>>) -> Result<(), Str
     Ok(())
 }
 
+/// 全库随机一本书（轻量：COUNT + 随机 offset；放阻塞线程池，避免同步持锁 O(N)）。
 #[tauri::command]
-pub fn random_book(state: State<'_, Arc<AppState>>) -> Option<BookRow> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let conn = state.db.0.lock().unwrap();
-    let books = db::list_books(&conn);
-    if books.is_empty() {
-        return None;
-    }
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0);
-    Some(books[n % books.len()].clone())
+pub async fn random_book(state: State<'_, Arc<AppState>>) -> Result<Option<BookRow>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::random_book_any(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 从「当前筛选结果」中随机一本书（query/sort/formats/states 与列表同源）。
+#[tauri::command]
+pub async fn random_book_filtered(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    sort: String,
+    formats: Option<Vec<String>>,
+    states: Option<Vec<String>>,
+) -> Result<Option<BookRow>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::random_book_filtered(&conn, &query, &sort, &formats, &states)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4144,30 +4258,30 @@ mod refresh_tests {
             db::upsert_book(&conn, &sp(&p), title, "txt", 1, mtime).unwrap();
         }
 
-        let p1 = db::list_books_page(&conn, "", "recent", 0, 500, &None, &None);
+        let p1 = db::list_books_page(&conn, "", "recent", 0, 500, &None, &None, true);
         assert_eq!(p1.total, 7);
         assert_eq!(p1.rows.len(), 7);
         assert_eq!(p1.rows[0].title, "zeta", "mtime DESC 最新在前");
 
-        let p2 = db::list_books_page(&conn, "", "recent", 2, 3, &None, &None);
+        let p2 = db::list_books_page(&conn, "", "recent", 2, 3, &None, &None, true);
         assert_eq!((p2.total, p2.rows.len()), (7, 3));
         assert_eq!(p2.rows[0].title, "delta", "offset=2 应从第三新开始");
 
-        let p3 = db::list_books_page(&conn, "", "added", 0, 9999, &None, &None);
+        let p3 = db::list_books_page(&conn, "", "added", 0, 9999, &None, &None, true);
         assert_eq!(p3.rows.len(), 7, "limit 超上限被 clamp 到 500，本应有 7 行");
 
-        let p4 = db::list_books_page(&conn, "epsilon", "title", 0, 10, &None, &None);
+        let p4 = db::list_books_page(&conn, "epsilon", "title", 0, 10, &None, &None, false);
         assert_eq!((p4.total, p4.rows.len()), (1, 1), "标题搜索应大小写不敏感");
         assert_eq!(p4.rows[0].title, "Epsilon");
 
-        let p5 = db::list_books_page(&conn, "%_marker", "title", 0, 10, &None, &None);
+        let p5 = db::list_books_page(&conn, "%_marker", "title", 0, 10, &None, &None, false);
         assert_eq!(p5.total, 1, "% 与 _ 必须按字面匹配");
         assert_eq!(p5.rows[0].title, "100%_marker");
 
-        let p6 = db::list_books_page(&conn, "%", "title", 0, 10, &None, &None);
+        let p6 = db::list_books_page(&conn, "%", "title", 0, 10, &None, &None, false);
         assert_eq!(p6.total, 1, "纯通配符不得匹配全部");
 
-        let p7 = db::list_books_page(&conn, "", "title", 0, 10, &None, &None);
+        let p7 = db::list_books_page(&conn, "", "title", 0, 10, &None, &None, false);
         assert_eq!(p7.rows[0].title, "100%_marker", "title COLLATE NOCASE 升序");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4201,31 +4315,31 @@ mod refresh_tests {
         }
 
         let t = Instant::now();
-        let p1 = db::list_books_page(&conn, "", "added", 0, 500, &None, &None);
+        let p1 = db::list_books_page(&conn, "", "added", 0, 500, &None, &None, true);
         println!("[perf160k] added page0: {:?} total={} rows={}", t.elapsed(), p1.total, p1.rows.len());
 
         let t = Instant::now();
-        let p2 = db::list_books_page(&conn, "", "title", 0, 500, &None, &None);
+        let p2 = db::list_books_page(&conn, "", "title", 0, 500, &None, &None, false);
         println!("[perf160k] title page0: {:?} rows={}", t.elapsed(), p2.rows.len());
 
         let t = Instant::now();
-        let p3 = db::list_books_page(&conn, "", "recent", 159_000, 500, &None, &None);
+        let p3 = db::list_books_page(&conn, "", "recent", 159_000, 500, &None, &None, true);
         println!("[perf160k] recent offset=159000: {:?} rows={}", t.elapsed(), p3.rows.len());
 
         let t = Instant::now();
-        let p3b = db::list_books_page(&conn, "", "added", 159_000, 500, &None, &None);
+        let p3b = db::list_books_page(&conn, "", "added", 159_000, 500, &None, &None, true);
         println!("[perf160k] added offset=159000: {:?} rows={}", t.elapsed(), p3b.rows.len());
 
         let t = Instant::now();
-        let p3c = db::list_books_page(&conn, "", "title", 159_000, 500, &None, &None);
+        let p3c = db::list_books_page(&conn, "", "title", 159_000, 500, &None, &None, false);
         println!("[perf160k] title offset=159000: {:?} rows={}", t.elapsed(), p3c.rows.len());
 
         let t = Instant::now();
-        let p3d = db::list_books_page(&conn, "", "lastread", 0, 500, &None, &None);
+        let p3d = db::list_books_page(&conn, "", "lastread", 0, 500, &None, &None, true);
         println!("[perf160k] lastread page0: {:?} rows={}", t.elapsed(), p3d.rows.len());
 
         let t = Instant::now();
-        let p4 = db::list_books_page(&conn, "Book 159", "title", 0, 500, &None, &None);
+        let p4 = db::list_books_page(&conn, "Book 159", "title", 0, 500, &None, &None, false);
         println!("[perf160k] search 'Book 159': {:?} total={} rows={}", t.elapsed(), p4.total, p4.rows.len());
 
         assert_eq!(p1.total, 160_000);
@@ -4241,48 +4355,56 @@ mod refresh_tests {
         let conn = db::init(&root.join("t.db")).unwrap();
         let sp = |p: &Path| p.to_string_lossy().into_owned();
         let data = [
-            ("a.txt", "Alpha", 100i64),
-            ("b.txt", "beta", 200),
-            ("c.txt", "Gamma", 300),
-            ("d.txt", "delta", 400),
-            ("e.txt", "Epsilon", 500),
+            ("a.txt", "Alpha", 100i64, 500i64),
+            ("b.txt", "beta", 200, 400),
+            ("c.txt", "Gamma", 300, 300),
+            ("d.txt", "delta", 400, 200),
+            ("e.txt", "Epsilon", 500, 100),
         ];
-        for (name, title, mtime) in data {
+        for (name, title, mtime, size) in data {
             let p = root.join(name);
             std::fs::write(&p, b"x").unwrap();
-            db::upsert_book(&conn, &sp(&p), title, "txt", 1, mtime).unwrap();
+            db::upsert_book(&conn, &sp(&p), title, "txt", size, mtime).unwrap();
         }
 
-        // 每个 sort：order_index_ids 的序列必须与 list_books_page 全量窗口逐行 id 一致。
-        for sort in ["added", "recent", "title", "lastread"] {
-            let idx = db::order_index_ids(&conn, sort, "", 1_000_000, &None, &None).unwrap();
-            let page = db::list_books_page(&conn, "", sort, 0, 500, &None, &None);
-            let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
-            assert_eq!(idx, page_ids, "order_index_ids 与 list_books_page 不同源: sort={sort}");
+        // 每个 sort × 每个方向：order_index_ids 的序列必须与 list_books_page 全量窗口逐行 id 一致。
+        for sort in ["added", "recent", "title", "lastread", "size"] {
+            for desc in [false, true] {
+                let idx = db::order_index_ids(&conn, sort, "", 1_000_000, &None, &None, desc).unwrap();
+                let page = db::list_books_page(&conn, "", sort, 0, 500, &None, &None, desc);
+                let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+                assert_eq!(idx, page_ids, "order_index_ids 与 list_books_page 不同源: sort={sort} desc={desc}");
+            }
         }
+
+        // size：降序大→小、升序小→大（反向按钮两端都可用）。
+        let big = db::list_books_page(&conn, "", "size", 0, 500, &None, &None, true);
+        let small = db::list_books_page(&conn, "", "size", 0, 500, &None, &None, false);
+        assert!(big.rows.len() >= 2 && big.rows[0].size >= big.rows[1].size, "size DESC 首行最大");
+        assert!(small.rows.len() >= 2 && small.rows[0].size <= small.rows[1].size, "size ASC 首行最小");
 
         // 未知 sort 回落 added。
         assert_eq!(
-            db::order_index_ids(&conn, "bogus", "", 1_000_000, &None, &None).unwrap(),
-            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None).unwrap(),
+            db::order_index_ids(&conn, "bogus", "", 1_000_000, &None, &None, true).unwrap(),
+            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None, true).unwrap(),
             "未知 sort 必须回落 added"
         );
 
         // 过滤档：order_index_ids(query) 必须与 list_books_page(query) 逐行同源（rank→id 对齐）。
-        for (sort, q) in [("title", "delta"), ("added", "a"), ("recent", "e")] {
-            let idx = db::order_index_ids(&conn, sort, q, 1_000_000, &None, &None).unwrap();
-            let page = db::list_books_page(&conn, q, sort, 0, 500, &None, &None);
+        for (sort, q, desc) in [("title", "delta", false), ("added", "a", true), ("recent", "e", true)] {
+            let idx = db::order_index_ids(&conn, sort, q, 1_000_000, &None, &None, desc).unwrap();
+            let page = db::list_books_page(&conn, q, sort, 0, 500, &None, &None, desc);
             let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
-            assert_eq!(idx, page_ids, "过滤档不同源: sort={sort} q={q}");
+            assert_eq!(idx, page_ids, "过滤档不同源: sort={sort} q={q} desc={desc}");
             assert_eq!(idx.len() as i64, page.total, "过滤档条数应等于 total");
         }
 
         // 越限：max_rows 限制触发 Err，不静默截断。
-        let err = db::order_index_ids(&conn, "added", "", 2, &None, &None).unwrap_err();
+        let err = db::order_index_ids(&conn, "added", "", 2, &None, &None, true).unwrap_err();
         assert!(err.starts_with("order_index_too_large:"), "越限必须报错: {err}");
 
         // books_by_ids_aligned：长度/顺序恒等于入参，缺行补 None。
-        let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &None, &None).unwrap();
+        let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &None, &None, false).unwrap();
         let missing = 424242i64; // 不存在
         let query_ids = vec![idx[2], missing, idx[0], idx[0]]; // 含重复与缺失
         let rows = db::books_by_ids_aligned(&conn, &query_ids);
@@ -4329,7 +4451,7 @@ mod refresh_tests {
 
         // 逐状态断言（用 order_index_ids 结果集合判定）。
         let ids_of = |states: Option<Vec<String>>| -> Vec<i64> {
-            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &states).unwrap()
+            db::order_index_ids(&conn, "added", "", 1_000_000, &None, &states, true).unwrap()
         };
         let has = |v: &[i64], id: i64| v.contains(&id);
 
@@ -4348,14 +4470,14 @@ mod refresh_tests {
 
         // 空数组 = 不约束（回完整库 4 本）。
         assert_eq!(ids_of(Some(vec![])).len(), 4, "空状态数组必须不约束");
-        assert_eq!(db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None).unwrap().len(), 4);
+        assert_eq!(db::order_index_ids(&conn, "added", "", 1_000_000, &None, &None, true).unwrap().len(), 4);
 
         // 格式过滤：epub 2 本。
-        let epub = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &None).unwrap();
+        let epub = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &None, true).unwrap();
         assert_eq!(epub.len(), 2, "epub 应 2 本");
 
         // 格式 + 状态取「且」：epub 且 read → 仅 id_read。
-        let epub_read = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &Some(vec!["read".into()])).unwrap();
+        let epub_read = db::order_index_ids(&conn, "added", "", 1_000_000, &Some(vec!["epub".into()]), &Some(vec!["read".into()]), true).unwrap();
         assert_eq!(epub_read, vec![id_read], "epub∩read 应仅 id_read");
 
         // 红线 3：任意过滤组合下 order_index_ids 与 list_books_page 逐行同源。
@@ -4364,8 +4486,8 @@ mod refresh_tests {
             (None, Some(vec!["read".into(), "reading".into()])),
             (Some(vec!["epub".into(), "mobi".into()]), Some(vec!["read".into()])),
         ] {
-            let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &fmts, &sts).unwrap();
-            let page = db::list_books_page(&conn, "", "title", 0, 500, &fmts, &sts);
+            let idx = db::order_index_ids(&conn, "title", "", 1_000_000, &fmts, &sts, false).unwrap();
+            let page = db::list_books_page(&conn, "", "title", 0, 500, &fmts, &sts, false);
             let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
             assert_eq!(idx, page_ids, "过滤组合不同源: fmts={fmts:?} sts={sts:?}");
             assert_eq!(idx.len() as i64, page.total, "total 应等于索引长度");
@@ -4392,18 +4514,18 @@ mod refresh_tests {
             ids.push(db::upsert_book(&conn, &sp(&p), name, "txt", 1, 1).unwrap());
         }
         // 初始 last_read 全 0 → 顺序按 id DESC。
-        let idx0 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
+        let idx0 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None, true).unwrap();
         assert_eq!(idx0.len(), 3);
 
         // 打开中间那本 → 它的 last_read 变大，应排到最前。
         db::touch_book_opened(&conn, ids[1]);
-        let idx1 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
+        let idx1 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None, true).unwrap();
         assert_eq!(idx1[0], ids[1], "打开的书应排在按最近阅读的最前");
 
         // 保存另一本的进度（更大的 updated_at）→ 它应排到最前。
         let p = crate::models::Progress { updated_at: db::now_ms() + 10_000, ..Default::default() };
         db::set_progress(&conn, ids[2], &p).unwrap();
-        let idx2 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None).unwrap();
+        let idx2 = db::order_index_ids(&conn, "lastread", "", 1_000_000, &None, &None, true).unwrap();
         assert_eq!(idx2[0], ids[2], "刚更新进度的书应排在最前");
 
         // 该档不得出现 TEMP B-TREE（走 idx_books_lastread_id）。

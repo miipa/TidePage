@@ -2,6 +2,8 @@ use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub struct AiConfig {
@@ -61,12 +63,46 @@ impl std::fmt::Display for AiError {
     }
 }
 
-fn classify_req(e: &reqwest::Error) -> AiError {
-    if e.is_timeout() {
-        AiError::timeout(format!("请求超时: {e}"))
-    } else {
-        AiError::network(format!("网络失败: {e}"))
+/// 去掉文本中 URL 的查询串：reqwest 错误 Display 会带完整 URL，而 Gemini 等历史实现
+/// 曾把 api_key 放进 query。改造后不再回显 query，避免任何密钥经错误信息外泄。
+fn redact_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '?' {
+            // 抹掉 query 直到空白或右括号（reqwest 的 "...for url (http://h/p?x)" 结构）。
+            while let Some(&n) = it.peek() {
+                if n.is_whitespace() || n == ')' {
+                    break;
+                }
+                it.next();
+            }
+            out.push_str("?<已隐藏>");
+        } else {
+            out.push(c);
+        }
     }
+    out
+}
+
+fn classify_req(e: &reqwest::Error) -> AiError {
+    let msg = redact_query(&e.to_string());
+    if e.is_timeout() {
+        AiError::timeout(format!("请求超时: {msg}"))
+    } else {
+        AiError::network(format!("网络失败: {msg}"))
+    }
+}
+
+/// 把代理/URL 里的 `user:pass@` 凭据打码，供测试连接展示（不改变可用性判断）。
+fn mask_creds(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // 可选 scheme + 含冒号的 userinfo + '@'：仅命中真正的凭据段，普通 URL 不受影响。
+        regex::Regex::new(r"(?i)([a-z][a-z0-9+.\-]*://)?([^/@\s]+:[^/@\s]+)@").unwrap()
+    });
+    re.replace_all(s, "${1}***:***@").into_owned()
 }
 
 /// 模型ID形状守卫（与前端 isPlainModelId 对齐）：只允许字母数字与 . _ / : -，
@@ -205,11 +241,84 @@ pub fn resolve_auto_proxy() -> ProxyResolution {
     ProxyResolution { url: None, source, pac: info.pac }
 }
 
-pub fn build_client(proxy_mode: &str, proxy_url: &str) -> Result<reqwest::Client, String> {
+/// 目标主机是否为本机/私有网段（loopback / 10/8 / 172.16/12 / 192.168/16 / 169.254/16）。
+/// 仅这些目标允许放宽 TLS 校验，以支持本地自签名服务（如 TTS 网关、局域网 NAS）。
+pub fn is_local_or_private_host(host: &str) -> bool {
+    use std::net::IpAddr;
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let h = h.split('%').next().unwrap_or(h); // 去掉 IPv6 zone id（fe80::1%eth0）
+    if h.eq_ignore_ascii_case("localhost") || h == "::1" {
+        return true;
+    }
+    match h.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(IpAddr::V6(v6)) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7（取首段高 7 位）
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10（取首段高 10 位）
+        }
+        Err(_) => false,
+    }
+}
+
+/// 从目标 URL 判断是否本机/私有；无 scheme 时按 http 解析（用户常填 `127.0.0.1:3900`）。
+pub fn is_local_or_private_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() {
+        return false;
+    }
+    let with_scheme = if u.contains("://") {
+        u.to_string()
+    } else {
+        format!("http://{u}")
+    };
+    reqwest::Url::parse(&with_scheme)
+        .ok()
+        .and_then(|p| p.host_str().map(is_local_or_private_host))
+        .unwrap_or(false)
+}
+
+/// client 缓存：key = (代理模式, 代理地址, 是否放宽 TLS)。
+type ClientCache = Mutex<HashMap<(String, String, bool), reqwest::Client>>;
+
+/// 按「目标是否本机/私有」缓存 client（key 含代理配置，避免跨配置串用）。
+/// `danger_accept_invalid_certs` 是 Client 级选项，无法逐请求切换，故分别构建并复用。
+fn client_cache() -> &'static ClientCache {
+    static CACHE: OnceLock<ClientCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `target_url`：即将访问的目标地址。仅当它是 loopback / 私有网段时才放宽 TLS 校验，
+/// 公网目标一律严格校验证书；本地自签名 TTS/NAS 因此仍可用。
+pub fn build_client(
+    proxy_mode: &str,
+    proxy_url: &str,
+    target_url: &str,
+) -> Result<reqwest::Client, String> {
+    let accept_invalid = is_local_or_private_url(target_url);
+    let key = (proxy_mode.to_string(), proxy_url.to_string(), accept_invalid);
+    if let Ok(cache) = client_cache().lock() {
+        if let Some(c) = cache.get(&key) {
+            return Ok(c.clone());
+        }
+    }
+    let client = build_client_uncached(proxy_mode, proxy_url, accept_invalid)?;
+    if let Ok(mut cache) = client_cache().lock() {
+        cache.insert(key, client.clone());
+    }
+    Ok(client)
+}
+
+fn build_client_uncached(
+    proxy_mode: &str,
+    proxy_url: &str,
+    accept_invalid_certs: bool,
+) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(20))
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(accept_invalid_certs);
     match proxy_mode {
         // 彻底直连：显式关闭 reqwest 对 HTTP(S)_PROXY 等环境变量的自动读取
         "direct" => {
@@ -596,17 +705,20 @@ fn build_request(
             } else {
                 "generateContent"
             };
+            // 不再把 apiKey 放进 URL query（会经错误信息/日志泄漏），改用官方请求头 x-goog-api-key。
             let url = format!("{base}/v1beta/models/{model}:{method}");
-            let sep = if url.contains('?') { '&' } else { '?' };
-            let url = format!("{url}{sep}key={}", cfg.api_key);
             let sys = if system.trim().is_empty() {
                 None
             } else {
                 Some(json!({"parts": [{"text": system}]}))
             };
+            let mut headers = vec![("Content-Type".into(), "application/json".into())];
+            if !cfg.api_key.is_empty() {
+                headers.push(("x-goog-api-key".into(), cfg.api_key.clone()));
+            }
             Ok(Prepared {
                 url,
-                headers: vec![("Content-Type".into(), "application/json".into())],
+                headers,
                 body: ChatBody::Gemini(GeminiChatBody {
                     contents: gemini_contents_json(messages),
                     system_instruction: sys,
@@ -736,31 +848,32 @@ pub async fn test_connection(
     .map_err(|e| format!("✗ 请求配置错误：{}", e.message))?;
 
     let mode = if proxy_mode.is_empty() { "auto" } else { proxy_mode.as_str() };
+    let target = prepared.url.as_str();
     let mut candidates: Vec<(String, reqwest::Client)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
     match mode {
         "custom" => {
-            let shown = normalize_proxy_url(&proxy_url).unwrap_or_else(|_| proxy_url.clone());
-            match build_client("custom", &proxy_url) {
+            let shown = mask_creds(&normalize_proxy_url(&proxy_url).unwrap_or_else(|_| proxy_url.clone()));
+            match build_client("custom", &proxy_url, target) {
                 Ok(c) => candidates.push((format!("自定义代理 {shown}"), c)),
-                Err(e) => notes.push(format!("自定义代理不可用：{e}")),
+                Err(e) => notes.push(format!("自定义代理不可用：{}", mask_creds(&e))),
             }
         }
-        "direct" => match build_client("direct", "") {
+        "direct" => match build_client("direct", "", target) {
             Ok(c) => candidates.push(("直连".into(), c)),
-            Err(e) => notes.push(format!("直连客户端构建失败：{e}")),
+            Err(e) => notes.push(format!("直连客户端构建失败：{}", mask_creds(&e))),
         },
         _ => {
             let r = resolve_auto_proxy();
             match &r.url {
-                Some(addr) => match build_client("custom", addr) {
+                Some(addr) => match build_client("custom", addr, target) {
                     Ok(c) => candidates.push((format!("自动代理（{}）", r.source), c)),
-                    Err(e) => notes.push(format!("自动代理（{}）不可用：{e}", r.source)),
+                    Err(e) => notes.push(format!("自动代理（{}）不可用：{}", r.source, mask_creds(&e))),
                 },
                 None => {
                     notes.push(r.source.clone());
-                    if let Ok(c) = build_client("direct", "") {
+                    if let Ok(c) = build_client("direct", "", target) {
                         candidates.push(("直连（自动模式未检测到代理）".into(), c));
                     }
                 }
@@ -774,7 +887,7 @@ pub async fn test_connection(
     }
     // 非直连模式再补一条直连回退，便于诊断
     if mode != "direct" {
-        if let Ok(c) = build_client("direct", "") {
+        if let Ok(c) = build_client("direct", "", target) {
             candidates.push(("直连（回退）".into(), c));
         }
     }
@@ -818,7 +931,7 @@ pub async fn test_connection(
     }
     let mut all: Vec<String> = errs;
     all.extend(notes);
-    Err(format!("✗ 全部尝试失败 → {}", all.join(" ； ")))
+    Err(format!("✗ 全部尝试失败 → {}", mask_creds(&all.join(" ； "))))
 }
 
 /* ============================ 流式聊天 ============================ */
@@ -1184,8 +1297,9 @@ pub fn breeze_root_candidates(base: &str) -> Vec<String> {
 
 /// Breeze 网关为本机 / 局域网服务，请求一律直连（绕过系统代理）。
 /// 否则 192.168.x.x 等局域网地址会被系统代理拦截而连不通。
-pub fn breeze_client() -> Result<reqwest::Client, AiError> {
-    build_client("direct", "").map_err(AiError::config)
+/// `base` 为网关地址，用于判定是否放宽 TLS 校验（仅本机/私有网段）。
+pub fn breeze_client(base: &str) -> Result<reqwest::Client, AiError> {
+    build_client("direct", "", base).map_err(AiError::config)
 }
 
 /// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
@@ -1401,11 +1515,23 @@ pub struct TtsParams<'a> {
     pub lang: &'a str,
 }
 
+/// 火山引擎固定公网端点（忽略用户 base_url）。
+const VOLCANO_TTS_URL: &str = "https://openspeech.bytedance.com/api/v1/tts";
+/// 百度语音固定公网端点（忽略用户 base_url）：取 token 与短文本合成分属两个公网 host。
+const BAIDU_TOKEN_URL: &str = "https://aip.baidubce.com/oauth/2.0/token";
+const BAIDU_TTS_URL: &str = "https://tsn.baidu.com/text2audio";
+
 /// 按用户显式选择的接口协议分派合成；不做事先的地址探测。
 /// 协议：openai / azure / dashscope / minimax / fish / gptsovits / breeze /
 /// volcano / baidu / edge，未知一律按 OpenAI 兼容处理。
+///
+/// `proxy_mode`/`proxy_url` 用于给「固定公网端点」的 provider 按其**真实请求 URL**
+/// 重新构建 client：这些 provider 忽略用户 base_url，若复用按 base_url 构建的 client，
+/// 用户把 base_url 误填成本地/私网地址时会错误地对公网端点放宽证书校验。
 pub async fn synthesize_tts(
     http: reqwest::Client,
+    proxy_mode: &str,
+    proxy_url: &str,
     p: &TtsParams<'_>,
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
@@ -1417,8 +1543,15 @@ pub async fn synthesize_tts(
         "fish" => synth_fish(&http, p, base, text).await,
         "gptsovits" => synth_gptsovits(&http, p, base, text).await,
         "breeze" => synth_breeze_dispatch(&http, p, base, text).await,
-        "volcano" => synth_volcano(&http, p, text).await,
-        "baidu" => synth_baidu(&http, p, text).await,
+        "volcano" => {
+            let c = build_client(proxy_mode, proxy_url, VOLCANO_TTS_URL).unwrap_or_else(|_| http.clone());
+            synth_volcano(&c, p, text).await
+        }
+        "baidu" => {
+            let c = build_client(proxy_mode, proxy_url, BAIDU_TTS_URL).unwrap_or_else(|_| http.clone());
+            synth_baidu(&c, p, text).await
+        }
+        // Edge 走 wss（tokio-tungstenite），不使用 reqwest client。
         "edge" => synth_edge(p, text).await,
         // openai / voicestudio 均为 OpenAI 兼容（VoiceStudio 本地 /v1/audio/speech）。
         _ => synth_openai(&http, p, base, text).await,
@@ -1626,7 +1759,7 @@ async fn synth_breeze_dispatch(
     if base.is_empty() {
         return Err(AiError::config("未填写服务地址"));
     }
-    let local = breeze_client().unwrap_or_else(|_| http.clone());
+    let local = breeze_client(base).unwrap_or_else(|_| http.clone());
     let cfg = AiConfig {
         provider: "breeze".into(),
         base_url: base.to_string(),
@@ -1644,7 +1777,7 @@ async fn synth_volcano(
     p: &TtsParams<'_>,
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
-    const URL: &str = "https://openspeech.bytedance.com/api/v1/tts";
+    const URL: &str = VOLCANO_TTS_URL;
     if p.app_id.trim().is_empty() {
         return Err(AiError::config("火山引擎语音需要填写 AppID"));
     }
@@ -1724,7 +1857,7 @@ async fn synth_baidu(
         ("aue", aue),
     ];
     let resp = http
-        .post("https://tsn.baidu.com/text2audio")
+        .post(BAIDU_TTS_URL)
         .form(&form)
         .send()
         .await
@@ -1769,7 +1902,7 @@ async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) ->
         }
     }
     let resp = http
-        .post("https://aip.baidubce.com/oauth/2.0/token")
+        .post(BAIDU_TOKEN_URL)
         .form(&[
             ("grant_type", "client_credentials"),
             ("client_id", api_key),
@@ -2056,6 +2189,42 @@ mod tests {
     }
 
     #[test]
+    fn tls_scope_local_and_private_hosts() {
+        // loopback / 私网 / link-local（含 IPv6 ULA 与 fe80）允许放宽；公网严格校验。
+        for h in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "10.0.0.5",
+            "172.16.3.4",
+            "172.31.255.1",
+            "192.168.1.20",
+            "169.254.10.1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+        ] {
+            assert!(is_local_or_private_host(h), "{h} 应视为本地/私有");
+        }
+        for h in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "203.0.113.5",
+            "2001:4860:4860::8888",
+            "example.com",
+            "evil.example",
+        ] {
+            assert!(!is_local_or_private_host(h), "{h} 应视为公网");
+        }
+        assert!(is_local_or_private_url("127.0.0.1:3900"));
+        assert!(is_local_or_private_url("http://192.168.1.10:7863/api"));
+        assert!(!is_local_or_private_url("https://openspeech.bytedance.com/api/v1/tts"));
+        assert!(!is_local_or_private_url(""));
+    }
+
+    #[test]
     fn dashscope_tts_url_shape() {
         let full = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
         assert_eq!(dashscope_tts_url("https://dashscope.aliyuncs.com"), full);
@@ -2216,10 +2385,13 @@ mod tests {
             api_version: "".into(),
         };
         let g = build_request(Provider::Gemini, &gemini_cfg, "", &[("user".into(), "hi".into())], true).unwrap();
+        // 密钥不再进 URL query，改用请求头 x-goog-api-key。
         assert_eq!(
             g.url,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key=gk"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse"
         );
+        assert!(!g.url.contains("key="), "URL 不得包含密钥");
+        assert!(g.headers.iter().any(|(k, v)| k == "x-goog-api-key" && v == "gk"));
 
         let azure_cfg = AiConfig {
             provider: "azure-openai".into(),
@@ -2235,6 +2407,23 @@ mod tests {
             "https://x.openai.azure.com/openai/deployments/my-deploy/chat/completions?api-version=2024-06-01"
         );
         assert!(z.headers.iter().any(|(k, v)| k == "api-key" && v == "zk"));
+    }
+
+    #[test]
+    fn proxy_credentials_are_masked() {
+        assert_eq!(mask_creds("http://user:pass@127.0.0.1:7897"), "http://***:***@127.0.0.1:7897");
+        assert_eq!(mask_creds("socks5://u:p@h:1080"), "socks5://***:***@h:1080");
+        assert_eq!(mask_creds("user:pass@host:8080"), "***:***@host:8080");
+        // 无凭据的普通地址保持不变
+        assert_eq!(mask_creds("http://127.0.0.1:7897"), "http://127.0.0.1:7897");
+    }
+
+    #[test]
+    fn error_url_query_is_redacted() {
+        let s = "error sending request for url (https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?key=SECRET)";
+        let out = redact_query(s);
+        assert!(!out.contains("SECRET"), "查询串中的密钥不应外泄: {out}");
+        assert!(out.contains("?<已隐藏>"));
     }
 
     #[test]

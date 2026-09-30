@@ -285,11 +285,12 @@
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    background: #26282cf2;
-    color: #fff;
-    border-radius: 12px;
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius, 12px);
     padding: 10px 10px 10px 14px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22), 0 18px 44px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    box-shadow: var(--shadow-lg), var(--edge-hi);
     animation: toast-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
     max-width: 100%;
     min-width: 0;
@@ -297,13 +298,15 @@
   }
 
   .toast-card.error {
-    background: #8f3a34ee;
+    background: var(--danger);
+    color: var(--accent-fg);
+    border-color: transparent;
   }
 
   .toast-msg {
     flex: 1;
     min-width: 0;
-    font-size: 12.5px;
+    font-size: var(--fs-xs, 12px);
     line-height: 1.55;
     white-space: pre-wrap;
     word-break: break-all;
@@ -318,10 +321,15 @@
   }
 
   .toast-acts button {
-    background: rgba(255, 255, 255, 0.12);
+    background: var(--hover-bg);
     border: none;
-    color: #fff;
+    color: var(--fg);
     padding: 2px 7px;
+  }
+
+  .toast-card.error .toast-acts button {
+    color: var(--accent-fg);
+    background: color-mix(in srgb, var(--accent-fg) 16%, transparent);
   }
 
   @keyframes toast-in {

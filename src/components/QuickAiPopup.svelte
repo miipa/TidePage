@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { config, copyText, saveConfigNow, toast } from "../lib/stores.svelte";
   import { api } from "../lib/api";
-  import { mdToHtml } from "../lib/md";
+  import { esc, mdToHtml } from "../lib/md";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
 
   let {
@@ -233,7 +233,7 @@
   </div>
   <div class="qa-body" bind:this={bodyEl}>
     {#if output}
-      <div class="qa-mark" class:err={failed}>{@html failed ? `<pre>${output}</pre>` : mdToHtml(output)}</div>
+      <div class="qa-mark" class:err={failed}>{@html failed ? `<pre>${esc(output)}</pre>` : mdToHtml(output)}</div>
     {:else}
       <div class="qa-loading">{busy ? "正在生成…" : "…"}</div>
     {/if}

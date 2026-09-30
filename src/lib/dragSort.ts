@@ -20,6 +20,8 @@ export interface DragSortOptions {
   axis?: "x" | "y";
   /** 进入拖拽的位移阈值（px）。 */
   threshold?: number;
+  /** 逐项判定是否禁止拖动；返回 true 的项不进入拖拽（仍可正常点击）。 */
+  disabled?: (id: string, el: HTMLElement) => boolean;
 }
 
 const SRC_CLASS = "fr-drag-src";
@@ -89,6 +91,8 @@ export function dragSort(node: HTMLElement, options: DragSortOptions) {
     const el = (e.target as HTMLElement | null)?.closest?.("[data-drag-id]") as HTMLElement | null;
     // 仅允许按钮组容器的直接子项参与拖拽（避免嵌套组互相干扰）。
     if (!el || el.parentElement !== node) return;
+    // 逐项禁用：展开中的项不进入拖拽，点击/内部交互照常。
+    if (opts.disabled?.(el.dataset.dragId as string, el)) return;
     src = el;
     pointerId = e.pointerId;
     startX = e.clientX;

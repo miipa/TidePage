@@ -1,20 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
-import { coverTheme, defaultCoverBust } from "./stores.svelte";
+import { coverTheme, defaultCoverBust, secretsReady } from "./stores.svelte";
 import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+
+/** 依赖凭据的封装统一先等凭据回填完成再 invoke，避免启动瞬间用到空密钥。
+ *  仅延后 invoke；调用方传入的参数保持不变（命令签名不变）。 */
+function needsSecrets<A extends unknown[], R>(fn: (...args: A) => Promise<R>) {
+  return async (...args: A): Promise<R> => {
+    await secretsReady;
+    return fn(...args);
+  };
+}
 
 export const api = {
   listFolders: () => invoke<string[]>("list_folders"),
   addFolder: (path: string) => invoke<void>("add_folder", { path }),
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
-  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[]) =>
-    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null }),
+  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean) =>
+    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
    *  query 为空=全量；非空=与 list_books_page 同源的 title/author 过滤（搜索档同样 O(W)）。
    *  formats/states：分类筛选（格式取「或」、状态取「或」、两组取「且」），空/省略=不约束该维度。
    *  结果超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
-  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[]) =>
-    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null }),
+  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[], desc?: boolean) =>
+    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null, desc: desc ?? null }),
   /** Task B：书库当前实际存在的格式列表（去重、固定排序 count DESC, format ASC）。 */
   listFormats: () => invoke<string[]>("list_formats"),
   /** Task F：手动设置阅读状态覆盖。state 取 "read" | "unread" | "auto"。只写 read_state，不动真实进度。 */
@@ -79,39 +88,55 @@ export const api = {
     invoke<string>("export_ai", { path, target, title, author, items }),
   setCustomCover: (bookId: number, imagePath: string) =>
     invoke<void>("set_custom_cover", { bookId, imagePath }),
-  webdavTest: (base: string, user: string, pass: string) =>
-    invoke<boolean>("webdav_test", { base, user, pass }),
-  webdavSyncProgress: (
+  webdavTest: needsSecrets((base: string, user: string, pass: string) =>
+    invoke<boolean>("webdav_test", { base, user, pass })),
+  webdavSyncProgress: needsSecrets((
     base: string, user: string, pass: string,
     bookId: number, bookPath: string, local: Progress | null,
-  ) => invoke<Progress>("webdav_sync_progress", { base, user, pass, bookId, bookPath, local }),
+  ) => invoke<Progress>("webdav_sync_progress", { base, user, pass, bookId, bookPath, local })),
   /** 只读：拉取云端本书进度（FlowRead/progress/{path_id}.json），不写库、不 PUT。无则 null。 */
-  webdavReadProgress: (base: string, user: string, pass: string, bookPath: string) =>
-    invoke<Progress | null>("webdav_read_progress", { base, user, pass, bookPath }),
-  webdavUploadBook: (base: string, user: string, pass: string, bookPath: string) =>
-    invoke<string>("webdav_upload_book", { base, user, pass, bookPath }),
-  webdavDownloadBooks: (base: string, user: string, pass: string, targetDir: string) =>
-    invoke<string[]>("webdav_download_books", { base, user, pass, targetDir }),
+  webdavReadProgress: needsSecrets((base: string, user: string, pass: string, bookPath: string) =>
+    invoke<Progress | null>("webdav_read_progress", { base, user, pass, bookPath })),
+  webdavUploadBook: needsSecrets((base: string, user: string, pass: string, bookPath: string) =>
+    invoke<string>("webdav_upload_book", { base, user, pass, bookPath })),
+  webdavDownloadBooks: needsSecrets((base: string, user: string, pass: string, targetDir: string) =>
+    invoke<string[]>("webdav_download_books", { base, user, pass, targetDir })),
   /** 单本书从云端 FlowRead/books/ 下载到 targetDir，并按扩展名自动加入书库。 */
-  webdavDownloadBook: (base: string, user: string, pass: string, bookPath: string, targetDir: string) =>
-    invoke<string>("webdav_download_book", { base, user, pass, bookPath, targetDir }),
-  webdavList: (base: string, user: string, pass: string, path: string) =>
-    invoke<{ name: string; is_dir: boolean; size: number; mtime: number }[]>("webdav_list", { base, user, pass, path }),
+  webdavDownloadBook: needsSecrets((base: string, user: string, pass: string, bookPath: string, targetDir: string) =>
+    invoke<string>("webdav_download_book", { base, user, pass, bookPath, targetDir })),
+  webdavList: needsSecrets((base: string, user: string, pass: string, path: string) =>
+    invoke<{ name: string; is_dir: boolean; size: number; mtime: number }[]>("webdav_list", { base, user, pass, path })),
   /** 删除云端文件/目录。 */
-  webdavDelete: (base: string, user: string, pass: string, path: string) =>
-    invoke<void>("webdav_delete", { base, user, pass, path }),
+  webdavDelete: needsSecrets((base: string, user: string, pass: string, path: string) =>
+    invoke<void>("webdav_delete", { base, user, pass, path })),
   /** 复制云端文件/目录（不覆盖同名项）。 */
-  webdavCopy: (base: string, user: string, pass: string, src: string, dst: string) =>
-    invoke<void>("webdav_copy", { base, user, pass, src, dst }),
+  webdavCopy: needsSecrets((base: string, user: string, pass: string, src: string, dst: string) =>
+    invoke<void>("webdav_copy", { base, user, pass, src, dst })),
   /** 移动/重命名云端文件/目录（不覆盖同名项）。 */
-  webdavMove: (base: string, user: string, pass: string, src: string, dst: string) =>
-    invoke<void>("webdav_move", { base, user, pass, src, dst }),
-  webdavDownloadFile: (base: string, user: string, pass: string, remotePath: string, targetDir: string) =>
-    invoke<string[]>("webdav_download_file", { base, user, pass, remotePath, targetDir }),
-  webdavDownloadProgress: (base: string, user: string, pass: string, remotePath: string, targetDir: string, session: string) =>
-    invoke<string[]>("webdav_download_progress", { base, user, pass, remotePath, targetDir, session }),
+  webdavMove: needsSecrets((base: string, user: string, pass: string, src: string, dst: string) =>
+    invoke<void>("webdav_move", { base, user, pass, src, dst })),
+  webdavDownloadFile: needsSecrets((base: string, user: string, pass: string, remotePath: string, targetDir: string) =>
+    invoke<string[]>("webdav_download_file", { base, user, pass, remotePath, targetDir })),
+  webdavDownloadProgress: needsSecrets((base: string, user: string, pass: string, remotePath: string, targetDir: string, session: string) =>
+    invoke<string[]>("webdav_download_progress", { base, user, pass, remotePath, targetDir, session })),
+  /** 上传设置备份到 FlowRead/settings/{name}，返回远端路径。 */
+  webdavBackupSettings: needsSecrets((base: string, user: string, pass: string, name: string, data: string) =>
+    invoke<string>("webdav_backup_settings", { base, user, pass, name, data })),
+  /** 读取云端指定设置备份；无则 null。 */
+  webdavRestoreSettings: needsSecrets((base: string, user: string, pass: string, name: string) =>
+    invoke<string | null>("webdav_restore_settings", { base, user, pass, name })),
   setSetting: (key: string, value: string) => invoke<void>("set_setting_kv", { key, value }),
   getSetting: (key: string) => invoke<string | null>("get_setting_kv", { key }),
+  /** 凭据加密落盘（DPAPI）：传入 JSON 明文串，Rust 侧加密后写入 settings.secret.config。 */
+  secretWrite: (plain: string) => invoke<void>("secret_write", { plain }),
+  /** 读回并解密凭据 JSON；无记录返回 null。 */
+  secretRead: () => invoke<string | null>("secret_read"),
+  /** 本机设备名（用于备份文件名）。 */
+  hostName: () => invoke<string>("host_name"),
+  /** 用口令派生密钥加密（AES-256-GCM），返回可入 JSON 的封装串。 */
+  backupSeal: (plain: string, passphrase: string) => invoke<string>("backup_seal", { plain, passphrase }),
+  /** 用口令解密封装串；口令不符/损坏时 reject。 */
+  backupOpen: (blob: string, passphrase: string) => invoke<string>("backup_open", { blob, passphrase }),
   setMobiEncoding: (value: string) => invoke<void>("set_mobi_encoding", { value }),
   getAppDataDir: () => invoke<string>("app_data_dir"),
   storageStats: () =>
@@ -142,6 +167,9 @@ export const api = {
   setBgImage: (imagePath: string) => invoke<string>("set_background_image", { imagePath }),
   clearBgImage: () => invoke<void>("clear_background_image"),
   randomBook: () => invoke<BookRow | null>("random_book"),
+  /** 从当前筛选结果随机一书（query/sort/formats/states 与列表同源）。 */
+  randomBookFiltered: (query: string, sort: string, formats: string[], states: string[]) =>
+    invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states }),
   reextractCover: (bookId: number) => invoke<string>("reextract_cover", { bookId }),
   startSession: (bookId: number) => invoke<number>("start_reading_session", { bookId }),
   updateSession: (sessionId: number, seconds: number, chars: number) =>
@@ -152,25 +180,25 @@ export const api = {
   installFontFile: (path: string) => invoke<string>("install_font_file", { path }),
   listCustomFonts: () => invoke<{ family: string; file: string }[]>("list_custom_fonts"),
   deleteCustomFont: (name: string) => invoke<void>("delete_custom_font", { name }),
-  aiChat: (args: {
+  aiChat: needsSecrets((args: {
     id: string; provider: string; baseUrl: string; apiKey: string;
     model: string; system: string; messages: [string, string][];
     deployment?: string; apiVersion?: string;
     proxyMode?: string; proxyUrl?: string;
-  }) => invoke<void>("ai_chat", args),
-  aiTest: (args: {
+  }) => invoke<void>("ai_chat", args)),
+  aiTest: needsSecrets((args: {
     provider: string; baseUrl: string; apiKey: string; model: string;
     deployment?: string; apiVersion?: string;
     proxyMode: string; proxyUrl: string;
-  }) => invoke<string>("ai_test", args),
-  ttsSynth: (args: {
+  }) => invoke<string>("ai_test", args)),
+  ttsSynth: needsSecrets((args: {
     provider: string; baseUrl: string; apiKey: string;
     secretKey?: string; appId?: string; cluster?: string;
     model: string; voice: string; format: string; text: string;
     lang?: string;
     proxyMode?: string; proxyUrl?: string;
-  }) => invoke<string>("tts_synth", args),
-  ttsVoices: (
+  }) => invoke<string>("tts_synth", args)),
+  ttsVoices: needsSecrets((
     provider: string,
     baseUrl: string,
     apiKey: string,
@@ -185,14 +213,14 @@ export const api = {
       secretKey,
       appId,
       cluster,
-    }),
-  ttsEnsureFixedVoice: (baseUrl: string, apiKey: string, language: string, instruct: string) =>
+    })),
+  ttsEnsureFixedVoice: needsSecrets((baseUrl: string, apiKey: string, language: string, instruct: string) =>
     invoke<{ id: string; created: boolean }>("tts_ensure_fixed_voice", {
       baseUrl,
       apiKey,
       language,
       instruct,
-    }),
+    })),
   addDroppedBook: (path: string) => invoke<BookRow>("add_dropped_book", { path }),
   searchAll: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   searchInBook: (bookId: number, query: string) =>

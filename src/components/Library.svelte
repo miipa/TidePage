@@ -21,6 +21,7 @@
     IconFolder,
     IconArrowBackUp,
     IconTrash,
+    IconArrowsSort,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
   import ProgressRing from "./ProgressRing.svelte";
@@ -56,12 +57,19 @@
   let folders: string[] = $state([]);
   let queryInput = $state("");
   let query = $state("");
-  let sortKey = $state<"added" | "lastread" | "title" | "recent">(
+  let sortKey = $state<"added" | "lastread" | "title" | "recent" | "size">(
     (() => {
       try {
         const v = localStorage.getItem("flowread.lib.sort");
-        return v === "lastread" || v === "title" || v === "recent" ? v : "added";
+        return v === "lastread" || v === "title" || v === "recent" || v === "size" ? v : "added";
       } catch { return "added"; }
+    })()
+  );
+  /** 是否反向排序（与 flowread.lib.sort 同款持久化）。 */
+  let reversed = $state(
+    (() => {
+      try { return localStorage.getItem("flowread.lib.sortDir") === "1"; }
+      catch { return false; }
     })()
   );
   let view = $state<"grid" | "list">(
@@ -134,6 +142,20 @@
   function saveSort() {
     try { localStorage.setItem("flowread.lib.sort", sortKey); } catch { /* ignore */ }
   }
+
+  function saveSortDir() {
+    try { localStorage.setItem("flowread.lib.sortDir", reversed ? "1" : "0"); } catch { /* ignore */ }
+  }
+
+  /** 各排序的默认方向（true=降序，如 size 默认大→小）；反向按钮整体翻转。 */
+  const SORT_DESC: Record<"added" | "lastread" | "title" | "recent" | "size", boolean> = {
+    added: true,
+    lastread: true,
+    recent: true,
+    size: true,
+    title: false,
+  };
+  const desc = $derived(reversed ? !SORT_DESC[sortKey] : SORT_DESC[sortKey]);
 
   // ===== 分类筛选（格式 + 阅读状态）=====
   // 进度「已满」阈值：与后端 db::READ_FULL_PCT 逐字同源（progress.pct 量纲 0–100）。
@@ -387,7 +409,7 @@
   async function loadRange(offset: number) {
     const seq = ++generation;
     try {
-      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates);
+      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates, desc);
       if (seq !== generation) return;
       total = r.total;
       rangeStart = offset;
@@ -528,7 +550,7 @@
     const seq = ++generation;
     loading = true;
     try {
-      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates);
+      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates, desc);
       if (seq !== generation) return;
       idIndex = new BigInt64Array(buf);
       total = idIndex.length;
@@ -658,6 +680,13 @@
     reload();
   }
 
+  /** 反向排序：翻转方向并持久化，重新加载当前列表。 */
+  function toggleReverse() {
+    reversed = !reversed;
+    saveSortDir();
+    reload();
+  }
+
   /** 就地修改窗口内某本书后触发重渲染。索引档：bump winVersion；回落档：替换 raw 数组引用。 */
   function touchWindow() {
     if (indexMode) winVersion++;
@@ -781,9 +810,9 @@
 
   async function openRandom() {
     try {
-      const b = await api.randomBook();
+      const b = await api.randomBookFiltered(query, sortKey, filterFormats, filterStates);
       if (b) tryOpenBook(b);
-      else toast("书库为空");
+      else toast("当前筛选为空");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1066,7 +1095,11 @@
       <option value="added">按添加时间</option>
       <option value="title">按书名</option>
       <option value="recent">按文件时间</option>
+      <option value="size">按文件大小</option>
     </select>
+    <button class="icon" data-tip="反向排序" aria-label="反向排序" onclick={toggleReverse}>
+      <IconArrowsSort size={20} stroke={1.75} />
+    </button>
     <div class="filter-wrap">
       <button
         class="cat-btn"

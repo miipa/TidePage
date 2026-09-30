@@ -41,6 +41,15 @@ sha2 = "0.10"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 html5ever = "0.39"
 tendril = "0.5"
+# 便携备份加密：PBKDF2-HMAC-SHA256 派生密钥 + AES-256-GCM 认证加密。
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+rand = "0.8"
+
+# 凭据加密：调用 Windows DPAPI（CryptProtectData/CryptUnprotectData）以当前用户
+# 密钥加密敏感配置。仅 Windows 目标编译该依赖（本应用仅发布 Windows）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
 [profile.release]
 opt-level = 3

@@ -279,6 +279,21 @@ export const HIGHLIGHT_COLORS: string[] = [
   "#7f8c8d",
 ];
 
+export interface WebdavBackupConfig {
+  /** 是否启用改动备份 */
+  enabled: boolean;
+  /** 检测周期（小时）：6/12/24/48 */
+  intervalHours: number;
+  /** 上次备份时间（毫秒时间戳；0=从未） */
+  lastAt: number;
+  /** 上次备份时的配置签名（配置/凭据有实质变化才改变） */
+  lastSig?: string;
+  /** 上次检测时间（毫秒时间戳） */
+  lastCheckAt?: number;
+  /** 改动备份最近一次失败原因（可读，不弹硬错误） */
+  lastError?: string;
+}
+
 export interface WebdavConfig {
   enabled: boolean;
   base: string;
@@ -287,6 +302,8 @@ export interface WebdavConfig {
   syncOnOpen: boolean;
   uploadBooks: boolean;
   downloadDir: string;
+  /** 设置备份（手动 + 定期） */
+  backup: WebdavBackupConfig;
 }
 
 export type AiProvider = "openai" | "ollama" | "anthropic" | "gemini" | "azure-openai";
@@ -1064,6 +1081,7 @@ p {
     syncOnOpen: true,
     uploadBooks: false,
     downloadDir: "",
+    backup: { enabled: false, intervalHours: 24, lastAt: 0, lastSig: "", lastCheckAt: 0 },
   },
   ai: {
     enabled: true,
@@ -1521,6 +1539,8 @@ function migrateAi(savedAi: any): AiConfig {
 let reasoningMigrationDirty = false;
 let readerMigrationDirty = false;
 let ttsMigrationDirty = false;
+// 升级迁移：旧版 localStorage 里含明文凭据，需落盘一次（加密入库 + 脱敏 localStorage）。
+let secretsMigrationDirty = false;
 
 /** 语音服务配置档案的遗留扁平键（迁移后物理删除，避免导出的配置残留协议概念）。 */
 const LEGACY_TTS_KEYS = [
@@ -1652,7 +1672,11 @@ function load(): AppConfig {
             : structuredClone(HIGHLIGHT_COLORS),
       },
       library: { ...DEFAULTS.library, ...(saved.library || {}) },
-      webdav: { ...DEFAULTS.webdav, ...saved.webdav },
+      webdav: {
+        ...DEFAULTS.webdav,
+        ...saved.webdav,
+        backup: { ...DEFAULTS.webdav.backup, ...(saved.webdav?.backup || {}) },
+      },
       ai: migratedAi,
       tts: migrateTts(saved.tts),
       regex: saved.regex ?? "",
@@ -1706,6 +1730,9 @@ function load(): AppConfig {
     }
     // 方案库首次为空时会注入内置方案：需要落盘一次，否则刷新前 localStorage 仍为空。
     if (!Array.isArray(saved.readerSchemes) || !saved.readerSchemes.length) readerMigrationDirty = true;
+    // 升级迁移：旧版 localStorage 明文存有凭据 → 标记落盘一次（saveConfigNow 会
+    // 加密写入 secret.config 并生成脱敏 localStorage）。
+    if (Object.values(collectSecrets(merged)).some((v) => v !== "")) secretsMigrationDirty = true;
     return merged;
   } catch {
     return structuredClone(DEFAULTS);
@@ -1713,6 +1740,95 @@ function load(): AppConfig {
 }
 
 export const config = $state<AppConfig>(load());
+
+/* ===================== 凭据抽取 / 回填 / 脱敏 ===================== */
+
+/** 敏感字段清单（唯一来源）：localStorage、跨窗广播、导出、云端备份一律不得含其明文。
+ *  - webdav.pass
+ *  - ai.profiles[*].apiKey / proxyUrl
+ *  - tts.services[*].apiKey / secretKey / appId
+ *  key 采用稳定标识：`webdav:pass`、`ai:{id}:apiKey`、`tts:{id}:secretKey` 等。 */
+
+/** 从配置中抽取全部敏感字段（含空串，保证「清空」也能同步）；纯函数，不改动入参。 */
+export function collectSecrets(cfg: AppConfig): Record<string, string> {
+  const out: Record<string, string> = {};
+  const wd = (cfg as any)?.webdav;
+  if (wd) out["webdav:pass"] = typeof wd.pass === "string" ? wd.pass : "";
+  for (const p of ((cfg as any)?.ai?.profiles ?? []) as any[]) {
+    if (!p) continue;
+    out[`ai:${p.id}:apiKey`] = typeof p.apiKey === "string" ? p.apiKey : "";
+    out[`ai:${p.id}:proxyUrl`] = typeof p.proxyUrl === "string" ? p.proxyUrl : "";
+  }
+  for (const s of ((cfg as any)?.tts?.services ?? []) as any[]) {
+    if (!s) continue;
+    out[`tts:${s.id}:apiKey`] = typeof s.apiKey === "string" ? s.apiKey : "";
+    out[`tts:${s.id}:secretKey`] = typeof s.secretKey === "string" ? s.secretKey : "";
+    out[`tts:${s.id}:appId`] = typeof s.appId === "string" ? s.appId : "";
+  }
+  return out;
+}
+
+/** 把抽取结果写回配置（仅覆盖 map 中显式出现的键）；纯副作用函数，不改动 map。 */
+export function applySecrets(cfg: AppConfig, map: Record<string, unknown> | null | undefined): void {
+  if (!map || typeof map !== "object") return;
+  const wd = (cfg as any)?.webdav;
+  if (wd && typeof map["webdav:pass"] === "string") wd.pass = map["webdav:pass"];
+  for (const p of ((cfg as any)?.ai?.profiles ?? []) as any[]) {
+    if (!p) continue;
+    const ka = `ai:${p.id}:apiKey`;
+    if (typeof map[ka] === "string") p.apiKey = map[ka];
+    const kp = `ai:${p.id}:proxyUrl`;
+    if (typeof map[kp] === "string") p.proxyUrl = map[kp];
+  }
+  for (const s of ((cfg as any)?.tts?.services ?? []) as any[]) {
+    if (!s) continue;
+    for (const f of ["apiKey", "secretKey", "appId"] as const) {
+      const k = `tts:${s.id}:${f}`;
+      if (typeof map[k] === "string") (s as any)[f] = map[k];
+    }
+  }
+}
+
+/** 返回脱敏后的配置深拷贝：敏感字段置空（保留字段形状，便于类型稳定与回填）。 */
+export function stripSecrets(cfg: AppConfig): AppConfig {
+  const copy = JSON.parse(JSON.stringify(cfg)) as AppConfig;
+  const wd = (copy as any)?.webdav;
+  if (wd) wd.pass = "";
+  for (const p of ((copy as any)?.ai?.profiles ?? []) as any[]) {
+    p.apiKey = "";
+    p.proxyUrl = "";
+  }
+  for (const s of ((copy as any)?.tts?.services ?? []) as any[]) {
+    s.apiKey = "";
+    s.secretKey = "";
+    s.appId = "";
+  }
+  return copy;
+}
+
+/** 启动后异步从加密存储读回凭据并回填；各窗 api 调用依赖凭据前需 await 此 Promise。 */
+let resolveSecretsReady: () => void = () => {};
+export const secretsReady: Promise<void> = new Promise<void>((r) => {
+  resolveSecretsReady = r;
+});
+
+// 仅做一次性初始化：读 secret.config → 解析 → 回填到当前 config。
+// 用 setTimeout 延后到所有模块求值完成，规避与 api.ts 的循环导入在求值期触发 TDZ。
+setTimeout(() => {
+  void (async () => {
+    try {
+      const raw = await api.secretRead();
+      if (raw) {
+        const map = JSON.parse(raw) as Record<string, unknown>;
+        applySecrets(config, map);
+      }
+    } catch {
+      /* 无加密设施 / 尚未写入时忽略，配置保持脱敏状态 */
+    } finally {
+      resolveSecretsReady();
+    }
+  })();
+}, 0);
 
 /** 解析当前生效的界面主题（system 时跟随操作系统）。 */
 export function resolvedUiTheme(): "light" | "dark" {
@@ -1900,7 +2016,7 @@ export function applyReaderSchemeGlobal(id: string): void {
 
 // 迁移落盘：检测到已废弃的旧键/需迁移的旧值（“关闭思考”、reader 废弃字段与旧默认）时，
 // 启动即把清理后的配置写回 localStorage。延后到模块初始化完成，避免 TDZ。
-if (reasoningMigrationDirty || readerMigrationDirty || ttsMigrationDirty) setTimeout(saveConfig, 0);
+if (reasoningMigrationDirty || readerMigrationDirty || ttsMigrationDirty || secretsMigrationDirty) setTimeout(saveConfig, 0);
 
 export function applyConfigJson(json: string) {
   try {
@@ -1927,6 +2043,11 @@ export function applyConfigJson(json: string) {
     // 跨窗同步/导入同样清理 reader 废弃键并迁移旧默认值
     normalizeReaderConfig(obj.reader, rawReader);
     obj.library = { ...structuredClone(DEFAULTS.library), ...(obj.library || {}) };
+    obj.webdav = { ...structuredClone(DEFAULTS.webdav), ...(obj.webdav || {}) };
+    obj.webdav.backup = {
+      ...structuredClone(DEFAULTS.webdav.backup),
+      ...((obj.webdav && obj.webdav.backup) || {}),
+    };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
@@ -1942,12 +2063,22 @@ export function applyConfigJson(json: string) {
     obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
     obj.language = typeof obj.language === "string" ? obj.language : "auto";
     obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
+    // 跨窗广播/导出的都是「已脱敏 config」，敏感字段均为空。先记下本窗当前密钥，
+    // 应用后对传入为空者回填，避免用空值覆盖已回填/待回填的凭据；
+    // 真正的「清空密钥」由 flowread-secrets-changed 信号（重读加密存储）兜底。
+    const preservedSecrets = collectSecrets(config);
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
     }
+    const incoming = collectSecrets(config);
+    const keep: Record<string, string> = {};
+    for (const k of Object.keys(preservedSecrets)) {
+      if (preservedSecrets[k] !== "" && (incoming[k] ?? "") === "") keep[k] = preservedSecrets[k];
+    }
+    applySecrets(config, keep);
     applyUiTheme();
-    // 记录为“已保存”，避免收到自身广播回声时重复 apply / 再次广播
-    lastSavedJson = JSON.stringify(config);
+    // 记录为“已保存”（脱敏形态，与广播/落盘一致），避免收到自身广播回声时重复 apply / 再次广播
+    lastSavedJson = JSON.stringify(stripSecrets(config));
     // 跨窗同步/导入同样物理清除废弃的“关闭思考”键（stripReasoningArtifacts），
     // 保证两端内存与 localStorage 均不再出现这些键，行为恒为 auto。
   } catch {
@@ -1957,17 +2088,31 @@ export function applyConfigJson(json: string) {
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let lastSavedJson = "";
+// 上次已写入加密存储的凭据快照：去重，避免每次保存都重复加密/广播敏感信号。
+let lastSavedSecretsJson: string | null = null;
 
 /** 立即写盘并广播（端点切换等需要“即时生效”的场景）。 */
 export function saveConfigNow() {
   clearTimeout(saveTimer);
   try {
-    const json = JSON.stringify(config);
+    // 凭据单独加密落盘；localStorage 与跨窗广播只保留脱敏配置（绝不含明文密钥）。
+    const secretsJson = JSON.stringify(collectSecrets(config));
+    const json = JSON.stringify(stripSecrets(config));
     localStorage.setItem(KEY, json);
+    // 先广播脱敏 config（含新增/删除的端点列表），再发敏感信号：
+    // 保证其它窗口先拿到新的 profiles/services，随后才能按 id 正确回填其密钥。
     if (json !== lastSavedJson) {
       lastSavedJson = json;
       void import("@tauri-apps/api/event")
         .then((m) => m.emit("flowread-config", json))
+        .catch(() => {});
+    }
+    if (secretsJson !== lastSavedSecretsJson) {
+      lastSavedSecretsJson = secretsJson;
+      void api.secretWrite(secretsJson).catch(() => {});
+      // 无载荷信号：各窗（含自身）收到后重读加密存储并回填。
+      void import("@tauri-apps/api/event")
+        .then((m) => m.emit("flowread-secrets-changed", null))
         .catch(() => {});
     }
   } catch {
@@ -1989,6 +2134,129 @@ void import("@tauri-apps/api/event")
     }),
   )
   .catch(() => {});
+
+// 敏感变更信号（无载荷）：任一窗口改动了凭据后，各窗重读加密存储并回填。
+// 单独走信号而非随 config 广播，确保密钥不经广播明文、且空值不会误清已回填的密钥。
+void import("@tauri-apps/api/event")
+  .then((m) =>
+    m.listen<null>("flowread-secrets-changed", () => {
+      void (async () => {
+        try {
+          const raw = await api.secretRead();
+          if (raw) applySecrets(config, JSON.parse(raw) as Record<string, unknown>);
+        } catch {
+          /* 重读失败则保持现状 */
+        }
+      })();
+    }),
+  )
+  .catch(() => {});
+
+/* ===================== WebDAV 设置备份（手动 + 定期） ===================== */
+
+/** 防重入：手动与定期共用，进行中则拒绝再次触发。 */
+let settingsBackupRunning = false;
+
+/** 确保 backup 子配置存在（旧内存/旧广播可能缺字段）。 */
+function webdavBackupCfg(): WebdavBackupConfig {
+  const wd = config.webdav as any;
+  if (!wd.backup || typeof wd.backup !== "object") {
+    wd.backup = { enabled: false, intervalHours: 24, lastAt: 0, lastSig: "", lastCheckAt: 0 };
+  }
+  return wd.backup as WebdavBackupConfig;
+}
+
+/**
+ * 配置签名：以 stripSecrets(config) 剔除 webdav.backup 子对象后，连同 collectSecrets(config)
+ * 做 FNV-1a 32 位哈希（十六进制）。只有「配置或凭据有实质变化」才改变签名；备份动作自身
+ * 改 lastAt/lastSig/lastCheckAt 不改变签名，避免自我触发。
+ */
+function settingsSig(): string {
+  const base = stripSecrets(config) as any;
+  if (base?.webdav) delete base.webdav.backup;
+  const s = JSON.stringify(base) + "\u0000" + JSON.stringify(collectSecrets(config));
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/** 本地时间戳 `yyyyMMdd-HHmmss`（用于备份文件名）。 */
+function backupStamp(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  );
+}
+
+/**
+ * 组装并上传设置备份（手动与改动检测共用同一分支）。
+ * 文件名 `config-<设备名>-<本地时间>.json`；凭据用 WebDAV 账号派生密钥加密（跨设备可解），
+ * 非密文配置脱敏。备份不限量，不再清理历史。返回写入的远端路径。
+ */
+export async function runSettingsBackup(): Promise<string> {
+  if (settingsBackupRunning) throw new Error("已有备份任务进行中");
+  const wd = config.webdav;
+  if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
+    throw new Error("请先填写 WebDAV 地址、账号与密码");
+  }
+  settingsBackupRunning = true;
+  try {
+    const passphrase = `${wd.user}\u0000${wd.pass}`;
+    const plaintext = JSON.stringify(collectSecrets(config));
+    const enc = await api.backupSeal(plaintext, passphrase);
+    const device = await api.hostName();
+    const name = `config-${device}-${backupStamp(new Date())}.json`;
+    const payload = { v: 2, at: Date.now(), device, config: stripSecrets(config), enc };
+    const path = await api.webdavBackupSettings(
+      wd.base,
+      wd.user,
+      wd.pass,
+      name,
+      JSON.stringify(payload),
+    );
+    const b = webdavBackupCfg();
+    b.lastAt = Date.now();
+    b.lastSig = settingsSig();
+    b.lastError = undefined;
+    saveConfigNow();
+    return path;
+  } finally {
+    settingsBackupRunning = false;
+  }
+}
+
+/** 改动检测：基础 tick 每 5 分钟；到检测周期后比对签名（剔除 backup 自身），
+ *  配置或凭据有变化才真正上传。失败仅记 lastError，不弹硬错误。 */
+function webdavBackupTick() {
+  const wd = config.webdav;
+  const b = webdavBackupCfg();
+  if (!b.enabled) return;
+  if (!wd.base.trim() || !wd.user.trim() || !wd.pass) return;
+  const intervalMs = Math.max(1, Number(b.intervalHours) || 24) * 3_600_000;
+  if (Date.now() - (b.lastCheckAt || 0) < intervalMs) return; // 未到检测周期
+  b.lastCheckAt = Date.now();
+  saveConfig();
+  if (settingsSig() !== (b.lastSig || "")) {
+    void runSettingsBackup().catch((e) => {
+      b.lastError = String(e);
+      saveConfig();
+    });
+  }
+}
+
+if (typeof window !== "undefined") {
+  // 仅主窗口跑调度，避免多个窗口同时触发重复备份。
+  void import("@tauri-apps/api/webviewWindow")
+    .then((m) => m.getCurrentWebviewWindow().label)
+    .then((label) => {
+      if (label === "main") setInterval(webdavBackupTick, 5 * 60_000);
+    })
+    .catch(() => {});
+}
 
 export interface Toast {
   id: number;

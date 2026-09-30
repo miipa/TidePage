@@ -1,4 +1,5 @@
 mod ai;
+mod backup;
 mod bookmeta;
 mod convert;
 mod covers;
@@ -9,6 +10,8 @@ mod fonts;
 mod library;
 mod mobi;
 mod models;
+mod sanitize;
+mod secret;
 mod txt;
 
 use library::AppState;
@@ -103,6 +106,11 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             let data_dir = data_dir(app.handle());
+            // 是否处于便携模式（FLOWREAD_DATA_DIR 显式指定）。仅便携模式才把
+            // WebView2 用户数据目录（localStorage 等）也迁徙到该目录，默认行为不变。
+            let portable = std::env::var("FLOWREAD_DATA_DIR")
+                .map(|p| !p.trim().is_empty())
+                .unwrap_or(false);
             std::fs::create_dir_all(&data_dir).ok();
             let conn = db::init(&data_dir.join("flowread.db"))?;
             if db::has_fts(&conn) {
@@ -137,6 +145,13 @@ pub fn run() {
                     .decorations(false)
                     .center()
                     .visible(false);
+                // 便携模式：把 WebView2 的用户数据目录（含 localStorage）固定到便携目录，
+                // 使配置/凭据随 FLOWREAD_DATA_DIR 一起搬走。非便携模式沿用 Tauri 默认目录。
+                // 注意：JS 运行期创建的独立窗口（如 AI 窗口）仍使用 Tauri 默认数据目录，
+                // 其持久化 localStorage 不跟随便携目录，但同一次运行内凭据经事件同步不受影响。
+                if portable {
+                    wb = wb.data_directory(data_dir.join("webview2"));
+                }
                 // wry 在设置了 additional_browser_args 时会替换默认参数，这里补回默认项
                 // wry 程序化参数优先于 WEBVIEW2_* 环境变量，故 CDP 端口只能在此注入；
                 // 仅 debug 构建编译该分支（release 二进制不含此代码路径与字符串）。
@@ -175,8 +190,9 @@ pub fn run() {
             let covers_dir = data_dir.join("covers");
             std::fs::create_dir_all(&covers_dir).ok();
             db::reset_epub_covers(&conn, &covers_dir);
+            // 共享 client 不再全局放宽 TLS：公网目标严格校验证书。按目标本机/私有
+            // 选择 client 的逻辑集中在 ai::build_client（带缓存），此字段仅作通用兜底。
             let http = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default();
@@ -374,10 +390,22 @@ pub fn run() {
                         Err(_) => ("image/png".to_string(), Vec::new()),
                     }
                 }
-            } else if let Some(name) = path.strip_prefix("bg/") {
-                match std::fs::read(dir.join(name)) {
-                    Ok(b) => (sniff_mime(&b).to_string(), b),
-                    Err(_) => ("image/png".into(), Vec::new()),
+            } else if let Some(raw) = path.strip_prefix("bg/") {
+                // 与 covers/res/epubimg 一致：空名、`..` 或含路径分隔的越界名一律拒绝，
+                // 规范化为纯文件名后再读取，避免任意文件读取。
+                let name = percent_decode(raw).replace('\\', "/");
+                let file_name = name.rsplit('/').next().unwrap_or("");
+                if name.is_empty()
+                    || name.contains("..")
+                    || file_name.is_empty()
+                    || file_name.contains(':')
+                {
+                    ("image/png".into(), Vec::new())
+                } else {
+                    match std::fs::read(dir.join(file_name)) {
+                        Ok(b) => (sniff_mime(&b).to_string(), b),
+                        Err(_) => ("image/png".into(), Vec::new()),
+                    }
                 }
             } else if let Some(name) = path.strip_prefix("fonts/") {
                 let file = name.replace('/', "").replace('\\', "");
@@ -395,12 +423,15 @@ pub fn run() {
                     covers::placeholder_svg("", "").into_bytes(),
                 )
             };
-            tauri::http::Response::builder()
+            // 仅跨域加载字体需要 CORS（@font-face 受 CORS 限制）；图片/封面由
+            // <img>/CSS 直接显示，无需也不应回显 `*`，收紧为仅字体响应放行。
+            let mut builder = tauri::http::Response::builder()
                 .status(200)
-                .header("Content-Type", mime)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(bytes)
-                .unwrap()
+                .header("Content-Type", mime);
+            if path.starts_with("fonts/") {
+                builder = builder.header("Access-Control-Allow-Origin", "*");
+            }
+            builder.body(bytes).unwrap()
         })
         .invoke_handler(tauri::generate_handler![
             library::list_folders,
@@ -431,6 +462,8 @@ pub fn run() {
             library::set_mobi_encoding,
             library::set_custom_cover,
             library::webdav_test,
+            library::webdav_backup_settings,
+            library::webdav_restore_settings,
             library::webdav_sync_progress,
             library::webdav_read_progress,
             library::webdav_upload_book,
@@ -491,6 +524,12 @@ pub fn run() {
             library::suggest_meta,
             library::add_dropped_book,
             library::get_book_word_count,
+            library::random_book_filtered,
+            secret::secret_write,
+            secret::secret_read,
+            backup::host_name,
+            backup::backup_seal,
+            backup::backup_open,
             fonts::list_system_fonts,
             fonts::install_font_file,
             fonts::list_custom_fonts,

@@ -42,6 +42,10 @@
     STATUS_ITEM_DEFS,
     AI_GROUPS,
     type AiGroup,
+    stripSecrets,
+    applySecrets,
+    applyConfigJson,
+    runSettingsBackup,
   } from "../lib/stores.svelte";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
   import {
@@ -59,7 +63,7 @@
   import ColorPicker from "./ColorPicker.svelte";
   import { dragSort } from "../lib/dragSort";
   import { slide } from "svelte/transition";
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { OnlineVoice } from "../lib/tts.svelte";
@@ -618,8 +622,11 @@
 
   async function exportConfig() {
     try {
-      await copyText(JSON.stringify(config, null, 2));
-      toast("配置已复制到剪贴板，可粘贴保存，日后导入恢复");
+      // 导出内容不含明文密钥：config 已脱敏，密钥以 DPAPI 密文单列。
+      const secret = await api.getSetting("secret.config").catch(() => null);
+      const payload = { v: 1, config: stripSecrets(config), secret: secret ?? null };
+      await copyText(JSON.stringify(payload, null, 2));
+      toast("配置已复制到剪贴板");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -630,7 +637,12 @@
     if (!ok) return;
     try {
       const txt = await navigator.clipboard.readText();
-      const obj = JSON.parse(txt);
+      const parsed = JSON.parse(txt);
+      // 兼容新格式 { v, config, secret } 与旧版「直接是完整配置」两种。
+      const obj =
+        parsed && typeof parsed === "object" && parsed.config && typeof parsed.config === "object"
+          ? parsed.config
+          : parsed;
       if (!obj || typeof obj !== "object" || !obj.reader) throw new Error("剪贴板不是有效的配置");
       Object.assign(config, {
         ...obj,
@@ -641,7 +653,18 @@
           style: { ...config.ai.style, ...(obj.ai?.style || {}) },
         },
       });
-      saveConfig();
+      // 密文原样写回（DPAPI 才能解），再解密回填。
+      const secret = parsed && typeof parsed === "object" ? (parsed as any).secret : undefined;
+      if (typeof secret === "string" && secret) {
+        try {
+          await api.setSetting("secret.config", secret);
+          const raw = await api.secretRead();
+          if (raw) applySecrets(config, JSON.parse(raw) as Record<string, unknown>);
+        } catch {
+          /* 密钥与当前机器不匹配时静默跳过 */
+        }
+      }
+      saveConfigNow();
       toast("已从剪贴板导入配置");
     } catch (e) {
       toast("导入失败：" + e, "error");
@@ -1010,6 +1033,139 @@
     if (!d) return;
     config.webdav.downloadDir = d;
     saveConfig();
+  }
+
+  /* ---------- WebDAV 设置备份（手动 + 定期） ---------- */
+  let webdavBackupBusy = $state(false);
+  let webdavRestoreBusy = $state(false);
+  let backupListBusy = $state(false);
+  let backupList = $state<{ name: string; mtime: number }[]>([]);
+  let selectedBackup = $state("");
+
+  /** 「上次备份」本地时间文本。 */
+  const lastBackupText = $derived.by(() => {
+    const t = config.webdav.backup?.lastAt ?? 0;
+    if (!t) return "从未备份";
+    try {
+      return new Date(t).toLocaleString();
+    } catch {
+      return String(t);
+    }
+  });
+
+  /** 备份下拉项文本：设备名 · 本地时间（时间优先用文件 mtime，缺失时回退文件名内时间）。 */
+  function backupLabel(it: { name: string; mtime: number }): string {
+    const base = it.name.replace(/^config-/, "").replace(/\.json$/, "");
+    const m = base.match(/^(.*)-(\d{8}-\d{6})$/);
+    const device = m ? m[1] : base;
+    const at = it.mtime ? new Date(it.mtime * 1000).toLocaleString() : m ? m[2] : "";
+    return `${device} · ${at}`;
+  }
+
+  /** 读取云端备份列表（仅 FlowRead/settings 下 config-*.json）。 */
+  async function loadBackupList() {
+    const wd = config.webdav;
+    if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
+      backupList = [];
+      return;
+    }
+    backupListBusy = true;
+    try {
+      const items = await api.webdavList(wd.base, wd.user, wd.pass, "FlowRead/settings");
+      backupList = items
+        .filter((it) => !it.is_dir && /^config-.*\.json$/.test(it.name))
+        .map((it) => ({ name: it.name, mtime: it.mtime || 0 }))
+        .sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+      if (!backupList.some((b) => b.name === selectedBackup)) {
+        selectedBackup = backupList[0]?.name ?? "";
+      }
+    } catch (e) {
+      backupList = [];
+      toast(`读取备份列表失败：${e}`, "error");
+    } finally {
+      backupListBusy = false;
+    }
+  }
+
+  $effect(() => {
+    if (tab !== "webdav") return;
+    untrack(() => {
+      void loadBackupList();
+    });
+  });
+
+  async function backupWebdavSettingsNow() {
+    webdavBackupBusy = true;
+    try {
+      await runSettingsBackup();
+      await loadBackupList();
+      toast("设置已备份到云端");
+    } catch (e) {
+      toast(`备份失败：${e}`, "error");
+    } finally {
+      webdavBackupBusy = false;
+    }
+  }
+
+  async function restoreWebdavSettings() {
+    const wd = config.webdav;
+    if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
+      toast("请先填写 WebDAV 地址、账号与密码", "error");
+      return;
+    }
+    if (!selectedBackup) {
+      toast("请先选择备份", "error");
+      return;
+    }
+    const ok = await appConfirm("从云端恢复设置？\n将覆盖当前设置。");
+    if (!ok) return;
+    webdavRestoreBusy = true;
+    try {
+      const data = await api.webdavRestoreSettings(wd.base, wd.user, wd.pass, selectedBackup);
+      if (!data) {
+        toast("该备份不存在", "error");
+        return;
+      }
+      const parsed = JSON.parse(data);
+      if (parsed && parsed.v === 2 && parsed.enc) {
+        // 跨设备可解：用当前 WebDAV 账号派生口令解密凭据。
+        const passphrase = `${wd.user}\u0000${wd.pass}`;
+        let credJson: string;
+        try {
+          credJson = await api.backupOpen(parsed.enc, passphrase);
+        } catch {
+          toast("备份无法解密（WebDAV 账号不一致或备份损坏）", "error");
+          return;
+        }
+        applyConfigJson(JSON.stringify(parsed.config));
+        await api.secretWrite(credJson);
+        applySecrets(config, JSON.parse(credJson) as Record<string, unknown>);
+      } else {
+        // v1 旧备份：非密文部分 + 本机 DPAPI 密文，尽力兼容。
+        const obj =
+          parsed && typeof parsed === "object" && (parsed as any).config
+            ? (parsed as any).config
+            : parsed;
+        if (!obj || typeof obj !== "object" || !obj.reader) throw new Error("云端备份格式无效");
+        applyConfigJson(JSON.stringify(obj));
+        const secret = parsed && typeof parsed === "object" ? (parsed as any).secret : undefined;
+        if (typeof secret === "string" && secret) {
+          try {
+            await api.setSetting("secret.config", secret);
+            const raw = await api.secretRead();
+            if (raw) applySecrets(config, JSON.parse(raw) as Record<string, unknown>);
+          } catch {
+            /* 旧备份密钥与当前机器不匹配时跳过 */
+          }
+        }
+      }
+      saveConfigNow();
+      toast("已从云端恢复设置");
+    } catch (e) {
+      toast(`恢复失败：${e}`, "error");
+    } finally {
+      webdavRestoreBusy = false;
+    }
   }
 
   async function saveRegex() {
@@ -1970,7 +2126,6 @@
         <span class="flex1" title={config.webdav.downloadDir}>{config.webdav.downloadDir || "未设置"}</span>
         <button onclick={pickWebdavDir}>选择…</button>
       </div>
-      <p class="tip">WebDAV 文件页下载到此目录，并自动加入书库。</p>
     </div>
 
     <div class="row-inline" style="margin: 6px 0 16px">
@@ -1978,11 +2133,38 @@
       {#if webdavStatus}<span class="status">{webdavStatus}</span>{/if}
     </div>
 
-    <p class="tip">
-      进度存于 <code>FlowRead/progress/</code> 下每本书一个文件，本地与云端以时间新的一方为准；关闭上面的自动同步后，进入/退出书籍不再自动同步，但阅读页顶栏仍可手动操作。
-      手动入口在<strong>阅读页顶栏</strong>：短按「☁↑」按钮同步进度（会先对比本地与云端并弹框确认）、长按弹出「上传/下载书籍」菜单；独立的「☁↓ 下载进度」按钮从云端恢复进度。
-      WebDAV 文件管理在书库页（左上「☁ 云盘」或向左滑）进入，打开即自动连接并列出整盘，可下载书籍到上面的目录并自动入书库。
-    </p>
+    <p class="sec-title" style="margin-top:18px">设置备份</p>
+    <div class="row-inline" style="margin: 6px 0 10px">
+      <button onclick={backupWebdavSettingsNow} disabled={webdavBackupBusy}>{webdavBackupBusy ? "备份中…" : "立即备份设置"}</button>
+      <button onclick={loadBackupList} disabled={backupListBusy}>{backupListBusy ? "读取中…" : "刷新备份列表"}</button>
+    </div>
+    <div class="row-inline" style="margin: 6px 0 10px">
+      <select class="flex1" bind:value={selectedBackup} disabled={!backupList.length}>
+        {#if !backupList.length}<option value="">无备份</option>{/if}
+        {#each backupList as b (b.name)}
+          <option value={b.name}>{backupLabel(b)}</option>
+        {/each}
+      </select>
+      <button onclick={restoreWebdavSettings} disabled={webdavRestoreBusy || !selectedBackup}>{webdavRestoreBusy ? "恢复中…" : "恢复所选备份"}</button>
+    </div>
+    <div class="checks">
+      <label><input type="checkbox" bind:checked={config.webdav.backup.enabled} onchange={saveConfig} /> 启用改动备份</label>
+    </div>
+    <div class="grid2" style="margin-top:6px">
+      <div class="field">
+        <label>检测周期</label>
+        <select bind:value={config.webdav.backup.intervalHours} onchange={saveConfig}>
+          <option value={6}>6 小时</option>
+          <option value={12}>12 小时</option>
+          <option value={24}>24 小时</option>
+          <option value={48}>48 小时</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>上次备份</label>
+        <span class="status" style="padding:6px 0;display:block">{lastBackupText}{config.webdav.backup.lastError ? `（最近失败：${config.webdav.backup.lastError}）` : ""}</span>
+      </div>
+    </div>
   </div>
   <div class="set-pane" data-pane="ai" hidden={tab !== "ai"}>
     <div class="checks" style="margin-bottom:12px">
@@ -1991,7 +2173,8 @@
     </div>
 
     <!-- 三个可折叠、可拖拽排序的分类；折叠态不持久化（本组件每次打开重挂载，天然全展开）。 -->
-    <div class="ai-groups" use:dragSort={{ onDrop: aiGroupDrop, axis: "y" }}>
+    <!-- 展开中的分组禁止拖动（避免拖到内部控件）；折叠后仍可拖拽排序。 -->
+    <div class="ai-groups" use:dragSort={{ onDrop: aiGroupDrop, axis: "y", disabled: (id) => !!aiOpen[id] }}>
       {#each aiGroups as g (g.id)}
         <section class="ai-group" data-drag-id={g.id}>
           <div class="ai-group-head" class:open={aiOpen[g.id]} onclick={() => (aiOpen[g.id] = !aiOpen[g.id])}>
