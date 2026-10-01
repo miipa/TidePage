@@ -82,6 +82,8 @@
   let refreshing = $state(false);
   /** 刷新扫描进度（由后端 refresh-progress 事件驱动）。 */
   let refreshProgress = $state<{ phase: string; done: number; total: number } | null>(null);
+  /** 添加目录扫描进度（由后端 folder-scan-progress 事件驱动；只统计本次目录的条目）。 */
+  let folderScan = $state<{ running: boolean; scanned: number; added: number } | null>(null);
   /** 封面/元数据后台生成进度（由后端 meta-progress 事件驱动；不阻塞其它操作）。 */
   let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
   /** 让最后一帧进度（N/N）短暂可见后再隐藏，避免一闪而过看不到。 */
@@ -325,6 +327,370 @@
       top: Math.max(8, Math.min(ctxMenu.y, maxY)),
     };
   });
+
+  // ===== 多选（长按进入 / 右键拉框）=====
+  // 选中集合用普通 Set（避免 16 万元素被 $state 深层代理带来额外开销），
+  // 由 selVersion 提供响应式：isSelected/selCount 读它建立模板依赖。
+  let selectMode = $state(false);
+  let selection = new Set<number>();
+  let selVersion = $state(0);
+  /** 回落档（indexMode===false）全选时标记「仅选中已加载部分」。 */
+  let selectPartial = $state(false);
+
+  function isSelected(id: number): boolean {
+    void selVersion;
+    return selection.has(id);
+  }
+  function selCount(): number {
+    void selVersion;
+    return selection.size;
+  }
+
+  // 长按（550ms，鼠标/触屏通用）：超过 6px 或提前松手即取消。
+  let lpTimer: ReturnType<typeof setTimeout> | undefined;
+  let lpId = -1;
+  let lpX = 0;
+  let lpY = 0;
+  /** 长按已触发：松手时抑制紧随的 click/dblclick，避免刚进入选择又被单击切换。 */
+  let lpFired = false;
+  /** 抑制阈值时间戳（长按松手后短暂生效，防止紧随的 click/dblclick 把刚进入的选择又切换掉）。 */
+  let suppressUntil = 0;
+  function suppressClicks() {
+    suppressUntil = Date.now() + 200;
+  }
+  function clearLongPress() {
+    if (lpTimer !== undefined) clearTimeout(lpTimer);
+    lpTimer = undefined;
+    lpId = -1;
+  }
+
+  function enterSelect(id: number) {
+    selectMode = true;
+    selection = new Set([id]);
+    selVersion++;
+    selectPartial = false;
+    lpFired = true;
+  }
+
+  function toggleSelect(id: number) {
+    if (selection.has(id)) selection.delete(id);
+    else selection.add(id);
+    selVersion++;
+  }
+
+  function exitSelect() {
+    if (!selectMode) return;
+    selectMode = false;
+    selection = new Set();
+    selVersion++;
+    selectPartial = false;
+    clearLongPress();
+  }
+
+  function cardPointerDown(e: PointerEvent, b: BookRow) {
+    if (e.button !== 0 || selectMode) return;
+    clearLongPress();
+    lpId = b.id;
+    lpX = e.clientX;
+    lpY = e.clientY;
+    lpTimer = setTimeout(() => {
+      lpTimer = undefined;
+      if (lpId !== b.id) return;
+      enterSelect(b.id);
+    }, 550);
+  }
+
+  function libPointerMove(e: PointerEvent) {
+    if (lpTimer === undefined) return;
+    if (Math.abs(e.clientX - lpX) > 6 || Math.abs(e.clientY - lpY) > 6) clearLongPress();
+  }
+
+  function libPointerUp(e: PointerEvent) {
+    onPtrUp(e);
+    if (lpFired) {
+      lpFired = false;
+      suppressClicks();
+    }
+    clearLongPress();
+  }
+
+  function onCardClick(e: MouseEvent, b: BookRow) {
+    if (Date.now() < suppressUntil) { e.stopPropagation(); return; }
+    if (!selectMode) return;
+    e.stopPropagation();
+    toggleSelect(b.id);
+  }
+
+  function onCardDblClick(e: MouseEvent, b: BookRow) {
+    if (selectMode || Date.now() < suppressUntil) { e.preventDefault(); e.stopPropagation(); return; }
+    tryOpenBook(b);
+  }
+
+  function onGridClick(e: MouseEvent) {
+    if (Date.now() < suppressUntil) return;
+    if (!selectMode) return;
+    const t = e.target as HTMLElement | null;
+    if (t?.closest?.(".card, .row")) return;
+    exitSelect();
+  }
+
+  // 左键拉框：在 .grid 空白处按下并拖动 > 6px 进入；起点在卡片/行上时不启动（交给长按/单击/双击）。
+  let boxPid = -1;
+  let boxStartX = 0;
+  let boxStartY = 0;
+  let boxLastX = 0;
+  let boxLastY = 0;
+  let boxMoved = false;
+  let boxActive = $state(false);
+  let boxEl: HTMLDivElement | undefined = $state();
+  // 非响应式：拖框期间「当前帧框内命中」（普通 Set）+ 单 rAF 循环（绘制 / 自动滚动 / 命中重算）。
+  let boxHits = new Set<number>();
+  let boxGridRect: DOMRect | null = null;
+  let boxScrollDy = 0;
+  let boxRaf = 0;
+
+  /** 夹取到 .grid 视口内的框（指针可越界到底栏外，但绘制/命中不超出网格）。 */
+  function clampedBox() {
+    const r = boxGridRect;
+    let sx = boxStartX, sy = boxStartY, lx = boxLastX, ly = boxLastY;
+    if (r) {
+      sx = Math.max(r.left, Math.min(r.right, sx));
+      lx = Math.max(r.left, Math.min(r.right, lx));
+      sy = Math.max(r.top, Math.min(r.bottom, sy));
+      ly = Math.max(r.top, Math.min(r.bottom, ly));
+    }
+    return { x0: Math.min(sx, lx), y0: Math.min(sy, ly), x1: Math.max(sx, lx), y1: Math.max(sy, ly) };
+  }
+
+  function paintBox() {
+    if (!boxEl) return;
+    const { x0, y0, x1, y1 } = clampedBox();
+    boxEl.style.transform = `translate(${x0}px, ${y0}px)`;
+    boxEl.style.width = `${x1 - x0}px`;
+    boxEl.style.height = `${y1 - y0}px`;
+  }
+
+  /** 按指针相对 grid 上下边缘的越界距离算每帧滚动量（速度随距离增大，上限 ~40px）。 */
+  function computeScrollDy(): number {
+    const r = boxGridRect;
+    if (!r) return 0;
+    const thr = 24, maxDy = 40;
+    if (boxLastY >= r.bottom - thr) {
+      return Math.min(maxDy, Math.max(2, (boxLastY - (r.bottom - thr)) * 0.6));
+    }
+    if (boxLastY <= r.top + thr) {
+      return -Math.min(maxDy, Math.max(2, (r.top + thr - boxLastY) * 0.6));
+    }
+    return 0;
+  }
+
+  /** 每帧重建 boxHits：先清空，再填入「当前夹取后的框 ∩ 当前可见 .card/.row」的 id。
+   *  即 boxHits 只表示**当前帧框内集合**（非累计并集）——拉远再收回、框变小后松开，
+   *  选中即为松开瞬间框内的书。框退化为 <1px 时也先 clear，避免残留上一帧命中。
+   *  自动滚动时同样每帧清空重算：滚进当前框的书会被选中、滚出当前框的书会被移出。 */
+  function updateBoxHits() {
+    const el = gridEl;
+    if (!el) return;
+    boxHits.clear();
+    const { x0, y0, x1, y1 } = clampedBox();
+    if (x1 - x0 < 1 || y1 - y0 < 1) return;
+    const nodes = el.querySelectorAll<HTMLElement>(".card[data-book-id], .row[data-book-id]");
+    for (const n of nodes) {
+      const r = n.getBoundingClientRect();
+      if (r.left < x1 && r.right > x0 && r.top < y1 && r.bottom > y0) {
+        const id = Number(n.dataset.bookId);
+        if (id) boxHits.add(id);
+      }
+    }
+  }
+
+  /** 单 rAF 循环：自动滚动 + 绘制 + 当前帧命中重算（指针不动时也持续滚动）。 */
+  function boxLoop() {
+    boxRaf = 0;
+    const el = gridEl;
+    if (!el) return;
+    boxScrollDy = computeScrollDy();
+    if (boxScrollDy !== 0) el.scrollTop += boxScrollDy;
+    paintBox();
+    updateBoxHits();
+    boxRaf = requestAnimationFrame(boxLoop);
+  }
+
+  function stopBoxLoop() {
+    if (boxRaf) {
+      cancelAnimationFrame(boxRaf);
+      boxRaf = 0;
+    }
+    boxScrollDy = 0;
+  }
+
+  function onGridPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const t = e.target as HTMLElement | null;
+    if (t?.closest?.(".card, .row")) return; // 起点在卡片/行上：不启动拉框
+    boxPid = e.pointerId;
+    boxStartX = e.clientX;
+    boxStartY = e.clientY;
+    boxLastX = e.clientX;
+    boxLastY = e.clientY;
+    boxMoved = false;
+    boxGridRect = gridEl?.getBoundingClientRect() ?? null;
+  }
+
+  function onGridPointerMove(e: PointerEvent) {
+    if (e.pointerId !== boxPid) return;
+    if (!boxMoved) {
+      if (Math.hypot(e.clientX - boxStartX, e.clientY - boxStartY) <= 6) return;
+      boxMoved = true;
+      boxActive = true;
+      e.preventDefault(); // 起框首帧阻止文本选中（.grid.boxing 已禁选中）
+      gridEl?.setPointerCapture?.(e.pointerId);
+      if (!boxRaf) boxRaf = requestAnimationFrame(boxLoop);
+    }
+    boxLastX = e.clientX;
+    boxLastY = e.clientY;
+  }
+
+  function commitBoxSelection() {
+    // 松手：把**当前帧** boxHits（= 松开瞬间框内集合）并入 selection：
+    // 未进入选择模式先清空 selection；已在模式中则与既有选中 union。
+    // 跨多次独立拉框仍累加，但单次拉框内以松开瞬间的框为准。
+    if (!selectMode) {
+      selectMode = true;
+      selection = new Set();
+      selectPartial = false;
+    }
+    for (const id of boxHits) selection.add(id);
+    selVersion++;
+    boxHits.clear();
+  }
+
+  function onGridPointerUp(e: PointerEvent) {
+    if (e.pointerId !== boxPid) return;
+    boxPid = -1;
+    stopBoxLoop();
+    if (gridEl?.hasPointerCapture?.(e.pointerId)) gridEl.releasePointerCapture(e.pointerId);
+    if (boxMoved) {
+      boxLastX = e.clientX;
+      boxLastY = e.clientY;
+      updateBoxHits(); // 最后一帧补算
+      commitBoxSelection();
+      boxActive = false;
+      suppressClicks(); // 抑制松手后紧随的 click，避免 onGridClick 立刻退出选择
+    }
+    boxMoved = false;
+    boxGridRect = null;
+  }
+
+  function onGridPointerCancel(e: PointerEvent) {
+    if (e.pointerId !== boxPid) return;
+    boxPid = -1;
+    stopBoxLoop();
+    boxMoved = false;
+    boxActive = false;
+    boxHits.clear();
+    boxGridRect = null;
+  }
+
+  function onGridPointerLeave(e: PointerEvent) {
+    if (e.pointerId !== boxPid) return;
+    // 拖框期间已 setPointerCapture，指针越界仍继续（自动滚动），不在此停止。
+    if (boxMoved) return;
+    boxPid = -1;
+    boxGridRect = null;
+  }
+
+  /** 全选：索引档取 idIndex 全量 id；回落档仅取已加载窗口行并说明。 */
+  function selectAll() {
+    if (indexMode && idIndex) {
+      const s = new Set<number>();
+      for (let i = 0; i < idIndex.length; i++) s.add(Number(idIndex[i]));
+      selection = s;
+      selectPartial = false;
+    } else {
+      const s = new Set<number>();
+      for (const b of booksWindow) if (b) s.add(b.id);
+      selection = s;
+      selectPartial = true;
+    }
+    selVersion++;
+  }
+
+  /** 反选：全量 id 集合减去当前选中（回落档仅在已加载行内反选）。 */
+  function invertSelection() {
+    if (indexMode && idIndex) {
+      for (let i = 0; i < idIndex.length; i++) {
+        const id = Number(idIndex[i]);
+        if (selection.has(id)) selection.delete(id);
+        else selection.add(id);
+      }
+      selectPartial = false;
+    } else {
+      for (const b of booksWindow) {
+        if (!b) continue;
+        if (selection.has(b.id)) selection.delete(b.id);
+        else selection.add(b.id);
+      }
+    }
+    selVersion++;
+  }
+
+  /** 批量移出/删除：按 ids 分批取 path（跳过死 id），一次性 deleteBooks 避免多次重建索引。 */
+  async function batchDelete(fromDisk: boolean) {
+    if (!selection.size) return;
+    const count = selection.size;
+    const action = await appChoose(
+      fromDisk
+        ? `已选中 ${count} 本。\n本地文件将移入回收站。\n\n请选择笔记的处理方式：`
+        : `已选中 ${count} 本。\n将从书库移除（本地文件保留）。\n\n请选择笔记的处理方式：`,
+      [
+        { id: "keep", label: "保留笔记并操作", kind: "plain" },
+        { id: "del", label: "连笔记一起删", kind: "danger" },
+        { id: "cancel", label: "取消", kind: "plain" },
+      ],
+    );
+    if (!action || action === "cancel") return;
+    const keepNotes = action === "keep";
+    const ids = [...selection];
+    const paths: string[] = [];
+    const seq = generation;
+    for (let i = 0; i < ids.length; i += IDS_CHUNK) {
+      const chunk = ids.slice(i, i + IDS_CHUNK);
+      let rows: (BookRow | null)[];
+      try {
+        rows = await api.listBooksByIds(chunk);
+      } catch (e) {
+        toast(String(e), "error");
+        return;
+      }
+      if (seq !== generation) return;
+      for (const r of rows) if (r) paths.push(r.path);
+    }
+    if (!paths.length) {
+      toast("未找到可操作的书籍", "error");
+      return;
+    }
+    try {
+      await api.deleteBooks(paths, fromDisk, keepNotes);
+      toast(
+        fromDisk
+          ? (keepNotes ? `已删除 ${paths.length} 本，笔记已保留` : `已删除 ${paths.length} 本及笔记`)
+          : (keepNotes ? `已移出书库 ${paths.length} 本，笔记已保留` : `已移出书库 ${paths.length} 本及笔记`),
+      );
+    } catch (e) {
+      toast(String(e), "error");
+      return;
+    }
+    exitSelect();
+    await reloadWindow();
+  }
+
+  function onLibKey(e: KeyboardEvent) {
+    if (e.key === "Escape" && selectMode) {
+      e.preventDefault();
+      exitSelect();
+    }
+  }
 
   // 真实内容宽 = clientWidth - 左右 padding（用 computed style 取，不写死），
   // 保证首列左边距与末列右边距对称，且末列不出右侧边界。
@@ -728,9 +1094,10 @@
   async function removeFolder(p: string) {
     const ok = await appConfirm(`从书库移除文件夹「${p}」？\n不会删除磁盘上的文件。`);
     if (!ok) return;
+    // remove_folder 已在后端分块删除完成；列表刷新交给 library-changed 监听（reloadWindow+loadFormats），
+    // 这里只更新目录胶囊，避免显式 reloadWindow 与监听叠加造成两次全量重建索引。
     await api.removeFolder(p);
     folders = await api.listFolders();
-    await api.rescan();
   }
 
   function openBook(b: BookRow) {
@@ -960,19 +1327,49 @@
   const BOOK_EXT = ["txt", "epub", "mobi", "azw3", "prc"];
 
   async function handleDrop(paths: string[]) {
-    const valid = paths.filter((p) =>
-      BOOK_EXT.includes((p.split(".").pop() || "").toLowerCase())
-    );
-    if (!valid.length) return;
+    let any = false;
+    let addedFolders = 0;
+    let addedBooks = 0;
     let last: BookRow | null = null;
-    for (const p of valid) {
+    for (const p of paths) {
+      // 目录：直接登记为书库根（含子目录，不弹任何设置），走与「添加文件夹」同款流程。
+      let isDir = false;
       try {
-        last = await api.addDroppedBook(p);
-      } catch (e) {
-        toast(`添加失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
+        isDir = await api.pathIsDir(p);
+      } catch { /* 判定失败则按文件处理 */ }
+      if (isDir) {
+        any = true;
+        try {
+          await api.addFolder(p);
+          addedFolders++;
+        } catch (e) {
+          toast(`添加目录失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
+        }
+        continue;
+      }
+      if (BOOK_EXT.includes((p.split(".").pop() || "").toLowerCase())) {
+        any = true;
+        try {
+          last = await api.addDroppedBook(p);
+          addedBooks++;
+        } catch (e) {
+          toast(`添加失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
+        }
       }
     }
-    await reloadWindow();
+    if (!any) return;
+    // 有书籍文件落库：按当前排序全量刷新（resetScroll + 重建 id 索引），让新书出现在其排序位置。
+    // 仅有目录时不在此刷新：交给「添加目录」扫描完成事件（folder-scan-progress running:false）统一 reload()，
+    // 避免与扫描过程中的 library-changed 叠加过多刷新（既不漏刷，也不重复刷）。
+    if (addedBooks > 0) {
+      await reload();
+    } else if (!addedFolders) {
+      await reloadWindow(); // 无新增（如全部失败）：保守刷新当前窗口
+    }
+    if (addedFolders) {
+      await loadFolders();
+      toast(`已添加 ${addedFolders} 个目录，正在扫描…`);
+    }
     if (last) {
       toast(`已添加《${last.title}》到书库，原文件未移动`);
       await tryOpenBook(last);
@@ -1028,6 +1425,20 @@
     const u4 = listen<{ phase: string; done: number; total: number }>("refresh-progress", (e) => {
       if (e.payload) refreshProgress = e.payload;
     });
+    // 添加目录扫描进度（专用事件）：只统计本次目录的条目；结束时提示新增书籍数。
+    const u8 = listen<{ running: boolean; scanned: number; added: number }>("folder-scan-progress", (e) => {
+      const p = e.payload;
+      if (!p) return;
+      if (p.running) {
+        folderScan = p;
+      } else {
+        folderScan = null;
+        toast(p.added > 0 ? `已添加目录，新增 ${p.added} 本书` : "已添加目录，未发现新书");
+        // 扫描完成后按当前排序全量刷新：resetScroll() + 按 sortKey/query/desc 重建 id 索引，
+        // 确保新书出现在其排序位置并回到顶部（reloadWindow 会锚定原顶部 id，新书可能不在可视区）。
+        if (p.added > 0) reload();
+      }
+    });
     // 封面增量扫描进度（入队时发一帧 / 每 16 本发一帧 / done==total 必发）。
     const u5 = listen<{ phase: string; done: number; total: number }>("meta-progress", (e) => {
       if (e.payload) {
@@ -1063,14 +1474,27 @@
       u5.then((f) => f());
       u6.then((f) => f());
       u7.then((f) => f());
+      u8.then((f) => f());
       u3?.then((f) => f());
     };
   });
 </script>
 
-<div class="library" onpointerdown={onPtrDown} onpointerup={onPtrUp}>
+<svelte:window onkeydown={onLibKey} />
+
+<div class="library" onpointerdown={onPtrDown} onpointerup={libPointerUp} onpointermove={libPointerMove} onpointercancel={clearLongPress}>
   <div class="toolbar" data-tauri-drag-region bind:clientHeight={tbH}>
-    <span class="logo">FlowRead</span>
+    {#if selectMode}
+      <span class="sel-count">已选 {selCount()} 本</span>
+      <button onclick={selectAll}>全选</button>
+      <button onclick={invertSelection}>反选</button>
+      <button onclick={() => batchDelete(false)}>移出书库</button>
+      <button class="danger" onclick={() => batchDelete(true)}>删除</button>
+      <button onclick={exitSelect}>取消</button>
+      {#if selectPartial}<span class="sel-note">（结果过大，仅选中已加载部分）</span>{/if}
+      <div class="spacer" data-tauri-drag-region></div>
+    {:else}
+    <span class="logo">TidePage</span>
     <button class="primary" onclick={addFolder}>＋ 添加文件夹</button>
     <div class="refresh-wrap">
       <button
@@ -1128,6 +1552,7 @@
         </button>
       {/each}
     </div>
+    {/if}
   </div>
 
   {#if filterPanelOpen}
@@ -1173,8 +1598,15 @@
   <div
     class="grid"
     class:list-view={view === "list"}
+    class:boxing={boxActive}
     bind:this={gridEl}
     onscroll={onScroll}
+    onclick={onGridClick}
+    onpointerdown={onGridPointerDown}
+    onpointermove={onGridPointerMove}
+    onpointerup={onGridPointerUp}
+    onpointercancel={onGridPointerCancel}
+    onpointerleave={onGridPointerLeave}
   >
     {#if loading && total === 0}
       <div class="hint">加载中…</div>
@@ -1196,10 +1628,15 @@
                 {#if b}
                   {@const ri = ringInfo(b)}
                   {@const cu = coverUrl(b)}
+                  {@const sel = isSelected(b.id)}
                   <div
                     class="card"
+                    class:selected={sel}
+                    data-book-id={b.id}
                     style="max-width:{CARD_MAX}px;"
-                    ondblclick={() => tryOpenBook(b)}
+                    onpointerdown={(e) => cardPointerDown(e, b)}
+                    onclick={(e) => onCardClick(e, b)}
+                    ondblclick={(e) => onCardDblClick(e, b)}
                     oncontextmenu={(e) => openCtx(e, b)}
                   >
                     <div class="cover" style="height:{coverH}px;">
@@ -1210,6 +1647,9 @@
                         <img src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
                       {/key}
                       <span class="fmt">{b.format.toUpperCase()}</span>
+                      {#if selectMode}
+                        <span class="sel-badge" class:on={sel} aria-hidden="true">{sel ? "✓" : ""}</span>
+                      {/if}
                       {#if ri.show && config.library.showCoverProgress}
                         <ProgressRing pct={ri.pct} full={ri.full} />
                       {/if}
@@ -1237,12 +1677,20 @@
           {#if b}
             {@const ri = ringInfo(b)}
             {@const cu = coverUrl(b)}
+            {@const sel = isSelected(b.id)}
             <div
               class="row"
+              class:selected={sel}
+              data-book-id={b.id}
               style="top:{i * ROW_H}px"
-              ondblclick={() => tryOpenBook(b)}
+              onpointerdown={(e) => cardPointerDown(e, b)}
+              onclick={(e) => onCardClick(e, b)}
+              ondblclick={(e) => onCardDblClick(e, b)}
               oncontextmenu={(e) => openCtx(e, b)}
             >
+              {#if selectMode}
+                <span class="sel-badge row-badge" class:on={sel} aria-hidden="true">{sel ? "✓" : ""}</span>
+              {/if}
               <div class="row-cover-wrap">
                 {#key cu}
                   <img class="row-cover" src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" />
@@ -1266,11 +1714,25 @@
 
   <div class="statusbar">
     <span>{total} 本书</span>
-    <span class="build" title="FlowRead 版本">FlowRead {APP_VERSION}</span>
+    <span class="build" title="TidePage 版本">TidePage {APP_VERSION}</span>
     {#if refreshProgress && refreshProgress.phase !== "done"}
       <div class="scan-progress" title="书库刷新扫描进度">
-        <div class="scan-bar"><div class="scan-fill" style="width:{refreshPct}%"></div></div>
-        <span class="scan-text">{refreshPhaseText(refreshProgress)} · {refreshPct}%</span>
+        <div class="scan-bar">
+          {#if refreshProgress.total > 0}
+            <div class="scan-fill" style="width:{refreshPct}%"></div>
+          {:else}
+            <div class="scan-fill indeterminate"></div>
+          {/if}
+        </div>
+        <span class="scan-text">
+          {refreshPhaseText(refreshProgress)}{#if refreshProgress.total > 0} · {refreshPct}%{/if}
+        </span>
+      </div>
+    {/if}
+    {#if folderScan && folderScan.running}
+      <div class="scan-progress" title="正在扫描目录">
+        <div class="scan-bar"><div class="scan-fill indeterminate"></div></div>
+        <span class="scan-text">正在扫描目录… 已扫描 {folderScan.scanned} 个</span>
       </div>
     {/if}
     {#if metaProgress && metaProgress.phase !== "done" && metaProgress.total > 0}
@@ -1283,6 +1745,8 @@
     <button class="icon view-btn" class:active={view === "grid"} title="网格视图" aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
     <button class="icon view-btn" class:active={view === "list"} title="列表视图" aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
   </div>
+
+  <div class="sel-box" class:on={boxActive} bind:this={boxEl}></div>
 
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
@@ -1505,6 +1969,12 @@
     /* 左右 20px 与 gridPadX 推导一致；底部多留一屏呼吸空间 */
     padding: 16px 20px 32px;
     position: relative;
+  }
+
+  /* 左键拉框期间禁止文本选中 */
+  .grid.boxing {
+    user-select: none;
+    -webkit-user-select: none;
   }
 
   .grid-inner {
@@ -1796,6 +2266,15 @@
     transition: width var(--dur, 0.2s) linear;
   }
 
+  /* 不确定进度（total<=0，如添加目录阶段）：来回滑动动画条。
+     keyframes 定义在全局 app.css（Svelte 会重命名组件内 keyframes，导致 app.css 的
+     reduce-motion 覆盖无法引用），此处仅引用其名字。 */
+  .scan-fill.indeterminate {
+    width: 35%;
+    transition: none;
+    animation: scan-indeterminate 1.1s ease-in-out infinite;
+  }
+
   .scan-text {
     white-space: nowrap;
     opacity: 0.75;
@@ -1866,4 +2345,94 @@
   .ctx button:active { transform: none; }
   .ctx button.danger { color: var(--danger); }
   .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+
+  /* ---------- 多选（长按 / 右键拉框） ---------- */
+  .card.selected,
+  .row.selected {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .card.selected .cover {
+    box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  }
+
+  .sel-badge {
+    position: absolute;
+    left: 6px;
+    top: 6px;
+    width: 20px;
+    height: 20px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-pill, 999px);
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    background: color-mix(in srgb, var(--panel) 82%, transparent);
+    border: 1.5px solid color-mix(in srgb, var(--fg2) 50%, transparent);
+    box-shadow: var(--shadow-sm);
+    z-index: 3;
+    pointer-events: none;
+  }
+
+  .sel-badge.on {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .row-badge {
+    left: 6px;
+    top: 6px;
+    width: 16px;
+    height: 16px;
+    font-size: 11px;
+  }
+
+  .sel-count {
+    font-size: var(--fs-sm, 13px);
+    font-weight: 600;
+    color: var(--fg);
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .sel-note {
+    font-size: var(--fs-xs, 12px);
+    color: var(--fg2);
+    white-space: nowrap;
+  }
+
+  .toolbar button.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  }
+
+  .toolbar button.danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+  }
+
+  /* 常驻元素（避免拉框时增删节点）：位置走 transform，尺寸由 rAF 写入；opacity 控制显隐。 */
+  .sel-box {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 0;
+    z-index: 200;
+    pointer-events: none;
+    border: 1px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-radius: var(--radius-xs, 6px);
+    opacity: 0;
+    will-change: transform;
+  }
+
+  .sel-box.on {
+    opacity: 1;
+  }
 </style>

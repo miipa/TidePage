@@ -177,6 +177,12 @@
     config.settingsOrder = arr;
     saveConfig();
   }
+  /** 漫画默认倍率滑块：先保存全局设置；若正从「正在阅读的书」打开设置，则清除本书 imgScale 覆盖，
+   *  使当前书跟随新全局值。书库（currentBookId=0）或其它书不受影响。 */
+  function onMangaScaleInput() {
+    saveConfig();
+    if (ui.currentBookId) setBookOverride(ui.currentBookId, { imgScale: undefined });
+  }
   let webdavTesting = $state(false);
   let webdavStatus = $state("");
   let regexText = $state(config.regex || "");
@@ -1755,7 +1761,7 @@
     </div>
   </div>
   <div class="set-pane" data-pane="manga" hidden={tab !== "manga"}>
-    <p class="tip">以下设置只影响漫画模式（自动识别的漫画书，或用顶栏「漫/文」按钮手动切换为漫画的书）；普通书不受影响。阅读界面右下角「图−/图＋/适宽」可按单本覆盖，并可超过此处默认值。</p>
+    <p class="tip">以下设置只影响漫画模式（自动识别的漫画书，或用顶栏「漫/文」按钮手动切换为漫画的书）；普通书不受影响。阅读界面右下角「图−/图＋」在漫画模式下直接调整这里的全局「图片大小」，当前书跟随；「适宽」为按书本覆盖。</p>
 
     <div class="grid3">
       <div class="field">
@@ -1789,8 +1795,8 @@
     <hr />
     <div class="field">
       <label>图片大小（默认倍率）{config.reader.manga.imgScale.toFixed(1)}×</label>
-      <input type="range" min="0.3" max="3" step="0.1" bind:value={config.reader.manga.imgScale} oninput={saveConfig} />
-      <p class="tip">默认 1.0×；阅读界面右下角「图−/图＋」可按单本继续增减，允许超过本默认值（0.1~8.0）。</p>
+      <input type="range" min="0.3" max="3" step="0.1" bind:value={config.reader.manga.imgScale} oninput={onMangaScaleInput} />
+      <p class="tip">默认 1.0×；漫画模式下阅读界面右下角「图−/图＋」直接调整此全局倍率（0.3~3.0），正在阅读的当前书会跟随。</p>
     </div>
 
     <div class="checks">

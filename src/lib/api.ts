@@ -34,6 +34,7 @@ export const api = {
   rescan: () => invoke<void>("rescan"),
   refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
   fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
+  pathIsDir: (path: string) => invoke<boolean>("path_is_dir", { path }),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
   getChapter: (bookId: number, chapterIndex: number, keepStyles = false) =>
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex, keepStyles }),

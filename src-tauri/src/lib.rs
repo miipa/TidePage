@@ -229,7 +229,7 @@ pub fn run() {
                 if !folders.is_empty() {
                     let st2 = st.clone();
                     tauri::async_runtime::spawn(async move {
-                        library::scan_folders(&st2).await;
+                        library::scan_folders(&st2, None).await;
                     });
                     library::install_watcher(&st);
                 }
@@ -446,6 +446,7 @@ pub fn run() {
             library::rescan,
             library::refresh_library,
             library::file_exists,
+            library::path_is_dir,
             library::open_book,
             library::get_chapter,
             library::list_book_images,

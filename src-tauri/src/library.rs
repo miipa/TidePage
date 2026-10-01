@@ -193,35 +193,65 @@ pub fn get_rules(state: &AppState) -> String {
     db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
 }
 
-pub async fn scan_folders(state: &AppState) {
+pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>) {
     let folders = {
         let conn = state.db.0.lock().unwrap();
         db::list_folders(&conn)
     };
+    let progress_on = progress_scope.is_some();
     // ---- 阶段一：无锁遍历目录，收集 (path → size, mtime, title, ext) ----
     let folders_walk = folders.clone();
-    let found: HashMap<String, (i64, i64, String, String)> =
+    let prog_app = state.app.clone();
+    let (found, scanned): (HashMap<String, (i64, i64, String, String)>, usize) =
         tauri::async_runtime::spawn_blocking(move || {
             let mut found: HashMap<String, (i64, i64, String, String)> = HashMap::new();
+            // scanned 只统计「本次进度范围内」的条目：不把其它已登记目录的条目算进去。
+            let mut scanned: usize = 0;
+            let emit = |scanned: usize, added: usize, running: bool| {
+                prog_app
+                    .emit(
+                        "folder-scan-progress",
+                        serde_json::json!({ "running": running, "scanned": scanned, "added": added }),
+                    )
+                    .ok();
+            };
+            if progress_on {
+                emit(0, 0, true);
+            }
+            let mut last_emit = std::time::Instant::now();
             for folder in &folders_walk {
                 for entry in walkdir::WalkDir::new(folder)
                     .follow_links(false)
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
                     let path = entry.path().to_string_lossy().into_owned();
-                    if let Some(ext) = ext_of(&path) {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
-                        let mtime = file_mtime(entry.path());
-                        let title = quick_title(&path);
-                        found.insert(path, (size, mtime, title, ext));
+                    let scoped = progress_on
+                        && progress_scope
+                            .as_ref()
+                            .map(|sc| sc.iter().any(|s| Path::new(&path).starts_with(Path::new(s))))
+                            .unwrap_or(false);
+                    if scoped {
+                        scanned += 1;
+                    }
+                    if entry.file_type().is_file() {
+                        if let Some(ext) = ext_of(&path) {
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
+                            let mtime = file_mtime(entry.path());
+                            let title = quick_title(&path);
+                            found.insert(path, (size, mtime, title, ext));
+                        }
+                    }
+                    // 心跳：范围内每 200 条或至少每 ~300ms 发一帧（即使条目数没到 200）。
+                    if progress_on
+                        && (last_emit.elapsed().as_millis() >= 300 || (scoped && scanned % 200 == 0))
+                    {
+                        last_emit = std::time::Instant::now();
+                        emit(scanned, 0, true);
                     }
                 }
             }
-            found
+            (found, scanned)
         })
         .await
         .unwrap_or_default();
@@ -301,6 +331,16 @@ pub async fn scan_folders(state: &AppState) {
     if !new_ids.is_empty() {
         ensure_scan_worker(&state.app);
     }
+    // 扫描结束发 running:false，并带上本次新增书籍数（供前端提示）。
+    if progress_on {
+        state
+            .app
+            .emit(
+                "folder-scan-progress",
+                serde_json::json!({ "running": false, "scanned": scanned, "added": new_files.len() }),
+            )
+            .ok();
+    }
 }
 
 pub fn install_watcher(state: &Arc<AppState>) {
@@ -336,7 +376,7 @@ pub fn spawn_watcher_loop(app: AppHandle) {
             let last = state.last_fs_event.load(Ordering::Relaxed);
             if last > last_handled && (db::now_ms() as u64) - last > 2500 {
                 last_handled = last;
-                tauri::async_runtime::block_on(scan_folders(&state));
+                tauri::async_runtime::block_on(scan_folders(&state, None));
             }
         }
     });
@@ -1079,30 +1119,70 @@ pub async fn add_folder(state: State<'_, Arc<AppState>>, path: String) -> Result
     }
     let st = state.inner().clone();
     tokio::spawn(async move {
-        scan_folders(&st).await;
+        scan_folders(&st, Some(vec![path])).await;
     });
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
+pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
+    let st = state.inner().clone();
+    let diag = std::env::var("TIDEPAGE_OP_DIAG").is_ok();
+    let t0 = std::time::Instant::now();
     {
-        let conn = state.db.0.lock().unwrap();
+        let conn = st.db.0.lock().unwrap();
         db::remove_folder(&conn, &path)?;
-        let base = path.trim_end_matches(['/', '\\']);
-        let esc = base.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        let like = format!("{}%", esc);
+    }
+    let base = path.trim_end_matches(['/', '\\']).to_string();
+    let folder = Path::new(&base).to_path_buf();
+    // 用可走索引的前缀范围代替 LIKE 全表扫描：base <= path < base+U+10FFFF。
+    let hi = format!("{}{}", base, '\u{10FFFF}');
+    let t_query = std::time::Instant::now();
+    let rows: Vec<String> = {
+        let conn = st.db.0.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT path FROM books WHERE path LIKE ?1 ESCAPE '\\'")
+            .prepare("SELECT path FROM books WHERE path >= ?1 AND path < ?2")
             .map_err(|e| e.to_string())?;
-        let doomed: Vec<String> = stmt
-            .query_map(rusqlite::params![like], |r| r.get::<_, String>(0))
+        stmt.query_map(rusqlite::params![base, hi], |r| r.get::<_, String>(0))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-        drop(stmt);
-        if !doomed.is_empty() {
-            db::delete_books(&conn, &doomed).ok();
+            .unwrap_or_default()
+    };
+    // 前缀边界修正：`C:\Books` 不应命中 `C:\Books2`。
+    let row_count = rows.len();
+    let doomed: Vec<String> = rows
+        .into_iter()
+        .filter(|p| Path::new(p).starts_with(&folder))
+        .collect();
+    if diag {
+        eprintln!(
+            "[remove_folder] query={:?} rows={} doomed={}",
+            t_query.elapsed(),
+            row_count,
+            doomed.len()
+        );
+    }
+    // 分批删除，每批一个事务；批间释放 db 锁并 yield，避免长持锁阻塞窗口取行等 DB 读取。
+    // 与 scan_folders 阶段四同款：异步命令体直接跑（非同步命令/主线程），批间让出。
+    let t_del = std::time::Instant::now();
+    for chunk in doomed.chunks(2000) {
+        let r: Result<(), String> = (|| {
+            let mut guard = st.db.0.lock().unwrap();
+            let tx = guard.transaction().map_err(|e| e.to_string())?;
+            db::delete_books_policy(&tx, chunk, true)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(e) = r {
+            eprintln!("[remove_folder] delete tx failed: {e}");
         }
+        tokio::task::yield_now().await;
+    }
+    if diag {
+        eprintln!(
+            "[remove_folder] delete={:?} total={:?}",
+            t_del.elapsed(),
+            t0.elapsed()
+        );
     }
     state.app.emit("library-changed", ()).ok();
     Ok(())
@@ -1239,7 +1319,7 @@ pub async fn list_books_by_ids(
 pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let st = state.inner().clone();
     tokio::spawn(async move {
-        scan_folders(&st).await;
+        scan_folders(&st, None).await;
     });
     Ok(())
 }
@@ -1449,6 +1529,12 @@ pub fn file_exists(path: String) -> bool {
     !path.is_empty() && Path::new(&path).exists()
 }
 
+/// 拖拽入书库时判定路径是否为目录（目录直接登记为书库根，文件走单本导入）。
+#[tauri::command]
+pub fn path_is_dir(path: String) -> bool {
+    !path.is_empty() && Path::new(&path).is_dir()
+}
+
 #[tauri::command]
 pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenResult, String> {
     // 打开未扫描的书：把该本封面扫描提升为最高优先级（处理完当前这一本后立即执行）。
@@ -1488,10 +1574,20 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
             .collect();
         (cached.doc.toc.clone(), docs, None)
     } else if ext == "txt" {
-        let cached = load_txt(&st, &book.path, id)?;
+        // TXT 整读+正则切分同样可能耗时：与 EPUB 一样放阻塞线程池。
+        let st2 = st.clone();
+        let bpath = book.path.clone();
+        let cached = tauri::async_runtime::spawn_blocking(move || load_txt(&st2, &bpath, id))
+            .await
+            .map_err(|e| e.to_string())??;
         (cached.2.clone(), Vec::new(), None)
     } else {
-        let doc = mobi_doc_for(&st, &book.path, id)?;
+        // MOBI/AZW3 解压 + 切分：放阻塞线程池。
+        let st2 = st.clone();
+        let bpath = book.path.clone();
+        let doc = tauri::async_runtime::spawn_blocking(move || mobi_doc_for(&st2, &bpath, id))
+            .await
+            .map_err(|e| e.to_string())??;
         let toc = doc.toc.clone();
         let html = doc.html.clone();
         let parts = doc.parts.clone();
@@ -1639,12 +1735,21 @@ pub async fn get_chapter(
     let (content, ranges, toc) = match cached_hit {
         Some(c) => c.as_ref().clone(),
         None => {
-            let entry = if is_mobi {
-                let doc = mobi_doc_for(&st, &book.path, book_id)?;
-                Arc::new((doc.html.clone(), doc.parts.clone(), doc.toc.clone()))
-            } else {
-                load_txt(&st, &book.path, book_id)?
-            };
+            // 缓存未命中才解析：TXT/MOBI 的解析放阻塞线程池，避免占用 async 运行时。
+            let st2 = st.clone();
+            let bpath = book.path.clone();
+            let entry = tauri::async_runtime::spawn_blocking(
+                move || -> Result<Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>, String> {
+                    if is_mobi {
+                        let doc = mobi_doc_for(&st2, &bpath, book_id)?;
+                        Ok(Arc::new((doc.html.clone(), doc.parts.clone(), doc.toc.clone())))
+                    } else {
+                        load_txt(&st2, &bpath, book_id)
+                    }
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())??;
             push_cache(&st.txt_cache, book_id, (ver, entry.clone()), 3);
             entry.as_ref().clone()
         }
@@ -1688,24 +1793,31 @@ pub fn load_progress(state: State<'_, Arc<AppState>>, book_id: i64) -> Option<Pr
 /// 删除书籍。`fromDisk`=删除本地文件；`keepNotes`=保留带笔记的划线（默认 true）。
 /// 前端需先调用 `book_note_info` 判断是否有笔记并弹窗让用户选择。
 #[tauri::command]
-pub fn delete_books(
+pub async fn delete_books(
     state: State<'_, Arc<AppState>>,
     paths: Vec<String>,
     from_disk: bool,
     keep_notes: Option<bool>,
 ) -> Result<(), String> {
     let keep = keep_notes.unwrap_or(true);
-    {
-        let conn = state.db.0.lock().unwrap();
-        db::delete_books_policy(&conn, &paths, keep)?;
-    }
-    if from_disk {
-        for p in &paths {
-            trash::delete(p).map_err(|e| format!("删除失败: {e:?}"))?;
+    let st = state.inner().clone();
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        {
+            let conn = st.db.0.lock().unwrap();
+            db::delete_books_policy(&conn, &paths, keep)?;
         }
-    }
-    state.app.emit("library-changed", ()).ok();
-    state.app.emit("notes-changed", ()).ok();
+        if from_disk {
+            for p in &paths {
+                trash::delete(p).map_err(|e| format!("删除失败: {e:?}"))?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    app.emit("library-changed", ()).ok();
+    app.emit("notes-changed", ()).ok();
     Ok(())
 }
 
@@ -2273,18 +2385,18 @@ pub async fn webdav_download_books(
         if out.exists() {
             continue;
         }
-        if let Some(data) = c.get(&format!("FlowRead/books/{name}")).await? {
+        if let Some(data) = c.get(&format!("TidePage/books/{name}")).await? {
             std::fs::write(&out, &data).map_err(|e| e.to_string())?;
             imported.push(out.to_string_lossy().into_owned());
         }
     }
     if !imported.is_empty() {
-        scan_folders(&state).await;
+        scan_folders(&state, None).await;
     }
     Ok(imported)
 }
 
-/// 单本书从云端下载到本地：远端键为 FlowRead/books/{file_name}，复用 webdav_download_file
+/// 单本书从云端下载到本地：远端键为 TidePage/books/{file_name}，复用 webdav_download_file
 /// 的「下载 → 按扩展名 upsert_book → emit library-changed」逻辑。返回落地路径。
 #[tauri::command]
 pub async fn webdav_download_book(
@@ -3296,24 +3408,17 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
     };
     let ext = ext_of(&book.path).unwrap_or_default();
     let chapters: Vec<(i64, String, String)> = if ext == "txt" {
-        let plain = {
-            let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
-            let (t, _) = txt::decode_bytes(&data);
-            t.replace("\r\n", "\n").replace('\r', "\n")
-        };
-        let pattern = {
-            let conn = state.db.0.lock().unwrap();
-            db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
-        };
-        let doc = txt::split_custom(&plain, &pattern)?;
-        doc.toc
-            .iter()
-            .zip(&doc.ranges)
-            .map(|(t, (s, e))| (t.index as i64, t.title.clone(), safe_slice(&plain, *s, *e)))
+        // 复用解析缓存（load_txt）：不再重新 fs::read + 解码 + 正则切分。
+        let cached = load_txt(state, &book.path, book_id)?;
+        let (plain, ranges, toc) = cached.as_ref();
+        toc.iter()
+            .zip(ranges)
+            .map(|(t, (s, e))| (t.index as i64, t.title.clone(), safe_slice(plain, *s, *e)))
             .collect()
     } else if ext == "epub" {
-        let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
-        let doc = crate::epub::parse(data.clone())?;
+        // 复用解析缓存（load_epub）：不再重新 fs::read + parse。
+        let cached = load_epub(state, &book.path, book_id)?;
+        let doc = &cached.doc;
         let spine_len = doc.spine.len();
         // 一次性建好「spine 下标 → 章节号 / 标题」，避免逐章线性查找目录（大书 O(n²)）。
         let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
@@ -3329,7 +3434,7 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
             }
         }
         // 复用单个 zip/CiMap 提取全章文本（而非每章重建索引）。
-        let texts = crate::epub::collect_texts(&data, &doc.spine);
+        let texts = crate::epub::collect_texts(&cached.data, &doc.spine);
         doc.spine
             .iter()
             .enumerate()

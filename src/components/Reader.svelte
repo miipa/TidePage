@@ -107,6 +107,7 @@
   let contentEl: HTMLDivElement | undefined = $state();
   let bodyEl: HTMLDivElement | undefined = $state();
   let thumbEl: HTMLDivElement | undefined = $state();
+  let scrollbarEl: HTMLDivElement | undefined = $state();
 
   // A?/A＋ 悬浮控件：默认完全隐藏（pointer-events:none），仅指针进入右下角热区才淡入，
   // 避免透明热区常驻拦截正文框选/右下角翻页点击。
@@ -796,10 +797,16 @@
       refreshHighlights();
       {
         const openedBookId = book.book.id;
-        api
-          .indexBookFts(openedBookId)
-          .catch(() => {})
-          .finally(() => { api.ensureBookText(openedBookId).catch(() => {}); });
+        // 延后到首屏稳定后再建索引：避免与首章渲染/预取争 CPU 与 DB 锁。
+        // index_book_fts 内部一次遍历同时写 fts 与 chapter_text；仅当无 FTS 能力（返回 0）时兜底补 chapter_text。
+        const runIndex = () => {
+          api
+            .indexBookFts(openedBookId)
+            .then((n) => { if (n === 0) api.ensureBookText(openedBookId).catch(() => {}); })
+            .catch(() => {});
+        };
+        if (typeof requestIdleCallback === "function") requestIdleCallback(runIndex, { timeout: 4000 });
+        else setTimeout(runIndex, 1500);
       }
       if (pendingHighlightJump && pendingHighlightJump.book_id === book.book.id) {
         const ph = pendingHighlightJump;
@@ -1103,15 +1110,19 @@
       }
     }
     if (placeholder) return;
-    try {
-      localStorage.setItem(
-        "fr.ai.ctx",
-        JSON.stringify({
-          title: `${book?.book.title ?? ""} · ${ch.title}`,
-          html: aiCtxHtml(ch.html),
-        })
-      );
-    } catch { /* ignore */ }
+    // AI 上下文写入移出换章热路径：仅在启用 AI 时写，且延后到空闲（html 上限 40 万字符，
+    // 同步 JSON.stringify + aiCtxHtml 会阻塞主线程导致换章顿挫）。
+    if (config.ai.enabled) {
+      const ctxTitle = `${book?.book.title ?? ""} · ${ch.title}`;
+      const ctxHtml = ch.html;
+      const writeCtx = () => {
+        try {
+          localStorage.setItem("fr.ai.ctx", JSON.stringify({ title: ctxTitle, html: aiCtxHtml(ctxHtml) }));
+        } catch { /* ignore */ }
+      };
+      if (typeof requestIdleCallback === "function") requestIdleCallback(writeCtx, { timeout: 2000 });
+      else setTimeout(writeCtx, 0);
+    }
     maybeAutoAi();
     saveProgressDebounced(false); // 章节定位/初次打开：保存进度但不算「用户移动」，不释放手动状态覆盖
   }
@@ -1375,6 +1386,60 @@
     }
   }
 
+  /* ===== 自定义滚动条拖动 ===== */
+  let sbDragPid = -1;
+  let sbDragging = $state(false);
+  // 拖动期间缓存的轨道几何：避免每次 pointermove 都读 getBoundingClientRect（写 scrollTop 后再读会触发布局抖动）。
+  let sbTop = 0;
+  let sbH = 0;
+
+  /** 按轨道内 Y 比例即时跳到目标位置（点击轨道 / 拖动 thumb 共用）。 */
+  function sbSeek(clientY: number) {
+    if (maxScroll <= 0 || sbH <= 0) return;
+    const ratio = (clientY - sbTop) / sbH;
+    const pos = Math.max(0, Math.min(1, ratio)) * maxScroll;
+    scroller?.jumpTo(pos, true);
+    applyScroll(pos); // 立即同步 thumb 位置
+  }
+
+  function onSbPointerDown(e: PointerEvent) {
+    // 先阻止冒泡：否则滚动条上的按下会冒泡到 .content 触发翻章/区域动作（内容不满屏、maxScroll=0 时也不能例外）。
+    e.stopPropagation();
+    e.preventDefault();
+    if (e.button !== 0 || maxScroll <= 0) return;
+    const el = scrollbarEl;
+    const r = el?.getBoundingClientRect();
+    if (!el || !r || r.height <= 0) return;
+    sbTop = r.top;
+    sbH = r.height;
+    el.setPointerCapture?.(e.pointerId);
+    sbDragPid = e.pointerId;
+    sbDragging = true;
+    sbSeek(e.clientY);
+  }
+
+  function onSbPointerMove(e: PointerEvent) {
+    if (e.pointerId !== sbDragPid) return;
+    e.stopPropagation();
+    sbSeek(e.clientY);
+  }
+
+  function onSbPointerUp(e: PointerEvent) {
+    if (e.pointerId !== sbDragPid) return;
+    e.stopPropagation();
+    sbDragPid = -1;
+    sbDragging = false;
+    if (scrollbarEl?.hasPointerCapture?.(e.pointerId)) scrollbarEl.releasePointerCapture(e.pointerId);
+    saveProgressDebounced();
+  }
+
+  function onSbPointerCancel(e: PointerEvent) {
+    if (e.pointerId !== sbDragPid) return;
+    sbDragPid = -1;
+    sbDragging = false;
+    if (scrollbarEl?.hasPointerCapture?.(e.pointerId)) scrollbarEl.releasePointerCapture(e.pointerId);
+  }
+
   /** 章节切换时把滚动容器复位到顶部并清除回弹位移。 */
   function resetScroll() {
     if (scrollArea) {
@@ -1517,13 +1582,24 @@
     if (n !== cur) setOv({ fontSize: n });
   }
 
-  /** 单本图片缩放（长按连续调整）。
-   *  以「有效大小」为基准增减，范围 0.1~8.0：可在总漫画设置基础上继续放大/缩小，
-   *  允许超过总设置大小，且始终可调（不再被总设置的倍率上限压制）。 */
+  /** 右下「图−/图＋」调整图片大小。
+   *  漫画模式：改为调整全局漫画倍率（0.3~3，步长 0.1），并清除本书 imgScale 覆盖使其跟随全局；
+   *  普通模式：保持单本覆盖行为（以有效值为基准，0.1~8，可超过默认）。 */
   function bumpImgScale(delta: number) {
-    const cur = effImgScale();
-    const n = Math.max(0.1, Math.min(8, Math.round((cur + delta) * 20) / 20));
-    if (n !== cur) setOv({ imgScale: n });
+    if (isMangaMode()) {
+      const g = config.reader.manga.imgScale;
+      const n = Math.max(0.3, Math.min(3, Math.round((g + delta) * 10) / 10));
+      if (n !== g) {
+        config.reader.manga.imgScale = n;
+        saveConfig();
+      }
+      // 清除本书单本覆盖，使当前书即时跟随新的全局倍率。
+      if (book) setBookOverride(book.book.id, { imgScale: undefined });
+    } else {
+      const cur = effImgScale();
+      const n = Math.max(0.1, Math.min(8, Math.round((cur + delta) * 20) / 20));
+      if (n !== cur) setOv({ imgScale: n });
+    }
   }
 
   /** 单本：图片适应阅读器宽度开关。 */
@@ -3588,7 +3664,16 @@ ${effCssExtra() || ""}
                 <div id="chapter-content">{@html chapter?.html ?? ""}</div>
               </div>
             </div>
-            <div class="scrollbar">
+            <div
+              class="scrollbar"
+              class:dragging={sbDragging}
+              bind:this={scrollbarEl}
+              onpointerdown={onSbPointerDown}
+              onpointermove={onSbPointerMove}
+              onpointerup={onSbPointerUp}
+              onpointercancel={onSbPointerCancel}
+              onclick={(e) => e.stopPropagation()}
+            >
               <div class="thumb" bind:this={thumbEl} style="height:8%"></div>
             </div>
           {:else}
@@ -4402,22 +4487,37 @@ ${effCssExtra() || ""}
     background: rgba(127, 127, 127, 0.14);
   }
 
+  /* 可视宽约 5px，但用 13px 透明命中区（左右各 4px padding），thumb 居中便于拖动。 */
   .scrollbar {
     position: absolute;
-    right: 5px;
+    right: 1px;
     top: 14px;
     bottom: 14px;
-    width: 5px;
+    width: 13px;
+    padding: 0 4px;
+    box-sizing: border-box;
     z-index: 20;
+    cursor: pointer;
+    touch-action: none;
   }
 
   .thumb {
     position: absolute;
     top: 0;
-    width: 100%;
+    left: 0;
+    right: 0;
+    width: 5px;
+    margin: 0 auto;
     background: rgba(128, 128, 128, 0.35);
     border-radius: 3px;
     will-change: transform;
+    transition: background 0.12s ease, width 0.12s ease;
+  }
+
+  .scrollbar:hover .thumb,
+  .scrollbar.dragging .thumb {
+    width: 8px;
+    background: rgba(128, 128, 128, 0.6);
   }
 
   /* 加载骨架：用与正文同形的灰条替代「加载中…」药丸，减少版面跳动。 */
