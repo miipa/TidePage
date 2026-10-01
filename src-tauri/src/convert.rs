@@ -89,7 +89,7 @@ pub fn mobi_to_ebook_data(input_path: &str) -> Result<ConvertedBook, String> {
 
 pub fn txt_to_epub_data(input_path: &str, pattern: &str) -> Result<ConvertedBook, String> {
     let pattern = if pattern.trim().is_empty() { crate::default_pattern().to_string() } else { pattern.to_string() };
-    let doc = txt::decode_and_split(input_path, Some(&pattern))?;
+    let doc = txt::decode_and_split(input_path, Some(&pattern), None)?;
     let plain = doc.text;
     let ranges = doc.ranges;
     let toc = doc.toc;
@@ -112,7 +112,7 @@ pub fn txt_to_epub_data(input_path: &str, pattern: &str) -> Result<ConvertedBook
 
 pub fn epub_to_txt_data(input_path: &str) -> Result<ConvertedBook, String> {
     let data = std::fs::read(input_path).map_err(|e| e.to_string())?;
-    let doc = crate::epub::parse(data.clone())?;
+    let doc = crate::epub::parse(&data)?;
     let mut out = String::new();
     let mut toc = Vec::new();
     for (i, doc_path) in doc.spine.iter().enumerate() {

@@ -198,22 +198,23 @@ fn percent_decode(s: &str) -> String {
 /// 快速解析：只解析 container/OPF/目录/封面，**不做全书逐章文本统计**。
 /// 打开书籍与取章节走这里，避免 7000+ 章的书在打开时卡 5 秒以上。
 /// 需要全书字数时用 `parse_with_chars`（后台元数据阶段）。
-pub fn parse(data: Vec<u8>) -> Result<EpubDoc, String> {
+/// 接收 `&[u8]` 借用（内部 `Cursor` 也只借用），调用方无需为解析复制整份书字节。
+pub fn parse(data: &[u8]) -> Result<EpubDoc, String> {
     parse_impl(data, false).map(|(doc, _)| doc)
 }
 
 /// 完整解析：额外统计每一章的字符数（供元数据/统计用，后台执行）。
-pub fn parse_with_chars(data: Vec<u8>) -> Result<EpubDoc, String> {
+pub fn parse_with_chars(data: &[u8]) -> Result<EpubDoc, String> {
     parse_impl(data, true).map(|(doc, _)| doc)
 }
 
 /// 快速解析并**同时返回条目索引**（避免调用方再扫一遍 zip 建 CiMap）。
-pub fn parse_with_ci(data: Vec<u8>) -> Result<(EpubDoc, CiMap), String> {
+pub fn parse_with_ci(data: &[u8]) -> Result<(EpubDoc, CiMap), String> {
     parse_impl(data, false)
 }
 
-fn parse_impl(data: Vec<u8>, compute_chars: bool) -> Result<(EpubDoc, CiMap), String> {
-    let cursor = std::io::Cursor::new(&data);
+fn parse_impl(data: &[u8], compute_chars: bool) -> Result<(EpubDoc, CiMap), String> {
+    let cursor = std::io::Cursor::new(data);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("EPUB 打开失败: {e}"))?;
     let ci = build_ci(&mut zip);
 
@@ -419,7 +420,7 @@ fn parse_impl(data: Vec<u8>, compute_chars: bool) -> Result<(EpubDoc, CiMap), St
         let counter = std::sync::atomic::AtomicUsize::new(0);
         let results = std::sync::Mutex::new(vec![(0i64, 0i64); spine_idx.len()]);
         let spine_idx_ref: &[Option<usize>] = &spine_idx;
-        let data_ref: &[u8] = &data;
+        let data_ref: &[u8] = data;
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for _ in 0..nworkers {
@@ -2171,7 +2172,7 @@ mod tests {
             _ => return,
         };
         let data = std::fs::read(&path).unwrap();
-        let (doc, ci) = parse_with_ci(data.clone()).unwrap();
+        let (doc, ci) = parse_with_ci(&data).unwrap();
         let mut total = 0usize;
         let mut ok = 0usize;
         for idx in [0usize, 1, 100, 1000, 3000] {

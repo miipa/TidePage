@@ -183,6 +183,17 @@
     saveConfig();
     if (ui.currentBookId) setBookOverride(ui.currentBookId, { imgScale: undefined });
   }
+  /** 漫画「适宽 / 适高」互斥：开一个自动关另一个。 */
+  function setMangaFit(which: "fitWidth" | "fitHeight", v: boolean) {
+    if (which === "fitWidth") {
+      config.reader.manga.fitWidth = v;
+      if (v) config.reader.manga.fitHeight = false;
+    } else {
+      config.reader.manga.fitHeight = v;
+      if (v) config.reader.manga.fitWidth = false;
+    }
+    saveConfig();
+  }
   let webdavTesting = $state(false);
   let webdavStatus = $state("");
   let regexText = $state(config.regex || "");
@@ -577,7 +588,7 @@
   async function saveMobiEnc() {
     try {
       await api.setMobiEncoding(mobiEnc);
-      toast("MOBI 编码已设置，重新打开书籍后生效");
+      toast("正文编码已设置（MOBI/TXT），重新打开书籍后生效");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1763,7 +1774,7 @@
   <div class="set-pane" data-pane="manga" hidden={tab !== "manga"}>
     <p class="tip">以下设置只影响漫画模式（自动识别的漫画书，或用顶栏「漫/文」按钮手动切换为漫画的书）；普通书不受影响。阅读界面右下角「图−/图＋」在漫画模式下直接调整这里的全局「图片大小」，当前书跟随；「适宽」为按书本覆盖。</p>
 
-    <div class="grid3">
+    <div class="grid3 mg-grid">
       <div class="field">
         <label>显示方式</label>
         <select bind:value={config.reader.manga.layout} onchange={saveConfig}>
@@ -1780,7 +1791,7 @@
           disabled={config.reader.manga.layout === "flow"}
         >
           <option value="ltr">从左到右</option>
-          <option value="rtl">从右到左（日漫）</option>
+          <option value="rtl">从右到左</option>
         </select>
       </div>
       <div class="field">
@@ -1800,23 +1811,24 @@
     </div>
 
     <div class="checks">
-      <label><input type="checkbox" bind:checked={config.reader.manga.fitWidth} onchange={saveConfig} /> 默认适应阅读器宽度</label>
+      <label><input type="checkbox" checked={config.reader.manga.fitWidth} onchange={(e) => setMangaFit("fitWidth", e.currentTarget.checked)} /> 默认适应阅读器宽度</label>
+      <label><input type="checkbox" checked={config.reader.manga.fitHeight} onchange={(e) => setMangaFit("fitHeight", e.currentTarget.checked)} /> 默认适应阅读器高度</label>
     </div>
 
     <hr />
-    <div class="grid3">
-      <div class="field">
-        <label>左右边距 {config.reader.manga.marginH}px</label>
+    <div class="grid3 mg-grid">
+      <div class="field" class:mg-off={config.reader.manga.layout === "horizontal"}>
+        <label>左右边距 {config.reader.manga.layout === "horizontal" ? "（横向不支持）" : config.reader.manga.marginH + "px"}</label>
         <div class="row-inline">
-          <input type="range" min="0" max="400" bind:value={config.reader.manga.marginH} oninput={saveConfig} />
-          <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginH} onchange={saveConfig} />
+          <input type="range" min="0" max="400" bind:value={config.reader.manga.marginH} oninput={saveConfig} disabled={config.reader.manga.layout === "horizontal"} />
+          <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginH} onchange={saveConfig} disabled={config.reader.manga.layout === "horizontal"} />
         </div>
       </div>
-      <div class="field">
-        <label>上下边距 {config.reader.manga.marginV}px</label>
+      <div class="field" class:mg-off={config.reader.manga.layout === "flow"}>
+        <label>上下边距 {config.reader.manga.layout === "flow" ? "（瀑布流不支持）" : config.reader.manga.marginV + "px"}</label>
         <div class="row-inline">
-          <input type="range" min="0" max="400" bind:value={config.reader.manga.marginV} oninput={saveConfig} />
-          <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginV} onchange={saveConfig} />
+          <input type="range" min="0" max="400" bind:value={config.reader.manga.marginV} oninput={saveConfig} disabled={config.reader.manga.layout === "flow"} />
+          <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginV} onchange={saveConfig} disabled={config.reader.manga.layout === "flow"} />
         </div>
       </div>
       <div class="field">
@@ -2489,7 +2501,7 @@
       <button onclick={rebuildIndex} disabled={rebuildingFts}>{rebuildingFts ? "重建中…" : "重建全文索引"}</button>
     </div>
 
-    <p class="sec-title" style="margin-top:18px">MOBI / AZW3</p>
+    <p class="sec-title" style="margin-top:18px">MOBI / AZW3 / TXT</p>
     <div class="field" style="margin-bottom:10px">
       <label>正文字符编码</label>
       <select bind:value={mobiEnc} onchange={saveMobiEnc}>
@@ -2692,6 +2704,8 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
+    /* 兜底：任何子项（如漫画区块的滑块栅格）都不得撑出横向滚动条。 */
+    overflow-x: hidden;
     padding: 20px 24px;
   }
 
@@ -2739,8 +2753,30 @@
 
   .grid3 {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    /* minmax(0,1fr) 允许列收缩（1fr 隐含 min-width:auto 会被 range 固有最小宽撑出横向条）。 */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
     gap: 12px;
+  }
+
+  /* 栅格内滑块允许收缩并占满单元格，杜绝其固有最小宽把栅格撑出横向滚动条。 */
+  .grid3 input[type="range"],
+  .grid2 input[type="range"] {
+    min-width: 0;
+    width: 100%;
+  }
+
+  /* 漫画区块专用：窄面板下自动降为 2 列 / 1 列并换行，不溢出（仅漫画 tab 生效，不动其它 tab）。 */
+  .mg-grid {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    align-items: start;
+  }
+
+  /* 按漫画显示方式禁用无关的那个边距字段（瀑布流只调左右、横向只调上下）：置灰 + 不可交互 */
+  .mg-grid .field.mg-off {
+    opacity: 0.45;
+  }
+  .mg-grid .field.mg-off input {
+    cursor: not-allowed;
   }
 
   /* 高级折叠区：把顶栏/底栏显示项这类低频配置收起来，减少阅读排版页的视觉负担 */

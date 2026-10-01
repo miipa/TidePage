@@ -117,6 +117,9 @@ pub fn run() {
                 let _ = db::ensure_fts(&conn);
             }
             db::migrate_book_ids(&conn);
+            // 切分算法升级（txt.rs 引入章节上限细分）：作废按旧 toc 写入的搜索缓存/FTS，
+            // 避免划词全文搜索定位到错误章节；下次搜索按新 toc 懒重建。
+            db::migrate_chapter_split(&conn);
 
             // 创建主窗口：注入 WebView2 字体渲染参数（需重启生效）。
             // 设置页现已简化为单个「灰度抗锯齿」复选框，只写入

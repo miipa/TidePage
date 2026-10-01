@@ -7,6 +7,8 @@ export interface BookOverride {
   imgScale?: number;
   /** 图片适应阅读器宽度 */
   fitWidth?: boolean;
+  /** 图片适应阅读器高度（与 fitWidth 互斥） */
+  fitHeight?: boolean;
   /** 是否显示正文图片（false=全部关闭） */
   showImages?: boolean;
   /** 已屏蔽图片的 src 列表 */

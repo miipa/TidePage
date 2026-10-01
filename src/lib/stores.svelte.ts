@@ -169,6 +169,8 @@ export interface MangaConfig {
   imgScale: number;
   /** 默认图片适应阅读器宽度 */
   fitWidth: boolean;
+  /** 默认图片适应阅读器高度（与 fitWidth 互斥） */
+  fitHeight: boolean;
   /** 漫画模式左右边距（px） */
   marginH: number;
   /** 漫画模式上下边距（px） */
@@ -1013,7 +1015,7 @@ p {
     topbarColor: "",
     topbarOrder: [...READER_TOPBAR_IDS],
     topbarHidden: [],
-    manga: { imgScale: 1, fitWidth: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "" },
+    manga: { imgScale: 1, fitWidth: false, fitHeight: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "" },
     mangaGuideDone: false,
     statusItems: [
       { id: "chapterName", enabled: true },
@@ -1443,6 +1445,10 @@ function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
   if (r.manga.imgScale !== mi) { r.manga.imgScale = mi; dirty = true; }
   const mfw = r.manga.fitWidth === true;
   if (r.manga.fitWidth !== mfw) { r.manga.fitWidth = mfw; dirty = true; }
+  // 适宽 / 适高互斥：两者同时为真时以适宽优先（历史配置兜底）。
+  let mfh = r.manga.fitHeight === true;
+  if (mfw && mfh) mfh = false;
+  if (r.manga.fitHeight !== mfh) { r.manga.fitHeight = mfh; dirty = true; }
   const mmh = clampI(r.manga.marginH, 0, 400, DEFAULTS.reader.manga.marginH);
   if (r.manga.marginH !== mmh) { r.manga.marginH = mmh; dirty = true; }
   const mmv = clampI(r.manga.marginV, 0, 400, DEFAULTS.reader.manga.marginV);

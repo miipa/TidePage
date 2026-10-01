@@ -55,6 +55,14 @@
   let rangeStart = $state(0);
 
   let folders: string[] = $state([]);
+  // 文件夹单选作用域（null=「全部」）。持久化到 tidepage.lib.folder（仿 tidepage.lib.filter 的存取）。
+  // 选中后：排序 / 分类筛选 / 随机打开 均只在该文件夹目录内生效（后端按路径前缀下推 SQLite）。
+  let selectedFolder = $state<string | null>(
+    (() => {
+      try { return localStorage.getItem("tidepage.lib.folder") || null; }
+      catch { return null; }
+    })()
+  );
   let queryInput = $state("");
   let query = $state("");
   let sortKey = $state<"added" | "lastread" | "title" | "recent" | "size">(
@@ -88,6 +96,9 @@
   let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
   /** 让最后一帧进度（N/N）短暂可见后再隐藏，避免一闪而过看不到。 */
   let metaHideTimer: ReturnType<typeof setTimeout> | undefined;
+  /** library-changed 防抖：移除大目录等场景可能短时多次触发，合并为一次全量刷新，
+   *  避免叠加多次整库索引重建把主线程压死。 */
+  let libChangedTimer: ReturnType<typeof setTimeout> | undefined;
   /** 长按刷新弹出的菜单（普通点击=只读书籍；长按=可刷新封面）。 */
   let refreshMenu = $state(false);
 
@@ -193,6 +204,22 @@
     try {
       localStorage.setItem("tidepage.lib.filter", JSON.stringify({ formats: filterFormats, states: filterStates }));
     } catch { /* ignore */ }
+  }
+
+  // ===== 文件夹单选作用域 =====
+  function saveFolder() {
+    try {
+      if (selectedFolder) localStorage.setItem("tidepage.lib.folder", selectedFolder);
+      else localStorage.removeItem("tidepage.lib.folder");
+    } catch { /* ignore */ }
+  }
+
+  /** 选中某文件夹（null=全部）：持久化并全量重载（排序/分类/随机随之限定作用域）。 */
+  function selectFolder(f: string | null) {
+    if (selectedFolder === f) return;
+    selectedFolder = f;
+    saveFolder();
+    reload();
   }
 
   /** 有效阅读状态：与后端 build_book_filter 的 CASE 表达式逐字同源（§0.3 红线 3）。 */
@@ -775,7 +802,7 @@
   async function loadRange(offset: number) {
     const seq = ++generation;
     try {
-      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates, desc);
+      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates, desc, selectedFolder ?? undefined);
       if (seq !== generation) return;
       total = r.total;
       rangeStart = offset;
@@ -915,8 +942,10 @@
   async function rebuildIndex(anchorId?: number) {
     const seq = ++generation;
     loading = true;
+    // 计时打点②：整库有序 id 索引重建（后端取序列 + 前端建 BigInt64Array + 锚点定位）耗时。
+    console.time("[tidepage] rebuildIndex");
     try {
-      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates, desc);
+      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates, desc, selectedFolder ?? undefined);
       if (seq !== generation) return;
       idIndex = new BigInt64Array(buf);
       total = idIndex.length;
@@ -951,6 +980,7 @@
       }
     } finally {
       if (seq === generation) loading = false;
+      console.timeEnd("[tidepage] rebuildIndex");
     }
   }
 
@@ -1076,7 +1106,15 @@
   }
 
   async function loadFolders() {
-    try { folders = await api.listFolders(); } catch { /* ignore */ }
+    try {
+      folders = await api.listFolders();
+      // 选中的文件夹已不存在（如上次会话移除 / 外部改动）→ 回到「全部」并重载。
+      if (selectedFolder && !folders.includes(selectedFolder)) {
+        selectedFolder = null;
+        saveFolder();
+        reload();
+      }
+    } catch { /* ignore */ }
   }
 
   async function addFolder() {
@@ -1098,6 +1136,12 @@
     // 这里只更新目录胶囊，避免显式 reloadWindow 与监听叠加造成两次全量重建索引。
     await api.removeFolder(p);
     folders = await api.listFolders();
+    // 移除的正是当前选中文件夹 → 回到「全部」并重载（library-changed 也会触发窗口刷新）。
+    if (selectedFolder === p) {
+      selectedFolder = null;
+      saveFolder();
+      reload();
+    }
   }
 
   function openBook(b: BookRow) {
@@ -1177,7 +1221,7 @@
 
   async function openRandom() {
     try {
-      const b = await api.randomBookFiltered(query, sortKey, filterFormats, filterStates);
+      const b = await api.randomBookFiltered(query, sortKey, filterFormats, filterStates, selectedFolder ?? undefined);
       if (b) tryOpenBook(b);
       else toast("当前筛选为空");
     } catch (e) {
@@ -1412,10 +1456,18 @@
     // 注意：这里**不触发** metaProgress / 扫描进度状态，避免进度条回退或跳变。
     const u1 = listen("library-changed", () => {
       bumpCoverBust();
-      // 增删书改变 N 与顺序：索引档按锚点重建，回落档重拉窗口。
-      reloadWindow();
-      // 格式可能新增/消失：刷新格式列表并清理失效选中。
-      loadFormats();
+      // 防抖合并：移除大目录/批量删除时该事件可能与其它事件叠加，120ms 内只做一次全量刷新，
+      // 避免多次整库索引重建叠加冻结 UI。计时打点①：从收到事件到窗口刷新完成的总耗时。
+      clearTimeout(libChangedTimer);
+      libChangedTimer = setTimeout(() => {
+        console.time("[tidepage] library-changed→refresh");
+        // 增删书改变 N 与顺序：索引档按锚点重建，回落档重拉窗口。
+        void reloadWindow().finally(() => {
+          console.timeEnd("[tidepage] library-changed→refresh");
+        });
+        // 格式可能新增/消失：刷新格式列表并清理失效选中。
+        loadFormats();
+      }, 120);
     });
     const u2 = listen("library-meta", () => {
       // 仅封面/元数据（不改顺序）：索引档只刷新可见行，回落档重拉窗口。
@@ -1468,6 +1520,7 @@
       .catch(() => {});
     return () => {
       clearTimeout(metaHideTimer);
+      clearTimeout(libChangedTimer);
       u1.then((f) => f());
       u2.then((f) => f());
       u4.then((f) => f());
@@ -1586,10 +1639,24 @@
 
   {#if folders.length}
     <div class="folders">
+      <button
+        class="folder-chip"
+        class:active={selectedFolder === null}
+        title="全部文件夹"
+        onclick={() => selectFolder(null)}
+      >全部</button>
       {#each folders as f (f)}
-        <span class="folder-chip" title="点击 × 移除">
+        <span
+          class="folder-chip"
+          class:active={selectedFolder === f}
+          role="button"
+          tabindex="0"
+          title={`${f}\n点击选中筛选，点 × 移除`}
+          onclick={() => selectFolder(f)}
+          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFolder(f); } }}
+        >
           📁 {f}
-          <button class="x" onclick={() => removeFolder(f)}>×</button>
+          <button class="x" onclick={(e) => { e.stopPropagation(); removeFolder(f); }}>×</button>
         </span>
       {/each}
     </div>
@@ -1938,11 +2005,24 @@
     border-radius: var(--radius-pill, 999px);
     padding: 4px 8px 4px 12px;
     font-size: var(--fs-xs, 12px);
+    font-family: inherit;
     color: var(--fg2);
     max-width: 420px;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+    cursor: pointer;
+    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease),
+      border-color var(--dur, 0.2s) var(--ease);
+  }
+
+  .folder-chip:hover { background: var(--hover-bg); color: var(--fg); }
+
+  /* 选中态：仿分类标签 .fp-tags .tag.active。 */
+  .folder-chip.active {
+    background: var(--accent-soft, var(--hover-bg));
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
   .folder-chip .x {

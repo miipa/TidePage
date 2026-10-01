@@ -16,14 +16,15 @@ export const api = {
   addFolder: (path: string) => invoke<void>("add_folder", { path }),
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
-  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean) =>
-    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null }),
+  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean, folder?: string) =>
+    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
    *  query 为空=全量；非空=与 list_books_page 同源的 title/author 过滤（搜索档同样 O(W)）。
    *  formats/states：分类筛选（格式取「或」、状态取「或」、两组取「且」），空/省略=不约束该维度。
+   *  folder：文件夹单选作用域（路径前缀），省略/null=全库。
    *  结果超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
-  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[], desc?: boolean) =>
-    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null, desc: desc ?? null }),
+  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[], desc?: boolean, folder?: string) =>
+    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null }),
   /** Task B：书库当前实际存在的格式列表（去重、固定排序 count DESC, format ASC）。 */
   listFormats: () => invoke<string[]>("list_formats"),
   /** Task F：手动设置阅读状态覆盖。state 取 "read" | "unread" | "auto"。只写 read_state，不动真实进度。 */
@@ -168,9 +169,9 @@ export const api = {
   setBgImage: (imagePath: string) => invoke<string>("set_background_image", { imagePath }),
   clearBgImage: () => invoke<void>("clear_background_image"),
   randomBook: () => invoke<BookRow | null>("random_book"),
-  /** 从当前筛选结果随机一书（query/sort/formats/states 与列表同源）。 */
-  randomBookFiltered: (query: string, sort: string, formats: string[], states: string[]) =>
-    invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states }),
+  /** 从当前筛选结果随机一书（query/sort/formats/states/folder 与列表同源）。 */
+  randomBookFiltered: (query: string, sort: string, formats: string[], states: string[], folder?: string) =>
+    invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states, folder: folder ?? null }),
   reextractCover: (bookId: number) => invoke<string>("reextract_cover", { bookId }),
   startSession: (bookId: number) => invoke<number>("start_reading_session", { bookId }),
   updateSession: (sessionId: number, seconds: number, chars: number) =>

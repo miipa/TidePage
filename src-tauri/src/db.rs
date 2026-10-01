@@ -324,6 +324,34 @@ pub fn migrate_book_ids(conn: &Connection) {
     }
 }
 
+/// 章节切分算法版本。改变 `txt.rs` 的切分策略（如引入 `MAX_CHAPTER_CHARS` 细分、
+/// toc/ranges 数量变化）后应递增此值，令按**旧 toc** 写入的搜索缓存（chapter_text）
+/// 与 FTS 索引作废，下次搜索/索引时按新 toc 懒重建，避免划词全文搜索定位到错误章节。
+pub const CHAPTER_SPLIT_VER: &str = "2";
+
+/// 若存储的切分版本与当前不一致，一次性清空 chapter_text 与 fts（存在才清），再记下新版本。
+/// 幂等、可重入：清空后立即写版本号；重开应用再搜索时按新 toc 懒重建。
+/// 不触碰 progress（阅读进度存 chapter_index，切分变化带来的轻微偏移为可接受回退）。
+pub fn migrate_chapter_split(conn: &Connection) {
+    if get_setting(conn, "chapter_split_ver").as_deref() == Some(CHAPTER_SPLIT_VER) {
+        return;
+    }
+    conn.execute("DELETE FROM chapter_text", []).ok();
+    // fts 为虚拟表，可能尚未创建；存在才清。
+    let has_fts_tbl: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if has_fts_tbl {
+        conn.execute("DELETE FROM fts", []).ok();
+    }
+    set_setting(conn, "chapter_split_ver", CHAPTER_SPLIT_VER);
+}
+
 pub fn reset_epub_covers(conn: &Connection, covers_dir: &std::path::Path) {
     const KEY: &str = "meta_reset_v4";
     if get_setting(conn, KEY).is_some() {
@@ -454,11 +482,17 @@ fn effective_state_case_sql() -> String {
 ///   由调用方与其它条件（如搜索 LIKE）用 `AND` 组合；无任何条件时返回空串。
 /// - 格式维度：`format IN (?,?,…)`，占位符数量随选中项变化，值一律走参数化绑定。
 /// - 状态维度：`(effective_read_state) IN (?,…)`，状态字符串走绑定（白名单校验后）。
+/// - 文件夹维度：`Some(base)` 时追加 `b.path >= ?A AND b.path < ?B` 前缀范围（可走 books.path
+///   UNIQUE 索引）。`base` 先 `trim_end_matches(['/','\\'])` 再**末尾补一个分隔符**，杜绝
+///   `C:\Books` 误命中 `C:\Books2`（补 `\` 后 `C:\Books2` 落在 `C:\Books\` 左端之外）。
+///   分隔符判定：原串含 `/` 且不含 `\` 用 `/`，否则用 `std::path::MAIN_SEPARATOR`（Windows `\`）。
+///   空串 / 纯根（trim 后为空）不追加条件（等价于不约束）。
 /// - 空数组 / None 语义（红线 & Task D）：**不追加该维度条件**（回到完整书库），
 ///   绝不翻成 `IN ()` 或恒假条件。
 pub fn build_book_filter(
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
+    folder: &Option<String>,
 ) -> (String, Vec<Value>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
@@ -484,6 +518,23 @@ pub fn build_book_filter(
             for s in valid {
                 params.push(Value::Text(s.to_string()));
             }
+        }
+    }
+    if let Some(f) = folder {
+        let trimmed = f.trim_end_matches(['/', '\\']);
+        if !trimmed.is_empty() {
+            // 原串用 '/'（且不含 '\'）→ 补 '/'；否则补平台主分隔符（Windows '\'）。
+            let sep = if f.contains('/') && !f.contains('\\') {
+                '/'
+            } else {
+                std::path::MAIN_SEPARATOR
+            };
+            let base = format!("{trimmed}{sep}");
+            // 上界用 U+10FFFF 保证「所有以 base 为前缀的路径」都 < hi（BINARY 比较）。
+            let hi = format!("{base}\u{10FFFF}");
+            conds.push("(b.path >= ? AND b.path < ?)".to_string());
+            params.push(Value::Text(base));
+            params.push(Value::Text(hi));
         }
     }
     (conds.join(" AND "), params)
@@ -592,6 +643,7 @@ pub fn order_by_clause(sort: &str, desc: bool) -> String {
 /// 超大书库分页查询：过滤/排序全部下推 SQLite（带索引），只返回窗口 rows + total。
 /// - query 为空不施加搜索过滤；否则按 title/author 模糊匹配（LIKE 对 ASCII 不区分大小写）。
 /// - formats/states 走 `build_book_filter` 下推（红线 3 同源）；空数组/None = 不约束该维度。
+/// - folder 走 `build_book_filter` 的路径前缀范围下推；None = 全库。
 /// - sort 走白名单，绝不拼接用户输入；desc 决定主列与 tiebreaker 方向。
 /// - limit 上限保护 500，offset 非负。
 pub fn list_books_page(
@@ -603,6 +655,7 @@ pub fn list_books_page(
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
     desc: bool,
+    folder: &Option<String>,
 ) -> crate::models::BookPage {
     let order = order_by_clause(sort, desc);
     let limit = limit.clamp(1, 500);
@@ -618,7 +671,7 @@ pub fn list_books_page(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states);
+    let (frag, fparams) = build_book_filter(formats, states, folder);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -652,7 +705,7 @@ pub fn list_books_page(
     crate::models::BookPage { total, rows }
 }
 
-/// 从「当前筛选结果」中随机取一本书（`query`/`sort`/`formats`/`states` 与 `list_books_page` 同源）。
+/// 从「当前筛选结果」中随机取一本书（`query`/`sort`/`formats`/`states`/`folder` 与 `list_books_page` 同源）。
 /// 先 COUNT 满足条件的行数，再随机 offset + LIMIT 1，避免把整库/整份筛选结果载入内存。
 pub fn random_book_filtered(
     conn: &Connection,
@@ -660,6 +713,7 @@ pub fn random_book_filtered(
     sort: &str,
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
+    folder: &Option<String>,
 ) -> Option<BookRow> {
     // 随机与顺序无关，方向固定（列仍走白名单）；offset 均匀分布即可。
     let order = order_by_clause(sort, false);
@@ -672,7 +726,7 @@ pub fn random_book_filtered(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states);
+    let (frag, fparams) = build_book_filter(formats, states, folder);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -714,8 +768,8 @@ pub fn random_book_any(conn: &Connection) -> Option<BookRow> {
     .ok()
 }
 
-/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` / `formats` / `states` 过滤，返回**有序 books.id 序列**。
-/// - `query`/`formats`/`states` 施加与 `list_books_page` **逐字同源**的 WHERE（后者由 `build_book_filter` 保证，红线 3），
+/// 秩可寻址分页：命令 1 的数据源。按白名单 `sort` + 可选 `query` / `formats` / `states` / `folder` 过滤，返回**有序 books.id 序列**。
+/// - `query`/`formats`/`states`/`folder` 施加与 `list_books_page` **逐字同源**的 WHERE（后者由 `build_book_filter` 保证，红线 3），
 ///   保证 rank→id 与 `books_by_ids_aligned` 取到的行严格对齐；
 /// - 不 JOIN progress；ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
 /// - 边收集边计数：超过 `max_rows` 立即中止并返回 `Err("order_index_too_large:N")`（禁止静默截断），
@@ -728,6 +782,7 @@ pub fn order_index_ids(
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
     desc: bool,
+    folder: &Option<String>,
 ) -> Result<Vec<i64>, String> {
     // 白名单 → 字面量 ORDER BY（与 list_books_page 同一函数，红线 3 同源）；未知一律回落 "added"。
     // 表别名 b 与 list_books_page 一致，令 build_book_filter 的 `b.format` 片段两处通用。
@@ -742,7 +797,7 @@ pub fn order_index_ids(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states);
+    let (frag, fparams) = build_book_filter(formats, states, folder);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -1013,21 +1068,94 @@ pub fn delete_books(conn: &Connection, paths: &[String]) -> Result<(), String> {
 }
 
 /// 按策略删除：keep_notes=true 保留带笔记的划线；false 全删。
+///
+/// 性能：把一批 paths 按「是否需要逐本定制」分流，仅对可安全批处理的书走集合删除，
+/// 把删 N 本书的 ~8N 条独立 DELETE 压缩成每表每块一条 `DELETE ... WHERE book_id IN (...)`。
+/// - keep_notes==false：highlights 一律全删 → 没有书需要逐本处理，全部走集合删除。
+/// - keep_notes==true：仅「有笔记(note!='')」的书走逐本路径（每本须分配唯一负 orphan_id，
+///   绝不能用一条集合 UPDATE 代替，否则多本共用同一 orphan_id 会丢笔记）；其余走集合删除。
+///
+/// 注：本函数既被 `&Connection` 也被 `&Transaction`（Deref 成 Connection）调用，
+/// 签名保持 `conn: &Connection` 不变。调用方已按 2000/批切分并包事务，这里仅对 id 做
+/// 二次 ≤900 分块以兼容 SQLite 变量上限。
 pub fn delete_books_policy(
     conn: &Connection,
     paths: &[String],
     keep_notes: bool,
 ) -> Result<(), String> {
-    // has_fts 为 pragma 查询：提到循环外只算一次，避免每本书重复查询。
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // has_fts 为 pragma 查询：提到最外层只算一次，避免每本/每块重复查询。
     let fts = has_fts(conn);
-    for p in paths {
-        delete_book_with_policy(conn, p, keep_notes)?;
-        if fts {
-            let id = path_id(p);
-            conn.execute("DELETE FROM fts WHERE book_id=?1", params![id])
-                .ok();
+
+    // 计算 path → id 映射（保留顺序：逐本路径仍按原顺序处理，与旧实现一致）。
+    let ids: Vec<(i64, &String)> = paths.iter().map(|p| (path_id(p), p)).collect();
+
+    // 「需逐本处理」的 book_id 集合。
+    let mut per_book: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    if keep_notes {
+        // 一条批查询找出有笔记的 book_id（对 id 做 ≤900 分块兼容变量上限）。
+        let all_ids: Vec<i64> = ids.iter().map(|(id, _)| *id).collect();
+        for chunk in all_ids.chunks(900) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT DISTINCT book_id FROM highlights WHERE note != '' AND book_id IN ({})",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            for r in rows.flatten() {
+                per_book.insert(r);
+            }
         }
     }
+
+    // 逐本路径：有笔记的书沿用原 delete_book_with_policy + 单条 FTS 删除（行为完全一致）。
+    for (id, p) in &ids {
+        if per_book.contains(id) {
+            delete_book_with_policy(conn, p, keep_notes)?;
+            if fts {
+                conn.execute("DELETE FROM fts WHERE book_id=?1", params![id]).ok();
+            }
+        }
+    }
+
+    // 集合删除路径：其余 id（通常是绝大多数）。这些书无需保留笔记，highlights 直接全删。
+    let bulk_ids: Vec<i64> = ids
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !per_book.contains(id))
+        .collect();
+    for chunk in bulk_ids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        // 非 books 表（键均 book_id）沿用 .ok() 容错，顺序无外键依赖、任意即可。
+        for table in [
+            "highlights",
+            "progress",
+            "txt_cache",
+            "chapter_text",
+            "bookmarks",
+            "book_fingerprint",
+        ] {
+            let sql = format!("DELETE FROM {} WHERE book_id IN ({})", table, placeholders);
+            conn.execute(&sql, params_from_iter(chunk.iter())).ok();
+        }
+        if fts {
+            let sql = format!("DELETE FROM fts WHERE book_id IN ({})", placeholders);
+            conn.execute(&sql, params_from_iter(chunk.iter())).ok();
+        }
+        // books（键 id）保留 ? 错误传播（与现状一致）。
+        let sql = format!("DELETE FROM books WHERE id IN ({})", placeholders);
+        conn.execute(&sql, params_from_iter(chunk.iter()))
+            .map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -1922,5 +2050,217 @@ mod fts_snippet_tests {
         assert!(row.4.contains('\u{1}'), "snippet 应含起始哨兵: {}", row.4);
         assert!(row.4.contains('\u{2}'), "snippet 应含结束哨兵: {}", row.4);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod delete_bulk_tests {
+    //! 覆盖 delete_books_policy「按是否有笔记分流 → 集合删除」后的语义不变性。
+    //! 用内存库建最小表结构，断言四种组合与改前逐本语义一致。
+    use super::*;
+    use rusqlite::Connection;
+
+    /// 建最小表结构（仅删除逻辑涉及的表）。
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE books(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT '',
+                format TEXT NOT NULL DEFAULT 'txt');
+             CREATE TABLE progress(book_id INTEGER PRIMARY KEY, pct REAL NOT NULL DEFAULT 0);
+             CREATE TABLE txt_cache(book_id INTEGER PRIMARY KEY, offsets TEXT NOT NULL DEFAULT '');
+             CREATE TABLE chapter_text(book_id INTEGER NOT NULL, chapter_index INTEGER NOT NULL,
+                body TEXT NOT NULL DEFAULT '', PRIMARY KEY(book_id, chapter_index));
+             CREATE TABLE bookmarks(id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL);
+             CREATE TABLE highlights(id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL,
+                text TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE book_fingerprint(book_id INTEGER PRIMARY KEY,
+                title_snap TEXT NOT NULL DEFAULT '', author_snap TEXT NOT NULL DEFAULT '');
+             CREATE TABLE orphan_books(book_id INTEGER PRIMARY KEY,
+                title_snap TEXT NOT NULL DEFAULT '', author_snap TEXT NOT NULL DEFAULT '',
+                deleted_at INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// 落一本书 + 全部相关表各一行；返回 book_id。notes 为每条划线的 note 文本。
+    fn seed(conn: &Connection, path: &str, title: &str, notes: &[&str]) -> i64 {
+        let id = path_id(path);
+        conn.execute(
+            "INSERT INTO books(id,path,title,author,format) VALUES(?1,?2,?3,'作者','txt')",
+            params![id, path, title],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO progress(book_id,pct) VALUES(?1,50)", params![id]).unwrap();
+        conn.execute("INSERT INTO txt_cache(book_id,offsets) VALUES(?1,'x')", params![id]).unwrap();
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,body) VALUES(?1,0,'b')",
+            params![id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO bookmarks(book_id) VALUES(?1)", params![id]).unwrap();
+        conn.execute(
+            "INSERT INTO book_fingerprint(book_id,title_snap,author_snap) VALUES(?1,?2,'作者')",
+            params![id, title],
+        )
+        .unwrap();
+        for n in notes {
+            conn.execute(
+                "INSERT INTO highlights(book_id,text,note) VALUES(?1,'划线',?2)",
+                params![id, n],
+            )
+            .unwrap();
+        }
+        id
+    }
+
+    fn count(conn: &Connection, sql: &str, id: i64) -> i64 {
+        conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    /// 该书 books/progress/txt_cache/chapter_text/bookmarks/book_fingerprint 全删。
+    fn assert_core_gone(conn: &Connection, id: i64) {
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM books WHERE id=?1", id), 0, "books");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM progress WHERE book_id=?1", id), 0, "progress");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM txt_cache WHERE book_id=?1", id), 0, "txt_cache");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM chapter_text WHERE book_id=?1", id), 0, "chapter_text");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM bookmarks WHERE book_id=?1", id), 0, "bookmarks");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM book_fingerprint WHERE book_id=?1", id), 0, "book_fingerprint");
+    }
+
+    /// 组合1：keep_notes=true + 有笔记 → 走逐本路径：带笔记划线改挂负 orphan_id、
+    /// 落 orphan 快照、纯划线删除、核心表全删。
+    #[test]
+    fn keep_notes_with_notes_goes_per_book() {
+        let conn = mem_db();
+        let id = seed(&conn, "/x/withnote.txt", "有笔记书", &["保留我", ""]);
+        delete_books_policy(&conn, &["/x/withnote.txt".into()], true).unwrap();
+        // 原正 id 下无划线
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM highlights WHERE book_id=?1", id), 0, "原 id 无残留划线");
+        // 带笔记划线改挂到某个负 orphan_id
+        let orphan_hl: i64 = conn
+            .query_row("SELECT COUNT(*) FROM highlights WHERE book_id<0 AND note='保留我'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphan_hl, 1, "带笔记划线移入孤儿命名空间");
+        // 纯划线（note='')被删（既不在原 id 也不在负 id）
+        let pure_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM highlights WHERE note=''", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pure_left, 0, "纯划线被删");
+        // orphan 快照
+        let orphan: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_books", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, 1, "有笔记需落 orphan 快照");
+        assert_core_gone(&conn, id);
+    }
+
+    /// 组合2：keep_notes=true + 无笔记 → 走集合路径：含 highlights 全删，不产生 orphan。
+    #[test]
+    fn keep_notes_without_notes_goes_bulk() {
+        let conn = mem_db();
+        let id = seed(&conn, "/x/pure.txt", "纯划线书", &["", ""]);
+        delete_books_policy(&conn, &["/x/pure.txt".into()], true).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM highlights WHERE book_id=?1", id), 0, "highlights 全删");
+        let orphan: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_books", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, 0, "无笔记不落 orphan");
+        assert_core_gone(&conn, id);
+    }
+
+    /// 组合3：keep_notes=false + 有笔记 → 笔记一并删除，核心表全删，无 orphan。
+    #[test]
+    fn delete_notes_when_not_keeping() {
+        let conn = mem_db();
+        let id = seed(&conn, "/x/dn.txt", "删笔记书", &["删掉我", ""]);
+        delete_books_policy(&conn, &["/x/dn.txt".into()], false).unwrap();
+        let hl_total: i64 = conn.query_row("SELECT COUNT(*) FROM highlights", [], |r| r.get(0)).unwrap();
+        assert_eq!(hl_total, 0, "keep_notes=false 下笔记一并删除（含负 id）");
+        let orphan: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_books", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, 0, "无 orphan");
+        assert_core_gone(&conn, id);
+    }
+
+    /// 组合4：一批混合（有笔记 + 无笔记 + 多本）一次调用，逐本路径与集合路径都生效，
+    /// 结果与「逐本循环旧实现」逐表计数一致。
+    #[test]
+    fn mixed_batch_matches_legacy() {
+        let conn = mem_db();
+        let a = seed(&conn, "/m/a.txt", "A有笔记", &["感想A", ""]); // 逐本
+        let b = seed(&conn, "/m/b.txt", "B纯划线", &[""]); // 集合
+        let c = seed(&conn, "/m/c.txt", "C无划线", &[]); // 集合
+        let d = seed(&conn, "/m/d.txt", "D有笔记", &["感想D"]); // 逐本
+        let paths: Vec<String> = ["/m/a.txt", "/m/b.txt", "/m/c.txt", "/m/d.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        delete_books_policy(&conn, &paths, true).unwrap();
+        // 四本核心表全删
+        for id in [a, b, c, d] {
+            assert_core_gone(&conn, id);
+        }
+        // 两本有笔记 → 两个独立负 orphan、两条带笔记划线保留
+        let orphan: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_books", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, 2, "两本有笔记各一条 orphan 快照");
+        let distinct_orphan_ids: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT book_id) FROM orphan_books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(distinct_orphan_ids, 2, "orphan_id 必须互不相同");
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM highlights WHERE book_id<0 AND note!=''", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 2, "两条带笔记划线改挂孤儿命名空间");
+        // 正 id 下不再有任何划线（纯划线删、带笔记改挂）
+        let pos_hl: i64 = conn
+            .query_row("SELECT COUNT(*) FROM highlights WHERE book_id>=0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pos_hl, 0, "原正 id 下无残留划线");
+
+        // 对照「旧实现逐本循环」：等价流程逐表计数应完全一致。
+        let legacy = mem_db();
+        seed(&legacy, "/m/a.txt", "A有笔记", &["感想A", ""]);
+        seed(&legacy, "/m/b.txt", "B纯划线", &[""]);
+        seed(&legacy, "/m/c.txt", "C无划线", &[]);
+        seed(&legacy, "/m/d.txt", "D有笔记", &["感想D"]);
+        for p in &paths {
+            delete_book_with_policy(&legacy, p, true).unwrap();
+        }
+        for (sql, label) in [
+            ("SELECT COUNT(*) FROM highlights", "highlights"),
+            ("SELECT COUNT(*) FROM highlights WHERE note!=''", "note!=''"),
+            ("SELECT COUNT(*) FROM orphan_books", "orphan_books"),
+            ("SELECT COUNT(*) FROM books", "books"),
+            ("SELECT COUNT(*) FROM progress", "progress"),
+            ("SELECT COUNT(*) FROM bookmarks", "bookmarks"),
+            ("SELECT COUNT(*) FROM book_fingerprint", "book_fingerprint"),
+        ] {
+            let new_n: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+            let old_n: i64 = legacy.query_row(sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(new_n, old_n, "{label} 计数应与旧逐本实现一致");
+        }
+    }
+
+    /// FTS：若编译期可建 FTS5，验证集合路径与逐本路径的 fts 行均被删。
+    #[test]
+    fn fts_rows_deleted_both_paths() {
+        let conn = mem_db();
+        if !has_fts(&conn) {
+            eprintln!("[delete_bulk_tests] FTS5 不可用，跳过 FTS 验证");
+            return;
+        }
+        ensure_fts(&conn).unwrap();
+        let a = seed(&conn, "/f/a.txt", "A有笔记", &["感想A"]); // 逐本
+        let b = seed(&conn, "/f/b.txt", "B纯划线", &[""]); // 集合
+        for id in [a, b] {
+            conn.execute(
+                "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'t','body')",
+                params![id],
+            )
+            .unwrap();
+        }
+        delete_books_policy(&conn, &["/f/a.txt".into(), "/f/b.txt".into()], true).unwrap();
+        let fts_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fts WHERE book_id IN (?1,?2)", params![a, b], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_left, 0, "两条路径的 fts 行都应被删");
     }
 }

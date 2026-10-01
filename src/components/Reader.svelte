@@ -66,11 +66,11 @@
     IconBook2,
     IconBookmarkPlus,
     IconBookmarks,
+    IconBooks,
     IconChartBar,
     IconCloudDownload,
     IconCloudUp,
     IconHighlight,
-    IconLayoutGrid,
     IconList,
     IconPalette,
     IconPhoto,
@@ -249,6 +249,10 @@
     const o = bookOv();
     return o.fitWidth ?? (isMangaMode() ? config.reader.manga.fitWidth : false);
   }
+  function effFitHeight(): boolean {
+    const o = bookOv();
+    return o.fitHeight ?? (isMangaMode() ? config.reader.manga.fitHeight : false);
+  }
   function effShowImages(): boolean {
     return bookOv().showImages ?? true;
   }
@@ -286,7 +290,7 @@
     { id: "ai", label: "AI 助手", title: "AI 助手", icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
     { id: "stats", label: "本书统计", title: "本书统计", icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
     { id: "toc", label: "目录", title: "目录 (F3)", icon: () => IconList, visible: () => true, run: () => toggleToc() },
-    { id: "manga", label: "漫画模式", title: () => (isMangaMode() ? "退出漫画模式（本书）" : "切换到漫画模式（本书）"), icon: () => (isMangaMode() ? IconLayoutGrid : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
+    { id: "manga", label: "漫画模式", title: () => (isMangaMode() ? "退出漫画模式（本书）" : "切换到漫画模式（本书）"), icon: () => (isMangaMode() ? IconBooks : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
     { id: "manager", label: "顶栏按钮管理", title: "顶栏按钮管理", icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => toggleManager() },
     { id: "images", label: "本书图片", title: "本书图片显示", icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => toggleImgMenu() },
     { id: "css", label: "全局样式开关", title: "使用阅读器全局样式（覆盖书籍排版，仅当前书）", icon: () => IconPalette, visible: () => true, run: () => toggleCss() },
@@ -770,6 +774,11 @@
       prefetchQueue = [];
       prefetchActive = 0;
       loadGeneration++;
+      mangaWindow = [];
+      lastMangaAnchorTop = -1;
+      // 换书：重置漫画模式/布局追踪，避免切书时误触发多余的窗口重建（首章加载由 applyChapter 负责）。
+      lastMangaOn = null;
+      lastMangaLayout = null;
       bookImages = null;
       viewerIndex = null;
       progressUserMoved = false; // 新书打开：清空「用户已移动」标记（打开本身不释放手动状态覆盖）
@@ -853,6 +862,7 @@
     scroller?.destroy();
     book = null;
     chapter = null;
+    mangaWindow = [];
     ui.currentBookId = 0;
   }
 
@@ -1048,12 +1058,17 @@
     if (gen !== loadGeneration && !placeholder) return;
     chapter = ch;
     chapterNum = idx;
+    // 漫画（横向 / 瀑布流）：重建跨章连续窗口，跳过普通单章定位逻辑。
+    if (isMangaMode()) {
+      await loadMangaWindow(idx, restore);
+      return;
+    }
     await tick();
     if (!fontsEnsured) return;
     fontsReady();
     scroller?.reset();
     resetScroll();
-    // 横向布局优先；否则按 scrollLayout()（漫画瀑布流或普通滚动模式）走纵向滚动。
+    // 横向布局优先；否则按 scrollLayout()（普通滚动模式）走纵向滚动。
     if (scrollLayout()) {
       measureScroll();
       let pos = 0;
@@ -1072,30 +1087,6 @@
       if (entry?.at === "tail") {
         requestAnimationFrame(() => pinToEnd());
       }
-    } else if (mangaHorizontal()) {
-      // 上一章回看（或显式章末）落到横向末尾；消费一次标记。
-      const wantEnd = entry?.at === "tail" || mangaStartAtEnd;
-      mangaStartAtEnd = false;
-      resetManga();
-      flattenMangaStrip();
-      measureManga();
-      let pos = wantEnd ? mangaMaxX : restore ? restore.chapter_ratio * mangaMaxX : 0;
-      mangaPosX = Math.max(0, Math.min(pos, mangaMaxX));
-      mangaPosY = 0;
-      applyMangaPan();
-      // 图片/字体延迟就绪后会改变内容宽度：多次重测保证落位准确。
-      requestAnimationFrame(() => {
-        if (gen !== loadGeneration) return;
-        measureManga();
-        mangaPosX = Math.max(0, Math.min(pos, mangaMaxX));
-        applyMangaPan();
-      });
-      setTimeout(() => {
-        if (gen !== loadGeneration) return;
-        measureManga();
-        mangaPosX = Math.max(0, Math.min(pos, mangaMaxX));
-        applyMangaPan();
-      }, 320);
     } else {
       measurePages();
       let pg = restore ? Math.round(restore.chapter_ratio * Math.max(1, pageCount - 1)) : 0;
@@ -1203,7 +1194,27 @@
   }
 
   function currentRatio(): number {
-    if (mangaHorizontal()) return mangaMaxX > 0 ? Math.min(1, mangaPosX / mangaMaxX) : 0;
+    // 漫画横向：按「当前章块内部」计算（而非整条窗口），保证恢复/进度对应到具体某章某位置。
+    if (mangaHorizontal()) {
+      const el = mangaCanvas;
+      const block = el?.querySelector<HTMLElement>(`.manga-block[data-index="${chapterNum}"]`);
+      if (el && block && block.offsetWidth > 0) {
+        const W = el.offsetWidth;
+        const semStart = mangaRtl() ? W - (block.offsetLeft + block.offsetWidth) : block.offsetLeft;
+        return Math.max(0, Math.min(1, (mangaPosX - semStart) / block.offsetWidth));
+      }
+      return mangaMaxX > 0 ? Math.min(1, mangaPosX / mangaMaxX) : 0;
+    }
+    // 漫画瀑布流：进度/比例按「当前章块内部」计算（而非整条窗口），保证跨会话恢复落回同一章同一位置。
+    if (scrollLayout() && isMangaMode()) {
+      const vp = mangaFlowViewport;
+      const block = vp?.querySelector<HTMLElement>(`.manga-block[data-index="${chapterNum}"]`);
+      if (block && block.offsetHeight > 0) {
+        const within = ((vp?.scrollTop ?? 0) - block.offsetTop) / block.offsetHeight;
+        return Math.max(0, Math.min(1, within));
+      }
+      return 0;
+    }
     if (scrollLayout()) return maxScroll > 0 ? Math.min(1, scrollTop / maxScroll) : 0;
     return pageCount > 1 ? Math.min(1, page / (pageCount - 1)) : 0;
   }
@@ -1455,8 +1466,15 @@
   }
 
   function handleScrollEdge(dir: number, carry: number) {
+    if (!book) return;
+    // 漫画瀑布流：连续窗口在两端自动续章，不重建窗口（保持视觉连续）。
+    if (isMangaMode()) {
+      if (dir > 0) void extendMangaWindow(1);
+      else void extendMangaWindow(-1);
+      return;
+    }
     const now = Date.now();
-    if (now - lastEdgeAt < 320 || loadingChapter || !book) return;
+    if (now - lastEdgeAt < 320 || loadingChapter) return;
     if (dir > 0) {
       if (chapterNum >= book.toc.length - 1) return;
       lastEdgeAt = now;
@@ -1604,7 +1622,14 @@
 
   /** 单本：图片适应阅读器宽度开关。 */
   function toggleFitWidth() {
-    setOv({ fitWidth: !effFitWidth() });
+    const on = !effFitWidth();
+    setOv({ fitWidth: on, fitHeight: false });
+  }
+
+  /** 单本：图片适应阅读器高度开关（与适宽互斥）。 */
+  function toggleFitHeight() {
+    const on = !effFitHeight();
+    setOv({ fitHeight: on, fitWidth: false });
   }
 
   /* ================= 漫画双页（横向连续阅读） ================= */
@@ -1612,6 +1637,12 @@
   // 拖动平移 vs 点击翻页/打开图库用 6px 手势阈值区分。
   let mangaViewport: HTMLDivElement | undefined = $state();
   let mangaCanvas: HTMLDivElement | undefined = $state();
+  let mangaFlowViewport: HTMLDivElement | undefined = $state();
+  let mangaFlowCanvas: HTMLDivElement | undefined = $state();
+  /** 跨章连续滚动窗口（按序连续章节区间）：漫画两种布局共用。 */
+  let mangaWindow = $state<{ index: number; html: string }[]>([]);
+  /** 下拉追加/前插的节流时间戳，避免连续滚动时反复触发 IPC。 */
+  let mangaExtendLock = 0;
   let mangaPosX = 0; // 横向位置：0=阅读起点（与阅读方向无关的语义坐标）
   let mangaPosY = 0; // 纵向位置（放大后超出屏幕时可上下平移）
   let mangaMaxX = 0;
@@ -1625,8 +1656,6 @@
   let mangaDownTarget: EventTarget | null = null;
   let mangaWheelAcc = 0;
   let mangaWheelLock = 0;
-  /** 换到上一章时是否需要落到章末（横向阅读的“接着看”）。 */
-  let mangaStartAtEnd = false;
 
   function clampManga() {
     mangaPosX = Math.max(0, Math.min(mangaPosX, mangaMaxX));
@@ -1637,6 +1666,27 @@
     mangaPosX = 0;
     mangaPosY = 0;
     if (mangaCanvas) mangaCanvas.style.transform = "translate3d(0,0,0)";
+  }
+
+  /** 把图片轴（视口内容盒）在视口内居中：固定视口层承载边距，内容变形层只做居中 + 平移。
+   *  单图/内容不满屏时主轴居中；超过时由 applyMangaPan 的平移查看。 */
+  function applyCanvasCentering() {
+    const el = mangaCanvas;
+    if (el) {
+      const vp = mangaViewport;
+      const mh = effMarginH();
+      const vh = vp?.clientHeight ?? 0;
+      const w = el.offsetWidth;
+      const ty = widthCentered && vh > 0 ? Math.max(0, (vh - el.offsetHeight) / 2) : 0;
+      el.style.transform = `translate(${Math.max(0, (vp?.clientWidth ?? w) / 2 - mh - w / 2)}px, ${ty}px)`;
+    }
+    const fel = mangaFlowCanvas;
+    if (fel) {
+      const vp = mangaFlowViewport;
+      const mh = effMarginH();
+      const w = fel.offsetWidth;
+      fel.style.transform = `translateX(${Math.max(0, (vp?.clientWidth ?? w) / 2 - mh - w / 2)}px)`;
+    }
   }
 
   /** 应用平移：LTR 起点在左、RTL 起点在右；无论方向，语义坐标 0 都是“阅读起点”。 */
@@ -1656,6 +1706,9 @@
     el.style.transition = "";
   }
 
+  /** 横向布局下，内容宽度是否小于可用宽度（单图不满屏 → 主轴居中）。 */
+  let widthCentered = false;
+
   /** 测量横向内容尺寸，计算可平移范围；进入/换章/窗口变化/图片加载后调用。 */
   function measureManga() {
     const vp = mangaViewport;
@@ -1667,51 +1720,239 @@
       requestAnimationFrame(() => { if (mangaHorizontal()) measureManga(); });
       return;
     }
-    // 图片缩放前的基准显示高度=视口高-上下边距（横向放大后由平移查看，不自动缩小）。
+    // 上下边距只保留这一条路径：作为固定视口 padding 后，基准图高 = 视口高 - 上下边距。
+    // 删除原先 imgMaxH = vh - mv*2 与 align-items:center、applyMangaPan 居中三者并存的打架。
     imgMaxH = Math.max(120, vh - effMarginV() * 2);
     if (el) {
       el.style.setProperty("--mg-vieww", `${Math.max(80, vw - effMarginH() * 2)}px`);
       mangaMaxX = Math.max(0, el.offsetWidth - vw);
       mangaMaxY = Math.max(0, el.offsetHeight - vh);
+      widthCentered = el.offsetWidth <= vw + 1;
     }
+    applyCanvasCentering();
     clampManga();
     applyMangaPan();
   }
 
-  /** 把章节 DOM 打平成一行：图片提为直接子项，文字按需保留为 span（仅图片时丢弃文字）。 */
-  function flattenMangaStrip() {
-    const root = contentEl?.querySelector("#chapter-content") as HTMLElement | null;
-    if (!root) return;
-    const hideText = config.reader.manga.hideText;
-    const out: Node[] = [];
-    const walk = (n: Node) => {
-      for (const c of Array.from(n.childNodes)) {
-        if (c.nodeType === Node.TEXT_NODE) {
-          const t = c.textContent ?? "";
-          if (t.trim() && !hideText) {
-            const span = document.createElement("span");
-            span.className = "mg-text";
-            span.textContent = t;
-            out.push(span);
-          }
-        } else if (c.nodeType === Node.ELEMENT_NODE) {
-          const el = c as HTMLElement;
-          const tag = el.tagName.toLowerCase();
-          if (tag === "img" || tag === "video" || tag === "svg") {
-            out.push(el);
-          } else if (el.querySelector("img,svg,video")) {
-            walk(el);
-          } else if (!hideText) {
-            const span = document.createElement("span");
-            span.className = "mg-text";
-            span.textContent = el.textContent ?? "";
-            out.push(span);
-          }
+  /** 瀑布流（纵向连续窗口）：测滚动范围并同步滚动条。 */
+  function measureFlow() {
+    const vp = mangaFlowViewport;
+    if (!vp) return;
+    const vh = vp.clientHeight;
+    if (vh > 0) imgMaxH = Math.max(120, vh - effMarginV() * 2);
+    applyCanvasCentering();
+    maxScroll = Math.max(0, vp.scrollHeight - vp.clientHeight);
+    scroller?.setMax(maxScroll);
+  }
+
+  /* ================= 漫画跨章连续窗口 ================= */
+  // 漫画两种布局都在一个容器里按序渲染「一段连续章节」的图片，滚到接近两端时续章、
+  // 裁掉远端，形成连续刷图体验（「一张图一章」不再卡住）。普通分页模式不走这里。
+  const MANGA_WINDOW_RADIUS = 8; // 当前章前后各保留的章数（约 17 张图的量级，保证 DOM 有界）
+
+  function mangaWindowTrim(pos: { top: number; height: number }) {
+    const vp = mangaFlowViewport;
+    if (!vp) return pos;
+    const blocks = Array.from(vp.querySelectorAll<HTMLElement>(".manga-block"));
+    let removed = 0;
+    while (mangaWindow.length > 1) {
+      const first = blocks.shift();
+      if (!first) break;
+      const nextTop = blocks[0]?.offsetTop ?? 0;
+      const nextH = blocks[0]?.offsetHeight ?? 0;
+      if (nextTop + nextH < pos.top) {
+        mangaWindow = mangaWindow.slice(1);
+        removed += first.offsetHeight;
+        continue;
+      }
+      break;
+    }
+    while (mangaWindow.length > 1) {
+      const last = blocks.pop();
+      if (!last) break;
+      const prev = blocks[blocks.length - 1];
+      const prevBottom = (prev?.offsetTop ?? 0) + (prev?.offsetHeight ?? 0);
+      if (prevBottom > pos.top + pos.height) {
+        mangaWindow = mangaWindow.slice(0, -1);
+        continue;
+      }
+      break;
+    }
+    if (removed) {
+      pos.top -= removed;
+      if (scrollArea) scrollArea.scrollTop = Math.max(0, pos.top);
+      scroller?.jumpTo(Math.max(0, pos.top), true);
+    }
+    return pos;
+  }
+
+  /** 按当前章重建窗口（换章/跳转/恢复进度/退出进入漫画模式时调用；同步首屏，保证定位准确）。 */
+  async function loadMangaWindow(idx: number, restore?: Progress) {
+    if (!book) return;
+    const gen = ++loadGeneration;
+    loadingChapter = true;
+    const start = Math.max(0, idx - MANGA_WINDOW_RADIUS);
+    const end = Math.min(book.toc.length - 1, idx + MANGA_WINDOW_RADIUS);
+    const idxs: number[] = [];
+    for (let i = start; i <= end; i++) idxs.push(i);
+    // 先构建窗口（空 html，逐章就绪后替换），保证窗口顺序/高度随 fetch 稳定增长。
+    mangaWindow = idxs.map((index) => ({ index, html: "" }));
+    chapterNum = idx;
+    chapter = cacheGet(idx) ?? null;
+    await tick();
+    // 逐章 fetch（window 中的图片加载后经 ResizeObserver → scheduleRelayout 重排）。
+    const results = await Promise.all(
+      idxs.map((i) => fetchChapter(i).catch(() => null)),
+    );
+    if (gen !== loadGeneration) return;
+    mangaWindow = idxs.map((i, k) => ({ index: i, html: results[k]?.html ?? "" }));
+    chapter = results[idx - start] ?? chapter;
+    loadingChapter = false;
+    await tick();
+    if (gen !== loadGeneration) return;
+    if (scrollLayout()) {
+      measureFlow();
+      // 定位到目标章块的顶部，再按章内比例下移：保证恢复/跳转落回「该章」而非窗口比例的任意位置。
+      const vp = mangaFlowViewport;
+      const block = vp?.querySelector<HTMLElement>(`.manga-block[data-index="${idx}"]`);
+      let pos = block ? block.offsetTop : 0;
+      if (restore && block && block.offsetHeight > 0) {
+        pos += Math.max(0, Math.min(1, restore.chapter_ratio)) * block.offsetHeight;
+      }
+      pos = Math.max(0, Math.min(pos, maxScroll));
+      scroller?.jumpTo(pos, true);
+      applyScroll(pos);
+      lastMangaAnchorTop = block?.offsetTop ?? -1;
+    } else if (mangaHorizontal()) {
+      measureManga();
+      // 定位到目标章块的「阅读起点」（LTR=左缘 / RTL=右缘的语义坐标），再按章内比例推进。
+      const el = mangaCanvas;
+      const block = el?.querySelector<HTMLElement>(`.manga-block[data-index="${idx}"]`);
+      let semX = 0;
+      if (el && block) {
+        const W = el.offsetWidth;
+        semX = mangaRtl() ? W - (block.offsetLeft + block.offsetWidth) : block.offsetLeft;
+        if (restore && block.offsetWidth > 0) {
+          semX += Math.max(0, Math.min(1, restore.chapter_ratio)) * block.offsetWidth;
         }
       }
-    };
-    walk(root);
-    root.replaceChildren(...out);
+      mangaPosX = Math.max(0, Math.min(semX, mangaMaxX));
+      mangaPosY = 0;
+      applyMangaPan();
+    }
+    prefetchAround(idx);
+    saveProgressDebounced(false);
+  }
+
+  /** 窗口向后/前追加一章（滚动接近两端时调用）；prepend 用滚动补偿避免跳动。 */
+  async function extendMangaWindow(dir: 1 | -1) {
+    if (!book || !mangaWindow.length) return;
+    const now = Date.now();
+    if (now < mangaExtendLock) return;
+    mangaExtendLock = now + 260;
+    const gen = loadGeneration;
+    if (dir > 0) {
+      const cur = mangaWindow[mangaWindow.length - 1].index;
+      const next = cur + 1;
+      if (next >= book.toc.length) return;
+      const ch = await fetchChapter(next).catch(() => null);
+      if (gen !== loadGeneration) return;
+      // 期间可能已由别处裁剪/重建：确认尾章仍是 cur 再追加。
+      if (!mangaWindow.length || mangaWindow[mangaWindow.length - 1].index !== cur) return;
+      mangaWindow = [...mangaWindow, { index: next, html: ch?.html ?? "" }];
+    } else {
+      const cur = mangaWindow[0].index;
+      const prev = cur - 1;
+      if (prev < 0) return;
+      const ch = await fetchChapter(prev).catch(() => null);
+      if (gen !== loadGeneration) return;
+      if (!mangaWindow.length || mangaWindow[0].index !== cur) return;
+      mangaWindow = [{ index: prev, html: ch?.html ?? "" }, ...mangaWindow];
+      await tick();
+      if (mangaHorizontal()) {
+        // 横向 prepend：新插入章排在阅读起点前，所有既有内容的语义坐标整体后移 newWidth，
+        // 用 measureManga 重算后把 mangaPosX 加上新章宽度，保持当前画面不跳。
+        const el = mangaCanvas;
+        const first = el?.querySelector<HTMLElement>(".manga-block");
+        const w = first?.offsetWidth ?? 0;
+        const gap = config.reader.manga.imgGap;
+        measureManga();
+        mangaPosX = Math.max(0, Math.min(mangaMaxX, mangaPosX + w + gap));
+        applyMangaPan();
+        prefetchAround(chapterNum);
+        return;
+      }
+      // 瀑布流 prepend 后补偿滚动位置，视觉不跳。
+      const vp = mangaFlowViewport;
+      if (vp) {
+        const first = vp.querySelector<HTMLElement>(".manga-block");
+        const h = first?.offsetHeight ?? 0;
+        if (scrollArea) scrollArea.scrollTop = Math.max(0, scrollArea.scrollTop + h);
+        scroller?.jumpTo(Math.max(0, (scroller?.targetPos ?? 0) + h), true);
+      }
+    }
+    await tick();
+    if (scrollLayout()) measureFlow();
+    else if (mangaHorizontal()) measureManga();
+  }
+
+  /** 滚动接近两端时续章（带 600px 提前量），并裁剪远端保持窗口有界。 */
+  function checkMangaWindowExtend() {
+    const vp = mangaFlowViewport;
+    if (!vp || !mangaWindow.length) return;
+    const top = vp.scrollTop;
+    const height = vp.clientHeight;
+    const full = vp.scrollHeight;
+    const pos = mangaWindowTrim({ top, height });
+    updateChapterFromWindow();
+    if (pos.top <= 600) void extendMangaWindow(-1);
+    if (full - (pos.top + height) <= 600) void extendMangaWindow(1);
+  }
+
+  /** 根据视口顶部所在章更新章号（保证 TOC 高亮 / 进度 / 朗读起点正确）。 */
+  function updateChapterFromWindow() {
+    const vp = mangaFlowViewport;
+    if (!vp || !mangaWindow.length) return;
+    const blocks = vp.querySelectorAll<HTMLElement>(".manga-block");
+    const target = vp.scrollTop + vp.clientHeight * 0.35;
+    let best = mangaWindow[0].index;
+    for (const b of blocks) {
+      const i = Number(b.dataset.index);
+      if (!Number.isFinite(i)) continue;
+      if (b.offsetTop <= target) best = i;
+      else break;
+    }
+    if (best !== chapterNum) {
+      chapterNum = best;
+      chapter = chapterCache.get(best) ?? chapter;
+      saveProgressDebounced();
+    }
+  }
+
+  /** 横向：根据当前平移位置落在哪一章更新章号（语义坐标，LTR/RTL 均正确）。 */
+  function updateChapterFromHorizontal() {
+    const el = mangaCanvas;
+    if (!el || !mangaWindow.length) return;
+    const W = el.offsetWidth;
+    const center = mangaPosX + (mangaViewport?.clientWidth ?? 0) / 2;
+    const blocks = el.querySelectorAll<HTMLElement>(".manga-block");
+    let best = mangaWindow[0].index;
+    let bestStart = -Infinity;
+    for (const b of blocks) {
+      const i = Number(b.dataset.index);
+      if (!Number.isFinite(i)) continue;
+      // 块的「阅读起点」语义坐标：LTR=左缘，RTL=右缘（随阅读顺序递增）。
+      const semStart = mangaRtl() ? W - (b.offsetLeft + b.offsetWidth) : b.offsetLeft;
+      if (semStart <= center && semStart >= bestStart) {
+        bestStart = semStart;
+        best = i;
+      }
+    }
+    if (best !== chapterNum) {
+      chapterNum = best;
+      chapter = chapterCache.get(best) ?? chapter;
+      saveProgressDebounced();
+    }
   }
 
   /** 一屏横向步长（约 90% 视口宽，保留少量重叠）。 */
@@ -1720,55 +1961,60 @@
     return Math.max(80, Math.round(vw * 0.9));
   }
 
-  /** 阅读前进一屏；到头则进入下一章（从起点）。 */
+  /** 阅读前进一屏；连续窗口下滚过头会自动续章。 */
   function nextManga() {
     if (mangaPosX < mangaMaxX - 2) {
       mangaPosX = Math.min(mangaMaxX, mangaPosX + mangaStep());
       applyMangaPan(true);
+      updateChapterFromHorizontal();
       saveProgressDebounced();
-    } else {
-      nextChapter(true);
+      if (mangaMaxX - mangaPosX < 600) void extendMangaWindow(1);
+    } else if (chapterNum < (book?.toc.length ?? 1) - 1) {
+      // 窗口尚未加载下一章时兜底：加载下一章并重建窗口。
+      loadMangaWindow(chapterNum + 1);
     }
   }
 
-  /** 阅读后退一屏；到起点则进入上一章的末尾。 */
+  /** 阅读后退一屏；到起点则续上一章。 */
   function prevManga() {
     if (mangaPosX > 2) {
       mangaPosX = Math.max(0, mangaPosX - mangaStep());
       applyMangaPan(true);
+      updateChapterFromHorizontal();
       saveProgressDebounced();
+      if (mangaPosX < 600) void extendMangaWindow(-1);
     } else if (chapterNum > 0) {
-      mangaStartAtEnd = true;
-      prevChapter();
+      loadMangaWindow(chapterNum - 1);
     }
   }
 
   function onMangaWheel(e: WheelEvent) {
     e.preventDefault();
     const now = Date.now();
-    if (now < mangaWheelLock) return;
     const delta = e.deltaX !== 0 ? e.deltaX : (e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY);
     if (Math.abs(delta) < 1) return;
+    if (now < mangaWheelLock) return;
     const before = mangaPosX;
     mangaPosX = Math.max(0, Math.min(mangaMaxX, mangaPosX + delta));
     if (mangaPosX !== before) {
       applyMangaPan();
+      updateChapterFromHorizontal();
       saveProgressDebounced();
       mangaWheelAcc = 0;
+      // 连续滚动：接近两端时自动续章（窗口未覆盖时先扩展；扩展后 maxX 变大可继续滚）。
+      if (mangaMaxX - mangaPosX < 600) void extendMangaWindow(1);
+      else if (mangaPosX < 600) void extendMangaWindow(-1);
       return;
     }
-    // 已到横向边界：继续向同一方向滚动则翻章（带累加阈值，避免误触）。
+    // 已到横向两端：滚轮继续推动即续章。
     const forward = delta > 0;
     const atForwardEdge = forward && mangaPosX >= mangaMaxX - 2;
     const atBackEdge = !forward && mangaPosX <= 2;
     if (atForwardEdge || atBackEdge) {
-      mangaWheelAcc += delta;
-      if (Math.abs(mangaWheelAcc) >= 120) {
-        mangaWheelAcc = 0;
-        mangaWheelLock = now + 320;
-        if (forward) nextChapter(true);
-        else if (chapterNum > 0) { mangaStartAtEnd = true; prevChapter(); }
-      }
+      if (forward) void extendMangaWindow(1);
+      else void extendMangaWindow(-1);
+      saveProgressDebounced();
+      updateChapterFromHorizontal();
     } else {
       mangaWheelAcc = 0;
     }
@@ -1865,13 +2111,38 @@
 
   function relayout() {
     if (!chapter) return;
-    // 漫画双页（横向）：重排后按原比例保持横向位置，并重新计算可平移范围。
+    // 漫画横向：重测窗口尺寸。内容窗口宽度可能因图片加载/缩放/边距变化而改变，
+    // 以横向绝对位置占内容总宽的比例恢复，避免重排后跳到别处。
     if (mangaHorizontal()) {
-      const ratio = currentRatio();
-      measureManga();
-      mangaPosX = ratio * mangaMaxX;
-      clampManga();
+      const vp = mangaViewport;
+      const vw = vp?.clientWidth ?? 0;
+      const prevSpanX = mangaMaxX + vw; // 旧内容总宽（measureManga 前仍是旧值）
+      const fx = prevSpanX > 0 ? mangaPosX / prevSpanX : 0;
+      measureManga(); // 重算 --mg-vieww / mangaMaxX / centered 居中
+      mangaPosX = Math.max(0, Math.min(fx * (mangaMaxX + vw), mangaMaxX));
       applyMangaPan();
+      return;
+    }
+    // 漫画瀑布流：重测滚动范围；窗口内容在视口上方变高时按锚点补偿 scrollTop，避免跳动。
+    if (scrollLayout() && isMangaMode()) {
+      const vp = mangaFlowViewport;
+      const anchorIndex = chapterNum;
+      const before = vp?.scrollTop ?? 0;
+      measureFlow();
+      const vp2 = mangaFlowViewport;
+      if (vp2) {
+        const block = vp2.querySelector<HTMLElement>(`.manga-block[data-index="${anchorIndex}"]`);
+        // 保持「锚点章节相对视口的位置」不变：用其 offsetTop 变化量补偿。
+        if (block && lastMangaAnchorTop >= 0) {
+          const delta = block.offsetTop - lastMangaAnchorTop;
+          if (delta !== 0) {
+            const p = Math.max(0, before + delta);
+            scroller?.jumpTo(p, true);
+            applyScroll(p);
+          }
+        }
+        lastMangaAnchorTop = block?.offsetTop ?? -1;
+      }
       return;
     }
     // 滚动模式下先同步节流的响应式位置，保证重排后按真实位置恢复
@@ -1898,6 +2169,9 @@
       gotoPage(Math.round(ratio * (pageCount - 1)), true);
     }
   }
+
+  /** 漫画瀑布流重排的锚点章相对视口的 offsetTop（-1=未记录）。 */
+  let lastMangaAnchorTop = -1;
 
   let relayoutTimer: ReturnType<typeof setTimeout> | undefined;
   function scheduleRelayout() {
@@ -1984,7 +2258,7 @@
         else nextChapter(true);
         break;
       case "chapterPrev":
-        if (mangaHorizontal()) { mangaStartAtEnd = false; prevChapter(); }
+        if (mangaHorizontal() && chapterNum > 0) loadMangaWindow(chapterNum - 1);
         else prevChapter(true);
         break;
       case "toc":
@@ -2306,7 +2580,7 @@
 
   $effect(() => {
     const w = pageWrap;
-    const sw = scrollWrap;
+    const sw = mangaFlowCanvas ?? scrollWrap;
     const c = contentEl;
     if (!w && !sw && !c) return;
     const updateW = () => { if (c) contentW = c.clientWidth; };
@@ -2391,15 +2665,8 @@
 .reader.manga #chapter-content :is(img,svg,video) { margin-top: calc(var(--rdr-img-gap, 6px) / 2) !important; margin-bottom: calc(var(--rdr-img-gap, 6px) / 2) !important; }
 .reader.fitw #chapter-content :is(img,svg,video) { width: 100% !important; max-width: 100% !important; height: auto !important; max-height: none !important; zoom: 1; }
 `;
-    // 漫画双页（横向连续阅读）：图片按阅读方向横向排列、间距 0 真正无缝、
-    // 不自动缩小（按倍率放大，超出屏幕由拖动平移）；放最后以覆盖上面的通用图片规则。
-    const mangaHRules = `
-.reader.manga-h #chapter-content { display: flex !important; flex-wrap: nowrap !important; align-items: flex-start !important; gap: var(--rdr-img-gap, 0) !important; padding: var(--rdr-mv, 0) var(--rdr-mh, 0) !important; margin: 0 !important; width: max-content !important; box-sizing: border-box !important; }
-.reader.manga-h #chapter-content.rtl { flex-direction: row-reverse !important; }
-.reader.manga-h #chapter-content :is(p,div,section,figure,li,blockquote,span) { margin: 0 !important; padding: 0 !important; display: inline-block !important; }
-.reader.manga-h #chapter-content :is(img,svg,video) { height: calc(var(--rdr-img-h, 80vh) * var(--rdr-img-scale, 1)) !important; max-height: none !important; max-width: none !important; width: auto !important; object-fit: contain !important; margin: 0 !important; padding: 0 !important; display: block !important; flex: 0 0 auto !important; zoom: 1 !important; }
-.reader.fitw.manga-h #chapter-content :is(img,svg,video) { width: var(--mg-vieww, 100vw) !important; height: auto !important; }
-`;
+    // 漫画两种布局的图片规则统一在组件样式区的 .manga-h-* / .manga-flow-* 中定义
+    // （固定视口层承载边距 + 内容变形层平移/滚动），不再依赖会随 transform 移动的 #chapter-content padding。
     const hideTextRule = isMangaMode() && r.manga.hideText
       ? `
 /* 漫画模式「仅图片」：隐藏不含图片的文本块 */
@@ -2409,7 +2676,6 @@
     return `
 ${overrideRule}
 ${imgRules}
-${mangaHRules}
 ${hideTextRule}
 ${effCssExtra() || ""}
 /* 硬编码根治发糊：正文统一禁止合成加粗/斜体（与 .ai-mark 一致），避免第三方字体假粗假斜发糊 */
@@ -2422,6 +2688,7 @@ ${effCssExtra() || ""}
     void effOverrideCss();
     void isMangaMode();
     void effCssExtra();
+    void effFitHeight();
     void r.manga.hideText;
     void r.manga.layout;
     void r.manga.imgGap;
@@ -2529,25 +2796,24 @@ ${effCssExtra() || ""}
     tick().then(() => applyImageVisibility());
   });
 
-  // 漫画双页：进入该布局/换章/切换「仅图片」时，把章节 DOM 打平成横向一行并测量。
+  // 漫画横向：窗口内容变化/切换「仅图片」时，测量横向窗口尺寸。
   $effect(() => {
-    void chapter;
-    void chapterNum;
+    void mangaWindow;
     const on = mangaHorizontal();
     void config.reader.manga.hideText;
     if (!on) return;
     tick().then(() => {
       if (!mangaHorizontal()) return;
-      flattenMangaStrip();
       measureManga();
     });
   });
 
-  // 单本字号/图片缩放/适应宽度/方案变化后重新测量（页模式页数、滚动模式高度、漫画双页宽度）。
+  // 单本字号/图片缩放/适应宽度/适应高度/方案变化后重新测量（页模式页数、滚动模式高度、漫画窗口宽度。
   $effect(() => {
     void effFontSize();
     void effImgScale();
     void effFitWidth();
+    void effFitHeight();
     void effShowImages();
     void effFontFamily();
     void effLatinFont();
@@ -2562,6 +2828,34 @@ ${effCssExtra() || ""}
     void config.reader.manga.imgGap;
     void config.reader.manga.layout;
     tick().then(() => scheduleRelayout());
+  });
+
+  // 漫画模式开关 / 布局切换：
+  //  - 进入漫画模式：按当前章重建跨章连续窗口（否则 mangaWindow 为空 → 空白）。
+  //  - 退出漫画模式：恢复普通单章渲染（重测分页/滚动）。
+  //  - 布局切换（flow ⇄ horizontal）：两种容器不同，需按当前章重建窗口。
+  // 初次打开由 applyChapter 直接调用 loadMangaWindow，这里用 lastMangaOn 初始化避免重复加载。
+  let lastMangaLayout: string | null = null;
+  let lastMangaOn: boolean | null = null;
+  $effect(() => {
+    const lay = config.reader.manga.layout;
+    const on = isMangaMode();
+    if (lastMangaOn === null) {
+      lastMangaOn = on;
+      lastMangaLayout = lay;
+      return;
+    }
+    const modeChanged = on !== lastMangaOn;
+    const layoutChanged = on && lay !== lastMangaLayout;
+    lastMangaOn = on;
+    lastMangaLayout = lay;
+    if (!book) return;
+    if (modeChanged) {
+      if (on) loadMangaWindow(chapterNum);
+      else loadChapter(chapterNum);
+      return;
+    }
+    if (layoutChanged) loadMangaWindow(chapterNum);
   });
 
   const bgImageUrl = $derived(
@@ -3465,6 +3759,7 @@ ${effCssExtra() || ""}
   class="reader"
   class:ovr={effOverrideCss()}
   class:fitw={effFitWidth()}
+  class:fith={effFitHeight()}
   class:manga={isMangaMode()}
   class:manga-h={mangaHorizontal()}
   class:hide-text={isMangaMode() && config.reader.manga.hideText}
@@ -3654,13 +3949,42 @@ ${effCssExtra() || ""}
               onpointercancel={onMangaPointerCancel}
               ondragstart={(e) => e.preventDefault()}
             >
-              <div class="manga-h-canvas" bind:this={mangaCanvas}>
-                <div id="chapter-content" class:rtl={mangaRtl()}>{@html chapter?.html ?? ""}</div>
+              <div class="manga-h-canvas" bind:this={mangaCanvas} class:rtl={mangaRtl()}>
+                {#each mangaWindow as item (item.index)}
+                  <div class="manga-block" data-index={item.index}>{@html item.html}</div>
+                {/each}
               </div>
             </div>
+          {:else if mangaFlow()}
+            <!-- 漫画瀑布流：跨章连续窗口（纵向），渲染 mangaWindow；原生竖向滚动 + SmoothScroller 共用同一元素。 -->
+            <div
+              class="scroll-area manga-flow-viewport"
+              bind:this={mangaFlowViewport}
+              bind:this={scrollArea}
+              onscroll={checkMangaWindowExtend}
+            >
+              <div class="manga-flow-canvas" bind:this={mangaFlowCanvas}>
+                {#each mangaWindow as item (item.index)}
+                  <div class="manga-block" data-index={item.index}>{@html item.html}</div>
+                {/each}
+              </div>
+            </div>
+            <div
+              class="scrollbar"
+              class:dragging={sbDragging}
+              bind:this={scrollbarEl}
+              onpointerdown={onSbPointerDown}
+              onpointermove={onSbPointerMove}
+              onpointerup={onSbPointerUp}
+              onpointercancel={onSbPointerCancel}
+              onclick={(e) => e.stopPropagation()}
+            >
+              <div class="thumb" bind:this={thumbEl} style="height:8%"></div>
+            </div>
           {:else if scrollLayout()}
+            <!-- 普通（非漫画）滚动模式：维持原有单章渲染 + SmoothScroller（overflow:hidden）。不改动。 -->
             <div class="scroll-area" bind:this={scrollArea}>
-              <div class="col-scroll" bind:this={scrollWrap}>
+              <div class="col-scroll">
                 <div id="chapter-content">{@html chapter?.html ?? ""}</div>
               </div>
             </div>
@@ -3845,11 +4169,16 @@ ${effCssExtra() || ""}
 
     {#if book && !openError}
       <div class="font-ctl" class:show={fontCtlShow}>
-        <button class="icon" title="减小字号（长按连续）" use:repeatAction={() => bumpFont(-1)}>A−</button>
-        <button class="icon" title="增大字号（长按连续）" use:repeatAction={() => bumpFont(1)}>A＋</button>
-        <button class="icon" title="缩小图片（长按连续）" use:repeatAction={() => bumpImgScale(-0.1)}>图−</button>
-        <button class="icon" title="放大图片（长按连续）" use:repeatAction={() => bumpImgScale(0.1)}>图＋</button>
-        <button class="icon" class:on={effFitWidth()} title="图片适应阅读器宽度" onclick={toggleFitWidth}>适宽</button>
+        <div class="ctl-row">
+          <button class="icon" title="减小字号（长按连续）" use:repeatAction={() => bumpFont(-1)}>A−</button>
+          <button class="icon" title="增大字号（长按连续）" use:repeatAction={() => bumpFont(1)}>A＋</button>
+        </div>
+        <div class="ctl-row">
+          <button class="icon" title="缩小图片（长按连续）" use:repeatAction={() => bumpImgScale(-0.1)}>图−</button>
+          <button class="icon" title="放大图片（长按连续）" use:repeatAction={() => bumpImgScale(0.1)}>图＋</button>
+          <button class="icon" class:on={effFitWidth()} title="图片适应阅读器宽度" onclick={toggleFitWidth}>适宽</button>
+          <button class="icon" class:on={effFitHeight()} title="图片适应阅读器高度" onclick={toggleFitHeight}>适高</button>
+        </div>
       </div>
     {/if}
 
@@ -4197,12 +4526,19 @@ ${effCssExtra() || ""}
     right: 14px;
     bottom: 46px;
     display: flex;
+    flex-direction: column;
     gap: 4px;
     z-index: 25;
     opacity: 0;
     pointer-events: none;
     transform: translateY(4px);
     transition: opacity 0.18s, transform 0.18s;
+  }
+
+  .font-ctl .ctl-row {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
   }
 
   .font-ctl.show,
@@ -4259,7 +4595,8 @@ ${effCssExtra() || ""}
     box-sizing: border-box;
   }
 
-  /* 漫画双页（横向连续阅读）：视口固定，内容按阅读方向横向排列并以 transform 平移。 */
+  /* 漫画横向连续阅读：固定视口层只承载上下边距（左右不加 marginH）；
+     内容变形层横向排列以 transform 平移，交叉轴（纵向）由 align-items:center 居中。 */
   .manga-h-viewport {
     position: absolute;
     inset: 0;
@@ -4267,6 +4604,8 @@ ${effCssExtra() || ""}
     cursor: grab;
     touch-action: none;
     background: var(--rdr-bg, #f5f1e8);
+    padding: var(--rdr-mv, 0) 0;
+    box-sizing: border-box;
   }
 
   .manga-h-canvas {
@@ -4274,7 +4613,120 @@ ${effCssExtra() || ""}
     left: 0;
     top: 0;
     width: max-content;
+    min-height: 100%;
     will-change: transform;
+  }
+
+  .reader.manga-h .manga-h-canvas {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+  }
+
+  .reader.manga-h .manga-h-canvas.rtl {
+    flex-direction: row-reverse !important;
+  }
+
+  .reader.manga-h .manga-h-canvas :global(.manga-block) {
+    flex: 0 0 auto !important;
+    margin: 0 var(--rdr-img-gap, 0) 0 0 !important;
+    padding: 0 !important;
+    width: auto !important;
+  }
+
+  .reader.manga-h .manga-h-canvas.rtl :global(.manga-block) {
+    margin: 0 0 0 var(--rdr-img-gap, 0) !important;
+  }
+
+  .reader.manga-h .manga-h-canvas :global(.manga-block:last-child) {
+    margin: 0 !important;
+  }
+
+  .reader.manga-h .manga-h-canvas :global(img),
+  .reader.manga-h .manga-h-canvas :global(svg),
+  .reader.manga-h .manga-h-canvas :global(video) {
+    height: calc(var(--rdr-img-h, 80vh) * var(--rdr-img-scale, 1)) !important;
+    width: auto !important;
+    max-height: none !important;
+    max-width: none !important;
+    object-fit: contain !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    display: block !important;
+    zoom: 1 !important;
+  }
+
+  .reader.fitw.manga-h .manga-h-canvas :global(img),
+  .reader.fitw.manga-h .manga-h-canvas :global(svg),
+  .reader.fitw.manga-h .manga-h-canvas :global(video) {
+    width: var(--mg-vieww, 100vw) !important;
+    height: auto !important;
+    max-width: none !important;
+  }
+
+  .reader.fith.manga-h .manga-h-canvas :global(img),
+  .reader.fith.manga-h .manga-h-canvas :global(svg),
+  .reader.fith.manga-h .manga-h-canvas :global(video) {
+    height: var(--rdr-img-h, 80vh) !important;
+    width: auto !important;
+    max-height: none !important;
+  }
+
+  /* 漫画瀑布流（纵向连续窗口）：固定视口层承载左右边距，内容块纵向顺排，原生竖向滚动。
+     canvas 占满宽度 + 每个 .manga-block 内部水平居中（漫画窗口里无 #chapter-content 包裹层）。 */
+  .manga-flow-viewport {
+    padding: 0 var(--rdr-mh, 0);
+    box-sizing: border-box;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    overflow-anchor: none;
+  }
+
+  .manga-flow-canvas {
+    width: 100%;
+    will-change: transform;
+  }
+
+  .reader.manga .manga-flow-canvas :global(.manga-block) {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+  }
+
+  .reader.manga .manga-flow-canvas :global(img),
+  .reader.manga .manga-flow-canvas :global(svg),
+  .reader.manga .manga-flow-canvas :global(video) {
+    max-width: 100% !important;
+    max-height: calc(var(--rdr-img-h, 80vh) * var(--rdr-img-scale, 1)) !important;
+    height: auto !important;
+    width: auto !important;
+    object-fit: contain !important;
+    display: block !important;
+    margin: calc(var(--rdr-img-gap, 6px) / 2) auto !important;
+    zoom: var(--rdr-img-scale, 1) !important;
+  }
+
+  .reader.fitw.manga .manga-flow-canvas :global(img),
+  .reader.fitw.manga .manga-flow-canvas :global(svg),
+  .reader.fitw.manga .manga-flow-canvas :global(video) {
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    max-height: none !important;
+    zoom: 1 !important;
+  }
+
+  .reader.fith.manga .manga-flow-canvas :global(img),
+  .reader.fith.manga .manga-flow-canvas :global(svg),
+  .reader.fith.manga .manga-flow-canvas :global(video) {
+    height: var(--rdr-img-h, 80vh) !important;
+    width: auto !important;
+    max-width: 100% !important;
+    max-height: var(--rdr-img-h, 80vh) !important;
+    zoom: 1 !important;
   }
 
   .tb-btn.on {
