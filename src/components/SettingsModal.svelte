@@ -1381,9 +1381,9 @@
       <label>翻页模式</label>
       <select bind:value={config.reader.mode} onchange={saveConfig}>
         <option value="page">左右翻页</option>
-        <option value="scroll">瀑布平滑滚动</option>
+        <option value="scroll">上下滚动</option>
       </select>
-      <p class="tip">左右翻页按栏数分屏；瀑布平滑滚动为单栏连续滚动，不受版式影响。</p>
+      <p class="tip">左右翻页按栏数分屏；上下滚动为单栏连续滚动，不受版式影响。</p>
     </div>
 
     {#if config.reader.mode === "scroll"}
@@ -1778,10 +1778,10 @@
       <div class="field">
         <label>显示方式</label>
         <select bind:value={config.reader.manga.layout} onchange={saveConfig}>
-          <option value="flow">瀑布流（纵向连续）</option>
-          <option value="horizontal">横向（连续）</option>
+          <option value="flow">上下滚动</option>
+          <option value="horizontal">横向连续</option>
         </select>
-        <p class="tip">瀑布流：图片纵向连续排布、向下滚动（条漫常用）；横向：图片横向连续排布、可拖动平移（日漫常用）。</p>
+        <p class="tip">上下滚动：图片纵向连续排布、向下滚动；横向连续：图片横向连续排布、可拖动平移。</p>
       </div>
       <div class="field">
         <label>阅读方向{config.reader.manga.layout === "flow" ? "（仅横向可用）" : ""}</label>
@@ -1825,7 +1825,7 @@
         </div>
       </div>
       <div class="field" class:mg-off={config.reader.manga.layout === "flow"}>
-        <label>上下边距 {config.reader.manga.layout === "flow" ? "（瀑布流不支持）" : config.reader.manga.marginV + "px"}</label>
+        <label>上下边距 {config.reader.manga.layout === "flow" ? "（上下滚动不支持）" : config.reader.manga.marginV + "px"}</label>
         <div class="row-inline">
           <input type="range" min="0" max="400" bind:value={config.reader.manga.marginV} oninput={saveConfig} disabled={config.reader.manga.layout === "flow"} />
           <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginV} onchange={saveConfig} disabled={config.reader.manga.layout === "flow"} />

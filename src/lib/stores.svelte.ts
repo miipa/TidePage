@@ -950,8 +950,8 @@ const DEFAULTS: AppConfig = {
     latinFont: "",
     fontSize: 32,
     fontWeight: 400,
-    lineHeight: 1.55,
-    paraSpacing: 0.5,
+    lineHeight: 1.75,
+    paraSpacing: 0.6,
     marginH: 320,
     maxLineChars: 0,
     marginV: 80,
@@ -963,35 +963,18 @@ const DEFAULTS: AppConfig = {
     bgImage: "",
     bgOpacity: 0.35,
     cssExtra: `
-h2 {
-  color: #4682B4;
-  font-size: 1.6rem;
-  font-weight: bold;
-  text-align: center;
-  margin: 2rem auto 2rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid #dddddd;
+#chapter-content :is(h1, h2, h3) {
+  color: #4682B4 !important;
+  font-size: 1.6rem !important;
+  font-weight: bold !important;
+  text-align: center !important;
+  margin: 2rem auto !important;
+  padding-bottom: 0.5rem !important;
+  border-bottom: 1px solid #ddd !important;
 }
-
-p {
-  text-indent: 2em;
-  margin-top: 0;
-  margin-bottom: 1rem;
-}
-
-@media (max-width: 480px) {
-  body {
-    padding: 1rem 0.5rem;
-  }
-
-  h2 {
-    font-size: 1.4rem;
-    margin: 1.5rem auto;
-  }
-
-  p {
-    margin-bottom: 0.8rem;
-  }
+#chapter-content p {
+  text-indent: 1em !important;
+  margin: 0 0 1rem !important;
 }`,
     overrideBookCss: true,
     pageTurnKeys: true,
@@ -1015,7 +998,7 @@ p {
     topbarColor: "",
     topbarOrder: [...READER_TOPBAR_IDS],
     topbarHidden: [],
-    manga: { imgScale: 1, fitWidth: false, fitHeight: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "" },
+    manga: { imgScale: 1.5, fitWidth: false, fitHeight: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "" },
     mangaGuideDone: false,
     statusItems: [
       { id: "chapterName", enabled: true },
@@ -1225,39 +1208,30 @@ function builtinSchemes(): ReaderScheme[] {
       marginH: 0, maxLineChars: 40, marginV: 72,
       indent: "0em", textAlign: "left",
     }),
-    mk("s-wide", "宽屏舒适", {
-      theme: "paper", bgColor: "#F7F3EA", fgColor: "#2b2b2b",
-      fontFamily: SERIF, latinFont: "Georgia",
-      fontSize: 34, lineHeight: 1.8, paraSpacing: 0.6,
-      marginH: 0, maxLineChars: 36, marginV: 96,
-      indent: "1em", textAlign: "justify",
-    }),
   ];
 }
 
-/// 内置方案升级：把「未被用户覆盖过」的内置方案刷新到当前预设（保留用户改过的名字），
-/// 并补上新增的内置方案；用户自建方案原样保留。
+/// 内置方案升级：把「未被用户覆盖过」的内置方案刷新到当前预设（保留用户改过的名字）；
+/// 用户自建方案与已被改过的内置方案原样保留；已退役的内置方案（如 s-wide）从存量中移除。
 /// 判定「未被覆盖」的方式：内置方案缺 rev 或 rev 落后于当前版本。
+/// 注意：不再把「列表里缺失的内置方案」补回——用户删除后不再复活。
 function upgradeBuiltinSchemes(list: ReaderScheme[]): { list: ReaderScheme[]; dirty: boolean } {
   const fresh = builtinSchemes();
   const freshById = new Map(fresh.map((s) => [s.id, s]));
-  const seen = new Set<string>();
   let dirty = false;
   const out: ReaderScheme[] = [];
   for (const s of list) {
-    seen.add(s.id);
+    // 已退役的内置方案：从存量安装中清除，不再找回。
+    if (s.id === "s-wide") {
+      dirty = true;
+      continue;
+    }
     const f = s.builtin ? freshById.get(s.id) : undefined;
     if (f && s.rev !== BUILTIN_SCHEME_REV) {
       out.push({ ...f, name: s.name || f.name });
       dirty = true;
     } else {
       out.push(s);
-    }
-  }
-  for (const f of fresh) {
-    if (!seen.has(f.id)) {
-      out.push(f);
-      dirty = true;
     }
   }
   return { list: out, dirty };
