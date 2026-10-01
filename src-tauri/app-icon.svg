@@ -1,0 +1,30 @@
+<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" class="w-full h-full">
+  <defs>
+    <linearGradient id="g3_bg" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0a0f1d"/>
+      <stop offset="100%" stop-color="#020408"/>
+    </linearGradient>
+    <linearGradient id="g3_moon" x1="210" y1="100" x2="310" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fef9c3"/>
+      <stop offset="50%" stop-color="#fef08a"/>
+      <stop offset="100%" stop-color="#ca8a04"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#g3_bg)"/>
+
+  <!-- Ambient Stars -->
+  <circle cx="130" cy="140" r="1.5" fill="#f8fafc" opacity="0.4"/>
+  <circle cx="390" cy="120" r="2" fill="#38bdf8" opacity="0.6"/>
+  <circle cx="360" cy="200" r="1.5" fill="#f8fafc" opacity="0.3"/>
+  <circle cx="100" cy="240" r="2" fill="#fef08a" opacity="0.5"/>
+
+  <!-- Paper Origami Crescent Moon -->
+  <path d="M290 110C240 110 190 145 190 205C190 265 240 300 290 300C250 280 230 245 230 205C230 165 250 130 290 110Z" fill="url(#g3_moon)"/>
+  <path d="M230 205L290 300" stroke="#fef08a" stroke-width="2" stroke-linecap="round" opacity="0.6"/>
+
+  <!-- Horizon Page Lines undulating into Calm Tide -->
+  <path d="M90 320C170 305 210 335 290 320C370 305 400 330 422 320" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" opacity="0.9"/>
+  <path d="M90 355C150 345 220 370 300 355C360 345 390 365 422 355" stroke="#0284c7" stroke-width="4" stroke-linecap="round" opacity="0.6"/>
+  <path d="M90 390C160 380 200 405 280 395C350 385 390 400 422 390" stroke="#1e293b" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M90 425C180 418 220 432 310 425C370 420 400 430 422 425" stroke="#1e293b" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
+</svg>
