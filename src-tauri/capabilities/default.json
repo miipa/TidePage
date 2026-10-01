@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window and AI window",
-  "windows": ["main", "flowread-ai", "reader-*", "panel-*"],
+  "windows": ["main", "tidepage-ai", "reader-*", "panel-*"],
   "permissions": [
     "core:default",
     "opener:allow-reveal-item-in-dir",

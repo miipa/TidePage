@@ -28,7 +28,7 @@ const bases = {
 const out = {};
 let app=null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "ex_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "ex_diag.log") });
   let M=null; for(let i=0;i<240;i++){try{M=await connectTarget(PORT,isApp);break}catch{await sleep(2000)}}
   for(let i=0;i<300;i++){try{if(await M.evalJs(`!!window.__TAURI_INTERNALS__`))break}catch{}await sleep(400)}
   const tmp=path.join(SANDBOX_ROOT,"ex_books"); fs.rmSync(tmp,{recursive:true,force:true}); fs.mkdirSync(tmp,{recursive:true});
@@ -47,7 +47,7 @@ try {
       await sleep(500);
       const pg=await inv('list_books_page',{query:'',sort:'title',offset:0,limit:50});
       const b=pg.rows.filter(x=>/ex_books/i.test(x.path))[0];
-      const svg=await (await fetch('http://flowread.localhost/cover-default/'+b.id)).text();
+      const svg=await (await fetch('http://tidepage.localhost/cover-default/'+b.id)).text();
       const dataUrl=await new Promise((res)=>{
         const blob=new Blob([svg],{type:'image/svg+xml'});const url=URL.createObjectURL(blob);
         const img=new Image();img.onload=()=>{const c=document.createElement('canvas');c.width=320;c.height=480;const ctx=c.getContext('2d');ctx.drawImage(img,0,0,320,480);URL.revokeObjectURL(url);res(c.toDataURL('image/png'))};

@@ -500,7 +500,7 @@ pub fn ai_to_epub(title: &str, author: &str, items: &[AiExportItem], out_path: &
 </package>"#,
         uuid = uuid,
         title = crate::txt::escape_html(&book.title),
-        author = crate::txt::escape_html(if author.is_empty() { "FlowRead AI" } else { author }),
+        author = crate::txt::escape_html(if author.is_empty() { "TidePage AI" } else { author }),
         modified = crate::db::day_string(),
         manifest = manifest,
         spine = spine,

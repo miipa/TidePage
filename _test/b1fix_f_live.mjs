@@ -44,7 +44,7 @@ function makePng(w, h, px) {
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f_diag.log") });
   let M = null; for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   if (!M) throw new Error("no cdp");
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
@@ -114,7 +114,7 @@ try {
       const withCover=rows.filter(r=>r.cover_path);
       if(withCover.length){
         const r=withCover[0];
-        const resp=await fetch('http://flowread.localhost/covers/'+encodeURIComponent(r.cover_path));
+        const resp=await fetch('http://tidepage.localhost/covers/'+encodeURIComponent(r.cover_path));
         const txt=await resp.text();
         return { total:rows.length, withCover:withCover.length, cover:r.cover_path, len:txt.length,
           hasOverlay: txt.includes('fill-opacity="0.60"'), hasWhite: txt.includes('fill="#ffffff"'),
@@ -159,7 +159,7 @@ try {
         const pg=await inv('list_books_page',{query:'', sort:'title', offset:0, limit:200});
         const rows=pg.rows.filter(x=>/f_books/i.test(x.path) && x.cover_path);
         if(rows.length>=3){
-          const resp=await fetch('http://flowread.localhost/covers/'+encodeURIComponent(rows[0].cover_path));
+          const resp=await fetch('http://tidepage.localhost/covers/'+encodeURIComponent(rows[0].cover_path));
           const txt=await resp.text();
           return { cover:rows[0].cover_path, len:txt.length, hasOverlay: txt.includes('fill-opacity="0.60"'), hasWhite: txt.includes('fill="#ffffff"'), hasSlice: txt.includes('preserveAspectRatio="xMidYMid slice"'), svg: txt };
         }

@@ -27,7 +27,7 @@ const step = (n, v) => { console.log("[step]", n, JSON.stringify(v)); return v; 
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f3_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f3_diag.log") });
   console.log("[step] launched pid", app.child.pid);
   let M = null; for (let i = 0; i < 150; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   if (!M) throw new Error("no cdp");

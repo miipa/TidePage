@@ -34,7 +34,7 @@ async function ensureReady(M, label) {
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "lib_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "lib_diag.log") });
   let M = null; for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   if (!M) throw new Error("no cdp");
   await ensureReady(M, "boot");

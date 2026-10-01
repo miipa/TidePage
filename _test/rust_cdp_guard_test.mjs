@@ -1,4 +1,4 @@
-// 直接 spawn target\debug\flowread.exe（不经 JS 守卫），验证 Rust 层 ASCII 纯数字校验。
+// 直接 spawn target\debug\tidepage.exe（不经 JS 守卫），验证 Rust 层 ASCII 纯数字校验。
 // 监听判定按“本轮 spawn 进程树 + fr_rustguard webview”归属，外部旁观者（如 adb）单列不误杀。
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { SANDBOX_ROOT } from "./isolation_guard.mjs";
 import { killTree, sweepSandboxWebviews } from "./launch_sandbox.mjs";
 
-const EXE = "C:\\Users\\A\\Documents\\a\\flowread\\src-tauri\\target\\debug\\flowread.exe";
+const EXE = "C:\\Users\\A\\Documents\\a\\TidePage\\src-tauri\\target\\debug\\tidepage.exe";
 const sandboxDir = path.join(SANDBOX_ROOT, "fr_rustguard");
 fs.mkdirSync(sandboxDir, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

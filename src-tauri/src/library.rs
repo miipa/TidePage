@@ -942,7 +942,7 @@ pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<Cache
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let (doc, ci) = crate::epub::parse_with_ci(data.clone())?;
-    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[open] load_epub book={book_id} parse+ci={:?} spine={} toc={}",
             t0.elapsed(), doc.spine.len(), doc.toc.len()
@@ -1038,7 +1038,7 @@ fn collect_book_images(state: &AppState, book_id: i64) -> Result<Vec<BookImage>,
                 .collect();
             files.sort();
             for f in files {
-                let url = format!("http://flowread.localhost/res/{book_id}/{}", f);
+                let url = format!("http://tidepage.localhost/res/{book_id}/{}", f);
                 if seen.insert(url.clone()) {
                     out.push(BookImage { url, chapter_index: -1, chapter_title: String::new() });
                 }
@@ -1499,7 +1499,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         push_cache(&st.txt_cache, id, (ver, Arc::new((html, parts, toc.clone()))), 3);
         (toc, Vec::new(), doc.warning)
     };
-    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[open] open_book id={id} ext={ext} total={:?} toc={}",
             t_open.elapsed(),
@@ -1514,7 +1514,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
     // 不读正文：普通小说（少量插图）比例很低，漫画（如 1.2 万图 / 75 章）比例极高。
     let toc_n = toc.len().max(1);
     let is_manga = images.len() >= 30 && (images.len() as f64) >= (toc_n as f64) * 1.5;
-    if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[open] is_manga id={id} images={} toc={} => {is_manga}",
             images.len(),
@@ -1616,7 +1616,7 @@ pub async fn get_chapter(
         })
         .await
         .map_err(|e| e.to_string())??;
-        if std::env::var("FLOWREAD_OPEN_DIAG").is_ok() {
+        if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
             eprintln!(
                 "[open] get_chapter book={book_id} idx={idx} render={:?} html={}B",
                 t_render.elapsed(),
@@ -1673,7 +1673,7 @@ pub async fn get_chapter(
 pub fn save_progress(state: State<'_, Arc<AppState>>, book_id: i64, p: Progress) -> Result<(), String> {
     let mut p = p;
     p.updated_at = db::now_ms();
-    p.device = "flowread-pc".into();
+    p.device = "tidepage-pc".into();
     let conn = state.db.0.lock().unwrap();
     db::set_progress(&conn, book_id, &p)?;
     Ok(())
@@ -1816,9 +1816,9 @@ pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crat
     let dir = crate::data_dir(&st.app)
         .join("res")
         .join(book_id.to_string());
-    let prefix = format!("http://flowread.localhost/res/{book_id}/");
+    let prefix = format!("http://tidepage.localhost/res/{book_id}/");
     let doc = crate::mobi::parse_full(path, force.as_deref(), Some((&dir, &prefix)))?;
-    if std::env::var("FLOWREAD_MOBI_DIAG").is_ok() {
+    if std::env::var("TIDEPAGE_MOBI_DIAG").is_ok() {
         eprintln!(
             "[mobi] {path} imgs={} res_urls={} placeholder={}",
             doc.image_count, doc.res_urls, doc.placeholder_count
@@ -2112,8 +2112,8 @@ pub async fn webdav_test(base: String, user: String, pass: String) -> Result<boo
     c.test().await
 }
 
-/// 上传设置备份到云端 `FlowRead/settings/{name}`（data 为前端组装的 JSON）。
-/// name 必须是单一文件名（非空、不含 `/`、`\`、`..`）；远端只写 FlowRead/settings/ 下文件。
+/// 上传设置备份到云端 `TidePage/settings/{name}`（data 为前端组装的 JSON）。
+/// name 必须是单一文件名（非空、不含 `/`、`\`、`..`）；远端只写 TidePage/settings/ 下文件。
 /// 返回写入的远端完整路径。
 #[tauri::command]
 pub async fn webdav_backup_settings(
@@ -2127,9 +2127,9 @@ pub async fn webdav_backup_settings(
         return Err("备份文件名无效".into());
     }
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    c.ensure_dir("FlowRead").await?;
-    c.ensure_dir("FlowRead/settings").await?;
-    let path = format!("FlowRead/settings/{name}");
+    c.ensure_dir("TidePage").await?;
+    c.ensure_dir("TidePage/settings").await?;
+    let path = format!("TidePage/settings/{name}");
     c.put(&path, data.into_bytes()).await?;
     Ok(path)
 }
@@ -2146,7 +2146,7 @@ pub async fn webdav_restore_settings(
         return Err("备份文件名无效".into());
     }
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    match c.get(&format!("FlowRead/settings/{name}")).await? {
+    match c.get(&format!("TidePage/settings/{name}")).await? {
         Some(bytes) => String::from_utf8(bytes)
             .map(Some)
             .map_err(|_| "云端设置备份不是合法文本".to_string()),
@@ -2175,10 +2175,10 @@ pub async fn webdav_sync_progress(
     local: Option<Progress>,
 ) -> Result<Progress, String> {
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    c.ensure_dir("FlowRead").await.ok();
+    c.ensure_dir("TidePage").await.ok();
     // 确保自有同步进度子目录存在（严格服务器对未建父目录的深路径 PUT 会 409）。
-    c.ensure_dir("FlowRead/progress").await.ok();
-    let remote_key = format!("FlowRead/progress/{}.json", db::path_id(&book_path));
+    c.ensure_dir("TidePage/progress").await.ok();
+    let remote_key = format!("TidePage/progress/{}.json", db::path_id(&book_path));
     let local_p = local.filter(|p| p.updated_at > 0);
 
     let remote_p: Option<Progress> = match c.get(&remote_key).await {
@@ -2211,7 +2211,7 @@ pub async fn webdav_sync_progress(
     Ok(merged)
 }
 
-/// 只读：从云端读取本书进度（FlowRead/progress/{path_id}.json），仅供「同步前对比」使用。
+/// 只读：从云端读取本书进度（TidePage/progress/{path_id}.json），仅供「同步前对比」使用。
 /// **绝不写库、绝不 PUT、绝不 set_progress**；文件不存在（404）或解析失败一律返回 None。
 #[tauri::command]
 pub async fn webdav_read_progress(
@@ -2221,7 +2221,7 @@ pub async fn webdav_read_progress(
     book_path: String,
 ) -> Result<Option<Progress>, String> {
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let remote_key = format!("FlowRead/progress/{}.json", db::path_id(&book_path));
+    let remote_key = format!("TidePage/progress/{}.json", db::path_id(&book_path));
     // get()：404 → Ok(None)，传输错误 → Err；两种失败都按「云端无进度」处理。
     Ok(match c.get(&remote_key).await {
         Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
@@ -2237,15 +2237,15 @@ pub async fn webdav_upload_book(
     book_path: String,
 ) -> Result<String, String> {
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    c.ensure_dir("FlowRead").await?;
-    c.ensure_dir("FlowRead/books").await?;
+    c.ensure_dir("TidePage").await?;
+    c.ensure_dir("TidePage/books").await?;
     let name = Path::new(&book_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or("路径无效")?;
     let data = std::fs::read(&book_path).map_err(|e| e.to_string())?;
-    c.put(&format!("FlowRead/books/{name}"), data).await?;
-    Ok(format!("FlowRead/books/{name}"))
+    c.put(&format!("TidePage/books/{name}"), data).await?;
+    Ok(format!("TidePage/books/{name}"))
 }
 
 #[tauri::command]
@@ -2257,7 +2257,7 @@ pub async fn webdav_download_books(
     target_dir: String,
 ) -> Result<Vec<String>, String> {
     let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let items = c.list("FlowRead/books").await?;
+    let items = c.list("TidePage/books").await?;
     let target = PathBuf::from(&target_dir);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
     let mut imported = Vec::new();
@@ -2299,7 +2299,7 @@ pub async fn webdav_download_book(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or("路径无效")?;
-    let remote_path = format!("FlowRead/books/{name}");
+    let remote_path = format!("TidePage/books/{name}");
     let mut files = webdav_download_file(state, base, user, pass, remote_path, target_dir).await?;
     Ok(if files.is_empty() { String::new() } else { files.remove(0) })
 }
@@ -2567,7 +2567,7 @@ pub fn storage_stats(state: State<'_, Arc<AppState>>) -> StorageStats {
     let (res_bytes, _) = dir_size(&dir.join("res"));
     let (fonts_bytes, _) = dir_size(&dir.join("fonts"));
     let (total_bytes, _) = dir_size(&dir);
-    let db_bytes = ["flowread.db", "flowread.db-wal", "flowread.db-shm"]
+    let db_bytes = ["tidepage.db", "tidepage.db-wal", "tidepage.db-shm"]
         .iter()
         .map(|n| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0))
         .sum();
@@ -3137,9 +3137,9 @@ pub async fn tts_ensure_fixed_voice(
             req.header("Authorization", format!("Bearer {key}"))
         }
     };
-    const NAME_PREFIX: &str = "FlowRead";
+    const NAME_PREFIX: &str = "TidePage";
 
-    // 1) 复用已存在的同语言 FlowRead 固定音色（避免重复创建）。
+    // 1) 复用已存在的同语言 TidePage 固定音色（避免重复创建）。
     if let Ok(resp) = auth(client.get(format!("{base}/profiles"))).send().await {
         if resp.status().is_success() {
             if let Ok(v) = resp.json::<serde_json::Value>().await {

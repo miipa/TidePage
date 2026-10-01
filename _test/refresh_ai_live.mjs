@@ -12,7 +12,7 @@ const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOG = path.join(SANDBOX_ROOT, "mock_reqs.jsonl");
 const reqs = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
-const DB = "C:/Users/A/AppData/Roaming/com.a.flowread/flowread.db";
+const DB = "C:/Users/A/AppData/Roaming/com.a.tidepage/tidepage.db";
 function dbExec(fn) {
   for (let i = 0; i < 20; i++) {
     const db = new DatabaseSync(DB);
@@ -38,7 +38,7 @@ const out = {};
 const M = await connectTarget(9444, (t) => t.type === "page" && !t.url.includes("ai=1"));
 await M.evalJs(H(`
   const c=cfgRead(); c.ai.profiles[0]={name:'EP',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',proxyMode:'direct',proxyUrl:''};
-  localStorage.setItem('flowread.config.v1',JSON.stringify(c)); setTimeout(()=>location.reload(),120); return 1;
+  localStorage.setItem('tidepage.config.v1',JSON.stringify(c)); setTimeout(()=>location.reload(),120); return 1;
 `));
 await sleep(4500);
 await M.evalJs(H(`

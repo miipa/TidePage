@@ -145,7 +145,7 @@
   // 用统一 $effect 广播，避免在 loadChapter 的多个分支里漏发；主窗内嵌抽屉靠 current 已实时、不受影响。
   $effect(() => {
     if (!book) return;
-    void emit("flowread-chapter-changed", { bookId: book.book.id, index: chapterNum });
+    void emit("tidepage-chapter-changed", { bookId: book.book.id, index: chapterNum });
   });
 
   let scrollTop = $state(0);
@@ -577,7 +577,7 @@
   /** 任务 5：把右侧/目录面板拉出为独立窗口，并从互斥组回收（tocOpen/rightPanel 置空）。 */
   async function popOutPanel(kind: "toc" | "bookmarks" | "highlights" | "stats") {
     if (!book) return;
-    const ok = await openPanelWindow(kind, book.book.id, book.book.title || "FlowRead");
+    const ok = await openPanelWindow(kind, book.book.id, book.book.title || "TidePage");
     if (!ok) { toast("弹出窗口失败", "error"); return; }
     // 互斥回收：拉出为独立窗后从右侧互斥/目录移除，互斥逻辑不再管它
     if (kind === "toc") tocOpen = false;
@@ -587,7 +587,7 @@
   // ② 独立划线窗实时同步：本窗划线集变化时广播，独立窗订阅后重载
   $effect(() => {
     void hlVersion;
-    void emit("flowread-hl-changed", {});
+    void emit("tidepage-hl-changed", {});
   });
 
   /* ================= F11 全屏切换（任务 8） =================
@@ -1159,14 +1159,14 @@
     if (config.ai.enabled && config.ai.autoOnChapter && chapter) {
       const ch = { title: chapter.title, html: chapter.html };
       window.dispatchEvent(
-        new CustomEvent("flowread-ai-chapter", {
+        new CustomEvent("tidepage-ai-chapter", {
           detail: { title: ch.title, html: aiCtxHtml(ch.html) },
         }),
       );
       // 跨窗口广播：AI 独立窗口也能收到
       import("@tauri-apps/api/event")
         .then((m) =>
-          m.emit("flowread-ai-chapter", {
+          m.emit("tidepage-ai-chapter", {
             title: ch.title,
             html: aiCtxHtml(ch.html),
           })
@@ -1267,7 +1267,7 @@
     try {
       await api.updateSession(sessionId, secs, dChars);
       // 广播给独立“统计”窗口（按 bookId 过滤后重新拉取时长/字数）
-      void emit("flowread-stats-changed", { bookId: book.book.id });
+      void emit("tidepage-stats-changed", { bookId: book.book.id });
     } catch { /* ignore */ }
   }
 
@@ -2184,16 +2184,16 @@
       doSaveProgress();
       flushSession(true);
     };
-    window.addEventListener("flowread-jump", onJump);
+    window.addEventListener("tidepage-jump", onJump);
     window.addEventListener("pagehide", onUnload);
     // 独立 AI 窗口「⇲ 停靠」回主窗口：以 rightPanel 打开抽屉（不经 ui.aiOpen）。
     const aiDockUn = listen("ai-dock", () => { setRight("ai"); });
     // 任务 5：独立面板窗口的跳转请求（跨窗 Tauri 事件）→ 主窗执行导航
-    const gotoChUn = listen<{ index: number }>("flowread-goto-chapter", (e) => {
+    const gotoChUn = listen<{ index: number }>("tidepage-goto-chapter", (e) => {
       const i = e.payload?.index;
       if (book && typeof i === "number" && i >= 0 && i < book.toc.length) loadChapter(i);
     });
-    const gotoHlUn = listen<{ id: number }>("flowread-goto-highlight", async (e) => {
+    const gotoHlUn = listen<{ id: number }>("tidepage-goto-highlight", async (e) => {
       const id = e.payload?.id;
       if (typeof id !== "number") return;
       await refreshHighlights();
@@ -2204,14 +2204,14 @@
       ttsStop();
       scroller?.destroy();
       if (statsTimer) clearInterval(statsTimer);
-      window.removeEventListener("flowread-jump", onJump);
+      window.removeEventListener("tidepage-jump", onJump);
       window.removeEventListener("pagehide", onUnload);
       aiDockUn.then((un) => un()).catch(() => {});
       gotoChUn.then((un) => un()).catch(() => {});
       gotoHlUn.then((un) => un()).catch(() => {});
       clearTimeout(fsHintTimer);
       doSaveProgress();
-      const el = document.getElementById("flowread-dynamic-css");
+      const el = document.getElementById("tidepage-dynamic-css");
       if (el) el.remove();
       styleTag = null;
     };
@@ -2352,7 +2352,7 @@ ${effCssExtra() || ""}
     const css = buildDynamicCss();
     if (!styleTag) {
       styleTag = document.createElement("style");
-      styleTag.id = "flowread-dynamic-css";
+      styleTag.id = "tidepage-dynamic-css";
       document.head.appendChild(styleTag);
     }
     styleTag.textContent = css;
@@ -2490,7 +2490,7 @@ ${effCssExtra() || ""}
 
   const bgImageUrl = $derived(
     (bookScheme()?.schemeBgImage ?? config.reader.bgImage)
-      ? `http://flowread.localhost/bg/${bookScheme()?.schemeBgImage ?? config.reader.bgImage}`
+      ? `http://tidepage.localhost/bg/${bookScheme()?.schemeBgImage ?? config.reader.bgImage}`
       : ""
   );
 
@@ -2513,7 +2513,7 @@ ${effCssExtra() || ""}
     toast("书签已添加");
     if (bookmarksOpen) bookmarks = await api.listBookmarks(book.book.id);
     // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
-    void emit("flowread-bookmarks-changed", { bookId: book.book.id });
+    void emit("tidepage-bookmarks-changed", { bookId: book.book.id });
   }
 
   async function deleteBookmark(id: number) {
@@ -2522,7 +2522,7 @@ ${effCssExtra() || ""}
       bookmarks = bookmarks.filter((b) => b.id !== id);
       toast("书签已删除");
       // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
-      if (book) void emit("flowread-bookmarks-changed", { bookId: book.book.id });
+      if (book) void emit("tidepage-bookmarks-changed", { bookId: book.book.id });
     } catch (e) {
       toast(String(e), "error");
     }

@@ -1,5 +1,5 @@
 import sqlite3, os, time
-db = r"C:\Users\A\AppData\Roaming\com.a.flowread\flowread.db"
+db = r"C:\Users\A\AppData\Roaming\com.a.tidepage\tidepage.db"
 wal = db + "-wal"
 print("time =", time.strftime("%Y-%m-%d %H:%M:%S"))
 print("db bytes =", os.path.getsize(db), " wal bytes =", os.path.getsize(wal) if os.path.exists(wal) else 0)

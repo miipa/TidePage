@@ -1474,7 +1474,7 @@ export const THEMES: Record<ThemeKey, { bg: string; fg: string; sel: string }> =
   night: { bg: "#0f1115", fg: "#8a8f96", sel: "#1d2026" },
 };
 
-const KEY = "flowread.config.v1";
+const KEY = "tidepage.config.v1";
 
 function migrateAi(savedAi: any): AiConfig {
   const base = {
@@ -2065,7 +2065,7 @@ export function applyConfigJson(json: string) {
     obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
     // 跨窗广播/导出的都是「已脱敏 config」，敏感字段均为空。先记下本窗当前密钥，
     // 应用后对传入为空者回填，避免用空值覆盖已回填/待回填的凭据；
-    // 真正的「清空密钥」由 flowread-secrets-changed 信号（重读加密存储）兜底。
+    // 真正的「清空密钥」由 tidepage-secrets-changed 信号（重读加密存储）兜底。
     const preservedSecrets = collectSecrets(config);
     for (const k of Object.keys(config) as (keyof AppConfig)[]) {
       (config as any)[k] = obj[k];
@@ -2104,7 +2104,7 @@ export function saveConfigNow() {
     if (json !== lastSavedJson) {
       lastSavedJson = json;
       void import("@tauri-apps/api/event")
-        .then((m) => m.emit("flowread-config", json))
+        .then((m) => m.emit("tidepage-config", json))
         .catch(() => {});
     }
     if (secretsJson !== lastSavedSecretsJson) {
@@ -2112,7 +2112,7 @@ export function saveConfigNow() {
       void api.secretWrite(secretsJson).catch(() => {});
       // 无载荷信号：各窗（含自身）收到后重读加密存储并回填。
       void import("@tauri-apps/api/event")
-        .then((m) => m.emit("flowread-secrets-changed", null))
+        .then((m) => m.emit("tidepage-secrets-changed", null))
         .catch(() => {});
     }
   } catch {
@@ -2129,7 +2129,7 @@ export function saveConfig() {
 // 用 lastSavedJson 去重，避免自身回声导致的循环（applyConfigJson 不再触发广播）。
 void import("@tauri-apps/api/event")
   .then((m) =>
-    m.listen<string>("flowread-config", (e) => {
+    m.listen<string>("tidepage-config", (e) => {
       if (e.payload && e.payload !== lastSavedJson) applyConfigJson(e.payload);
     }),
   )
@@ -2139,7 +2139,7 @@ void import("@tauri-apps/api/event")
 // 单独走信号而非随 config 广播，确保密钥不经广播明文、且空值不会误清已回填的密钥。
 void import("@tauri-apps/api/event")
   .then((m) =>
-    m.listen<null>("flowread-secrets-changed", () => {
+    m.listen<null>("tidepage-secrets-changed", () => {
       void (async () => {
         try {
           const raw = await api.secretRead();
@@ -2363,7 +2363,7 @@ export const convertState = $state({
   book: null as { id: number; title: string; path: string; format: string } | null,
 });
 
-export const AI_WIN_LABEL = "flowread-ai";
+export const AI_WIN_LABEL = "tidepage-ai";
 
 export const aiState = $state({
   lastMode: (typeof localStorage !== "undefined"
@@ -2389,7 +2389,7 @@ export async function openAiWindow(): Promise<boolean> {
     try {
       const win = new WebviewWindow(AI_WIN_LABEL, {
         url: "/?ai=1",
-        title: "FlowRead AI",
+        title: "TidePage AI",
         width: w,
         height: h,
         minWidth: 300,

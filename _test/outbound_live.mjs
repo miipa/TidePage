@@ -16,7 +16,7 @@ const M = await connectTarget(9444, (t) => t.type === "page" && !t.url.includes(
 await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
 
 // ollama auto
-await M.evalJs(H(`const c=cfgRead(); c.ai.profiles[0]={name:'EP',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',proxyMode:'direct',proxyUrl:''}; localStorage.setItem('flowread.config.v1',JSON.stringify(c)); return 1`));
+await M.evalJs(H(`const c=cfgRead(); c.ai.profiles[0]={name:'EP',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',proxyMode:'direct',proxyUrl:''}; localStorage.setItem('tidepage.config.v1',JSON.stringify(c)); return 1`));
 await M.evalJs(`(()=>{setTimeout(()=>location.reload(),150);return 1})()`);
 await sleep(4500);
 await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));
@@ -25,7 +25,7 @@ out.ollama_send = await sendTestPrompt(M);
 out.ollama = reqs()[n];
 
 // openai-compat auto
-await M.evalJs(H(`const c=cfgRead(); c.ai.profiles[0]={name:'EP',provider:'openai',baseUrl:'http://127.0.0.1:18081',apiKey:'sk-LOCAL-TEST',model:'mock',proxyMode:'direct',proxyUrl:''}; localStorage.setItem('flowread.config.v1',JSON.stringify(c)); return 1`));
+await M.evalJs(H(`const c=cfgRead(); c.ai.profiles[0]={name:'EP',provider:'openai',baseUrl:'http://127.0.0.1:18081',apiKey:'sk-LOCAL-TEST',model:'mock',proxyMode:'direct',proxyUrl:''}; localStorage.setItem('tidepage.config.v1',JSON.stringify(c)); return 1`));
 await M.evalJs(`(()=>{setTimeout(()=>location.reload(),150);return 1})()`);
 await sleep(4500);
 await M.evalJs(H(`await openBook(); await openDrawer(); return 1`));

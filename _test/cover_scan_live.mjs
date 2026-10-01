@@ -64,7 +64,7 @@ try {
   fs.writeFileSync(basePng, makePng(400, 600, (x, y) => (((x >> 5) + (y >> 5)) % 2 ? [200, 60, 40] : [245, 225, 220])));
 
   app = launchSandbox({
-    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data },
+    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data },
     cdpPort: PORT,
     logFile: path.join(SANDBOX_ROOT, "cs_diag.log"),
   });
@@ -170,7 +170,7 @@ try {
     const res=[];
     for(const b of rows){
       const perBook = !!b.cover_path;
-      const url = perBook ? 'http://flowread.localhost/book-cover/'+b.id+'?v=0-'+b.cover_ver : 'http://flowread.localhost/cover-default/'+b.id;
+      const url = perBook ? 'http://tidepage.localhost/book-cover/'+b.id+'?v=0-'+b.cover_ver : 'http://tidepage.localhost/cover-default/'+b.id;
       const buf=new Uint8Array(await (await fetch(url)).arrayBuffer());
       res.push({ id:b.id, cover_path:b.cover_path, cover_ver:b.cover_ver, meta_done:b.meta_done, perBook, isPng:buf[0]===0x89&&buf[1]===0x50, isSvg:buf[0]===0x3c, bytes:buf.length, hash:fnv(buf) });
     }

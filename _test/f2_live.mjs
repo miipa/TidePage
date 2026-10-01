@@ -24,7 +24,7 @@ function makePng(w,h,px){const raw=Buffer.alloc((w*3+1)*h);let o=0;for(let y=0;y
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f2_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "f2_diag.log") });
   let M = null; for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   if (!M) throw new Error("no cdp");
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
@@ -62,13 +62,13 @@ try {
     const rows=pg.rows.filter(r=>/f2_books/i.test(r.path)).slice(0,3);
     const res=[];
     for(const b of rows){
-      const url='http://flowread.localhost/cover-default/'+b.id;
+      const url='http://tidepage.localhost/cover-default/'+b.id;
       const t=await (await fetch(url)).text();
       const m=t.match(/font-weight="700"[^>]*>([^<]*)</);
       res.push({ id:b.id, dbTitle:b.title, dbAuthor:b.author, svgTitle:m?m[1]:null, hasShade:t.includes('id="shade"'), hasSlice:t.includes('slice')||false });
     }
     // 存第一个 svg 供肉眼检查
-    if(rows[0]){ const t=await (await fetch('http://flowread.localhost/cover-default/'+rows[0].id)).text(); window.__svg0=t; }
+    if(rows[0]){ const t=await (await fetch('http://tidepage.localhost/cover-default/'+rows[0].id)).text(); window.__svg0=t; }
     return { count:rows.length, res, svg0: window.__svg0 ? window.__svg0.slice(0,400) : null };
   `));
   log("threeBooks: " + JSON.stringify(out.steps.threeBooks));
@@ -88,7 +88,7 @@ try {
       await sleep(600);
       const pg=await inv('list_books_page',{query:'', sort:'title', offset:0, limit:200});
       const b=pg.rows.filter(x=>/f2_books/i.test(x.path))[0];
-      const t=await (await fetch('http://flowread.localhost/cover-default/'+b.id)).text();
+      const t=await (await fetch('http://tidepage.localhost/cover-default/'+b.id)).text();
       return { len:t.length, hasShade:t.includes('id="shade"'), hasWhite:t.includes('fill="#ffffff"'), hasSlice:t.includes('preserveAspectRatio="xMidYMid slice"'), svg:t.slice(0,300) };
     `));
     out.steps.bases[tag] = { len: r.len, hasShade: r.hasShade, hasWhite: r.hasWhite, hasSlice: r.hasSlice };

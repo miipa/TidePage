@@ -60,21 +60,21 @@
   let sortKey = $state<"added" | "lastread" | "title" | "recent" | "size">(
     (() => {
       try {
-        const v = localStorage.getItem("flowread.lib.sort");
+        const v = localStorage.getItem("tidepage.lib.sort");
         return v === "lastread" || v === "title" || v === "recent" || v === "size" ? v : "added";
       } catch { return "added"; }
     })()
   );
-  /** 是否反向排序（与 flowread.lib.sort 同款持久化）。 */
+  /** 是否反向排序（与 tidepage.lib.sort 同款持久化）。 */
   let reversed = $state(
     (() => {
-      try { return localStorage.getItem("flowread.lib.sortDir") === "1"; }
+      try { return localStorage.getItem("tidepage.lib.sortDir") === "1"; }
       catch { return false; }
     })()
   );
   let view = $state<"grid" | "list">(
     (() => {
-      try { return localStorage.getItem("flowread.lib.view") === "list" ? "list" : "grid"; }
+      try { return localStorage.getItem("tidepage.lib.view") === "list" ? "list" : "grid"; }
       catch { return "grid"; }
     })()
   );
@@ -140,11 +140,11 @@
   );
 
   function saveSort() {
-    try { localStorage.setItem("flowread.lib.sort", sortKey); } catch { /* ignore */ }
+    try { localStorage.setItem("tidepage.lib.sort", sortKey); } catch { /* ignore */ }
   }
 
   function saveSortDir() {
-    try { localStorage.setItem("flowread.lib.sortDir", reversed ? "1" : "0"); } catch { /* ignore */ }
+    try { localStorage.setItem("tidepage.lib.sortDir", reversed ? "1" : "0"); } catch { /* ignore */ }
   }
 
   /** 各排序的默认方向（true=降序，如 size 默认大→小）；反向按钮整体翻转。 */
@@ -164,10 +164,10 @@
   const ALL_STATES: ReadState[] = ["unread", "reading", "read"];
   const STATE_LABELS: Record<ReadState, string> = { unread: "未读", reading: "在读", read: "已读" };
 
-  // 从 localStorage 恢复筛选（key 与 flowread.lib.sort 同款）；脏值过滤。
+  // 从 localStorage 恢复筛选（key 与 tidepage.lib.sort 同款）；脏值过滤。
   const _initFilter = (() => {
     try {
-      const raw = localStorage.getItem("flowread.lib.filter");
+      const raw = localStorage.getItem("tidepage.lib.filter");
       if (raw) {
         const o = JSON.parse(raw);
         return {
@@ -189,7 +189,7 @@
 
   function saveFilter() {
     try {
-      localStorage.setItem("flowread.lib.filter", JSON.stringify({ formats: filterFormats, states: filterStates }));
+      localStorage.setItem("tidepage.lib.filter", JSON.stringify({ formats: filterFormats, states: filterStates }));
     } catch { /* ignore */ }
   }
 
@@ -263,7 +263,7 @@
   function setView(v: "grid" | "list") {
     if (v === view) return;
     view = v;
-    try { localStorage.setItem("flowread.lib.view", v); } catch { /* ignore */ }
+    try { localStorage.setItem("tidepage.lib.view", v); } catch { /* ignore */ }
     resetScroll();
   }
 

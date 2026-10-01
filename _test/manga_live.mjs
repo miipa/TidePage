@@ -31,8 +31,8 @@ const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
 const q=(s)=>document.querySelector(s);
 const qa=(s)=>[...document.querySelectorAll(s)];
 const rect=(el)=>{ if(!el) return null; const r=el.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}; };
-const cfgRead=()=>JSON.parse(localStorage.getItem('flowread.config.v1')||'{}');
-const bcRead=()=>JSON.parse(localStorage.getItem('flowread.bookcfg.v1')||'{}');
+const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
+const bcRead=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const rdVar=()=>getComputedStyle(q('.reader')).getPropertyValue('--rdr-img-scale').trim();
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
 const setSelect=async(label,val)=>{ const s=field(label)?.querySelector('select'); if(!s) throw new Error('no select '+label); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(180); };
@@ -70,7 +70,7 @@ async function ensureReady(M, label) {
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: diagLog });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: diagLog });
   log("launched pid " + app.child.pid);
   let M = null;
   for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
@@ -205,7 +205,7 @@ try {
     const id=${bookId};
     let jumped=null;
     for(let i=1;i<40;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); const n=(c.html.match(/<img/gi)||[]).length; if(n>=2){ jumped=i; break; } }catch(e){} }
-    if(jumped!=null){ window.dispatchEvent(new CustomEvent('flowread-jump',{detail:jumped})); await sleep(3000); }
+    if(jumped!=null){ window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:jumped})); await sleep(3000); }
     const vp=q('.manga-h-viewport'); const cv=q('.manga-h-canvas');
     if(!vp||!cv) return { err:'no viewport', jumped };
     const cc=q('.manga-h-canvas #chapter-content');
@@ -241,12 +241,12 @@ try {
   `));
   log("drag: " + JSON.stringify(out.steps.drag));
 
-  out.steps.dragReload = await M.evalJs(`(()=>{ const o=JSON.parse(localStorage.getItem('flowread.config.v1')).reader.topbarOrder; localStorage.setItem('fr.test.order', JSON.stringify(o)); setTimeout(()=>location.reload(),80); return o; })()`);
+  out.steps.dragReload = await M.evalJs(`(()=>{ const o=JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.topbarOrder; localStorage.setItem('fr.test.order', JSON.stringify(o)); setTimeout(()=>location.reload(),80); return o; })()`);
   await sleep(3500);
   M.close();
   M = await connectTarget(PORT, isApp);
   await ensureReady(M, "after reload");
-  out.steps.dragPersisted = await M.evalJs(`(()=>{ const o=JSON.parse(localStorage.getItem('flowread.config.v1')).reader.topbarOrder; const want=JSON.parse(localStorage.getItem('fr.test.order')||'[]'); return { equal: JSON.stringify(o)===JSON.stringify(want) }; })()`);
+  out.steps.dragPersisted = await M.evalJs(`(()=>{ const o=JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.topbarOrder; const want=JSON.parse(localStorage.getItem('fr.test.order')||'[]'); return { equal: JSON.stringify(o)===JSON.stringify(want) }; })()`);
   log("dragPersisted: " + JSON.stringify(out.steps.dragPersisted));
 
   // ---- 6) right-bottom image bump goes beyond global manga cap ----

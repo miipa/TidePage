@@ -1,4 +1,4 @@
-$log = 'C:\Users\A\Documents\a\flowread\dev_log.txt'
+$log = 'C:\Users\A\Documents\a\TidePage\dev_log.txt'
 for ($i = 0; $i -lt 40; $i++) {
   if (Test-Path $log) {
     $t = Get-Content $log -Raw

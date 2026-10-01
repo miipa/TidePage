@@ -72,11 +72,11 @@ export function assertTestConfig(cfgObj) {
 export async function assertPageEndpointIsLocal(pageEval) {
   let raw;
   try {
-    raw = await pageEval(`localStorage.getItem("flowread.config.v1") || ""`);
+    raw = await pageEval(`localStorage.getItem("tidepage.config.v1") || ""`);
   } catch (e) {
     throw new Error(`隔离守卫失败：无法从页面读取配置，拒绝发送任何 AI 请求：${e.message}`);
   }
-  if (!raw) throw new Error("隔离守卫失败：页面 localStorage 无 flowread.config.v1，拒绝发送。");
+  if (!raw) throw new Error("隔离守卫失败：页面 localStorage 无 tidepage.config.v1，拒绝发送。");
   const cfg = JSON.parse(raw);
   assertTestConfig(cfg);
   return cfg;

@@ -52,7 +52,7 @@ const PROBE = `
   const fnv=(b)=>{let h=0x811c9dc5;for(let i=0;i<b.length;i++){h^=b[i];h=(h*0x01000193)>>>0;}return h.toString(16);};
   const res=[];
   for(const b of rows){
-    const url = b.cover_path ? 'http://flowread.localhost/covers/'+encodeURIComponent(b.cover_path) : 'http://flowread.localhost/cover-default/'+b.id;
+    const url = b.cover_path ? 'http://tidepage.localhost/covers/'+encodeURIComponent(b.cover_path) : 'http://tidepage.localhost/cover-default/'+b.id;
     const isPerBook=!!b.cover_path;
     let info={ id:b.id, title:b.title, author:b.author, path:b.path, cover_path:b.cover_path, kind:isPerBook?'per-book':'shared-default', url };
     if(isPerBook){
@@ -84,7 +84,7 @@ try {
 
   // CDP 端口只在 debug 构建注入（FR_TEST_CDP_PORT），故用 tauri dev 沙箱启动。
   app = launchSandbox({
-    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data },
+    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data },
     cdpPort: PORT,
     logFile: path.join(SANDBOX_ROOT, "dcf_diag.log"),
   });
@@ -194,7 +194,7 @@ try {
     const pg=await inv('list_books_page',{query:'', sort:'title', offset:0, limit:500});
     const b=pg.rows.filter(r=>/dcf_books/i.test(r.path) && !r.cover_path)[0];
     let mime=null, svgTitle=null;
-    if(b){ const t=await (await fetch('http://flowread.localhost/cover-default/'+b.id)).text(); mime=(t.match(/data:(image\\/[a-z]+);base64/)||[])[1]||null; svgTitle=(t.match(/font-weight="700"[^>]*>([^<]*)</)||[])[1]||null; }
+    if(b){ const t=await (await fetch('http://tidepage.localhost/cover-default/'+b.id)).text(); mime=(t.match(/data:(image\\/[a-z]+);base64/)||[])[1]||null; svgTitle=(t.match(/font-weight="700"[^>]*>([^<]*)</)||[])[1]||null; }
     return { err, hasDefault: await inv('has_default_cover'), dataMime: mime, svgTitle };
   `));
   log("JPEG " + JSON.stringify(out.steps.jpeg));

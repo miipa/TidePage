@@ -94,14 +94,14 @@ export const api = {
     base: string, user: string, pass: string,
     bookId: number, bookPath: string, local: Progress | null,
   ) => invoke<Progress>("webdav_sync_progress", { base, user, pass, bookId, bookPath, local })),
-  /** 只读：拉取云端本书进度（FlowRead/progress/{path_id}.json），不写库、不 PUT。无则 null。 */
+  /** 只读：拉取云端本书进度（TidePage/progress/{path_id}.json），不写库、不 PUT。无则 null。 */
   webdavReadProgress: needsSecrets((base: string, user: string, pass: string, bookPath: string) =>
     invoke<Progress | null>("webdav_read_progress", { base, user, pass, bookPath })),
   webdavUploadBook: needsSecrets((base: string, user: string, pass: string, bookPath: string) =>
     invoke<string>("webdav_upload_book", { base, user, pass, bookPath })),
   webdavDownloadBooks: needsSecrets((base: string, user: string, pass: string, targetDir: string) =>
     invoke<string[]>("webdav_download_books", { base, user, pass, targetDir })),
-  /** 单本书从云端 FlowRead/books/ 下载到 targetDir，并按扩展名自动加入书库。 */
+  /** 单本书从云端 TidePage/books/ 下载到 targetDir，并按扩展名自动加入书库。 */
   webdavDownloadBook: needsSecrets((base: string, user: string, pass: string, bookPath: string, targetDir: string) =>
     invoke<string>("webdav_download_book", { base, user, pass, bookPath, targetDir })),
   webdavList: needsSecrets((base: string, user: string, pass: string, path: string) =>
@@ -119,7 +119,7 @@ export const api = {
     invoke<string[]>("webdav_download_file", { base, user, pass, remotePath, targetDir })),
   webdavDownloadProgress: needsSecrets((base: string, user: string, pass: string, remotePath: string, targetDir: string, session: string) =>
     invoke<string[]>("webdav_download_progress", { base, user, pass, remotePath, targetDir, session })),
-  /** 上传设置备份到 FlowRead/settings/{name}，返回远端路径。 */
+  /** 上传设置备份到 TidePage/settings/{name}，返回远端路径。 */
   webdavBackupSettings: needsSecrets((base: string, user: string, pass: string, name: string, data: string) =>
     invoke<string>("webdav_backup_settings", { base, user, pass, name, data })),
   /** 读取云端指定设置备份；无则 null。 */
@@ -267,8 +267,8 @@ export function coverUrl(book: Pick<BookRow, "id" | "cover_path" | "cover_ver">)
     // 追加默认底图缓存破坏分量（仅此端点）：换/恢复默认底图时 bumpDefaultCoverBust() 自增，
     // 内部读 defaultCoverBust.n 建立响应式依赖，令无内嵌封面的 <img> 即时重取新底图。
     // /book-cover/ 端点不追加此参数，故有内嵌封面的书不受换底图影响、不闪白。
-    return `http://flowread.localhost/cover-default/${book.id}?v=${v}${q}&db=${defaultCoverBust.n}`;
+    return `http://tidepage.localhost/cover-default/${book.id}?v=${v}${q}&db=${defaultCoverBust.n}`;
   }
   // 有内嵌封面 → per-book 端点（/book-cover/<id>），按 id + coverVer 缓存破坏。
-  return `http://flowread.localhost/book-cover/${book.id}?v=${v}`;
+  return `http://tidepage.localhost/book-cover/${book.id}?v=${v}`;
 }

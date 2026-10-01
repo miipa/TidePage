@@ -1,6 +1,6 @@
 import { config } from "./stores.svelte";
 
-const STYLE_ID = "flowread-fontface-css";
+const STYLE_ID = "tidepage-fontface-css";
 
 export interface CustomFontItem {
   family: string;
@@ -15,7 +15,7 @@ export function customFontFaceCss(fonts?: CustomFontItem[]): string {
     .map(
       (f) =>
         // font-display:block：字体未就绪时先不显示回退字体，避免「先别字体再变」的闪烁
-        `@font-face { font-family: "${f.family}"; src: url('http://flowread.localhost/fonts/${f.file}'); font-display: block; }`,
+        `@font-face { font-family: "${f.family}"; src: url('http://tidepage.localhost/fonts/${f.file}'); font-display: block; }`,
     )
     .join("\n");
 }

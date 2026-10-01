@@ -1,12 +1,12 @@
 [package]
-name = "flowread"
+name = "tidepage"
 version = "0.1.25"
-description = "FlowRead - a fast local reading app"
+description = "TidePage - a fast local reading app"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "flowread_lib"
+name = "tidepage_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

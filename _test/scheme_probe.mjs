@@ -13,7 +13,7 @@ const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
 const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const openSettings=async(tab)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };\n${b} })()`;
 let app=null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "probe.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "probe.log") });
   let M=null; for(let i=0;i<240;i++){try{M=await connectTarget(PORT,isApp);break}catch{await sleep(2000)}}
   for(let i=0;i<300;i++){try{const r=await M.evalJs(`!!window.__TAURI_INTERNALS__`);if(r)break}catch{}await sleep(400)}
   await sleep(800);
@@ -41,7 +41,7 @@ try {
     await sleep(600);
     out.toast=qa('.toast-card').map(t=>t.textContent).join(' | ');
     out.nameInputVal=q('.ss-new input')?.value;
-    const raw=JSON.parse(localStorage.getItem('flowread.config.v1'));
+    const raw=JSON.parse(localStorage.getItem('tidepage.config.v1'));
     out.clickErr=clickErr;
     out.rawSchemeType=Array.isArray(raw.readerSchemes)?'array':typeof raw.readerSchemes;
     out.rawSchemes=raw.readerSchemes;

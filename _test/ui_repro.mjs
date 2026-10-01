@@ -44,13 +44,13 @@ async function main() {
     if (process.env.FR_EXE) {
       const fd = fs.openSync(diagLog, "a");
       const child = spawn(process.env.FR_EXE, [], {
-        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data, FR_TEST_CDP_PORT: String(PORT), FLOWREAD_OPEN_DIAG: "1" },
+        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data, FR_TEST_CDP_PORT: String(PORT), TIDEPAGE_OPEN_DIAG: "1" },
         stdio: ["ignore", fd, fd], windowsHide: true,
       });
       app = { child };
     } else {
       app = launchSandbox({
-        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data, FLOWREAD_OPEN_DIAG: "1" },
+        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data, TIDEPAGE_OPEN_DIAG: "1" },
         cdpPort: PORT, logFile: diagLog,
       });
     }
@@ -75,10 +75,10 @@ async function main() {
 
     // seed config
     await main.evalJs(H(`
-      const raw=localStorage.getItem('flowread.config.v1');
+      const raw=localStorage.getItem('tidepage.config.v1');
       const cfg=raw?JSON.parse(raw):{};
       cfg.reader=Object.assign({},cfg.reader||{},{mode:'${process.env.FR_MODE || "scroll"}'});
-      localStorage.setItem('flowread.config.v1',JSON.stringify(cfg));
+      localStorage.setItem('tidepage.config.v1',JSON.stringify(cfg));
       return 1;`));
     await main.evalJs(`setTimeout(()=>location.reload(),100);1`);
     await sleep(4000);
@@ -100,7 +100,7 @@ async function main() {
       // jump to a chapter with an image
       await main.evalJs(H(`
         const id=${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id};
-        for(let i=0;i<80;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); if(/<img/i.test(c.html)){ window.dispatchEvent(new CustomEvent('flowread-jump',{detail:i})); return {i}; } }catch(e){} }
+        for(let i=0;i<80;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); if(/<img/i.test(c.html)){ window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:i})); return {i}; } }catch(e){} }
         return null;`));
       await sleep(2500);
       // open viewer by pointerdown+pointerup on first img
@@ -158,7 +158,7 @@ async function main() {
         return { toolbar: qa('.toolbar button').map(b=>({title:b.getAttribute('title'), text:b.textContent.trim()})),
           statusbar: qa('.statusbar button').map(b=>({title:b.getAttribute('title')})) };`));
     } else if (SCENARIO === "flashline") {
-      await main.evalJs(H(`window.dispatchEvent(new CustomEvent('flowread-jump',{detail:20})); return 1;`));
+      await main.evalJs(H(`window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:20})); return 1;`));
       await sleep(2000);
       // in-page strip analyzer: returns per-row average brightness
       await main.evalJs(H(`
@@ -188,14 +188,14 @@ async function main() {
       // jump to a chapter with an image
       await main.evalJs(H(`
         const id=${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id};
-        for(let i=0;i<80;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); if(/<img/i.test(c.html)){ window.dispatchEvent(new CustomEvent('flowread-jump',{detail:i})); return {i}; } }catch(e){} }
+        for(let i=0;i<80;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); if(/<img/i.test(c.html)){ window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:i})); return {i}; } }catch(e){} }
         return null;`));
       await sleep(2500);
       out.f = await main.evalJs(H(`
         const out={};
         const btnByTitle=(s)=>qa('.tb-r .icon').find(b=>(b.getAttribute('title')||'').includes(s));
-        const cfg=()=>JSON.parse(localStorage.getItem('flowread.config.v1'));
-        const bcfg=()=>JSON.parse(localStorage.getItem('flowread.bookcfg.v1')||'{}');
+        const cfg=()=>JSON.parse(localStorage.getItem('tidepage.config.v1'));
+        const bcfg=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
         const bid=String(${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id});
         // --- manager ---
         btnByTitle('顶栏按钮管理')?.click(); await sleep(250);
@@ -253,7 +253,7 @@ async function main() {
           await sleep(300);
         }catch(e){ out.dragErr=String(e); }
         out.order=cfg().reader.topbarOrder.slice(0,6);
-        out.orderPersist=!!localStorage.getItem('flowread.config.v1');
+        out.orderPersist=!!localStorage.getItem('tidepage.config.v1');
         // --- long-press font (per-book) ---
         const body=q('.body'); const br=body.getBoundingClientRect();
         body.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:br.right-20,clientY:br.bottom-20})); await sleep(300);
@@ -283,7 +283,7 @@ async function main() {
         const id=${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id};
         let pick=-1;
         for(let i=0;i<120;i++){ try{ const c=await inv('get_chapter',{bookId:id,chapterIndex:i,keepStyles:false}); if(/<img[^>]*width="[4-9]\d\d"/i.test(c.html)){ pick=i; break; } if(pick<0 && /<img/i.test(c.html)) pick=i; }catch(e){} }
-        if(pick>=0) window.dispatchEvent(new CustomEvent('flowread-jump',{detail:pick}));
+        if(pick>=0) window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:pick}));
         return {pick};`));
       await sleep(2500);
       out.z = await main.evalJs(H(`
@@ -336,7 +336,7 @@ async function main() {
           from.dispatchEvent(new DragEvent('dragend',{bubbles:true,dataTransfer:dt}));
         }catch(e){ return {err:String(e)}; }
         await sleep(500);
-        return JSON.parse(localStorage.getItem('flowread.config.v1')).library.topbarOrder;`));
+        return JSON.parse(localStorage.getItem('tidepage.config.v1')).library.topbarOrder;`));
     } else if (SCENARIO === "manga") {
       out.manga = await main.evalJs(H(`
         const id=${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id};
@@ -348,7 +348,7 @@ async function main() {
         const low=c.html.toLowerCase();
         return { len:c.html.length, img:(low.match(/<img/gi)||[]).length, image:(low.match(/<image/gi)||[]).length, svg:(low.match(/<svg/gi)||[]).length, head:c.html.slice(0,260) };`));
       // jump to a real manga page chapter (many page images)
-      await main.evalJs(H(`window.dispatchEvent(new CustomEvent('flowread-jump',{detail:20})); return 1;`));
+      await main.evalJs(H(`window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:20})); return 1;`));
       await sleep(2500);
       out.guideApply = await main.evalJs(H(`
         const rd=q('.reader');
@@ -366,7 +366,7 @@ async function main() {
         return { before, after, bigBefore, bigAfter, imgCount:qa('#chapter-content img').length,
           contentH:q('#chapter-content')?.getBoundingClientRect().height,
           first: f?{w:Math.round(fr.width),h:Math.round(fr.height),nw:f.naturalWidth,nh:f.naturalHeight,disp:getComputedStyle(f).display,zoom:getComputedStyle(f).zoom,complete:f.complete,src:(f.getAttribute('src')||'').slice(0,90),attrW:f.getAttribute('width'),attrH:f.getAttribute('height')}:null,
-          mangaImageScale:JSON.parse(localStorage.getItem('flowread.config.v1')).reader.mangaImageScale };`));
+          mangaImageScale:JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.mangaImageScale };`));
     } else if (SCENARIO === "fonthold") {
       out.hold = await main.evalJs(H(`
         // ensure font ctl visible
@@ -375,14 +375,14 @@ async function main() {
         await sleep(300);
         const plus=qa('.font-ctl .icon').find(b=>b.getAttribute('title')?.includes('增大'));
         if(!plus) return {err:'no plus', ctl:!!q('.font-ctl')};
-        const before=JSON.parse(localStorage.getItem('flowread.config.v1')).reader.fontSize;
+        const before=JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.fontSize;
         const b=plus.getBoundingClientRect();
         plus.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:b.left+b.width/2,clientY:b.top+b.height/2,button:0,pointerId:2}));
         await sleep(1500);
-        const during=JSON.parse(localStorage.getItem('flowread.config.v1')).reader.fontSize;
+        const during=JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.fontSize;
         plus.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,clientX:b.left+b.width/2,clientY:b.top+b.height/2,button:0,pointerId:2}));
         await sleep(300);
-        const after=JSON.parse(localStorage.getItem('flowread.config.v1')).reader.fontSize;
+        const after=JSON.parse(localStorage.getItem('tidepage.config.v1')).reader.fontSize;
         return { before, during, after, controls: qa('.font-ctl .icon').map(x=>x.getAttribute('title')) };`));
     }
 

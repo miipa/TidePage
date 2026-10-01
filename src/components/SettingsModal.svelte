@@ -210,7 +210,7 @@
   /** 预览：用共享端点渲染一张样例封面（底图 + 实时叠字）；未设底图时即主题渐变。
    *  带上主题配色参数，预览与书库默认封面完全一致，且切主题即时更新。 */
   const coverPreviewUrl = $derived(
-    `http://flowread.localhost/cover-default/0?v=${coverPreviewBust}` +
+    `http://tidepage.localhost/cover-default/0?v=${coverPreviewBust}` +
       `&g1=${encodeURIComponent(coverTheme.g1)}&g2=${encodeURIComponent(coverTheme.g2)}` +
       `&g3=${encodeURIComponent(coverTheme.g3)}&tc=${encodeURIComponent(coverTheme.tc)}`,
   );
@@ -684,7 +684,7 @@
   }
 
   function copyDataDir() {
-    copyText(dataDir || "%APPDATA%\\com.a.flowread");
+    copyText(dataDir || "%APPDATA%\\com.a.tidepage");
     toast("数据目录已复制");
   }
 
@@ -926,9 +926,9 @@
   // 打开设置时自动把已装字体的旧名修正为字体内部真实名（只需一次）
   $effect(() => {
     let key = "";
-    try { key = localStorage.getItem("flowread.font.mig") ?? ""; } catch { /* ignore */ }
+    try { key = localStorage.getItem("tidepage.font.mig") ?? ""; } catch { /* ignore */ }
     if (key !== "1") {
-      try { localStorage.setItem("flowread.font.mig", "1"); } catch { /* ignore */ }
+      try { localStorage.setItem("tidepage.font.mig", "1"); } catch { /* ignore */ }
       refreshFontNames(true);
     }
   });
@@ -1062,7 +1062,7 @@
     return `${device} · ${at}`;
   }
 
-  /** 读取云端备份列表（仅 FlowRead/settings 下 config-*.json）。 */
+  /** 读取云端备份列表（仅 TidePage/settings 下 config-*.json）。 */
   async function loadBackupList() {
     const wd = config.webdav;
     if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
@@ -1071,7 +1071,7 @@
     }
     backupListBusy = true;
     try {
-      const items = await api.webdavList(wd.base, wd.user, wd.pass, "FlowRead/settings");
+      const items = await api.webdavList(wd.base, wd.user, wd.pass, "TidePage/settings");
       backupList = items
         .filter((it) => !it.is_dir && /^config-.*\.json$/.test(it.name))
         .map((it) => ({ name: it.name, mtime: it.mtime || 0 }))
@@ -1554,7 +1554,7 @@
       <label>背景图片</label>
       <div class="row-inline">
         {#if config.reader.bgImage}
-          <img class="bg-thumb" src={"http://flowread.localhost/bg/" + config.reader.bgImage} alt="" />
+          <img class="bg-thumb" src={"http://tidepage.localhost/bg/" + config.reader.bgImage} alt="" />
           <button onclick={pickBgImage}>更换图片</button>
           <button onclick={removeBgImage}>移除图片</button>
         {:else}
@@ -2499,14 +2499,14 @@
     <p class="sec-title">关于</p>
     <div class="field">
       <label>版本</label>
-      <div class="sec-val">FlowRead · {APP_VERSION}</div>
+      <div class="sec-val">TidePage · {APP_VERSION}</div>
     </div>
   </div>
     </section>
   </div>
 
   <footer class="set-foot">
-    <span class="ver">FlowRead {APP_VERSION}</span>
+    <span class="ver">TidePage {APP_VERSION}</span>
     <button class="primary" onclick={() => (ui.settingsOpen = false)}>完成</button>
   </footer>
 </div>

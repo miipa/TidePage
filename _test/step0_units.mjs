@@ -1,4 +1,4 @@
-﻿import fs from "node:fs";
+import fs from "node:fs";
 import path from "node:path";
 import { assertLaunchEnv, buildSandboxEnv, assertTestConfig, SANDBOX_ROOT } from "../_test/isolation_guard.mjs";
 import { launchSandbox } from "../_test/launch_sandbox.mjs";
@@ -9,7 +9,7 @@ const must = (cond, label) => { console.log((cond ? "PASS      " : "!!FAIL    ")
 
 console.log("SANDBOX_ROOT =", SANDBOX_ROOT);
 
-const real = "C:\\Users\\A\\AppData\\Local\\com.a.flowread\\EBWebView";
+const real = "C:\\Users\\A\\AppData\\Local\\com.a.tidepage\\EBWebView";
 must(fs.existsSync(real), "real profile exists (sanity)");
 
 ok("A-real-default", () => assertLaunchEnv({ WEBVIEW2_USER_DATA_FOLDER: real }));

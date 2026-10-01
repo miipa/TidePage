@@ -19,7 +19,7 @@ let app = null;
 const SHOT = async (M, n) => { try { const s = await M.call("Page.captureScreenshot", { format: "png" }); if (s?.data) { fs.writeFileSync(path.join(evid, n), Buffer.from(s.data, "base64")); return true; } } catch {} return false; };
 
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "fin_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "fin_diag.log") });
   let M = null; for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
 
@@ -53,7 +53,7 @@ try {
   `));
   const hlIds = await M.evalJs(H(`
     const id=await inv('add_highlight',{bookId:${ids.a},chapterIndex:0,chapterTitle:'第一章',start:0,end:6,text:'这是一段',style:'underline',color:'',note:''});
-    window.dispatchEvent(new CustomEvent('flowread-jump',{detail:0})); await sleep(1500);
+    window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:0})); await sleep(1500);
     return { hlNoNote: id, hasDebug: !!window.__frDebug };
   `));
   out.steps.hlIds = hlIds;
@@ -83,7 +83,7 @@ try {
   // H2: 悬停该划线（有 note）→ 浮层；再悬停一条 note='' → 不弹
   const hlNoNote2 = await M.evalJs(H(`
     const id=await inv('add_highlight',{bookId:${ids.a},chapterIndex:0,chapterTitle:'第一章',start:8,end:12,text:'用于悬停',style:'underline',color:'',note:''});
-    window.dispatchEvent(new CustomEvent('flowread-jump',{detail:0})); await sleep(1200);
+    window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:0})); await sleep(1200);
     return id;
   `));
   out.steps.h2 = await M.evalJs(H(`

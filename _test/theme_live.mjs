@@ -27,8 +27,8 @@ const cards=(rounds=200)=>wait(()=>{const c=qa('.card,.row');return c.length?c:n
 const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
 const q=(s)=>document.querySelector(s);
 const qa=(s)=>[...document.querySelectorAll(s)];
-const cfgRead=()=>JSON.parse(localStorage.getItem('flowread.config.v1')||'{}');
-const bcRead=()=>JSON.parse(localStorage.getItem('flowread.bookcfg.v1')||'{}');
+const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
+const bcRead=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const cssvar=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const openSettings=async(tab)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };
 const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(300); };
@@ -47,7 +47,7 @@ async function ensureReady(M, label) {
 const out = { steps: {} };
 let app = null;
 try {
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: diagLog });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: diagLog });
   log("launched pid " + app.child.pid);
   let M = null;
   for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
@@ -175,12 +175,12 @@ try {
   log("del: " + JSON.stringify(out.steps.del));
 
   // ---- 5) 持久化：重载后方案与皮肤保持 ----
-  await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('flowread.config.v1')); localStorage.setItem('fr.t.schemes', JSON.stringify(c.readerSchemes.map(s=>s.name))); localStorage.setItem('fr.t.skin', c.uiSkinDark); setTimeout(()=>location.reload(),80); return 1; })()`);
+  await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('tidepage.config.v1')); localStorage.setItem('fr.t.schemes', JSON.stringify(c.readerSchemes.map(s=>s.name))); localStorage.setItem('fr.t.skin', c.uiSkinDark); setTimeout(()=>location.reload(),80); return 1; })()`);
   await sleep(3500);
   M.close();
   M = await connectTarget(PORT, isApp);
   await ensureReady(M, "after reload");
-  out.steps.persist = await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('flowread.config.v1')); const want=JSON.parse(localStorage.getItem('fr.t.schemes')); return { schemes: c.readerSchemes.map(s=>s.name), equal: JSON.stringify(c.readerSchemes.map(s=>s.name))===JSON.stringify(want), skin: c.uiSkinDark, skinEqual: c.uiSkinDark===localStorage.getItem('fr.t.skin') }; })()`);
+  out.steps.persist = await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('tidepage.config.v1')); const want=JSON.parse(localStorage.getItem('fr.t.schemes')); return { schemes: c.readerSchemes.map(s=>s.name), equal: JSON.stringify(c.readerSchemes.map(s=>s.name))===JSON.stringify(want), skin: c.uiSkinDark, skinEqual: c.uiSkinDark===localStorage.getItem('fr.t.skin') }; })()`);
   log("persist: " + JSON.stringify(out.steps.persist));
 
   M.close();

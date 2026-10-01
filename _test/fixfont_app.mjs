@@ -33,7 +33,7 @@ const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
 const out = { steps: {} };
 let child = null;
 try {
-  const env = { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FR_TEST_CDP_PORT: "0", FLOWREAD_DATA_DIR: data };
+  const env = { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FR_TEST_CDP_PORT: "0", TIDEPAGE_DATA_DIR: data };
   child = spawn("cmd.exe", ["/d", "/s", "/c", "npm run tauri dev"], { cwd: REPO, env, stdio: ["ignore", diag, diag], windowsHide: true });
   log("spawned cmd pid " + child.pid);
 
@@ -87,7 +87,7 @@ try {
     await sleep(200);
     const r=field('字号')?.querySelector('input[type=range]'); if(r){ r.value='40'; r.dispatchEvent(new Event('input',{bubbles:true})); r.dispatchEvent(new Event('change',{bubbles:true})); }
     await sleep(400);
-    const cfg=JSON.parse(localStorage.getItem('flowread.config.v1'));
+    const cfg=JSON.parse(localStorage.getItem('tidepage.config.v1'));
     return { font: cfg.reader.fontFamily, size: cfg.reader.fontSize };
   `));
   log("set: " + JSON.stringify(out.steps.set));

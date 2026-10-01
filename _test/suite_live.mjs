@@ -1,4 +1,4 @@
-// FlowRead 实机回归（“关闭思考”功能已彻底移除后的 auto-only 版本）。
+// TidePage 实机回归（“关闭思考”功能已彻底移除后的 auto-only 版本）。
 // 覆盖：seed 后旧键不残留、非本机端点守卫、ollama/openai 兼容发送恒 auto（无 think/reasoning 键、形状一致）、
 // AI 分页不跳末页（切换「每行字数上限」触发重排）、发送密钥不泄露、故障注入树回收。
 import fs from "node:fs";
@@ -22,7 +22,7 @@ const HELPER = `
 const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
 const wait=async(fn,name,rounds=150)=>{for(let i=0;i<rounds;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+name)};
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
-const cfgRead=()=>JSON.parse(localStorage.getItem('flowread.config.v1')||'{}');
+const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
 const openBook=async()=>{ if(!document.querySelector('#chapter-content')){ const c=await wait(()=>document.querySelector('.card,.row'),'card'); c.dispatchEvent(new MouseEvent('dblclick',{bubbles:true})); await wait(()=>document.querySelector('#chapter-content'),'chapter'); } await sleep(500); };
 const openDrawer=async()=>{ localStorage.setItem('fr.ai.mode','drawer'); if(!document.querySelector('.ai-panel')) [...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='AI')?.click(); const d=await wait(()=>document.querySelector('.ai-panel'),'panel'); if(!d.classList.contains('reader')){[...d.querySelectorAll('button')].find(x=>x.textContent.includes('阅读样式'))?.click();await sleep(400);} return d; };
 const openSettings=async(tab)=>{ document.querySelector('button[title="设置"]')?.click(); await wait(()=>document.querySelector('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(250); };
@@ -49,21 +49,21 @@ async function waitForCdp(timeoutMs = 360_000) {
 async function ensureReady(cdp, timeoutMs = 60_000) {
   const t0 = Date.now();
   for (;;) {
-    try { await cdp.evalJs(`(()=>{localStorage.getItem('flowread.config.v1');return location.href})()`); return; }
+    try { await cdp.evalJs(`(()=>{localStorage.getItem('tidepage.config.v1');return location.href})()`); return; }
     catch (e) { if (Date.now() - t0 > timeoutMs) throw e; await sleep(500); }
   }
 }
 function auditTree() {
   const psScript =
-    "$fr=@(Get-Process flowread -EA SilentlyContinue).Count;" +
-    "$dev=@(Get-CimInstance Win32_Process | Where-Object { ($_.Name -match '^(node|cargo|rustc|flowread)\\.exe$' -and $_.CommandLine -match 'tauri dev|vite|flowread_lib') -or ($_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'tauri dev') }).Count;" +
+    "$fr=@(Get-Process tidepage -EA SilentlyContinue).Count;" +
+    "$dev=@(Get-CimInstance Win32_Process | Where-Object { ($_.Name -match '^(node|cargo|rustc|tidepage)\\.exe$' -and $_.CommandLine -match 'tauri dev|vite|tidepage_lib') -or ($_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'tauri dev') }).Count;" +
     "$wv=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -match 'fr_test_profiles' }).Count;" +
     "$ls=@(Get-NetTCPConnection -State Listen -EA SilentlyContinue | Where-Object { $_.LocalPort -in 9444,1420 }).Count;" +
     "\"$fr|$dev|$wv|$ls\"";
   try {
     const [fr, dev, wv, ls] = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", psScript], { encoding: "utf8" }).trim().split("|");
-    return { flowread: Number(fr), tauriDev: Number(dev), sandboxWebView: Number(wv), listeners9444_1420: Number(ls) };
-  } catch { return { flowread: -1, tauriDev: -1, sandboxWebView: -1, listeners9444_1420: -1 }; }
+    return { tidepage: Number(fr), tauriDev: Number(dev), sandboxWebView: Number(wv), listeners9444_1420: Number(ls) };
+  } catch { return { tidepage: -1, tauriDev: -1, sandboxWebView: -1, listeners9444_1420: -1 }; }
 }
 
 const out = {};
@@ -91,7 +91,7 @@ try {
         profiles:[{name:"TEST-EP",provider:"ollama",baseUrl:"http://127.0.0.1:18081",apiKey:"sk-GUARDTEST-PLACEHOLDER-9f3k2l",model:"mock",proxyMode:"direct",proxyUrl:""}],
         prompts:[{id:1,name:"测试总结",key:"F1",text:"总结：{chapter}"}], display:"reader", style: base.ai?.style||{} },
       webdav:{enabled:false}, regex:"" };
-    localStorage.setItem("flowread.config.v1", JSON.stringify(cfg));
+    localStorage.setItem("tidepage.config.v1", JSON.stringify(cfg));
     setTimeout(()=>location.reload(),200);
     return "seeded+reloading";
   `));
@@ -115,10 +115,10 @@ try {
     const n0 = mockReqs().length;
     await M.evalJs(H(`
       const c=cfgRead(); c.ai.profiles.push({name:"EVIL-DEEPSEEK",provider:"openai",baseUrl:"https://api.deepseek.com",apiKey:"x",model:"deepseek-chat",proxyMode:"auto",proxyUrl:""});
-      localStorage.setItem("flowread.config.v1", JSON.stringify(c)); return 1`));
+      localStorage.setItem("tidepage.config.v1", JSON.stringify(c)); return 1`));
     out.B_blockedWith = await expectSendBlocked(M, "非本机端点");
     out.B_mockDelta = mockReqs().length - n0;
-    await M.evalJs(H(`const c=cfgRead(); c.ai.profiles=c.ai.profiles.filter(p=>p.name!=="EVIL-DEEPSEEK"); localStorage.setItem("flowread.config.v1", JSON.stringify(c)); return 1`));
+    await M.evalJs(H(`const c=cfgRead(); c.ai.profiles=c.ai.profiles.filter(p=>p.name!=="EVIL-DEEPSEEK"); localStorage.setItem("tidepage.config.v1", JSON.stringify(c)); return 1`));
   }
 
   log("S 发送恒 auto（ollama 两章 + openai 兼容）");
@@ -191,7 +191,7 @@ try {
   let a = null;
   for (let i = 0; i < 10; i++) {
     a = auditTree();
-    if (a.flowread === 0 && a.tauriDev === 0 && a.sandboxWebView === 0 && a.listeners9444_1420 === 0) break;
+    if (a.tidepage === 0 && a.tauriDev === 0 && a.sandboxWebView === 0 && a.listeners9444_1420 === 0) break;
     await sleep(2000);
   }
   out.teardownAudit = a;

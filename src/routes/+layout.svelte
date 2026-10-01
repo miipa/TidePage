@@ -151,7 +151,7 @@
 </script>
 
 <svelte:head>
-  <title>FlowRead</title>
+  <title>TidePage</title>
 </svelte:head>
 
 {@render children()}

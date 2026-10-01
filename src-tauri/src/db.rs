@@ -1018,10 +1018,12 @@ pub fn delete_books_policy(
     paths: &[String],
     keep_notes: bool,
 ) -> Result<(), String> {
+    // has_fts 为 pragma 查询：提到循环外只算一次，避免每本书重复查询。
+    let fts = has_fts(conn);
     for p in paths {
         delete_book_with_policy(conn, p, keep_notes)?;
-        let id = path_id(p);
-        if has_fts(conn) {
+        if fts {
+            let id = path_id(p);
             conn.execute("DELETE FROM fts WHERE book_id=?1", params![id])
                 .ok();
         }

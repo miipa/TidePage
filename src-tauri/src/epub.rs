@@ -1099,11 +1099,11 @@ pub fn chapter_html_multi_ci(
 }
 
 /// 生成按需图片 URL（不内联 base64，避免单章 HTML 达到几百 KB）。
-/// 形如 `http://flowread.localhost/epubimg/<book_id>/<b64url(zip内路径)>`。
+/// 形如 `http://tidepage.localhost/epubimg/<book_id>/<b64url(zip内路径)>`。
 pub fn epub_image_url(book_id: i64, target: &str) -> String {
     use base64::Engine;
     let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-    format!("http://flowread.localhost/epubimg/{book_id}/{enc}")
+    format!("http://tidepage.localhost/epubimg/{book_id}/{enc}")
 }
 
 /// 把单个 XHTML 文档渲染为可内联进阅读器的 HTML 片段（复用已打开的 zip 与索引）。
@@ -1890,7 +1890,7 @@ pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
     drop(zip);
 
     let opf_key = opf_path.replace('\\', "/").to_lowercase();
-    let tmp = format!("{path}.flowread-tmp");
+    let tmp = format!("{path}.tidepage-tmp");
     {
         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         let mut zw = zip::ZipWriter::new(file);
@@ -2163,10 +2163,10 @@ mod tests {
         );
     }
 
-    /// 设置 FLOWREAD_PROFILE_EPUB 时，校验按需图片 URL 能被 read_entry 正确解析。
+    /// 设置 TIDEPAGE_PROFILE_EPUB 时，校验按需图片 URL 能被 read_entry 正确解析。
     #[test]
     fn epubimg_urls_resolve() {
-        let path = match std::env::var("FLOWREAD_PROFILE_EPUB") {
+        let path = match std::env::var("TIDEPAGE_PROFILE_EPUB") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => return,
         };

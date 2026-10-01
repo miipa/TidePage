@@ -273,7 +273,7 @@
   .fr-toast-wrap {
     position: fixed;
     left: 16px;
-    bottom: 16px;
+    bottom: 52px; /* 底栏高度约 30–34px + 间距：通知浮在书库状态栏 / 阅读页底栏之上，不遮挡 */
     display: flex;
     flex-direction: column;
     gap: 8px;

@@ -210,7 +210,7 @@ pub fn font_css_face(app: &tauri::AppHandle) -> String {
     let mut css = String::new();
     for (family, file) in installed_custom_fonts(app) {
         css.push_str(&format!(
-            "@font-face {{ font-family: \"{family}\"; src: url('http://flowread.localhost/fonts/{file}'); }}"
+            "@font-face {{ font-family: \"{family}\"; src: url('http://tidepage.localhost/fonts/{file}'); }}"
         ));
     }
     css

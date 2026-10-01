@@ -16,7 +16,7 @@ use base64::Engine;
 pub const SECRET_SETTING_KEY: &str = "secret.config";
 
 /// 固定附加熵：绑定到本应用语义，避免跨程序误用。
-const ENTROPY: &[u8] = b"FlowRead.secret.config.v1";
+const ENTROPY: &[u8] = b"TidePage.secret.config.v1";
 
 #[cfg(windows)]
 mod dpapi {

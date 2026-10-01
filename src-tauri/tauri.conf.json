@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "FlowRead",
+  "productName": "TidePage",
   "version": "0.1.25",
-  "identifier": "com.a.flowread",
+  "identifier": "com.a.tidepage",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://flowread.localhost; font-src 'self' data: http://flowread.localhost; media-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost http://flowread.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://tidepage.localhost; font-src 'self' data: http://tidepage.localhost; media-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost http://tidepage.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {

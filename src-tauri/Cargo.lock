@@ -1335,45 +1335,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowread"
-version = "0.1.25"
-dependencies = [
- "aes-gcm",
- "base64 0.22.1",
- "chardetng",
- "encoding_rs",
- "fancy-regex",
- "futures-util",
- "html5ever 0.39.0",
- "image",
- "mobi",
- "notify",
- "pbkdf2",
- "quick-xml 0.36.2",
- "rand 0.8.8",
- "rayon",
- "regex",
- "reqwest 0.12.28",
- "rfd",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tauri-plugin-window-state",
- "tendril",
- "tokio",
- "tokio-tungstenite",
- "trash",
- "walkdir",
- "windows 0.61.3",
- "winreg",
- "zip",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4736,6 +4697,45 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "tidepage"
+version = "0.1.25"
+dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "chardetng",
+ "encoding_rs",
+ "fancy-regex",
+ "futures-util",
+ "html5ever 0.39.0",
+ "image",
+ "mobi",
+ "notify",
+ "pbkdf2",
+ "quick-xml 0.36.2",
+ "rand 0.8.8",
+ "rayon",
+ "regex",
+ "reqwest 0.12.28",
+ "rfd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tauri-plugin-window-state",
+ "tendril",
+ "tokio",
+ "tokio-tungstenite",
+ "trash",
+ "walkdir",
+ "windows 0.61.3",
+ "winreg",
+ "zip",
 ]
 
 [[package]]

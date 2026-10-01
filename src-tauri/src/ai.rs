@@ -556,9 +556,9 @@ pub fn sanitize_messages(messages: &[(String, String)]) -> Vec<(String, String)>
 }
 
 /// 溯源（独立宽松版）：**不复用 is_budget_line**，用子串宽松匹配捕捉任何漏删残留。
-/// `FLOWREAD_AI_TRACE=1` 时逐条打印 idx/role/len；命中打印 head= 残留原文。
+/// `TIDEPAGE_AI_TRACE=1` 时逐条打印 idx/role/len；命中打印 head= 残留原文。
 pub fn trace_budget(messages: &[(String, String)]) {
-    if std::env::var("FLOWREAD_AI_TRACE").as_deref() != Ok("1") {
+    if std::env::var("TIDEPAGE_AI_TRACE").as_deref() != Ok("1") {
         return;
     }
     let total: usize = messages.iter().map(|(_, c)| c.chars().count()).sum();
@@ -945,7 +945,7 @@ pub async fn stream_chat(
     messages: Vec<(String, String)>,
 ) -> Result<(), AiError> {
     // 溯源（清洗前）：显示进入本层的原始 messages 是否已含 budget 残留。
-    // FLOWREAD_AI_TRACE=1 时，先打印一块 [ai-trace]（pre），再由 build_request 打印清洗后的（post）。
+    // TIDEPAGE_AI_TRACE=1 时，先打印一块 [ai-trace]（pre），再由 build_request 打印清洗后的（post）。
     // 若 pre hits>0 而 post hits=0 → 注入来自上游（客户端配置/网关/代理），清洗已摘除。
     trace_budget(&messages);
     let p = Provider::parse(&cfg.provider);
@@ -1793,7 +1793,7 @@ async fn synth_volcano(
     let cluster = if p.cluster.trim().is_empty() { "volcano_tts" } else { p.cluster.trim() };
     let body = json!({
         "app": { "appid": p.app_id.trim(), "token": p.api_key.trim(), "cluster": cluster },
-        "user": { "uid": "flowread" },
+        "user": { "uid": "tidepage" },
         "audio": { "voice_type": voice, "encoding": fmt, "rate": 24000 },
         "request": { "reqid": unique_reqid(), "text": text, "text_type": "plain", "operation": "query" },
     });
@@ -1847,7 +1847,7 @@ async fn synth_baidu(
     let form = [
         ("tex", text),
         ("tok", token.as_str()),
-        ("cuid", "flowread"),
+        ("cuid", "tidepage"),
         ("ctp", "1"),
         ("lan", "zh"),
         ("spd", "5"),
@@ -2551,7 +2551,7 @@ mod budget_sanitize {
     }
 
     /// 走真实出站构造路径（build_request → sanitize_messages → trace_budget）。
-    /// 外部以 `FLOWREAD_AI_TRACE=1 cargo test trace_real_path -- --nocapture` 运行时，
+    /// 外部以 `TIDEPAGE_AI_TRACE=1 cargo test trace_real_path -- --nocapture` 运行时，
     /// 会打印 `[ai-trace] total=/hits=`。断言：出站 body 不含 budget 字样。
     #[test]
     fn trace_real_path() {
@@ -2580,7 +2580,7 @@ mod budget_sanitize {
     ///   1) trace_budget(&raw)  —— pre（原始 messages）
     ///   2) build_request(...)   —— 内部 sanitize + trace_budget(cleaned) post
     ///   3) 真发 TCP HTTP POST 到本地服务并读回 200
-    /// 以 `FLOWREAD_AI_TRACE=1 cargo test real_http_roundtrip_trace -- --nocapture` 运行。
+    /// 以 `TIDEPAGE_AI_TRACE=1 cargo test real_http_roundtrip_trace -- --nocapture` 运行。
     #[test]
     fn real_http_roundtrip_trace() {
         use std::io::{Read, Write};
@@ -2639,6 +2639,6 @@ mod budget_sanitize {
         let polluted: Vec<(String, String)> = vec![
             ("user".to_string(), "正常正文\n<budget:token_budget>20oooo</budget:token_budget>".to_string()),
         ];
-        trace_budget(&polluted); // FLOWREAD_AI_TRACE=1 时打印 hits=1 + head=
+        trace_budget(&polluted); // TIDEPAGE_AI_TRACE=1 时打印 hits=1 + head=
     }
 }

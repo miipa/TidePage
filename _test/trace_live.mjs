@@ -1,4 +1,4 @@
-// 真实请求 pre/post trace：本地 mock 端点 + FLOWREAD_AI_TRACE=1，抓 Rust stderr 的 [ai-trace]。
+// 真实请求 pre/post trace：本地 mock 端点 + TIDEPAGE_AI_TRACE=1，抓 Rust stderr 的 [ai-trace]。
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -21,7 +21,7 @@ try {
   mock = spawn(process.execPath, [path.join(process.cwd(), "_test", "mock_ai_server.mjs")], { stdio: "ignore", windowsHide: true });
   await sleep(800);
   app = launchSandbox({
-    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data, FLOWREAD_AI_TRACE: "1" },
+    env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data, TIDEPAGE_AI_TRACE: "1" },
     cdpPort: PORT, logFile: diag,
   });
   console.log("[trace-live] launched pid", app.child.pid);
@@ -36,12 +36,12 @@ try {
   await sleep(1200);
   // 种本地端点
   await M.evalJs(H(`
-    const raw=localStorage.getItem('flowread.config.v1');
+    const raw=localStorage.getItem('tidepage.config.v1');
     const c=raw?JSON.parse(raw):{};
     c.ai=Object.assign({},c.ai||{},{enabled:true,autoOnChapter:false,active:0,
       profiles:[{id:1,name:'MOCK',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',deployment:'',apiVersion:'',proxyMode:'direct',proxyUrl:''}],
       prompts:[{id:1,name:'总结',key:'F1',text:'总结：{chapter}'}],display:'reader'});
-    localStorage.setItem('flowread.config.v1',JSON.stringify(c));
+    localStorage.setItem('tidepage.config.v1',JSON.stringify(c));
     return 1;
   `));
   await M.evalJs(`setTimeout(()=>location.reload(),100);1`);

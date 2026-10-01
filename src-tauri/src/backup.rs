@@ -44,7 +44,7 @@ fn derive_key(passphrase: &str, salt: &[u8], iter: u32) -> [u8; KEY_LEN] {
 pub fn host_name() -> String {
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "flowread-pc".to_string());
+        .unwrap_or_else(|_| "tidepage-pc".to_string());
     let s: String = raw
         .chars()
         .map(|c| {
@@ -56,7 +56,7 @@ pub fn host_name() -> String {
         })
         .collect();
     if s.is_empty() {
-        "flowread-pc".to_string()
+        "tidepage-pc".to_string()
     } else {
         s
     }

@@ -40,18 +40,18 @@
   function lsGet(k: string, fallback: string): string {
     try { return localStorage.getItem(k) ?? fallback; } catch { return fallback; }
   }
-  const sb0 = lsGet("flowread.wd.sortBy", "time");
-  const sd0 = lsGet("flowread.wd.sortDir", "desc");
+  const sb0 = lsGet("tidepage.wd.sortBy", "time");
+  const sd0 = lsGet("tidepage.wd.sortDir", "desc");
   let sortBy = $state<"name" | "time" | "size">(sb0 === "name" || sb0 === "size" ? sb0 : "time");
   let sortDir = $state<"asc" | "desc">(sd0 === "asc" ? "asc" : "desc");
-  let foldersFirst = $state(lsGet("flowread.wd.foldersFirst", "1") !== "0");
+  let foldersFirst = $state(lsGet("tidepage.wd.foldersFirst", "1") !== "0");
 
   // 任一排序状态变化即写回（首次运行写入默认值，无害）。
   $effect(() => {
     try {
-      localStorage.setItem("flowread.wd.sortBy", sortBy);
-      localStorage.setItem("flowread.wd.sortDir", sortDir);
-      localStorage.setItem("flowread.wd.foldersFirst", foldersFirst ? "1" : "0");
+      localStorage.setItem("tidepage.wd.sortBy", sortBy);
+      localStorage.setItem("tidepage.wd.sortDir", sortDir);
+      localStorage.setItem("tidepage.wd.foldersFirst", foldersFirst ? "1" : "0");
     } catch { /* ignore */ }
   });
 
@@ -72,14 +72,14 @@
   });
 
   function rememberedPath(): string {
-    try { return localStorage.getItem("flowread.wd.path") ?? ""; } catch { return ""; }
+    try { return localStorage.getItem("tidepage.wd.path") ?? ""; } catch { return ""; }
   }
 
   /// 列目录：成功返回 true。失败只置 error（保留 path、不回连接页），交由界面展示错误+重试。
   async function load(p?: string): Promise<boolean> {
     if (p !== undefined) {
       path = p;
-      try { localStorage.setItem("flowread.wd.path", p); } catch { /* ignore */ }
+      try { localStorage.setItem("tidepage.wd.path", p); } catch { /* ignore */ }
     }
     loading = true;
     error = "";

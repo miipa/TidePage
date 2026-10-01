@@ -54,7 +54,7 @@ pub struct ChapterData {
 /// 全书图片查看器：一张图片的引用（按 spine/章节顺序）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookImage {
-    /// 按需加载 URL（http://flowread.localhost/...）
+    /// 按需加载 URL（http://tidepage.localhost/...）
     pub url: String,
     /// 所属章节下标
     pub chapter_index: i64,

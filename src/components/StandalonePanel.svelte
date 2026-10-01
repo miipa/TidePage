@@ -1,9 +1,9 @@
 <!-- 独立面板窗口容器：由 +page.svelte 在 ?panel=xxx&book=<id> 时挂载。
      数据源约定（任务 5）：
        toc / bookmarks / stats → ① 按 URL 的 book id 首屏自拉现有 api（openBook/listBookmarks/BookStatsModal 自载）；
-       highlights           → ①首屏自拉 + ② 订阅主窗广播 flowread-hl-changed 实时刷新；
+       highlights           → ①首屏自拉 + ② 订阅主窗广播 tidepage-hl-changed 实时刷新；
        notes                → NotesPanel 组件本体自载（① 自拉，未改其本体）。
-     跳转类操作通过 Tauri event 广播回主窗（flowread-goto-chapter / flowread-goto-highlight）。
+     跳转类操作通过 Tauri event 广播回主窗（tidepage-goto-chapter / tidepage-goto-highlight）。
      吸附：本窗作为卫星窗 startSnap()，onDestroy 时 stopSnap() 清理监听与吸附组引用。 -->
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
@@ -53,7 +53,7 @@
         curChapter = p?.chapter_index ?? 0;
       } catch { /* ignore */ }
       // 订阅主窗“当前章变化”广播：仅本窗对应 book 生效，TocPanel 会据 current 自动定位/高亮。
-      unChap = await listen<{ bookId: number; index: number }>("flowread-chapter-changed", (e) => {
+      unChap = await listen<{ bookId: number; index: number }>("tidepage-chapter-changed", (e) => {
         if (e.payload?.bookId === bookId && typeof e.payload.index === "number") {
           curChapter = e.payload.index;
         }
@@ -62,18 +62,18 @@
       await loadTitle();
       try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
       // 订阅主窗书签增删：仅本窗对应 book 生效，重新拉取列表。
-      unBm = await listen<{ bookId: number }>("flowread-bookmarks-changed", async (e) => {
+      unBm = await listen<{ bookId: number }>("tidepage-bookmarks-changed", async (e) => {
         if (e.payload?.bookId === bookId) {
           try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
         }
       });
     } else if (panel === "highlights") {
       await loadTitle();
-      unHl = await listen("flowread-hl-changed", () => { hlVersion++; }); // ② 订阅主窗广播
+      unHl = await listen("tidepage-hl-changed", () => { hlVersion++; }); // ② 订阅主窗广播
     } else if (panel === "stats") {
       await loadTitle();
       // 订阅主窗阅读会话刷新：仅本窗对应 book 生效，version++ 触发 BookStatsModal 重载。
-      unStats = await listen<{ bookId: number }>("flowread-stats-changed", (e) => {
+      unStats = await listen<{ bookId: number }>("tidepage-stats-changed", (e) => {
         if (e.payload?.bookId === bookId) statsVersion++;
       });
     }
@@ -87,10 +87,10 @@
   });
 
   function gotoChapter(index: number) {
-    void emit("flowread-goto-chapter", { index });
+    void emit("tidepage-goto-chapter", { index });
   }
   function gotoHighlight(h: HighlightRow) {
-    void emit("flowread-goto-highlight", { id: h.id });
+    void emit("tidepage-goto-highlight", { id: h.id });
   }
 </script>
 

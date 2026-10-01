@@ -33,7 +33,7 @@ export interface BookOverride {
   schemeFontWeight?: number;
 }
 
-const KEY = "flowread.bookcfg.v1";
+const KEY = "tidepage.bookcfg.v1";
 
 function loadMap(): Record<string, BookOverride> {
   try {

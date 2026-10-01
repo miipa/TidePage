@@ -1,10 +1,10 @@
 import sqlite3, os, sys, time, glob
 
 appdata = os.environ["APPDATA"]
-db = os.path.join(appdata, "com.a.flowread", "flowread.db")
+db = os.path.join(appdata, "com.a.tidepage", "tidepage.db")
 print("db:", db, "exists:", os.path.exists(db))
-for f in ["flowread.db", "flowread.db-wal", "flowread.db-shm"]:
-    p = os.path.join(appdata, "com.a.flowread", f)
+for f in ["tidepage.db", "tidepage.db-wal", "tidepage.db-shm"]:
+    p = os.path.join(appdata, "com.a.tidepage", f)
     if os.path.exists(p):
         print(f"{f}: {os.path.getsize(p):,} bytes")
 

@@ -535,7 +535,7 @@ pub fn extract_records_and_decompress_limited(
                 Err(format!(
                     "PalmDocFormatError: HUFF/CDIC 正文解码失败（{first_err}）。\
                      该书可能为不支持的 KF8 变体或压缩表受损，请在书库中「转换为 EPUB」后再阅读\
-                     （设 FLOWREAD_MOBI_DIAG=1 可输出诊断信息）"
+                     （设 TIDEPAGE_MOBI_DIAG=1 可输出诊断信息）"
                 ))
             }
         },
@@ -1609,7 +1609,7 @@ fn build_mobi_doc(
     // res_urls 语义：成功重写为书内本地资源 URL 的图片引用数（验收指标之一）
     let res_urls = rewrite_stats.rewritten;
     let (toc, parts) = split_mobi_chapters(&html);
-    if std::env::var("FLOWREAD_MOBI_DIAG").is_ok() {
+    if std::env::var("TIDEPAGE_MOBI_DIAG").is_ok() {
         let kf8 = detect_kf8(&mobi);
         let m = &mobi.metadata.mobi;
         let recs = raw_records_safe(&mobi);
@@ -2174,7 +2174,7 @@ mod tests {
 
     #[test]
     fn sniff_drm_file_fast_path() {
-        let dir = std::env::temp_dir().join(format!("flowread-mobi-sniff-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-sniff-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 明文：嗅探应放行
         let ok_file = dir.join("plain.mobi");
@@ -2308,16 +2308,16 @@ mod tests {
         .build();
         detect_drm(&b).unwrap();
         let mobi = Mobi::new(&b).unwrap();
-        let dir = std::env::temp_dir().join(format!("flowread-mobi-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://flowread.localhost/res/1/");
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://tidepage.localhost/res/1/");
         assert_eq!(ordered.len(), 2, "应提取 2 张图");
         std::fs::remove_dir_all(&dir).ok();
         let html = String::from_utf8_lossy(&text).to_string();
         let fi = mobi.metadata.mobi.first_image_index;
         let (out, st) = rewrite_images(&html, &by_rec, &by_res, &ordered, fi);
-        assert!(out.contains("http://flowread.localhost/res/1/r00002.jpg"), "{out}");
-        assert!(out.contains("http://flowread.localhost/res/1/r00003.png"), "{out}");
+        assert!(out.contains("http://tidepage.localhost/res/1/r00002.jpg"), "{out}");
+        assert!(out.contains("http://tidepage.localhost/res/1/r00003.png"), "{out}");
         assert!(!out.contains("recindex"), "{out}");
         assert!(!out.contains("kindle:embed"), "{out}");
         assert!(!out.contains("\"1.jpg\""), "{out}");
@@ -2350,7 +2350,7 @@ mod tests {
         }
         .build();
         let mobi = Mobi::new(&b).unwrap();
-        let dir = std::env::temp_dir().join(format!("flowread-mobi-rec-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/");
         std::fs::remove_dir_all(&dir).ok();
@@ -2491,7 +2491,7 @@ mod tests {
             text_encoding: 65001,
         }
         .build();
-        let dir = std::env::temp_dir().join(format!("flowread-mobi-synth-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-synth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("synth.mobi");
@@ -2741,18 +2741,18 @@ mod tests {
         assert!(!out.contains("script"), "{out}");
         assert!(out.contains("<p>KEEP</p>"), "{out}");
     }
-    /// 端到端真实文件测试：设置 FLOWREAD_TEST_MOBI="路径1;路径2" 时运行
+    /// 端到端真实文件测试：设置 TIDEPAGE_TEST_MOBI="路径1;路径2" 时运行
     #[test]
     fn real_world_samples_end_to_end() {
-        let env = match std::env::var("FLOWREAD_TEST_MOBI") {
+        let env = match std::env::var("TIDEPAGE_TEST_MOBI") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => {
-                eprintln!("skip: FLOWREAD_TEST_MOBI not set");
+                eprintln!("skip: TIDEPAGE_TEST_MOBI not set");
                 return;
             }
         };
         for path in env.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let dir = std::env::temp_dir().join(format!("flowread-real-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("tidepage-real-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let t0 = std::time::Instant::now();
             let doc = match parse_full(path, None, Some((&dir, "res/"))) {

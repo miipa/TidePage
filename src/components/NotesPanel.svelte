@@ -23,14 +23,14 @@
   let sortKey = $state<"recent" | "title" | "count">(
     (() => {
       try {
-        const v = localStorage.getItem("flowread.notes.sort");
+        const v = localStorage.getItem("tidepage.notes.sort");
         return v === "title" || v === "count" ? v : "recent";
       } catch { return "recent"; }
     })(),
   );
   let view = $state<"grid" | "list">(
     (() => {
-      try { return localStorage.getItem("flowread.notes.view") === "list" ? "list" : "grid"; }
+      try { return localStorage.getItem("tidepage.notes.view") === "list" ? "list" : "grid"; }
       catch { return "grid"; }
     })(),
   );
@@ -65,12 +65,12 @@
 
   function setView(v: "grid" | "list") {
     view = v;
-    try { localStorage.setItem("flowread.notes.view", v); } catch { /* ignore */ }
+    try { localStorage.setItem("tidepage.notes.view", v); } catch { /* ignore */ }
   }
 
   function setSort(v: string) {
     sortKey = v === "title" || v === "count" ? v : "recent";
-    try { localStorage.setItem("flowread.notes.sort", sortKey); } catch { /* ignore */ }
+    try { localStorage.setItem("tidepage.notes.sort", sortKey); } catch { /* ignore */ }
   }
 
   async function openDetail(b: NoteBook) {
@@ -231,7 +231,7 @@
 
   <div class="nl-status">
     <span>{shown.length} 本书 · 划线 {totalHl} 条 · 感想 {totalNotes} 条</span>
-    <span class="build" title="FlowRead 版本">FlowRead {APP_VERSION}</span>
+    <span class="build" title="TidePage 版本">TidePage {APP_VERSION}</span>
     <div class="spacer"></div>
     <button class="icon view-btn" class:active={view === "grid"} title="网格视图" aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
     <button class="icon view-btn" class:active={view === "list"} title="列表视图" aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>

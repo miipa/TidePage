@@ -58,8 +58,8 @@
     }
   }
 
-  // 交互定义：仅「右上角 ×」与「Esc」关闭图库；点击图片切换缩放；
-  // 点击图片四周留白（含图片上方）不关闭，避免误退出。
+  // 交互定义：点击图片之外的空白区域或「Esc」关闭图库；点击图片切换缩放。
+  // 不放置右上角 ×：该位置被全局窗口控件（WindowControls，z-index 100000）覆盖，会误触关闭软件。
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -78,15 +78,11 @@
     <span class="iv-meta" title={current?.chapter_title || ""}>
       {index + 1} / {total}{current?.chapter_title ? " · " + current.chapter_title : ""}
     </span>
-    <div class="iv-actions">
-      <button class="iv-btn" title="适应/原始大小" onclick={() => (zoomed = !zoomed)}>{zoomed ? "适应" : "放大"}</button>
-      <button class="iv-btn" title="关闭 (Esc)" onclick={onclose}>×</button>
-    </div>
   </div>
 
   <button class="iv-nav left" title="上一张 (←)" onclick={prev} disabled={total <= 1}>‹</button>
 
-  <div class="iv-stage">
+  <div class="iv-stage" onclick={(e) => { if (e.target === e.currentTarget) onclose(); }}>
     {#if current}
       <img
         class:zoomed
@@ -102,7 +98,7 @@
 
   <button class="iv-nav right" title="下一张 (→)" onclick={next} disabled={total <= 1}>›</button>
 
-  <div class="iv-hint">滚轮 / ← → 切换，点击图片缩放，× 或 Esc 关闭</div>
+  <div class="iv-hint">滚轮 / ← → 切换，点击图片缩放，点击图片外空白处或 Esc 关闭</div>
 </div>
 
 <style>
@@ -173,20 +169,6 @@
     text-overflow: ellipsis;
     max-width: 70%;
   }
-
-  .iv-actions { display: flex; gap: 8px; }
-
-  .iv-btn {
-    background: rgba(255, 255, 255, 0.12);
-    border: none;
-    color: #fff;
-    font-size: 13px;
-    padding: 5px 12px;
-    border-radius: 8px;
-    cursor: pointer;
-  }
-
-  .iv-btn:hover { background: rgba(255, 255, 255, 0.22); }
 
   .iv-nav {
     position: absolute;

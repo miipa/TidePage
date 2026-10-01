@@ -1,4 +1,4 @@
-$covers = Join-Path $env:APPDATA 'com.a.flowread\covers'
+$covers = Join-Path $env:APPDATA 'com.a.tidepage\covers'
 for ($i = 0; $i -lt 60; $i++) {
   $n = (Get-ChildItem $covers -ErrorAction SilentlyContinue).Count
   if ($n -gt 100) { break }

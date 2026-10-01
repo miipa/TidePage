@@ -176,7 +176,7 @@
 
   $effect(() => {
     let done = false;
-    const ctrl = listen<{ title: string; html: string }>("flowread-ai-chapter", (e) => {
+    const ctrl = listen<{ title: string; html: string }>("tidepage-ai-chapter", (e) => {
       if (!done) onChapterAuto(e.payload);
     });
     // Same-window fallback event too (浏览器原生事件不跨窗口，但面板场景保证覆盖)
@@ -184,10 +184,10 @@
       const ce = e as CustomEvent<{ title: string; html: string }>;
       if (!done) onChapterAuto(ce.detail);
     };
-    window.addEventListener("flowread-ai-chapter", local);
+    window.addEventListener("tidepage-ai-chapter", local);
     return () => {
       done = true;
-      window.removeEventListener("flowread-ai-chapter", local);
+      window.removeEventListener("tidepage-ai-chapter", local);
       ctrl.then((fn) => fn());
     };
   });
@@ -514,12 +514,12 @@ ${readerStyle.extra}
     if (isReader) {
       if (!aiStyleTag) {
         aiStyleTag = document.createElement("style");
-        aiStyleTag.id = "flowread-ai-reader-css";
+        aiStyleTag.id = "tidepage-ai-reader-css";
         document.head.appendChild(aiStyleTag);
       }
       aiStyleTag.textContent = readerCss;
     } else {
-      document.getElementById("flowread-ai-reader-css")?.remove();
+      document.getElementById("tidepage-ai-reader-css")?.remove();
       aiStyleTag = null;
     }
   });
@@ -767,7 +767,7 @@ ${readerStyle.extra}
   });
 
   /* ---------- 独立窗口：跟随主窗口设置 ---------- */
-  // 跨窗同步改由 stores.svelte.ts 里的全局 flowread-config 监听统一处理
+  // 跨窗同步改由 stores.svelte.ts 里的全局 tidepage-config 监听统一处理
   // （主/独立窗口双向、lastSavedJson 去重）；这里不再单独监听，避免旧配置覆盖刚切换的端点。
   // 首次进入时 load() 已从共享 localStorage 读取最新配置。
 
@@ -799,7 +799,7 @@ ${readerStyle.extra}
     const path = await api.pickSave("导出 AI 内容", kind, `${base}-AI.${kind}`);
     if (!path) return;
     try {
-      await api.exportAi(path, kind, ctx.title || "AI 笔记", "FlowRead AI", items);
+      await api.exportAi(path, kind, ctx.title || "AI 笔记", "TidePage AI", items);
       toast(`已导出 ${items.length} 条 AI 内容：${path}`);
     } catch (e) {
       toast(`导出失败：${e}`, "error");

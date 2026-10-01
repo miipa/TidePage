@@ -30,7 +30,7 @@ export function launchSandbox({
   return { child, env: finalEnv, cdp: `http://127.0.0.1:${cdpPort}` };
 }
 
-// 杀 cmd→npm→tauri CLI→cargo/vite→flowread 全树 + 沙箱内 WebView2 浏览器进程；循环直到归零。
+// 杀 cmd→npm→tauri CLI→cargo/vite→tidepage 全树 + 沙箱内 WebView2 浏览器进程；循环直到归零。
 export function killTree(pid) {
   try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* already gone */ }
 }

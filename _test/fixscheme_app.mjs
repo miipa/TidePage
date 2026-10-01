@@ -22,8 +22,8 @@ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
 const wait=async(fn,name,rounds=400)=>{for(let i=0;i<rounds;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+name)};
 const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)];
 const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
-const cfg=()=>JSON.parse(localStorage.getItem('flowread.config.v1')||'{}');
-const bc=()=>JSON.parse(localStorage.getItem('flowread.bookcfg.v1')||'{}');
+const cfg=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
+const bc=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const fontOf=()=>{const p=q('#chapter-content p,#chapter-content div,#chapter-content font');return p?getComputedStyle(p).fontFamily:null};
 const openSettings=async()=>{ (q('button[data-tip="设置"]')||q('button[aria-label="设置"]')||q('button[title="设置"]'))?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
 `;
@@ -31,7 +31,7 @@ const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
 const out = { steps: {} };
 let child = null;
 try {
-  const env = { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FR_TEST_CDP_PORT: "0", FLOWREAD_DATA_DIR: data };
+  const env = { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FR_TEST_CDP_PORT: "0", TIDEPAGE_DATA_DIR: data };
   child = spawn("cmd.exe", ["/d", "/s", "/c", "npm run tauri dev"], { cwd: REPO, env, stdio: ["ignore", diag, diag], windowsHide: true });
   let port = 0;
   for (let i = 0; i < 180; i++) { try { port = Number(fs.readFileSync(DTP, "utf8").split(/\r?\n/)[0]); if (port) break; } catch { /* wait */ } await sleep(1000); }
@@ -48,7 +48,7 @@ try {
   out.steps.seed = await M.evalJs(H(`
     const m=bc(); m["${id}"]={ fontSize:30, overrideBookCss:true, schemeTheme:"white", schemeBg:"#FAFAF9", schemeFg:"#22252A",
       schemeFontFamily:'"Microsoft YaHei","PingFang SC",sans-serif', schemeLineHeight:1.7, schemeParaSpacing:0.9, schemeIndent:"0em", schemeTextAlign:"left" };
-    localStorage.setItem('flowread.bookcfg.v1', JSON.stringify(m)); return Object.keys(m);
+    localStorage.setItem('tidepage.bookcfg.v1', JSON.stringify(m)); return Object.keys(m);
   `));
   await M.evalJs(`setTimeout(()=>location.reload(),100);1`); await sleep(4000);
   M.close(); M = await connectTarget(port, isApp);

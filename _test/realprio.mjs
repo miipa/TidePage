@@ -9,7 +9,7 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = "C:/Users/A/AppData/Local/Temp/opencode";
 const wv = path.join(TMP, "realprio_wv");
 const diag = path.join(TMP, "realprio_diag.log");
-const REALDB = path.join(process.env.APPDATA, "com.a.flowread", "flowread.db");
+const REALDB = path.join(process.env.APPDATA, "com.a.tidepage", "tidepage.db");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (s) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
@@ -24,9 +24,9 @@ let child = null;
 try {
   fs.rmSync(wv, { recursive: true, force: true });
   fs.writeFileSync(diag, "");
-  // 真库：不设 FLOWREAD_DATA_DIR，用默认 %APPDATA%\com.a.flowread。
+  // 真库：不设 TIDEPAGE_DATA_DIR，用默认 %APPDATA%\com.a.tidepage。
   const env = { ...process.env, WEBVIEW2_USER_DATA_FOLDER: wv, FR_TEST_CDP_PORT: "0" };
-  delete env.FLOWREAD_DATA_DIR;
+  delete env.TIDEPAGE_DATA_DIR;
   child = spawn("cmd.exe", ["/d", "/s", "/c", "npm run tauri dev"],
     { cwd: REPO, env, stdio: ["ignore", fs.openSync(diag, "a"), fs.openSync(diag, "a")], windowsHide: true });
   let port = 0;

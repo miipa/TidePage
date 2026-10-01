@@ -15,12 +15,12 @@ const reqs = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf8").trim().spl
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const HELPER = fs.readFileSync("_test/suite_live.mjs", "utf8").match(/const HELPER = `([\s\S]*?)\n`;/)[1];
 const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
-async function ensureReady(c, ms = 60000) { const t0 = Date.now(); for (;;) { try { await c.evalJs(`localStorage.getItem('flowread.config.v1');location.href;1`); return; } catch (e) { if (Date.now() - t0 > ms) throw e; await sleep(400); } } }
+async function ensureReady(c, ms = 60000) { const t0 = Date.now(); for (;;) { try { await c.evalJs(`localStorage.getItem('tidepage.config.v1');location.href;1`); return; } catch (e) { if (Date.now() - t0 > ms) throw e; await sleep(400); } } }
 function procCount() {
   const f = path.join(SANDBOX_ROOT, "pc.ps1");
-  fs.writeFileSync(f, "$fr=@(Get-Process flowread -EA SilentlyContinue|?{$_.Path -notlike '*\\Local\\FlowRead\\*'}).Count; $wv=@(Get-CimInstance Win32_Process|?{$_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -match 'fr_sbx'}).Count; $n=@(Get-Process node -EA SilentlyContinue).Count; \"$fr|$wv|$n\"");
+  fs.writeFileSync(f, "$fr=@(Get-Process tidepage -EA SilentlyContinue|?{$_.Path -notlike '*\\Local\\TidePage\\*'}).Count; $wv=@(Get-CimInstance Win32_Process|?{$_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -match 'fr_sbx'}).Count; $n=@(Get-Process node -EA SilentlyContinue).Count; \"$fr|$wv|$n\"");
   const r = execFileSync("powershell.exe", ["-NoProfile", "-Command", "& '" + f + "'"], { encoding: "utf8" }).trim().split("|");
-  return { flowread: +r[0], sandboxWebview: +r[1], node: +r[2] };
+  return { tidepage: +r[0], sandboxWebview: +r[1], node: +r[2] };
 }
 
 const out = {};
@@ -35,7 +35,7 @@ out.E_seed = await M.evalJs(H(`
       profiles:[{name:'TEST-EP',provider:'ollama',baseUrl:'http://127.0.0.1:18081',apiKey:'',model:'mock',proxyMode:'direct',proxyUrl:'',
         reasoningOffModel:'TARGET-OFF',reasoningOffStrategy:'chat-json-think-false',protocolProbe:{baseUrl:'http://127.0.0.1:18081',model:'mock',strategies:['chat-json-think-false'],at:1}}]},
     webdav:{enabled:false},regex:''};
-  localStorage.setItem('flowread.config.v1',JSON.stringify(cfg)); setTimeout(()=>location.reload(),200); return 'seeded-with-legacy-keys';
+  localStorage.setItem('tidepage.config.v1',JSON.stringify(cfg)); setTimeout(()=>location.reload(),200); return 'seeded-with-legacy-keys';
 `));
 await sleep(4500); await ensureReady(M);
 out.E_afterLoad = await M.evalJs(H(`

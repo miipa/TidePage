@@ -49,7 +49,7 @@
     ui.view = "reader";
     ui.searchOpen = false;
     setTimeout(() => {
-      window.dispatchEvent(new CustomEvent("flowread-jump", { detail: h.chapter_index }));
+      window.dispatchEvent(new CustomEvent("tidepage-jump", { detail: h.chapter_index }));
     }, 1200);
   }
 </script>

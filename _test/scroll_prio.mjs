@@ -9,7 +9,7 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = "C:/Users/A/AppData/Local/Temp/opencode";
 const sbx = path.join(TMP, "prio_sbx");
 const bk = path.join(sbx, "books");
-const db = path.join(sbx, "flowread.db");
+const db = path.join(sbx, "tidepage.db");
 const diag = path.join(TMP, "prio_diag.log");
 const PY = "py";
 const seedpy = path.join(TMP, "seed2.py");
@@ -44,7 +44,7 @@ try {
   fs.writeFileSync(diag, "");
   const wv = path.join(sbx, "wv");
   child = spawn("cmd.exe", ["/d", "/s", "/c", "npm run tauri dev"],
-    { cwd: REPO, env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: wv, FLOWREAD_DATA_DIR: sbx, FR_TEST_CDP_PORT: "0" },
+    { cwd: REPO, env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: wv, TIDEPAGE_DATA_DIR: sbx, FR_TEST_CDP_PORT: "0" },
       stdio: ["ignore", fs.openSync(diag, "a"), fs.openSync(diag, "a")], windowsHide: true });
   let port = 0;
   const dtp = path.join(wv, "EBWebView", "DevToolsActivePort");

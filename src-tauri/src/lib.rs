@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use tauri_plugin_window_state::StateFlags;
 
 /// 应用数据目录（数据库/封面/字体/提取资源）。
-/// 默认使用系统的 app_data_dir；当设置了 `FLOWREAD_DATA_DIR` 时改为该目录，
+/// 默认使用系统的 app_data_dir；当设置了 `TIDEPAGE_DATA_DIR` 时改为该目录，
 /// 用于「便携模式」以及测试时的数据隔离（默认不设置 → 行为完全不变）。
 pub fn data_dir(app: &tauri::AppHandle) -> PathBuf {
-    if let Ok(p) = std::env::var("FLOWREAD_DATA_DIR") {
+    if let Ok(p) = std::env::var("TIDEPAGE_DATA_DIR") {
         let p = p.trim();
         if !p.is_empty() {
             return PathBuf::from(p);
@@ -106,13 +106,13 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             let data_dir = data_dir(app.handle());
-            // 是否处于便携模式（FLOWREAD_DATA_DIR 显式指定）。仅便携模式才把
+            // 是否处于便携模式（TIDEPAGE_DATA_DIR 显式指定）。仅便携模式才把
             // WebView2 用户数据目录（localStorage 等）也迁徙到该目录，默认行为不变。
-            let portable = std::env::var("FLOWREAD_DATA_DIR")
+            let portable = std::env::var("TIDEPAGE_DATA_DIR")
                 .map(|p| !p.trim().is_empty())
                 .unwrap_or(false);
             std::fs::create_dir_all(&data_dir).ok();
-            let conn = db::init(&data_dir.join("flowread.db"))?;
+            let conn = db::init(&data_dir.join("tidepage.db"))?;
             if db::has_fts(&conn) {
                 let _ = db::ensure_fts(&conn);
             }
@@ -137,7 +137,7 @@ pub fn run() {
                     format!("--disable-lcd-text {raw}")
                 };
                 let mut wb = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                    .title("FlowRead 阅读")
+                    .title("TidePage 阅读")
                     .inner_size(1380.0, 880.0)
                     .min_inner_size(940.0, 620.0)
                     // 去掉系统原生标题栏（大黑边），改为前端自绘窗口控制按钮；
@@ -146,7 +146,7 @@ pub fn run() {
                     .center()
                     .visible(false);
                 // 便携模式：把 WebView2 的用户数据目录（含 localStorage）固定到便携目录，
-                // 使配置/凭据随 FLOWREAD_DATA_DIR 一起搬走。非便携模式沿用 Tauri 默认目录。
+                // 使配置/凭据随 TIDEPAGE_DATA_DIR 一起搬走。非便携模式沿用 Tauri 默认目录。
                 // 注意：JS 运行期创建的独立窗口（如 AI 窗口）仍使用 Tauri 默认数据目录，
                 // 其持久化 localStorage 不跟随便携目录，但同一次运行内凭据经事件同步不受影响。
                 if portable {
@@ -254,7 +254,7 @@ pub fn run() {
 
             Ok(())
         })
-        .register_uri_scheme_protocol("flowread", |ctx, request| {
+        .register_uri_scheme_protocol("tidepage", |ctx, request| {
             use tauri::Manager;
             let path = request.uri().path().trim_start_matches('/');
             let dir = covers::covers_dir(ctx.app_handle());

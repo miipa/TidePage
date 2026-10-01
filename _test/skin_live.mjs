@@ -15,20 +15,20 @@ for (const d of [sbx, data]) for (const f of fs.readdirSync(d)) fs.rmSync(path.j
 const outFile = path.join(SANDBOX_ROOT, "skin_out.json");
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
 
-const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('flowread.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===t)?.click(); await sleep(350); };\n${b} })()`;
+const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===t)?.click(); await sleep(350); };\n${b} })()`;
 
 const out = { steps: {} };
 let app = null;
 try {
   // 预置旧皮肤 id，验证迁移
-  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "skin_diag.log") });
+  app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "skin_diag.log") });
   let M = null; for (let i = 0; i < 240; i++) { try { M = await connectTarget(PORT, isApp); break; } catch { await sleep(2000); } }
   if (!M) throw new Error("no cdp");
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
   await sleep(800);
 
   // 写入旧皮肤 id（eye/ink），验证迁移
-  await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('flowread.config.v1')||'{}'); c.uiSkinLight='eye'; c.uiSkinDark='ink'; c.uiTheme='system'; c.glass=true; localStorage.setItem('flowread.config.v1', JSON.stringify(c)); setTimeout(()=>location.reload(),100); return 1; })()`);
+  await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); c.uiSkinLight='eye'; c.uiSkinDark='ink'; c.uiTheme='system'; c.glass=true; localStorage.setItem('tidepage.config.v1', JSON.stringify(c)); setTimeout(()=>location.reload(),100); return 1; })()`);
   await sleep(3500);
   M.close(); M = await connectTarget(PORT, isApp);
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
@@ -88,11 +88,11 @@ try {
   log("glassRemoved: " + JSON.stringify(out.steps.glassRemoved));
 
   // 持久化
-  await M.evalJs(`localStorage.setItem('fr.t.light', JSON.parse(localStorage.getItem('flowread.config.v1')).uiSkinLight); localStorage.setItem('fr.t.dark', JSON.parse(localStorage.getItem('flowread.config.v1')).uiSkinDark); setTimeout(()=>location.reload(),80);1`);
+  await M.evalJs(`localStorage.setItem('fr.t.light', JSON.parse(localStorage.getItem('tidepage.config.v1')).uiSkinLight); localStorage.setItem('fr.t.dark', JSON.parse(localStorage.getItem('tidepage.config.v1')).uiSkinDark); setTimeout(()=>location.reload(),80);1`);
   await sleep(3500);
   M.close(); M = await connectTarget(PORT, isApp);
   for (let i = 0; i < 300; i++) { try { if (await M.evalJs(`!!window.__TAURI_INTERNALS__`)) break; } catch {} await sleep(400); }
-  out.steps.persist = await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('flowread.config.v1')); return { light:c.uiSkinLight, dark:c.uiSkinDark, lightOk:c.uiSkinLight===localStorage.getItem('fr.t.light'), darkOk:c.uiSkinDark===localStorage.getItem('fr.t.dark') }; })()`);
+  out.steps.persist = await M.evalJs(`(()=>{ const c=JSON.parse(localStorage.getItem('tidepage.config.v1')); return { light:c.uiSkinLight, dark:c.uiSkinDark, lightOk:c.uiSkinLight===localStorage.getItem('fr.t.light'), darkOk:c.uiSkinDark===localStorage.getItem('fr.t.dark') }; })()`);
   log("persist: " + JSON.stringify(out.steps.persist));
 
   M.close();

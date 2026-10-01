@@ -10,7 +10,7 @@ for(const d of [sbx,data]) for(const f of fs.readdirSync(d)) fs.rmSync(path.join
 const isApp=(t)=>t.type==="page"&&!t.url.includes("ai=1");
 let app=null;
 try{
-  app=launchSandbox({env:{...process.env,WEBVIEW2_USER_DATA_FOLDER:sbx,FLOWREAD_DATA_DIR:data},cdpPort:PORT,logFile:path.join(SANDBOX_ROOT,"smoke.log")});
+  app=launchSandbox({env:{...process.env,WEBVIEW2_USER_DATA_FOLDER:sbx,TIDEPAGE_DATA_DIR:data},cdpPort:PORT,logFile:path.join(SANDBOX_ROOT,"smoke.log")});
   console.log("launched",app.child.pid);
   let M=null; for(let i=0;i<60;i++){ try{M=await connectTarget(PORT,isApp);break}catch{await sleep(2000)} }
   console.log("cdp:",!!M);

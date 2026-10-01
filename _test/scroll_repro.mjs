@@ -2,7 +2,7 @@
 // (dev via tauri dev, or a release exe via FR_EXE) in an isolated sandbox, drives real
 // scrolling through CDP, and samples per-frame scrollTop / visible text / chapter state
 // to detect flicker (jumps), blank regions and toc-jump blanks.
-// Data isolation: WEBVIEW2_USER_DATA_FOLDER + FLOWREAD_DATA_DIR both point outside the repo;
+// Data isolation: WEBVIEW2_USER_DATA_FOLDER + TIDEPAGE_DATA_DIR both point outside the repo;
 // the user's real DB is never touched.
 import fs from "node:fs";
 import path from "node:path";
@@ -67,13 +67,13 @@ async function main() {
     if (process.env.FR_EXE) {
       const fd = fs.openSync(diagLog, "a");
       const child = spawn(process.env.FR_EXE, [], {
-        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data, FR_TEST_CDP_PORT: String(PORT), FLOWREAD_OPEN_DIAG: "1" },
+        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data, FR_TEST_CDP_PORT: String(PORT), TIDEPAGE_OPEN_DIAG: "1" },
         stdio: ["ignore", fd, fd], windowsHide: true,
       });
       app = { child };
     } else {
       app = launchSandbox({
-        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, FLOWREAD_DATA_DIR: data, FLOWREAD_OPEN_DIAG: "1" },
+        env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data, TIDEPAGE_OPEN_DIAG: "1" },
         cdpPort: PORT,
         logFile: diagLog,
       });
@@ -135,10 +135,10 @@ async function main() {
     }
 
     await main.evalJs(H(`
-      const raw = localStorage.getItem('flowread.config.v1');
+      const raw = localStorage.getItem('tidepage.config.v1');
       const cfg = raw ? JSON.parse(raw) : {};
       cfg.reader = Object.assign({}, cfg.reader || {}, { mode: '${process.env.FR_MODE || "scroll"}' });
-      localStorage.setItem('flowread.config.v1', JSON.stringify(cfg));
+      localStorage.setItem('tidepage.config.v1', JSON.stringify(cfg));
       return 1;`));
     await main.evalJs(`setTimeout(()=>location.reload(),100); 1`);
     await sleep(4000);
@@ -157,7 +157,7 @@ async function main() {
       await wait(()=>document.querySelector('#chapter-content'),'chapter');
       await sleep(800);
       return document.querySelector('.btitle')?.textContent;`));
-    out.opened = await main.evalJs(H(`return { mode: (JSON.parse(localStorage.getItem('flowread.config.v1')).reader||{}).mode, tocOpen: !!document.querySelector('.toc-item') };`));
+    out.opened = await main.evalJs(H(`return { mode: (JSON.parse(localStorage.getItem('tidepage.config.v1')).reader||{}).mode, tocOpen: !!document.querySelector('.toc-item') };`));
 
     out.diag0 = await main.evalJs(H(`
       const c=content();
@@ -211,7 +211,7 @@ async function main() {
           const tags=c.html.match(/<img[^>]*>/gi)||[]; if(tags.length>0) return {i,imgs:tags.length,len:c.html.length,tags:tags.slice(0,4)}; }catch(e){} }
         return null;`));
       if (out.pickImgChapter) {
-        await main.evalJs(`window.dispatchEvent(new CustomEvent('flowread-jump',{detail:${out.pickImgChapter.i}})); 1`);
+        await main.evalJs(`window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:${out.pickImgChapter.i}})); 1`);
         await sleep(2000);
       }
       await main.evalJs(H(`
@@ -234,7 +234,7 @@ async function main() {
       out.imgLoads = await main.evalJs(`window.__imgLoads`);
     } else if (SCENARIO === "flash") {
       await main.evalJs(H(`
-        window.dispatchEvent(new CustomEvent('flowread-jump',{detail:8})); return 1;`));
+        window.dispatchEvent(new CustomEvent('tidepage-jump',{detail:8})); return 1;`));
       await sleep(2500);
       await main.evalJs(H(`
         window.__frFrames=[]; window.__frStop=false;
