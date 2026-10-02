@@ -175,3 +175,11 @@ export function errText(e: unknown): string {
 export function labelOfId(kind: string, id: string): string {
   return t(`dict.${kind}.${id}` as MessageKey);
 }
+
+/** 字典里是否存在 `dict.<kind>.<id>` 这个键（只认 en 表：它是 Record<MessageKey,string> 的全集）。
+ *  用途：结构体里「内置条目」与「用户自建条目」混在一起时，显示前先分流——
+ *  内置走 labelOfId() 取译文，用户自建的必须原样显示用户自己的名字（绝不查表）。
+ *  例：config.readerSchemes 里内置 5 套有 dict.scheme.* 键，用户自建的没有。 */
+export function hasLabelOf(kind: string, id: string): boolean {
+  return Object.prototype.hasOwnProperty.call(TABLES[FALLBACK_LOCALE], `dict.${kind}.${id}`);
+}

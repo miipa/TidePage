@@ -56,13 +56,26 @@ const blankRange = (a, s, e) => {
 };
 const clone = (src) => src.split("");
 
-/** 挖掉行注释/块注释（字符串与正则保留给后续扫描），字符数不变以便行号映射。 */
+/**
+ * 挖掉行注释/块注释（字符串与正则保留给后续扫描），字符数不变以便行号映射。
+ *
+ * 必须先标出字符串/模板/正则字面量的区间，只挖区间之外的 `//` 与块注释：
+ * URL 里的 `//`（如 `"http://127.0.0.1:3900"`）不是注释。早期版本照挖会把该字面量的
+ * **闭合引号**一起吃掉，于是后面几十行被并成一个巨大的假字面量 —— 一旦那段区间里恰好有中文，
+ * 就会报出一条压根不存在的「残留中文」，还把行号指到无关的地方（历史误报）。
+ */
 function stripJsComments(src) {
   const out = clone(src);
   const n = src.length;
+  // 字面量区间掩码：mask[k]=1 表示 k 落在字符串/模板/正则之内，注释扫描须跳过。
+  const mask = new Uint8Array(n);
+  for (const lit of literals(src)) {
+    if (lit.end > lit.start) for (let k = lit.start; k < lit.end && k < n; k++) mask[k] = 1;
+  }
   let i = 0;
   while (i < n) {
     const c = src[i];
+    if (mask[i]) { i++; continue; }
     if (c === "/" && src[i + 1] === "/") {
       let j = i;
       while (j < n && src[j] !== "\n") j++;
@@ -103,7 +116,8 @@ function skipRegex(src, i) {
   return -1;
 }
 
-/** 抽取字符串字面量（含模板字符串），跳过正则字面量。返回 [{start, content}]。 */
+/** 抽取字符串字面量（含模板字符串），跳过正则字面量。返回 [{start, end, content}]。
+ *  end = 字面量闭合处的下标（含闭合引号）；未闭合时为到达的位置。 */
 function literals(src) {
   const out = [];
   const n = src.length;
@@ -122,7 +136,7 @@ function literals(src) {
         body += src[j];
         j++;
       }
-      out.push({ start: i, content: body });
+      out.push({ start: i, end: j, content: body });
       i = j;
       prevSig = "x";
       continue;
@@ -190,7 +204,25 @@ function tagRanges(src, tag) {
   return out;
 }
 
-/* ============================== 采集 ============================== */
+/* ============================== 检查 5：markup 可见文本（注释写法残留） ============================== */
+
+/**
+ * Svelte 的 markup 里 `//` 与块注释起手式 **不是注释**，会被原样渲染成界面文字
+ * （历史缺陷：SettingsModal 的「＋」芯片后面跟着整句 `// i18n-allow:…`）。
+ * 中文扫描抓不到它（注释里可以不含中文，且 en 界面一样露馅），故单列本检查。
+ *
+ * 扫描范围：最后一个 `</script>` **之后**的部分（`<script>` 内的注释是真注释，不算）。
+ * 挖空（不参与判定）：
+ *   - `<style>…</style>`：CSS 块，其内的块注释是合法的 CSS 注释；
+ *   - 成对的 HTML 注释（`OPENC` + `CLOSE`，见下方常量）：Svelte 里是真注释，不渲染；
+ *   - `{…}` 表达式：块内的 `//` 与 `{块注释}` 都是合法 JS 注释。
+ * 判定（剩下的才是**会被渲染**的可见文本）：
+ *   1) 行首（trim 后）以 `//` 或块注释起手式开头 → FAIL；
+ *   2) 出现未闭合的 HTML 注释起手式（成对的已挖空，剩下的必然露馅）→ FAIL。
+ */
+const HTML_OPEN = "<" + "!--"; // 源码里直接写 HTML 注释起手式会被 node 的 ESM 词法器拒收
+const HTML_CLOSE = "--" + ">";
+const BLOCK_OPEN = "/" + "*";
 
 const files = walk(SRC, [])
   .filter((p) => {
@@ -201,6 +233,46 @@ const files = walk(SRC, [])
     return true;
   })
   .sort();
+
+const markupLeaks = [];
+for (const f of files) {
+  if (!f.endsWith(".svelte")) continue;
+  const raw = fs.readFileSync(f, "utf8");
+  // 最后一个 </script> 之后才是 markup（多 script 块时取最后一个）。
+  let cut = 0;
+  for (let i = raw.indexOf("</script>"); i >= 0; i = raw.indexOf("</script>", i + 1)) cut = i + "</script>".length;
+  let out = clone(raw.slice(cut));
+  const base = raw.slice(0, cut).split("\n").length - 1; // 行号偏移
+  // (1) <style>…</style>
+  for (const [s, e] of tagRanges(out.join(""), "style")) blankRange(out, s, e);
+  // (2) 成对的 HTML 注释
+  {
+    const txt = out.join("");
+    let i = 0;
+    while (i < txt.length) {
+      const s = txt.indexOf(HTML_OPEN, i);
+      if (s < 0) break;
+      const e = txt.indexOf(HTML_CLOSE, s);
+      if (e < 0) break; // 未闭合 → 留给下面的判定
+      blankRange(out, s, e + HTML_CLOSE.length);
+      i = e + HTML_CLOSE.length;
+    }
+  }
+  // (3) {…} 表达式（从后往前挖，避免下标漂移）
+  {
+    const txt = out.join("");
+    const spans = [];
+    for (let i = 0; i < txt.length; i++) if (txt[i] === "{") spans.push([i, matchBrace(txt, i)]);
+    for (let k = spans.length - 1; k >= 0; k--) blankRange(out, spans[k][0], spans[k][1]);
+  }
+  out.join("").split("\n").forEach((ln, i) => {
+    const t = ln.trim();
+    if (t.startsWith("//") || t.startsWith(BLOCK_OPEN)) markupLeaks.push({ file: rel(f), line: base + i + 1, text: t.slice(0, 90) });
+    else if (ln.includes(HTML_OPEN)) markupLeaks.push({ file: rel(f), line: base + i + 1, text: "未闭合的 " + HTML_OPEN + "： " + t.slice(0, 80) });
+  });
+}
+
+/* ============================== 采集 ============================== */
 
 const perFile = new Map();
 const lineNo = (src, i) => src.slice(0, i).split("\n").length;
@@ -312,11 +384,27 @@ const enKeys = readKeys("en.ts");
 const keySet = new Set(zhKeys);
 
 // 键引用：t("…") 直呼 + 键表里以字面量形式出现（labelKey: "…" / STATE_LABEL_KEYS / ERR_CODES）
+//        + 动态拼键入口 labelOfId("<kind>", id) / hasLabelOf("<kind>", id) → 视作引用 dict.<kind>.* 全部键。
+//
+// 两条关键修正（曾经的守门盲区，务必别改回去）：
+//  1) **不得把 zh-CN.ts / en.ts 自身算进引用源**。文案表里每个键天然以字符串字面量出现，
+//     把它算作「被引用」等于让 unusedKeys 恒等于 0（本检查形同虚设）。
+//     只有 index.svelte.ts / types.ts 这类运行期代码（ERR_CODES 等）才允许提供引用。
+//  2) labelOfId("kind", …) 是运行时拼键 `dict.<kind>.<id>`，静态扫不到；
+//     不认它就会把 dict.bind.* / dict.skin.* / dict.zone.* / dict.bounce.* / dict.scheme.* /
+//     dict.hlStyle.* / dict.statusItem.* / dict.aiProvider.* 一律误报成死键。
 const tCallRe = /(?<![\w.])t\(\s*"([^"]+)"/g;
+/** 动态拼键入口：kind 用字面量给出，故可静态推出它覆盖 dict.<kind>.* 全部键。 */
+const dynKeyRe = /\b(?:labelOfId|hasLabelOf)\(\s*"([^"]+)"/g;
+/** 文案表本体：只提供键定义，绝不参与「谁引用了键」的统计。 */
+const NOT_REF_SOURCES = new Set(["zh-CN.ts", "en.ts"]);
 const usedAll = new Set();
 const usedMigrated = new Set();
+/** kind → 被动态入口覆盖的键数（输出里单独列，便于判断「接了但只接了一半」）。 */
+const dynKinds = new Map();
 let callSites = 0;
 for (const f of [...files, ...walk(path.join(SRC, "lib", "i18n"), [])]) {
+  if (NOT_REF_SOURCES.has(path.basename(f))) continue;
   const raw = fs.readFileSync(f, "utf8");
   const wl = !!FILE_WHITELIST[rel(f)];
   // 键引用既可能在模板表达式里，也可能在 <script> 的键表里（labelKey: "…"），
@@ -329,8 +417,55 @@ for (const f of [...files, ...walk(path.join(SRC, "lib", "i18n"), [])]) {
     usedMigrated.add(m[1]);
     callSites++;
   }
+  dynKeyRe.lastIndex = 0;
+  while ((m = dynKeyRe.exec(raw))) dynKinds.set(m[1], (dynKinds.get(m[1]) || 0) + 1);
 }
-const unusedKeys = zhKeys.filter((k) => !usedAll.has(k));
+// 动态入口展开：labelOfId("bind", …) 存在 → dict.bind.* 全部键视为已接线。
+for (const kind of dynKinds.keys()) {
+  for (const k of zhKeys) if (k.startsWith(`dict.${kind}.`)) usedAll.add(k);
+}
+const allUnused = zhKeys.filter((k) => !usedAll.has(k));
+
+/**
+ * 「已确认无人接线」的键：逐条写明为什么它合法地留在表里。
+ * 规则：一条 = 一个键 + 原因；新增/移除都必须显式改这里（禁止通配、禁止整前缀）。
+ * 任何一条「其实已经有人引用了」或「已不在表里」都会报陈旧豁免 —— 防止长期掩盖新接线。
+ * 允许的类别仅限：
+ *   a) 早期迁移遗留的重复/改名键（已有新键在用，旧键删前先留着对齐键数）；
+ *   b) 通用词条：同一含义在业务键里已有更具体的写法（如 settings.tts.serviceFallback）；
+ *   c) 显示名改由结构体 id 经 labelOfId 取，故不需要独立键（dict.ttsModel.* 里那几条
+ *      「服务商给定的取值」，随 hint 原样显示）。
+ */
+const DEAD_KEY_ALLOWED = {
+  "reader.toast.davCompare": "重复键：同一段云端/本地进度文案实际用 reader.confirm.davCompare（Reader.svelte 确认框）",
+  "notes.deletedBook": "重复键：划线删除提示实际用 reader.toast.hlDeleted",
+  "tts.serviceDefault": "未被引用：TTS 服务档默认名由 stores 的 uniqueTtsServiceName() 生成并持久化（禁止翻译），显示侧空名兜底用 settings.tts.serviceFallback",
+  "tts.serviceDefaultN": "未被引用：同上（带序号的旧写法）",
+  "ai.profileDefault": "未被引用：AI 端点默认名由 stores 的 uniqueEndpointName() 生成并持久化（禁止翻译）",
+  "ai.profileDefaultN": "未被引用：同上（带序号的旧写法）",
+  "common.untitledScheme": "未被引用：方案名兜底是 stores 里会被持久化的「未命名方案」（禁止翻译）",
+  "common.action.save": "未被引用：保存一律用 settings.*.save / reader.* 等更具体的键",
+  "common.action.reset": "未被引用：恢复默认一律用 settings.*.reset 等更具体的键",
+  "common.action.back": "未被引用：返回一律用各面板自己的 close/back 键",
+  "common.action.open": "未被引用：打开一律用 library.ctx.open 等业务键",
+  "common.action.add": "未被引用：新增一律用 settings.*.add / library.toolbar.addFolder 等业务键",
+  "common.unit.chapter": "未被引用：时长/数量格式化走 dateLocale()，不拆单位键",
+  "common.dur.h": "未被引用：同上",
+  "err.dbBusy": "未被引用：Rust 侧只返回 dbLocked / dbBadColumn / dbUnique 三个 ASCII 码，没有 dbBusy",
+  "settings.tts.testing": "未被引用：测试中提示实际用 settings.ai.testingHint",
+  "settings.ai.model": "重复键：AI 端点的模型字段标签实际用 settings.tts.model",
+  "settings.ai.font": "重复键：AI 样式字体相关标签实际用 settings.ai.fontSize / settings.font.*",
+  "settings.ai.bg": "重复键：AI 背景色字段标题实际用 settings.ai.bgColorTitle",
+  "settings.ai.fg": "重复键：AI 文字色字段标题实际用 settings.ai.fgColorTitle",
+  "settings.ai.indent": "重复键：AI 首行缩进字段标签实际用 settings.font.indent",
+  "settings.prefs.encodingAuto": "重复键：MOBI 编码下拉的 auto 选项实际用 settings.ai.proxyAuto（通用「自动」）",
+  "dict.ttsModel.dashscope": "服务商给定的音色 id（Cherry），按规则原样显示、不查表",
+  "dict.ttsModel.minimax": "服务商给定的音色 id（male-qn-qingse），按规则原样显示、不查表",
+  "dict.ttsModel.fish": "服务商给定的字段名（reference_id），按规则原样显示、不查表",
+  "dict.ttsModel.edge": "重复键：Edge 固定端点的模型提示实际用 dict.ttsModel.common",
+};
+const unusedKeys = allUnused.filter((k) => !DEAD_KEY_ALLOWED[k]);
+const deadAllowStale = Object.keys(DEAD_KEY_ALLOWED).filter((k) => usedAll.has(k) || !keySet.has(k));
 // 键集合必须完全一致：只比数量的话「en 少一个 A、多一个 B」会被漏掉。
 const zhSet = new Set(zhKeys), enSet = new Set(enKeys);
 // ---- 文案表全量校验（任务要求 5）：键集合 / 重复键 / 占位符逐键一致 / en 无中文 / 无空值 / 无“未翻译” ----
@@ -396,6 +531,7 @@ const TEST_DIR = path.resolve(HERE, "..", "_test");
  */
 const TEST_ALLOW_LINES = {
   "b1fix_f_live.mjs:55": "夹具书籍名与正文（书名/作者/正文就是要断言的对象）",
+  "b1fix_f_live.mjs:74": "脚本自有中文注释与用例名（注入页面的探针代码内注释 + 断言标签）",
   "b1fix_f_live.mjs:57": "夹具书籍名与正文（书名/作者/正文就是要断言的对象）",
   "b1fix_f_live.mjs:58": "夹具书籍名与正文（书名/作者/正文就是要断言的对象）",
   "b1fix_f_live.mjs:59": "夹具书籍名与正文（书名/作者/正文就是要断言的对象）",
@@ -403,6 +539,7 @@ const TEST_ALLOW_LINES = {
   "batch1_live.mjs:117": "脚本自有断言/日志文案（书库页行为已改用 data-testid 选择）",
   "batch1_live.mjs:52": "脚本自有断言/日志文案（书库页行为已改用 data-testid 选择）",
   "batch1_live.mjs:87": "脚本自有断言/日志文案（书库页行为已改用 data-testid 选择）",
+  "batch1_live.mjs:73": "脚本自有中文注释与断言（bad[] 里是「已应删除文案」的原文，正是断言对象）",
   "c_live.mjs:11": "夹具书籍名与正文（删除已打开书籍的回归用例）",
   "c_live.mjs:13": "夹具书籍名与正文（删除已打开书籍的回归用例）",
   "c_live.mjs:30": "夹具书籍名与正文（删除已打开书籍的回归用例）",
@@ -412,6 +549,7 @@ const TEST_ALLOW_LINES = {
   "cover_shots.mjs:51": "夹具书籍名与正文（封面截图用例）",
   "cover_shots.mjs:52": "夹具书籍名与正文（封面截图用例）",
   "cover_shots.mjs:55": "夹具书籍名与正文（封面截图用例）",
+  "cover_scan_live.mjs:79": "脚本自有中文注释与用例名（封面扫描进度记录器）",
   "defaultcover_fix_live.mjs:81": "夹具书籍名与正文（默认封面修复用例）",
   "defaultcover_fix_live.mjs:82": "夹具书籍名与正文（默认封面修复用例）",
   "defaultcover_fix_live.mjs:82": "夹具书籍名与正文（默认封面修复用例）",
@@ -420,11 +558,13 @@ const TEST_ALLOW_LINES = {
   "defaultcover_live.mjs:41": "脚本自有断言/日志文案",
   "defaultcover_live.mjs:55": "脚本自有断言/日志文案",
   "e_portal.mjs:59": "全文搜索的输入关键词（用户输入值，非界面文案）",
+  "e_portal.mjs:63": "脚本自有中文注释（弹框层级探针）",
   "extremes.mjs:35": "夹具书籍名与正文（极值用例）",
   "extremes.mjs:35": "夹具书籍名与正文（极值用例）",
   "extremes.mjs:36": "夹具书籍名与正文（极值用例）",
   "f2_live.mjs:35": "夹具书籍名与正文（批量用例）",
   "f2_live.mjs:35": "夹具书籍名与正文（批量用例）",
+  "f2_live.mjs:60": "脚本自有中文注释与用例名（批量封面用例）",
   "final_evidence.mjs:103": "夹具书籍名/正文/章节名 + 脚本自有断言",
   "final_evidence.mjs:124": "夹具书籍名/正文/章节名 + 脚本自有断言",
   "final_evidence.mjs:125": "夹具书籍名/正文/章节名 + 脚本自有断言",
@@ -457,6 +597,8 @@ const TEST_ALLOW_LINES = {
   "fixfont_app.mjs:54": "真实书路径与书名（字体修复用例）+ 脚本自有断言",
   "fixfont_app.mjs:61": "真实书路径与书名（字体修复用例）+ 脚本自有断言",
   "fixfont_app.mjs:84": "真实书路径与书名（字体修复用例）+ 脚本自有断言",
+  "fixfont_browser.mjs:34": "夹具 HTML（模拟书籍自带样式对抗 !important）+ 脚本自有注释",
+  "fixfont_browser.mjs:109": "脚本自有中文注释（字体计算样式探针）",
   "fixscheme_app.mjs:44": "真实书路径与书名（阅读方案用例）+ 脚本自有断言",
   "fixscheme_app.mjs:57": "真实书路径与书名（阅读方案用例）+ 脚本自有断言",
   "gh_live.mjs:28": "夹具书籍名/正文/章节名 + 脚本自有断言",
@@ -466,6 +608,8 @@ const TEST_ALLOW_LINES = {
   "gh_live.mjs:39": "夹具书籍名/正文/章节名 + 脚本自有断言",
   "gh_live.mjs:48": "夹具书籍名/正文/章节名 + 脚本自有断言",
   "gh_live.mjs:74": "夹具书籍名/正文/章节名 + 脚本自有断言",
+  "gh_live.mjs:97": "脚本自有中文注释（孤儿划线重建用例）",
+  "grid_fit.mjs:54": "脚本自有中文注释与断言标签（网格列数几何用例）",
   "i18n_live.mjs:120": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
   "i18n_live.mjs:121": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
   "i18n_live.mjs:121": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
@@ -534,6 +678,84 @@ const TEST_ALLOW_LINES = {
   "i18n_live.mjs:472": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
   "i18n_live.mjs:473": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
   "i18n_live.mjs:481": "i18n 实机验证脚本自身：断言标签与中英对照期望值",
+  "i18n_live.mjs:217": "i18n 实机验证脚本自身：中文注释与断言标签",
+  "i18n_live.mjs:233": "i18n 实机验证脚本自身：中文注释与断言标签",
+  "i18n_live.mjs:377": "i18n 实机验证脚本自身：中文注释与断言标签",
+  "i18n_settings_live.mjs:48": "脚本自身的中文报错信息",
+  "i18n_settings_live.mjs:49": "脚本自身的中文报错信息",
+  "i18n_settings_live.mjs:68": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:69": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:76": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:81": "预置的老数据与注入页面的探针脚本自身的中文注释",
+  "i18n_settings_live.mjs:192": "预置的老数据与注入页面的探针脚本自身的中文注释",
+  "i18n_settings_live.mjs:219": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:220": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:222": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:223": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:224": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:247": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:248": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:249": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:251": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:252": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:254": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:257": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:258": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:262": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:263": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:264": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:266": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:267": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:268": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:271": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:272": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:274": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:275": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:276": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:278": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:280": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:281": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:282": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:284": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:285": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:287": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:289": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:297": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:298": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:299": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:301": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:303": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:305": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:306": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:307": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:308": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:309": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:310": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:311": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:312": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:313": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:314": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:318": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:319": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:320": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:321": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:323": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:324": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:325": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:352": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:353": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:354": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:362": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:363": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:364": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:365": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:373": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:374": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:375": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:377": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:378": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:379": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:386": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "isolation_guard.mjs:28": "隔离守卫自身的中文报错信息",
   "isolation_guard.mjs:33": "隔离守卫自身的中文报错信息",
   "isolation_guard.mjs:37": "隔离守卫自身的中文报错信息",
@@ -573,15 +795,24 @@ const TEST_ALLOW_LINES = {
   "lib_delete_blank_live.mjs:245": "回归脚本自身的 PASS/FAIL 中文标签",
   "lib_delete_blank_live.mjs:251": "回归脚本自身的 PASS/FAIL 中文标签",
   "lib_delete_blank_live.mjs:42": "回归脚本自身的 PASS/FAIL 中文标签",
+  "lib_delete_blank_live.mjs:49": "回归脚本自身的中文注释与 PASS/FAIL 标签",
+  "lib_delete_blank_live.mjs:204": "回归脚本自身的中文注释与 PASS/FAIL 标签",
   "manga_flow_regress.mjs:106": "漫画瀑布流回归脚本自身的中文报错",
   "manga_flow_regress.mjs:21": "漫画瀑布流回归脚本自身的中文报错",
+  "manga_flow_regress.mjs:61": "漫画瀑布流回归脚本自身的中文注释",
   "manga_flow_scroll.mjs:143": "夹具书名 + 脚本自身的中文报错",
   "manga_flow_scroll.mjs:175": "夹具书名 + 脚本自身的中文报错",
   "manga_flow_scroll.mjs:187": "夹具书名 + 脚本自身的中文报错",
   "manga_flow_scroll.mjs:26": "夹具书名 + 脚本自身的中文报错",
+  "manga_flow_scroll.mjs:47": "漫画瀑布流回归脚本自身的中文注释",
+  "manga_flow_scroll.mjs:179": "漫画瀑布流回归脚本自身的中文注释",
+  "manga_flow_scroll.mjs:217": "漫画瀑布流回归脚本自身的中文注释",
+  "manga_flow_scroll.mjs:270": "漫画瀑布流回归脚本自身的中文注释",
+  "manga_flow_scroll.mjs:300": "漫画瀑布流回归脚本自身的中文注释",
   "manga_live.mjs:134": "夹具书名/章节名 + 脚本自身的中文断言",
   "manga_live.mjs:178": "夹具书名/章节名 + 脚本自身的中文断言",
   "manga_live.mjs:254": "夹具书名/章节名 + 脚本自身的中文断言",
+  "meta_fix.mjs:63": "脚本自身的中文注释（列表进度轮询探针）",
   "mock_ai_server.mjs:11": "mock 服务的固定文本载荷 + 端口守卫报错",
   "mock_ai_server.mjs:47": "mock 服务的固定文本载荷 + 端口守卫报错",
   "removal_live.mjs:31": "种子字体族名/提示词种子（刻意与真实用户数据一致）+ 脚本自有日志",
@@ -596,18 +827,20 @@ const TEST_ALLOW_LINES = {
   "send.mjs:75": "发送守卫自身的中文报错",
   "settings_ui.mjs:36": "脚本自有断言：读 DOM 文本做对照（选择器已全部换成 data-testid）",
   "settings_ui.mjs:46": "脚本自有断言：读 DOM 文本做对照（选择器已全部换成 data-testid）",
-  "suite_live.mjs:100": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:103": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:103": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:122": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:129": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:132": "种子字体族名/提示词种子 + 脚本自有断言与日志",
+  "skin_live.mjs:51": "脚本自有断言/日志文案（皮肤对比度用例）",
+  "skin_live.mjs:69": "脚本自有断言/日志文案（皮肤对比度用例）",
+  "settings_ui.mjs:55": "脚本自有断言/日志文案（分区遍历已改用 data-testid）",
   "suite_live.mjs:142": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:147": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:160": "种子字体族名/提示词种子 + 脚本自有断言与日志",
   "suite_live.mjs:21": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:53": "种子字体族名/提示词种子 + 脚本自有断言与日志",
-  "suite_live.mjs:63": "种子字体族名/提示词种子 + 脚本自有断言与日志",
+  "suite_live.mjs:58": "脚本自有的中文报错信息",
+  "suite_live.mjs:93": "脚本自有的中文报错信息 + 种子字体族名/提示词种子",
+  "suite_live.mjs:98": "种子字体族名（方正兰亭圆_gbk）+ 提示词种子（测试总结）+ 脚本自有断言",
+  "suite_live.mjs:124": "脚本自有用例名（log 标签）+ 依赖中文 UI 文本的断言（[错误] toast 前缀）",
+  "suite_live.mjs:130": "脚本自有用例名（log 标签）+ 依赖中文 UI 文本的断言（[错误] toast 前缀）",
+  "suite_live.mjs:135": "脚本自有用例名（log 标签）+ 依赖中文 UI 文本的断言（[错误] toast 前缀）",
+  "suite_live.mjs:150": "脚本自有用例名（log 标签）+ 读中文分页文本「第 N/M 页」「上一页」做断言",
+  "suite_live.mjs:155": "脚本自有用例名（log 标签）+ 读中文分页文本「第 N/M 页」「上一页」做断言",
+  "suite_live.mjs:179": "脚本自有用例名（log 标签）+ 读中文分页文本「第 N/M 页」做断言",
   "theme_live.mjs:117": "持久化的阅读配色方案名（如 纸质）+ 脚本自有断言",
   "theme_live.mjs:147": "持久化的阅读配色方案名（如 纸质）+ 脚本自有断言",
   "theme_live.mjs:161": "持久化的阅读配色方案名（如 纸质）+ 脚本自有断言",
@@ -713,7 +946,9 @@ L("=".repeat(78));
 L("i18n 守门检查 —— 扫描 src/**/*.svelte 与 src/**/*.ts");
 L("=".repeat(78));
 L(`文案表：zh-CN.ts ${zhKeys.length} 键 / en.ts ${enKeys.length} 键` + (zhKeys.length === enKeys.length ? "（数量一致）" : "  ⚠ 数量不一致！"));
-L(`文案表里没有任何地方引用的键：${unusedKeys.length}` + (unusedKeys.length ? " → " + unusedKeys.join(", ") : ""));
+L(`文案表里没有任何地方引用的键（死键，必须为 0）：${unusedKeys.length}` + (unusedKeys.length ? " → " + unusedKeys.join(", ") : ""));
+L(`动态拼键入口 labelOfId/hasLabelOf 覆盖 ${dynKinds.size} 个字典域：` + ([...dynKinds].map(([k, n]) => `${k}×${n}`).join(", ") || "（无）"));
+L(`已登记的「确认无人接线」豁免：${Object.keys(DEAD_KEY_ALLOWED).length} 条（陈旧 ${deadAllowStale.length}）` + (deadAllowStale.length ? " → " + deadAllowStale.join(", ") : ""));
 L(`en.ts 里 zh-CN 没有的键：${onlyEn.length}` + (onlyEn.length ? " → " + onlyEn.join(", ") : ""));
 L(`zh-CN.ts 里 en.ts 没有的键：${onlyZh.length}` + (onlyZh.length ? " → " + onlyZh.join(", ") : ""));
 L(`重复键：zh-CN ${dupZh.length} / en ${dupEn.length}` + (dupZh.length + dupEn.length ? " → " + [...dupZh, ...dupEn].join(", ") : ""));
@@ -727,6 +962,9 @@ L(`zh 值豁免 ${Object.keys(ZH_NON_CJK_ALLOWED).length} 条（陈旧 ${zhAllow
 L(`—— 检查 4：labelKey/titleKey 不得复用 ——`);
 L(`同一文件内同一显示名键被复用（必须为 0）：${dupLabelKeys.length}` + (dupLabelKeys.length ? " → " + dupLabelKeys.join(" | ") : ""));
 L(`本轮迁移（非白名单文件）：${usedMigrated.size} 个键 / ${callSites} 处 t() 调用点`);
+L("—— 检查 5：markup 可见文本（`</script>` 之后不得残留注释写法） ——");
+L(`markup 可见文本：${markupLeaks.length}` + (markupLeaks.length ? "" : "（0）"));
+for (const v of markupLeaks) L(`  ✗ ${v.file}:L${v.line}  ${v.text}`);
 L("");
 L("—— 检查 2：_test/*.mjs 中的中文选择器/断言 ——");
 L("");
@@ -777,10 +1015,13 @@ const tablesOutOfSync =
   onlyZh.length + onlyEn.length + dupZh.length + dupEn.length +
   phMismatch.length + cjkInEn.length + emptyVal.length + untranslated.length +
   zhNonCjk.length + zhAllowStale.length + dupLabelKeys.length;
-if (violations.length || testViolations.length || tablesOutOfSync || testStale.length || stale.length) {
+if (violations.length || testViolations.length || tablesOutOfSync || testStale.length || stale.length || markupLeaks.length || unusedKeys.length || deadAllowStale.length) {
   L(`RESULT: FAIL —— src 侧 ${violations.length} 个文件 + _test 侧 ${testViolations.length} 个文件仍有未迁移的中文` + (tablesOutOfSync ? `；文案表键集合不一致（${tablesOutOfSync} 处）` : "") + (testStale.length || stale.length ? `；陈旧豁免 src ${stale.length} 条 / _test ${testStale.length} 条` : "") +
     (zhNonCjk.length ? `；zh 非中文值 ${zhNonCjk.length} 处` : "") +
     (dupLabelKeys.length ? `；显示名键复用 ${dupLabelKeys.length} 处` : "") +
+    (unusedKeys.length ? `；死键（建了没人接线）${unusedKeys.length} 个：${unusedKeys.slice(0, 12).join(", ")}${unusedKeys.length > 12 ? " …" : ""}` : "") +
+    (deadAllowStale.length ? `；死键豁免陈旧 ${deadAllowStale.length} 条（该键已有人引用或已不在表里）` : "") +
+    (markupLeaks.length ? `；markup 可见文本 ${markupLeaks.length} 行（注释写法被当界面文字渲染）` : "") +
     (zhAllowStale.length ? `；zh 豁免陈旧 ${zhAllowStale.length} 条` : ""));
   process.exit(1);
 }

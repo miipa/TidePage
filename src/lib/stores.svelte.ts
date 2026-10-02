@@ -342,7 +342,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
   { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
   { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
   { id: "gemini", label: "Google Gemini", baseUrlHint: "https://generativelanguage.googleapis.com", modelHint: "gemini-1.5-flash", needsKey: true },
-  { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true },
+  { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true }, // i18n-allow:baseUrlHint 是服务地址占位模板（<资源名> 是地址里的中文提示段），地址属标识符不翻译
 ];
 
 export function aiProviderMeta(p: string): AiProviderMeta {

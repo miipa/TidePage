@@ -64,7 +64,7 @@
   import { dragSort } from "../lib/dragSort";
   import { slide } from "svelte/transition";
   // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
-  import { dateLocale, errText, labelOfId, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
+  import { dateLocale, errText, hasLabelOf, labelOfId, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
   import type { MessageKey } from "../lib/i18n/types";
   import { onMount, tick, untrack } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
@@ -371,6 +371,18 @@
       schemeFontWeight: undefined,
     });
     toast(t("settings.scheme.cleared"));
+  }
+
+  /**
+   * 配色方案（config.readerSchemes）的显示名。方案库里混着两类条目，必须分流：
+   *  - 内置 5 套：stores.svelte.ts 的 builtinSchemes() 里 id 与文案表键后缀**逐字相同**，
+   *    即 s-paper → dict.scheme.s-paper（纸质）、s-modern（现代）、s-green（护眼绿）、
+   *    s-night（夜间）、s-ink（纯黑）；显示走译文，**持久化的 name 一个字都不改**。
+   *  - 用户自建：id 由 createReaderScheme() 现生成（s-<时间戳36进制><随机>），
+   *    字典里必然没有对应键 → 原样显示用户自己起的名字（如「我的老方案」），绝不查表、绝不翻译。
+   */
+  function schemeLabel(s: ReaderScheme): string {
+    return hasLabelOf("scheme", s.id) ? labelOfId("scheme", s.id) : s.name;
   }
 
   function openSchemeSave() {
@@ -1000,6 +1012,11 @@
     }
   }
 
+  // 「添加快捷键」芯片在未捕获态显示的图形符号。放脚本常量而非 markup 字面量有两个原因：
+  //   1) markup 里的 `//` 不是注释，会被 Svelte 原样渲染成界面文字（历史缺陷）；
+  //   2) 豁免说明必须和字面量同处脚本块，守门脚本的行内 `// i18n-allow:` 规则才认得到。
+  const ADD_BIND_GLYPH = "＋"; // i18n-allow:全角加号是图形符号（"添加"芯片），不是可翻译文案
+
   let capturing = $state<BindAction | null>(null);
 
   $effect(() => {
@@ -1332,7 +1349,7 @@
             class="skin-card" data-skin-id={skin.id}
             class:active={config.uiSkinLight === skin.id}
             onclick={() => setUiSkin(skin.id)}
-            title={skin.name}
+            title={labelOfId("skin", skin.id)}
           >
             <span class="sk-preview" style="background:{skin.bg}; border-color:{skin.line};">
               <span class="sk-panel" style="background:{skin.panel};"></span>
@@ -1340,7 +1357,7 @@
               <span class="sk-bar" style="background:{skin.fg};"></span>
               <span class="sk-bar short" style="background:{skin.fg2};"></span>
             </span>
-            <span class="sk-name">{skin.name}</span>
+            <span class="sk-name">{labelOfId("skin", skin.id)}</span>
             {#if config.uiSkinLight === skin.id}<span class="sk-check">✓</span>{/if}
           </button>
         {/each}
@@ -1355,7 +1372,7 @@
             class="skin-card" data-skin-id={skin.id}
             class:active={config.uiSkinDark === skin.id}
             onclick={() => setUiSkin(skin.id)}
-            title={skin.name}
+            title={labelOfId("skin", skin.id)}
           >
             <span class="sk-preview" style="background:{skin.bg}; border-color:{skin.line};">
               <span class="sk-panel" style="background:{skin.panel};"></span>
@@ -1363,7 +1380,7 @@
               <span class="sk-bar" style="background:{skin.fg};"></span>
               <span class="sk-bar short" style="background:{skin.fg2};"></span>
             </span>
-            <span class="sk-name">{skin.name}</span>
+            <span class="sk-name">{labelOfId("skin", skin.id)}</span>
             {#if config.uiSkinDark === skin.id}<span class="sk-check">✓</span>{/if}
           </button>
         {/each}
@@ -1412,8 +1429,8 @@
         <div class="field">
           <label>{t("settings.reader.bufferStrength")}</label>
           <select bind:value={config.reader.scrollBounceLevel} onchange={saveConfig}>
-            {#each Object.entries(SCROLL_BOUNCE_PRESETS) as [k, p] (k)}
-              <option value={k}>{p.label}</option>
+            {#each Object.entries(SCROLL_BOUNCE_PRESETS) as [k] (k)}
+              <option value={k}>{labelOfId("bounce", k)}</option>
             {/each}
           </select>
           <p class="tip">{t("settings.reader.bufferTip")}</p>
@@ -1511,7 +1528,7 @@
               <span class="sp-line" style="background:currentColor; opacity:.75;"></span>
               <span class="sp-chip" style="background:var(--accent);"></span>
             </button>
-            <div class="scheme-name" title={s.name}>{s.name}</div>
+            <div class="scheme-name" title={schemeLabel(s)}>{schemeLabel(s)}</div>
             <div class="scheme-menu">
               <button class="icon" data-testid="scheme-global" title={t("settings.scheme.globalTitle")} onclick={() => applyScheme(s.id, "global")}>{t("settings.scheme.global")}</button>
               <button class="icon" data-testid="scheme-book" title={t("settings.scheme.bookTitle")} onclick={() => applyScheme(s.id, "book")}>{t("settings.scheme.book")}</button>
@@ -1536,13 +1553,13 @@
           <p class="tip">{t("settings.scheme.saveTip")}</p>
           <div class="scheme-grid compact">
             {#each config.readerSchemes as s (s.id)}
-              <button class="scheme-card save-target" onclick={() => saveOverScheme(s)} title={t("settings.scheme.overwriteTitle", { name: s.name })}>
+              <button class="scheme-card save-target" onclick={() => saveOverScheme(s)} title={t("settings.scheme.overwriteTitle", { name: schemeLabel(s) })}>
                 <span class="scheme-preview" style="background:{s.cfg.bgColor || THEMES[s.cfg.theme].bg}; color:{s.cfg.fgColor || THEMES[s.cfg.theme].fg};">
                   <span class="sp-line" style="background:currentColor; opacity:.85;"></span>
                   <span class="sp-line short" style="background:currentColor; opacity:.55;"></span>
                   <span class="sp-chip" style="background:var(--accent);"></span>
                 </span>
-                <span class="scheme-name">{s.name}</span>
+                <span class="scheme-name">{schemeLabel(s)}</span>
               </button>
             {/each}
           </div>
@@ -1758,7 +1775,7 @@
         <label>{t("settings.hl.defaultStyle")}</label>
         <select bind:value={config.reader.highlightStyle} onchange={saveConfig} title={t("settings.hl.defaultStyleTip")}>
           {#each HIGHLIGHT_STYLES as s (s.id)}
-            <option value={s.id}>{s.name}</option>
+            <option value={s.id}>{labelOfId("hlStyle", s.id)}</option>
           {/each}
         </select>
       </div>
@@ -1918,13 +1935,13 @@
     <div class="bind-list">
       {#each BIND_DEFS as def (def.id)}
         <div class="bind-row">
-          <span class="bind-name">{def.name}</span>
+          <span class="bind-name">{labelOfId("bind", def.id)}</span>
           <div class="bind-keys">
             {#each config.reader.bindings[def.id] as k (k)}
               <button class="key-chip" title={t("settings.keys.chipDelete")} onclick={() => removeBind(def.id, k)}>{k} ×</button>
             {/each}
             <button class="key-add" class:cap={capturing === def.id} onclick={() => (capturing = capturing === def.id ? null : def.id)}>
-              {capturing === def.id ? t("settings.keys.capture") : "＋"} // i18n-allow:全角加号是图形符号（“添加”芯片），不是可翻译文案
+              {capturing === def.id ? t("settings.keys.capture") : ADD_BIND_GLYPH}
             </button>
           </div>
         </div>
@@ -1939,14 +1956,14 @@
     <div class="zone-grid">
       {#each ZONE_DEFS as z (z.id)}
         <div class="zone-cell">
-          <span class="zone-label">{z.name}</span>
+          <span class="zone-label">{labelOfId("zone", z.id)}</span>
           <select
             value={config.reader.zones[z.id]}
             onchange={(e) => { config.reader.zones[z.id] = (e.currentTarget as HTMLSelectElement).value as ZoneAction; saveConfig(); }}
           >
             <option value="none">{t("settings.keys.zoneNone")}</option>
             {#each BIND_DEFS as d (d.id)}
-              <option value={d.id}>{d.name}</option>
+              <option value={d.id}>{labelOfId("bind", d.id)}</option>
             {/each}
           </select>
         </div>
@@ -2238,7 +2255,7 @@
                     <label for="ai-provider-sel">{t("settings.ai.provider")}</label>
                     <select id="ai-provider-sel" bind:value={ap.provider} onchange={saveConfig}>
                       {#each AI_PROVIDERS as prov (prov.id)}
-                        <option value={prov.id}>{prov.label}</option>
+                        <option value={prov.id}>{labelOfId("aiProvider", prov.id)}</option>
                       {/each}
                     </select>
                   </div>
