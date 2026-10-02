@@ -66,6 +66,7 @@ try {
   await sleep(1500);
   M.close();
 } catch (e) {
+    process.exitCode = 1; /* 失败必须体现在退出码上 */
   console.error("[trace-live] ERROR", String(e));
 } finally {
   if (app) { killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles"); }
@@ -77,3 +78,7 @@ try {
     console.log(lines.join("\n") || "(none found)");
   } catch (e) { console.log("(diag read err)", String(e)); }
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

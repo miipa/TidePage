@@ -79,3 +79,7 @@ const bad = malicious.filter((r) => r.treeListeners !== "NONE" || r.injectedArgs
 const legal = results.find((r) => r.name === "legal-9444");
 console.log(bad.length === 0 ? "GUARD: ALL 8 MALICIOUS VALUES REJECTED (zero tree listeners, zero injected args)" : "GUARD FAIL: " + JSON.stringify(bad));
 console.log("legal:", JSON.stringify({ treeListeners: legal.treeListeners, injectedArgs: legal.injectedArgs, cdp: legal.cdp }));
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

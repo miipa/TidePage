@@ -64,7 +64,8 @@
   import { dragSort } from "../lib/dragSort";
   import { slide } from "svelte/transition";
   // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
-  import { localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
+  import { dateLocale, errText, labelOfId, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
+  import type { MessageKey } from "../lib/i18n/types";
   import { onMount, tick, untrack } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
@@ -76,24 +77,25 @@
   let { initialTab = undefined as SettingsTab | undefined }: { initialTab?: SettingsTab } = $props();
 
   /** 设置各分区的元信息（扁平列表，无分组）：标签 + 线性图标。 */
-  const TAB_META: Record<SettingsTab, { label: string; icon: TablerIcon }> = {
-    reader: { label: "阅读排版", icon: IconTypography },
-    appearance: { label: "界面外观", icon: IconColorSwatch },
-    manga: { label: "漫画模式", icon: IconPhoto },
-    tts: { label: "语音朗读", icon: IconVolume },
-    split: { label: "分章规则", icon: IconScissors },
-    ai: { label: "AI 助手", icon: IconSparkles },
-    keys: { label: "按键与手势", icon: IconKeyboard },
-    webdav: { label: "WebDAV", icon: IconCloud },
-    prefs: { label: "首选项", icon: IconAdjustments },
-    other: { label: "关于", icon: IconSettings },
+  // 分区 label 走 labelKey（t() 渲染时才求值，故切语言即时生效）；持久化只存 id。
+  const TAB_META: Record<SettingsTab, { labelKey: MessageKey; icon: TablerIcon }> = {
+    reader: { labelKey: "settings.tab.reader", icon: IconTypography },
+    appearance: { labelKey: "settings.tab.appearance", icon: IconColorSwatch },
+    manga: { labelKey: "settings.tab.manga", icon: IconPhoto },
+    tts: { labelKey: "settings.tab.tts", icon: IconVolume },
+    split: { labelKey: "settings.tab.split", icon: IconScissors },
+    ai: { labelKey: "settings.tab.ai", icon: IconSparkles },
+    keys: { labelKey: "settings.tab.keys", icon: IconKeyboard },
+    webdav: { labelKey: "settings.tab.webdav", icon: IconCloud },
+    prefs: { labelKey: "settings.tab.prefs", icon: IconAdjustments },
+    other: { labelKey: "settings.tab.other", icon: IconSettings },
   };
 
   /** 按持久化顺序排列的扁平分区列表（settingsOrder 已归一化，含全部合法 id）。 */
   const navItems = $derived(
     config.settingsOrder
       .filter((id): id is SettingsTab => id in TAB_META)
-      .map((id) => ({ id, label: TAB_META[id].label, icon: TAB_META[id].icon })),
+      .map((id) => ({ id, labelKey: TAB_META[id].labelKey, icon: TAB_META[id].icon })),
   );
 
   // 打开机制：+page.svelte 两处入口都在 {#if ui.settingsOpen} 内，每次打开重新挂载，
@@ -102,13 +104,13 @@
   let tab = $state<SettingsTab>(initialTab ?? navItems[0]?.id ?? "reader");
 
   /** 当前标签的显示名（用于头部面包屑）。 */
-  const tabLabel = $derived(TAB_META[tab]?.label ?? "设置");
+  const tabLabel = $derived(TAB_META[tab] ? t(TAB_META[tab].labelKey) : t("settings.title"));
 
   /** 导航搜索过滤（空则全部显示）。 */
   let navQuery = $state("");
   const navFiltered = $derived(
     navQuery.trim()
-      ? navItems.filter((i) => i.label.includes(navQuery.trim()))
+      ? navItems.filter((i) => t(i.labelKey).toLowerCase().includes(navQuery.trim().toLowerCase()))
       : navItems,
   );
 
@@ -228,15 +230,16 @@
 
   /** 预览：用共享端点渲染一张样例封面（底图 + 实时叠字）；未设底图时即主题渐变。
    *  带上主题配色参数，预览与书库默认封面完全一致，且切主题即时更新。 */
+  // i18n-allow:纯 URL 拼接、无可翻译文案（+ 连接的模板字面量会被守门扫描器合并成一段，属已知误报）
   const coverPreviewUrl = $derived(
     `http://tidepage.localhost/cover-default/0?v=${coverPreviewBust}` +
       `&g1=${encodeURIComponent(coverTheme.g1)}&g2=${encodeURIComponent(coverTheme.g2)}` +
-      `&g3=${encodeURIComponent(coverTheme.g3)}&tc=${encodeURIComponent(coverTheme.tc)}`,
-  );
+      `&g3=${encodeURIComponent(coverTheme.g3)}&tc=${encodeURIComponent(coverTheme.tc)}`, // i18n-allow:纯 URL 拼接、无可翻译文案（+ 连接的模板字面量会被守门扫描器合并成一段，属已知误报）
+  ); // i18n-allow:纯 URL 拼接、无可翻译文案（+ 连接的模板字面量会被守门扫描器合并成一段，属已知误报）
 
   async function pickDefaultCover() {
-    const p = await api.pickFile("选择默认封面底图", [
-      { name: "图片", exts: ["png", "jpg", "jpeg", "webp"] },
+    const p = await api.pickFile(t("settings.cover.pickDlg"), [
+      { name: t("settings.fileDlg.image"), exts: ["png", "jpg", "jpeg", "webp"] },
     ]);
     if (!p) return;
     coverBusy = true;
@@ -248,7 +251,7 @@
       // 与 {#key coverUrl} 一起确保无内嵌封面的书立即重挂 <img> 换新底图，无需滚动。
       ui.coverTick++;
       coverPreviewBust++;
-      toast("默认封面已更新");
+      toast(t("settings.cover.updated"));
     } catch (e) {
       toast(String(e), "error");
     } finally {
@@ -265,7 +268,7 @@
       // 同 pickDefaultCover：触发书库可见窗口重拉行数据，配合 {#key coverUrl} 即时重挂封面。
       ui.coverTick++;
       coverPreviewBust++;
-      toast("已恢复内置默认封面");
+      toast(t("settings.cover.restored"));
     } catch (e) {
       toast(String(e), "error");
     } finally {
@@ -289,13 +292,13 @@
   }
 
   async function clearCache(what: "covers" | "res" | "all") {
-    const label = what === "covers" ? "封面缓存" : what === "res" ? "提取资源缓存" : "全部缓存";
-    const ok = await appConfirm(`清理${label}？\n清理后会在后台重新生成，不影响书库与阅读进度。`);
+    const label = what === "covers" ? t("settings.cache.covers") : what === "res" ? t("settings.cache.res") : t("settings.cache.all");
+    const ok = await appConfirm(t("settings.cache.confirm", { label }));
     if (!ok) return;
     storageBusy = true;
     try {
       const freed = await api.clearCache(what);
-      toast(`已清理${label}，释放 ${fmtBytes(freed)}`);
+      toast(t("settings.cache.cleared", { label, size: fmtBytes(freed) }));
       await loadStorage();
     } catch (e) {
       toast(String(e), "error");
@@ -367,7 +370,7 @@
       schemeCssExtra: undefined,
       schemeFontWeight: undefined,
     });
-    toast("已清除本书方案，恢复为全局设置");
+    toast(t("settings.scheme.cleared"));
   }
 
   function openSchemeSave() {
@@ -376,29 +379,29 @@
   }
 
   function openSchemeNew() {
-    const id = createReaderScheme(schemeNameInput || "新方案");
+    const id = createReaderScheme(schemeNameInput || t("settings.scheme.defaultName"));
     schemeNameInput = "";
     schemeSaveOpen = false;
-    toast(`已新建方案「${config.readerSchemes.find((s) => s.id === id)?.name ?? ""}」`);
+    toast(t("settings.scheme.created", { name: config.readerSchemes.find((s) => s.id === id)?.name ?? "" }));
   }
 
   function saveOverScheme(s: ReaderScheme) {
     overwriteReaderScheme(s.id);
     schemeSaveOpen = false;
-    toast(`已覆盖方案「${s.name}」`);
+    toast(t("settings.scheme.overwritten", { name: s.name }));
   }
 
   function renameScheme(s: ReaderScheme) {
-    const n = window.prompt("重命名方案", s.name);
+    const n = window.prompt(t("settings.scheme.renamePrompt"), s.name);
     if (n == null) return;
     renameReaderScheme(s.id, n);
   }
 
   async function delScheme(s: ReaderScheme) {
-    const ok = await appConfirm(`删除方案「${s.name}」？删除后无法找回。`);
+    const ok = await appConfirm(t("settings.scheme.delConfirm", { name: s.name }));
     if (!ok) return;
     deleteReaderScheme(s.id);
-    toast("方案已删除");
+    toast(t("settings.scheme.deleted"));
   }
 
   /** 应用方案：global=写全局；book=只给当前书（无打开书时退化为全局）。 */
@@ -407,12 +410,12 @@
     if (!s) return;
     if (scope === "global" || !ui.currentBookId) {
       applyReaderSchemeGlobal(id);
-      toast(`已应用到全局：${s.name}`);
+      toast(t("settings.scheme.appliedGlobal", { name: s.name }));
       return;
     }
     // 仅当前书：把方案快照写入这本书的覆盖。
     applySchemeToBook(s);
-    toast(`已应用到本书：${s.name}`);
+    toast(t("settings.scheme.appliedBook", { name: s.name }));
   }
 
   function applySchemeToBook(s: ReaderScheme) {
@@ -451,8 +454,11 @@
   /** 各接口协议的文案提示与默认值（切换协议时用于补空字段）。 */
   interface TtsProviderMeta {
     id: string;
-    label: string;
+    /** 界面文案走 t()：labelKey 恒有；model/voiceHint 仅在含中文说明时给 *HintKey，其余是纯取值（模型名、音色 id 等）。 */
+    labelKey: MessageKey;
     baseHint: string;
+    modelHintKey?: MessageKey;
+    voiceHintKey?: MessageKey;
     modelHint: string;
     voiceHint: string;
     defaults: { baseUrl: string; model: string; voice: string; format: string };
@@ -463,17 +469,17 @@
   }
 
   const TTS_PROVIDER_METAS: TtsProviderMeta[] = [
-    { id: "openai", label: "OpenAI 兼容", baseHint: "http://127.0.0.1:3900", modelHint: "omnivoice", voiceHint: "音色名/参数，留空默认", defaults: { baseUrl: "http://127.0.0.1:3900", model: "omnivoice", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
-    { id: "voicestudio", label: "VoiceStudio（本地）", baseHint: "http://127.0.0.1:3900", modelHint: "tts-1（跟随 VoiceStudio 当前引擎）/ omnivoice", voiceHint: "default 或音色档案 ID，留空默认", defaults: { baseUrl: "http://127.0.0.1:3900", model: "tts-1", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
-    { id: "azure", label: "Azure OpenAI", baseHint: "https://<资源名>.openai.azure.com", modelHint: "部署名", voiceHint: "如 zh-CN-XiaoxiaoNeural", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "dashscope", label: "通义千问（DashScope）", baseHint: "https://dashscope.aliyuncs.com", modelHint: "qwen3-tts-flash", voiceHint: "Cherry", defaults: { baseUrl: "https://dashscope.aliyuncs.com", model: "qwen3-tts-flash", voice: "Cherry", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "minimax", label: "MiniMax", baseHint: "https://api.minimax.chat", modelHint: "speech-2.6-hd", voiceHint: "male-qn-qingse", defaults: { baseUrl: "https://api.minimax.chat", model: "speech-2.6-hd", voice: "male-qn-qingse", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "fish", label: "Fish Audio", baseHint: "https://api.fish.audio", modelHint: "s1", voiceHint: "reference_id", defaults: { baseUrl: "https://api.fish.audio", model: "s1", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "gptsovits", label: "GPT-SoVITS（本地）", baseHint: "http://127.0.0.1:9880", modelHint: "留空", voiceHint: "参考音频路径", defaults: { baseUrl: "http://127.0.0.1:9880", model: "", voice: "", format: "wav" }, voiceList: false, hideKeyModel: false },
-    { id: "breeze", label: "Breeze（本地）", baseHint: "http://127.0.0.1:7863", modelHint: "留空", voiceHint: "音色 id", defaults: { baseUrl: "http://127.0.0.1:7863", model: "", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
-    { id: "volcano", label: "火山引擎（豆包）", baseHint: "https://openspeech.bytedance.com/api/v1/tts", modelHint: "留空", voiceHint: "zh_female_cancan_mars_bigtts", defaults: { baseUrl: "https://openspeech.bytedance.com/api/v1/tts", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "baidu", label: "百度语音", baseHint: "https://tsn.baidu.com", modelHint: "留空", voiceHint: "音色编号，如 0", defaults: { baseUrl: "https://tsn.baidu.com", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "edge", label: "Edge TTS（免费）", baseHint: "服务地址固定，留空即可", modelHint: "", voiceHint: "如 zh-CN-XiaoxiaoNeural", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: true, hideKeyModel: true },
+    { id: "openai", labelKey: "dict.ttsProtocol.openai", baseHint: "http://127.0.0.1:3900", modelHint: "omnivoice", modelHintKey: undefined, voiceHint: "", voiceHintKey: "dict.ttsModel.openai", defaults: { baseUrl: "http://127.0.0.1:3900", model: "omnivoice", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "voicestudio", labelKey: "dict.ttsProtocol.voicestudio", baseHint: "http://127.0.0.1:3900", modelHint: "tts-1", modelHintKey: "dict.ttsModel.voicestudio", voiceHint: "", voiceHintKey: "dict.ttsModel.voicestudio", defaults: { baseUrl: "http://127.0.0.1:3900", model: "tts-1", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "azure", labelKey: "dict.ttsProtocol.azure", baseHint: "https://<resource name>.openai.azure.com", modelHint: "", modelHintKey: "dict.ttsModel.azure", voiceHint: "", voiceHintKey: "dict.ttsModel.common", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "dashscope", labelKey: "dict.ttsProtocol.dashscope", baseHint: "https://dashscope.aliyuncs.com", modelHint: "qwen3-tts-flash", voiceHint: "Cherry", defaults: { baseUrl: "https://dashscope.aliyuncs.com", model: "qwen3-tts-flash", voice: "Cherry", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "minimax", labelKey: "dict.ttsProtocol.minimax", baseHint: "https://api.minimax.chat", modelHint: "speech-2.6-hd", voiceHint: "male-qn-qingse", defaults: { baseUrl: "https://api.minimax.chat", model: "speech-2.6-hd", voice: "male-qn-qingse", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "fish", labelKey: "dict.ttsProtocol.fish", baseHint: "https://api.fish.audio", modelHint: "s1", voiceHint: "reference_id", defaults: { baseUrl: "https://api.fish.audio", model: "s1", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "gptsovits", labelKey: "dict.ttsProtocol.gptsovits", baseHint: "http://127.0.0.1:9880", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.gptsovits", defaults: { baseUrl: "http://127.0.0.1:9880", model: "", voice: "", format: "wav" }, voiceList: false, hideKeyModel: false },
+    { id: "breeze", labelKey: "dict.ttsProtocol.breeze", baseHint: "http://127.0.0.1:7863", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.breeze", defaults: { baseUrl: "http://127.0.0.1:7863", model: "", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "volcano", labelKey: "dict.ttsProtocol.volcano", baseHint: "https://openspeech.bytedance.com/api/v1/tts", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "zh_female_cancan_mars_bigtts", voiceHintKey: undefined, defaults: { baseUrl: "https://openspeech.bytedance.com/api/v1/tts", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "baidu", labelKey: "dict.ttsProtocol.baidu", baseHint: "https://tsn.baidu.com", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.baidu", defaults: { baseUrl: "https://tsn.baidu.com", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "edge", labelKey: "dict.ttsProtocol.edge", baseHint: "", modelHint: "", modelHintKey: undefined, voiceHint: "", voiceHintKey: "dict.ttsModel.common", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: true, hideKeyModel: true },
   ];
 
   function ttsProviderMeta(id: string): TtsProviderMeta {
@@ -508,7 +514,7 @@
   function delTtsService() {
     const list = config.tts.services;
     if (list.length <= 1) {
-      toast("至少保留一个语音服务", "error");
+      toast(t("settings.tts.keepOne"), "error");
       return;
     }
     const i = Math.min(Math.max(config.tts.activeService, 0), list.length - 1);
@@ -548,7 +554,7 @@
     if (!m.voiceList) {
       ttsVoiceList = [];
       ttsState.onlineVoices = [];
-      ttsVoiceMsg = "该服务不支持音色列表，请手动填写音色名";
+      ttsVoiceMsg = t("settings.tts.noVoiceList");
       return;
     }
     if (!(s.baseUrl || "").trim() && s.provider !== "edge") return;
@@ -558,8 +564,8 @@
       // 列表同时写入 ttsState.onlineVoices，供阅读界面播放条复用。
       ttsVoiceList = await refreshOnlineVoices();
       ttsVoiceMsg = ttsVoiceList.length
-        ? `共 ${ttsVoiceList.length} 个音色`
-        : "该服务不支持音色列表，请手动填写音色名";
+        ? t("settings.tts.voiceCount", { n: ttsVoiceList.length })
+        : t("settings.tts.noVoiceList");
     } finally {
       ttsVoiceLoading = false;
     }
@@ -590,7 +596,7 @@
   async function saveMobiEnc() {
     try {
       await api.setMobiEncoding(mobiEnc);
-      toast("正文编码已设置（MOBI/TXT），重新打开书籍后生效");
+      toast(t("settings.tts.encodingDone"));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -645,14 +651,14 @@
       const secret = await api.getSetting("secret.config").catch(() => null);
       const payload = { v: 1, config: stripSecrets(config), secret: secret ?? null };
       await copyText(JSON.stringify(payload, null, 2));
-      toast("配置已复制到剪贴板");
+      toast(t("settings.backup.copied"));
     } catch (e) {
       toast(String(e), "error");
     }
   }
 
   async function importConfig() {
-    const ok = await appConfirm("从剪贴板导入配置？\n将覆盖当前阅读、AI、WebDAV 等设置。");
+    const ok = await appConfirm(t("settings.backup.importConfirm"));
     if (!ok) return;
     try {
       const txt = await navigator.clipboard.readText();
@@ -662,7 +668,7 @@
         parsed && typeof parsed === "object" && parsed.config && typeof parsed.config === "object"
           ? parsed.config
           : parsed;
-      if (!obj || typeof obj !== "object" || !obj.reader) throw new Error("剪贴板不是有效的配置");
+      if (!obj || typeof obj !== "object" || !obj.reader) throw new Error(t("settings.backup.invalid"));
       Object.assign(config, {
         ...obj,
         reader: { ...config.reader, ...obj.reader },
@@ -684,9 +690,9 @@
         }
       }
       saveConfigNow();
-      toast("已从剪贴板导入配置");
+      toast(t("settings.backup.imported"));
     } catch (e) {
-      toast("导入失败：" + e, "error");
+      toast(t("settings.backup.importFailed", { err: String(e) }), "error");
     }
   }
 
@@ -694,7 +700,7 @@
     rebuildingFts = true;
     try {
       const n = await api.rebuildFts();
-      toast(`全文索引已重建，共 ${n} 个章节`);
+      toast(t("settings.backup.indexRebuilt", { n }));
     } catch (e) {
       toast(String(e), "error");
     } finally {
@@ -704,19 +710,23 @@
 
   function copyDataDir() {
     copyText(dataDir || "%APPDATA%\\com.a.tidepage");
-    toast("数据目录已复制");
+    toast(t("settings.backup.dataDirCopied"));
   }
 
-  const SPLIT_PRESETS: { name: string; pattern: string }[] = [
+  const SPLIT_PRESETS: { id: string; labelKey: MessageKey; pattern: string }[] = [
     {
-      name: "章节+特殊篇",
+      id: "chapterSpecial",
+      labelKey: "dict.splitPreset.chapterSpecial",
       pattern:
+        // i18n-allow:分章正则的字面量本身（要匹配的正是中文标题词），翻译它会直接改变匹配行为
         "(?<=[　\\s])(?:(?:内容|文章)?简介|文案|前言|序章|楔子|正文(?!完|结)|终章|后记|番外|第?\\s*[\\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+\\s*(?:卷|章))(?![\\w\\d]).{0,30}$",
     },
-    { name: "第X章/卷/回", pattern: "第\\s*[0-9〇零一二两三四五六七八九十百千]{1,12}\\s*[章节卷回部篇]" },
-    { name: "Chapter N", pattern: "^\\s*Chapter\\s+\\d+.*$" },
-    { name: "数字编号", pattern: "^\\s*\\d+[、.．]\\s*\\S.*$" },
-    { name: "分隔符", pattern: "^\\s*[-=*_]{3,}\\s*$" },
+    // i18n-allow:分章正则的字面量本身（要匹配的正是中文标题词），翻译它会直接改变匹配行为
+    { id: "chapterN", labelKey: "dict.splitPreset.chapterN", pattern: "第\\s*[0-9〇零一二两三四五六七八九十百千]{1,12}\\s*[章节卷回部篇]" },
+    { id: "chapterEn", labelKey: "dict.splitPreset.chapterEn", pattern: "^\\s*Chapter\\s+\\d+.*$" },
+    // i18n-allow:分章正则的字面量本身（含中文顿号/句点），翻译它会直接改变匹配行为
+    { id: "numbered", labelKey: "dict.splitPreset.numbered", pattern: "^\\s*\\d+[、.．]\\s*\\S.*$" },
+    { id: "separator", labelKey: "dict.splitPreset.separator", pattern: "^\\s*[-=*_]{3,}\\s*$" },
   ];
 
   const FALLBACK_FONTS = [
@@ -728,11 +738,11 @@
     "Segoe UI",
     "Georgia",
     "Consolas",
-    "仿宋",
-    "幼圆",
-    "隶书",
-    "思源黑体",
-    "思源宋体",
+    "仿宋", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
+    "幼圆", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
+    "隶书", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
+    "思源黑体", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
+    "思源宋体", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
   ];
 
   let fontList: string[] = $state([]);
@@ -770,7 +780,7 @@
       }
       if (config.ai.style.fontFamily === family) config.ai.style.fontFamily = "";
       saveConfig();
-      toast(fellBack ? `已删除字体「${family}」，正文字体已回退默认` : `已删除字体「${family}」`);
+      toast(fellBack ? t("settings.font.deletedFallbackToast", { name: family }) : t("settings.font.deletedToast", { name: family }));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -778,11 +788,11 @@
 
   async function resetReader() {
     const ok = await appConfirm(
-      "确定恢复「阅读」设置为默认吗？字体、主题、版式、快捷键与点击区域都会重置，不含 AI 与 WebDAV。"
+      t("settings.reader.resetConfirm")
     );
     if (!ok) return;
     resetReaderConfig();
-    toast("阅读设置已恢复默认");
+    toast(t("settings.reader.resetDone"));
   }
 
   let aiTesting = $state(false);
@@ -806,7 +816,7 @@
   async function saveWebviewArgs() {
     try {
       await api.setSetting("render.webviewArgs", grayAA ? "--disable-lcd-text" : "--enable-lcd-text");
-      toast("字体平滑已保存，重启应用后生效");
+      toast(t("settings.font.graySaved"));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -818,10 +828,10 @@
   const apMeta = $derived(aiProviderMeta(ap?.provider ?? "openai"));
 
   /** AI 设置三个分类的标题（显示顺序由 config.ai.groupOrder 决定）。 */
-  const AI_GROUP_TITLES: Record<string, string> = {
-    node: "AI 节点设置",
-    window: "AI 窗口",
-    prompt: "提示词",
+  const AI_GROUP_TITLES: Record<string, MessageKey> = {
+    node: "dict.aiGroup.node",
+    window: "dict.aiGroup.window",
+    prompt: "dict.aiGroup.prompt",
   };
   /** 分类开合状态；本组件每次打开重挂载，故每次默认全展开（折叠态不持久化）。 */
   let aiOpen = $state<Record<string, boolean>>({ node: true, window: true, prompt: true });
@@ -852,12 +862,12 @@
     config.ai.profiles.push(created);
     config.ai.active = config.ai.profiles.length - 1;
     saveConfigNow();
-    toast(`已新增端点「${created.name}」，请填写地址与密钥`);
+    toast(t("settings.ai.endpointCreated", { name: created.name }));
   }
 
   function delProfile() {
     if (config.ai.profiles.length <= 1) {
-      toast("至少保留一个端点", "error");
+      toast(t("settings.ai.keepOneEndpoint"), "error");
       return;
     }
     config.ai.profiles.splice(config.ai.active, 1);
@@ -877,17 +887,17 @@
     s.bgColor = r.bgColor;
     s.fgColor = r.fgColor;
     saveConfig();
-    toast("已把当前阅读设置复制为 AI 窗口专用");
+    toast(t("settings.ai.copiedReaderStyle"));
   }
 
   function addPrompt() {
-    config.ai.prompts.push({ id: Date.now(), name: `提示${config.ai.prompts.length + 1}`, text: "{chapter}", key: "" });
+    config.ai.prompts.push({ id: Date.now(), name: `提示${config.ai.prompts.length + 1}`, text: "{chapter}", key: "" }); // i18n-allow:新建提示词档的种子名，会被持久化进 config.ai.prompts，按规则禁止翻译
     saveConfig();
   }
 
   function delPrompt(i: number) {
     if (config.ai.prompts.length <= 1) {
-      toast("至少保留一个提示词", "error");
+      toast(t("settings.ai.keepOnePrompt"), "error");
       return;
     }
     config.ai.prompts.splice(i, 1);
@@ -915,7 +925,7 @@
 
   async function testAi() {
     aiTesting = true;
-    aiTestResult = "测试中…发送 1 条测试消息，最多等 25 秒";
+    aiTestResult = t("settings.ai.testingHint");
     try {
       const p = ap;
       const r = await api.aiTest({
@@ -953,8 +963,8 @@
   });
 
   async function installFont() {
-    const p = await api.pickFile("选择字体文件", [
-      { name: "字体", exts: ["ttf", "otf", "ttc"] },
+    const p = await api.pickFile(t("settings.font.pickDlg"), [
+      { name: t("settings.fileDlg.font"), exts: ["ttf", "otf", "ttc"] },
     ]);
     if (!p) return;
     try {
@@ -965,7 +975,7 @@
       }
       config.reader.fontFamily = family;
       saveConfig();
-      toast(`字体「${family}」已安装并应用`);
+      toast(t("settings.font.installedToast", { name: family }));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -984,7 +994,7 @@
       config.reader.customFonts = updated;
       if (renamed[config.reader.fontFamily]) config.reader.fontFamily = renamed[config.reader.fontFamily];
       saveConfig();
-      if (!silent) toast("已按字体内部名称更新");
+      if (!silent) toast(t("settings.font.namesFixed"));
     } catch (e) {
       if (!silent) toast(String(e), "error");
     }
@@ -1008,7 +1018,7 @@
         const arr = config.reader.bindings[def.id];
         if (arr && def.id !== act && arr.includes(combo)) {
           arr.splice(arr.indexOf(combo), 1);
-          toast(`${combo} 已从「${def.name}」移除`);
+          toast(t("settings.font.comboRemoved", { combo, name: def.name }));
         }
       }
       const target = config.reader.bindings[act];
@@ -1030,16 +1040,16 @@
   function resetBindings() {
     config.reader.bindings = structuredClone(DEFAULT_BINDINGS);
     saveConfig();
-    toast("快捷键已恢复默认");
+    toast(t("settings.keys.resetDone"));
   }
 
   async function testWebdav() {
     webdavTesting = true;
-    webdavStatus = "测试中…";
+    webdavStatus = t("settings.dav.testing");
     try {
       const ok = await api.webdavTest(config.webdav.base, config.webdav.user, config.webdav.pass);
-      webdavStatus = ok ? "✓ 连接成功" : "✗ 连接失败";
-      if (!ok) toast("WebDAV 连接失败", "error");
+      webdavStatus = ok ? t("settings.dav.testOk") : t("settings.dav.testFail");
+      if (!ok) toast(t("settings.dav.testFailed"), "error");
     } catch (e) {
       webdavStatus = `✗ ${e}`;
     } finally {
@@ -1048,7 +1058,7 @@
   }
 
   async function pickWebdavDir() {
-    const d = await api.pickFolder("选择 WebDAV 下载目录");
+    const d = await api.pickFolder(t("settings.dav.pickDlg"));
     if (!d) return;
     config.webdav.downloadDir = d;
     saveConfig();
@@ -1063,12 +1073,12 @@
 
   /** 「上次备份」本地时间文本。 */
   const lastBackupText = $derived.by(() => {
-    const t = config.webdav.backup?.lastAt ?? 0;
-    if (!t) return "从未备份";
+    const lastAt = config.webdav.backup?.lastAt ?? 0;
+    if (!lastAt) return t("settings.dav.never");
     try {
-      return new Date(t).toLocaleString();
+      return new Date(lastAt).toLocaleString(dateLocale());
     } catch {
-      return String(t);
+      return String(lastAt);
     }
   });
 
@@ -1100,7 +1110,7 @@
       }
     } catch (e) {
       backupList = [];
-      toast(`读取备份列表失败：${e}`, "error");
+      toast(t("settings.dav.listFailed", { err: String(e) }), "error");
     } finally {
       backupListBusy = false;
     }
@@ -1118,9 +1128,9 @@
     try {
       await runSettingsBackup();
       await loadBackupList();
-      toast("设置已备份到云端");
+      toast(t("settings.dav.backupDone"));
     } catch (e) {
-      toast(`备份失败：${e}`, "error");
+      toast(t("settings.dav.backupFailed", { err: String(e) }), "error");
     } finally {
       webdavBackupBusy = false;
     }
@@ -1129,20 +1139,20 @@
   async function restoreWebdavSettings() {
     const wd = config.webdav;
     if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
-      toast("请先填写 WebDAV 地址、账号与密码", "error");
+      toast(t("settings.dav.needCreds"), "error");
       return;
     }
     if (!selectedBackup) {
-      toast("请先选择备份", "error");
+      toast(t("settings.dav.pickFirst"), "error");
       return;
     }
-    const ok = await appConfirm("从云端恢复设置？\n将覆盖当前设置。");
+    const ok = await appConfirm(t("settings.dav.restoreConfirm"));
     if (!ok) return;
     webdavRestoreBusy = true;
     try {
       const data = await api.webdavRestoreSettings(wd.base, wd.user, wd.pass, selectedBackup);
       if (!data) {
-        toast("该备份不存在", "error");
+        toast(t("settings.dav.notExist"), "error");
         return;
       }
       const parsed = JSON.parse(data);
@@ -1153,7 +1163,7 @@
         try {
           credJson = await api.backupOpen(parsed.enc, passphrase);
         } catch {
-          toast("备份无法解密（WebDAV 账号不一致或备份损坏）", "error");
+          toast(t("settings.dav.decryptFailed"), "error");
           return;
         }
         applyConfigJson(JSON.stringify(parsed.config));
@@ -1165,7 +1175,7 @@
           parsed && typeof parsed === "object" && (parsed as any).config
             ? (parsed as any).config
             : parsed;
-        if (!obj || typeof obj !== "object" || !obj.reader) throw new Error("云端备份格式无效");
+        if (!obj || typeof obj !== "object" || !obj.reader) throw new Error(t("settings.dav.invalidFormat"));
         applyConfigJson(JSON.stringify(obj));
         const secret = parsed && typeof parsed === "object" ? (parsed as any).secret : undefined;
         if (typeof secret === "string" && secret) {
@@ -1179,9 +1189,9 @@
         }
       }
       saveConfigNow();
-      toast("已从云端恢复设置");
+      toast(t("settings.dav.restored"));
     } catch (e) {
-      toast(`恢复失败：${e}`, "error");
+      toast(t("settings.dav.restoreFailed", { err: String(e) }), "error");
     } finally {
       webdavRestoreBusy = false;
     }
@@ -1192,7 +1202,7 @@
       await api.saveSplitRules(regexText.trim());
       config.regex = regexText.trim();
       saveConfig();
-      toast("分章规则已保存，重新打开书籍后生效");
+      toast(t("settings.split.saved"));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1203,8 +1213,8 @@
   let previewing = $state(false);
 
   async function pickBgImage() {
-    const p = await api.pickFile("选择背景图片", [
-      { name: "图片", exts: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] },
+    const p = await api.pickFile(t("settings.bgImage.pickDlg"), [
+      { name: t("settings.fileDlg.image"), exts: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] },
     ]);
     if (!p) return;
     try {
@@ -1225,7 +1235,7 @@
   }
 
   async function pickRegexBook() {
-    const p = await api.pickFile("选择 TXT 文件测试分章", [{ name: "TXT", exts: ["txt"] }]);
+    const p = await api.pickFile(t("settings.split.pickDlg"), [{ name: t("settings.fileDlg.txt"), exts: ["txt"] }]);
     if (p) {
       regexBookPath = p;
       await previewRegex();
@@ -1253,20 +1263,20 @@
   <!-- 顶栏：标题 + 面包屑 + 关闭 -->
   <header class="set-head">
     <div class="set-title">
-      <span class="set-title-main">设置</span>
+      <span class="set-title-main">{t("settings.title")}</span>
       <span class="set-crumb">›</span>
       <span class="set-crumb-now">{tabLabel}</span>
     </div>
-    <button class="icon set-close" title="关闭" onclick={() => (ui.settingsOpen = false)}>×</button>
+    <button class="icon set-close" title={t("settings.close")} onclick={() => (ui.settingsOpen = false)}>×</button>
   </header>
 
   <div class="set-main">
     <!-- 左侧导航：扁平分区列表（无分组）+ 搜索；分区可拖拽排序（复用 dragSort，特效同顶栏图标）。 -->
     <aside class="set-nav">
       <div class="set-search">
-        <input placeholder="搜索设置…" bind:value={navQuery} aria-label="搜索设置" onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
+        <input placeholder={t("settings.nav.searchPlaceholder")} bind:value={navQuery} aria-label={t("settings.nav.searchAria")} onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
         {#if navQuery}
-          <button class="set-search-clear" title="清除" aria-label="清除搜索" onclick={() => (navQuery = "")}>×</button>
+          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}>×</button>
         {/if}
       </div>
       <div class="set-nav-list" use:dragSort={{ onDrop: navDrop, axis: "y" }}>
@@ -1275,27 +1285,28 @@
           <button
             class="set-nav-item"
             data-drag-id={it.id}
+            data-testid={"set-tab-" + it.id}
             class:active={tab === it.id}
             onclick={() => { tab = it.id; if (it.id === "tts") refreshVoices(); }}
           >
             <span class="set-nav-glyph"><Icon size={16} stroke={1.75} /></span>
-            <span class="set-nav-label">{it.label}</span>
+            <span class="set-nav-label">{t(it.labelKey)}</span>
           </button>
         {/each}
       </div>
       {#if navQuery.trim()}
-        <div class="set-nav-group">具体设置</div>
+        <div class="set-nav-group">{t("settings.nav.group")}</div>
         {#if searchResults.length}
           <div class="set-nav-results">
             {#each searchResults as h, i (h.tab + "|" + h.text + "|" + i)}
               <button class="set-result" onclick={() => locateSetting(h)} title={h.text}>
                 <span class="set-result-label">{h.text}</span>
-                <span class="set-result-tab">{TAB_META[h.tab].label}</span>
+                <span class="set-result-tab">{t(TAB_META[h.tab].labelKey)}</span>
               </button>
             {/each}
           </div>
         {:else if !navFiltered.length}
-          <div class="set-nav-empty">无匹配项</div>
+          <div class="set-nav-empty">{t("settings.nav.noMatch")}</div>
         {/if}
       {/if}
     </aside>
@@ -1305,20 +1316,20 @@
   <div class="set-pane" data-pane="appearance" hidden={tab !== "appearance"}>
 
     <div class="field">
-      <label>明暗模式</label>
+      <label>{t("settings.uiTheme")}</label>
       <div class="fr-seg">
-        <button class:active={config.uiTheme === "light"} onclick={() => setUiTheme("light")}>浅色</button>
-        <button class:active={config.uiTheme === "dark"} onclick={() => setUiTheme("dark")}>深色</button>
-        <button class:active={config.uiTheme === "system"} onclick={() => setUiTheme("system")}>系统</button>
+        <button data-testid="ui-theme-light" class:active={config.uiTheme === "light"} onclick={() => setUiTheme("light")}>{t("settings.uiTheme.light")}</button>
+        <button data-testid="ui-theme-dark" class:active={config.uiTheme === "dark"} onclick={() => setUiTheme("dark")}>{t("settings.uiTheme.dark")}</button>
+        <button data-testid="ui-theme-system" class:active={config.uiTheme === "system"} onclick={() => setUiTheme("system")}>{t("settings.uiTheme.system")}</button>
       </div>
     </div>
 
     <div class="field">
-      <label>浅色皮肤</label>
+      <label>{t("settings.skin.light")}</label>
       <div class="skin-grid">
         {#each UI_SKINS.filter((s) => s.mode === "light") as skin (skin.id)}
           <button
-            class="skin-card"
+            class="skin-card" data-skin-id={skin.id}
             class:active={config.uiSkinLight === skin.id}
             onclick={() => setUiSkin(skin.id)}
             title={skin.name}
@@ -1337,11 +1348,11 @@
     </div>
 
     <div class="field">
-      <label>深色皮肤</label>
+      <label>{t("settings.skin.dark")}</label>
       <div class="skin-grid">
         {#each UI_SKINS.filter((s) => s.mode === "dark") as skin (skin.id)}
           <button
-            class="skin-card"
+            class="skin-card" data-skin-id={skin.id}
             class:active={config.uiSkinDark === skin.id}
             onclick={() => setUiSkin(skin.id)}
             title={skin.name}
@@ -1360,141 +1371,141 @@
     </div>
 
     <div class="field">
-      <label>默认封面底图</label>
+      <label>{t("settings.cover.base")}</label>
       <div class="cover-ctl">
-        <img class="cover-preview" src={coverPreviewUrl} alt="默认封面预览" />
+        <img class="cover-preview" src={coverPreviewUrl} alt={t("settings.cover.previewAlt")} />
         <div class="cover-ctl-main">
           <p class="tip">
-            无内嵌封面的书（如 TXT）统一使用此底图，书名/作者在渲染时叠于其上。
-            {hasDefaultCover ? "当前使用自定义底图。" : "当前使用内置渐变底图。"}
+            {t("settings.cover.hint")}
+            {hasDefaultCover ? t("settings.cover.custom") : t("settings.cover.builtin")}
           </p>
           <div class="cover-ctl-acts">
-            <button onclick={pickDefaultCover} disabled={coverBusy}>选择图片…</button>
-            <button onclick={resetDefaultCover} disabled={coverBusy || !hasDefaultCover}>恢复内置</button>
+            <button onclick={pickDefaultCover} disabled={coverBusy}>{t("settings.cover.pick")}</button>
+            <button onclick={resetDefaultCover} disabled={coverBusy || !hasDefaultCover}>{t("settings.cover.restore")}</button>
           </div>
         </div>
       </div>
-      <p class="tip">支持 PNG / JPG / JPEG / WebP；底图会按封面比例居中裁切填满，不变形。更换后书库封面立即刷新。</p>
+      <p class="tip">{t("settings.cover.tip")}</p>
     </div>
 
   </div>
   <div class="set-pane" data-pane="reader" hidden={tab !== "reader"}>
     <div class="field">
-      <label>翻页模式</label>
+      <label>{t("settings.reader.pageMode")}</label>
       <select bind:value={config.reader.mode} onchange={saveConfig}>
-        <option value="page">左右翻页</option>
-        <option value="scroll">上下滚动</option>
+        <option value="page">{t("settings.reader.pageModePage")}</option>
+        <option value="scroll">{t("settings.reader.pageModeScroll")}</option>
       </select>
-      <p class="tip">左右翻页按栏数分屏；上下滚动为单栏连续滚动，不受版式影响。</p>
+      <p class="tip">{t("settings.reader.pageModeTip")}</p>
     </div>
 
     {#if config.reader.mode === "scroll"}
       <div class="field">
-        <label>章节过渡</label>
+        <label>{t("settings.reader.chapterTransition")}</label>
         <select bind:value={config.reader.scrollBounce} onchange={saveConfig}>
-          <option value={false}>无缝衔接</option>
-          <option value={true}>缓冲过渡</option>
+          <option value={false}>{t("settings.reader.transSeamless")}</option>
+          <option value={true}>{t("settings.reader.transBuffered")}</option>
         </select>
-        <p class="tip">无缝衔接：滚动到底自动续接上下章；缓冲过渡：超出阈值后触发翻页。</p>
+        <p class="tip">{t("settings.reader.transTip")}</p>
       </div>
       {#if config.reader.scrollBounce}
         <div class="field">
-          <label>缓冲强度</label>
+          <label>{t("settings.reader.bufferStrength")}</label>
           <select bind:value={config.reader.scrollBounceLevel} onchange={saveConfig}>
             {#each Object.entries(SCROLL_BOUNCE_PRESETS) as [k, p] (k)}
               <option value={k}>{p.label}</option>
             {/each}
           </select>
-          <p class="tip">档位越高，切换上/下一章所需的滚动量越大；仅在「缓冲过渡」下生效。</p>
+          <p class="tip">{t("settings.reader.bufferTip")}</p>
         </div>
       {/if}
     {:else}
       <div class="grid2">
         <div class="field">
-          <label>栏数</label>
-          <select bind:value={config.reader.duo} onchange={saveConfig} title="固定为单栏或双栏，不随窗口宽度改变">
-            <option value={false}>单栏</option>
-            <option value={true}>双栏</option>
+          <label>{t("settings.reader.columns")}</label>
+          <select bind:value={config.reader.duo} onchange={saveConfig} title={t("settings.reader.columnsTitle")}>
+            <option value={false}>{t("settings.reader.columnSingle")}</option>
+            <option value={true}>{t("settings.reader.columnDual")}</option>
           </select>
         </div>
         <div class="field">
-          <label>双栏栏间距 {config.reader.colGap}px</label>
+          <label>{t("settings.reader.colGap", { n: config.reader.colGap })}</label>
           <input type="range" min="0" max="160" step="4" bind:value={config.reader.colGap} oninput={saveConfig} disabled={!config.reader.duo} />
         </div>
       </div>
-      <p class="tip">栏数固定，不随窗口宽度改变。</p>
+      <p class="tip">{t("settings.reader.columnsTip")}</p>
     {/if}
 
     <div class="grid3">
       <div class="field">
-        <label>顶栏信息位置</label>
+        <label>{t("settings.reader.statusPos")}</label>
         <select bind:value={config.reader.statusPos} onchange={saveConfig}>
-          <option value="left">靠左</option>
-          <option value="center">居中</option>
-          <option value="right">靠右</option>
-          <option value="none">隐藏</option>
+          <option value="left">{t("settings.reader.posLeft")}</option>
+          <option value="center">{t("settings.reader.posCenter")}</option>
+          <option value="right">{t("settings.reader.posRight")}</option>
+          <option value="none">{t("settings.reader.posNone")}</option>
         </select>
       </div>
       <div class="field">
-        <label>信息文字色</label>
+        <label>{t("settings.reader.statusColor")}</label>
         <div class="color-row">
-          <input placeholder="自动" title="如 #333；留空则跟随主题" bind:value={config.reader.statusColor} oninput={saveConfig} />
-          <ColorPicker bind:value={config.reader.statusColor} allowEmpty emptyLabel="跟随主题" title="信息文字色" onchange={saveConfig} />
+          <input placeholder={t("settings.reader.colorAuto")} title={t("settings.reader.statusColorTip")} bind:value={config.reader.statusColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.statusColor} allowEmpty emptyLabel={t("settings.reader.followTheme")} title={t("settings.reader.statusColor")} onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
-        <label>顶栏背景色</label>
+        <label>{t("settings.reader.topbarColor")}</label>
         <div class="color-row">
-          <input placeholder="自动" title="留空则跟随主题" bind:value={config.reader.topbarColor} oninput={saveConfig} />
-          <ColorPicker bind:value={config.reader.topbarColor} allowEmpty emptyLabel="跟随主题" title="顶栏背景色" onchange={saveConfig} />
+          <input placeholder={t("settings.reader.colorAuto")} title={t("settings.reader.topbarColorTip")} bind:value={config.reader.topbarColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.topbarColor} allowEmpty emptyLabel={t("settings.reader.followTheme")} title={t("settings.reader.topbarColor")} onchange={saveConfig} />
         </div>
       </div>
     </div>
 
     <details class="adv">
-      <summary>顶栏 / 底栏显示内容（高级）</summary>
+      <summary>{t("settings.statusItems.title")}</summary>
       <div class="field">
       <div class="stat-grid">
-        <div class="stat-head">项目</div>
-        <div class="stat-head">顶栏</div>
-        <div class="stat-head">底栏左</div>
-        <div class="stat-head">底栏右</div>
+        <div class="stat-head">{t("settings.statusItems.item")}</div>
+        <div class="stat-head">{t("settings.statusItems.top")}</div>
+        <div class="stat-head">{t("settings.statusItems.footerLeft")}</div>
+        <div class="stat-head">{t("settings.statusItems.footerRight")}</div>
         {#each STATUS_ITEM_DEFS as d (d.id)}
-          <div class="stat-name">{d.name}</div>
+          <div class="stat-name">{labelOfId("statusItem", d.id)}</div>
           <div class="stat-cell">
             <input type="checkbox" checked={topEnabled(d.id)} onchange={() => toggleTopItem(d.id)} />
           </div>
           <div class="stat-cell">
             <input type="checkbox" checked={footerHas("left", d.id)} onchange={() => toggleFooter("left", d.id)} />
             {#if footerHas("left", d.id)}
-              <button type="button" class="stat-mv" title="左移" onclick={() => moveFooter("left", d.id, -1)}>‹</button>
-              <button type="button" class="stat-mv" title="右移" onclick={() => moveFooter("left", d.id, 1)}>›</button>
+              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("left", d.id, -1)}>‹</button>
+              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("left", d.id, 1)}>›</button>
             {/if}
           </div>
           <div class="stat-cell">
             <input type="checkbox" checked={footerHas("right", d.id)} onchange={() => toggleFooter("right", d.id)} />
             {#if footerHas("right", d.id)}
-              <button type="button" class="stat-mv" title="左移" onclick={() => moveFooter("right", d.id, -1)}>‹</button>
-              <button type="button" class="stat-mv" title="右移" onclick={() => moveFooter("right", d.id, 1)}>›</button>
+              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("right", d.id, -1)}>‹</button>
+              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("right", d.id, 1)}>›</button>
             {/if}
           </div>
         {/each}
       </div>
-      <p class="tip">顶栏项在阅读界面可用鼠标拖动排序；底栏顺序用 ‹ › 调整。“本节页数/百分比”“全书总页数”仅在翻页模式有意义。</p>
+      <p class="tip">{t("settings.statusItems.tip")}</p>
       </div>
     </details>
 
     <div class="field">
       <div class="scheme-head">
-        <label>阅读配色方案</label>
+        <label>{t("settings.scheme.title")}</label>
         <div class="scheme-actions">
-          <button onclick={() => openSchemeSave()}>保存当前配置…</button>
+          <button onclick={() => openSchemeSave()}>{t("settings.scheme.saveCurrent")}</button>
         </div>
       </div>
       <div class="scheme-grid">
         {#each config.readerSchemes as s (s.id)}
           <div class="scheme-card" class:active={schemeActive(s)}>
-            <button class="scheme-preview" title="应用方案" style="background:{s.cfg.bgColor || THEMES[s.cfg.theme].bg}; color:{s.cfg.fgColor || THEMES[s.cfg.theme].fg};" onclick={() => applyScheme(s.id, "book")}>
+            <button class="scheme-preview" data-testid={"scheme-apply-" + s.id} title={t("settings.scheme.applyTip")} style="background:{s.cfg.bgColor || THEMES[s.cfg.theme].bg}; color:{s.cfg.fgColor || THEMES[s.cfg.theme].fg};" onclick={() => applyScheme(s.id, "book")}>
               <span class="sp-line" style="background:currentColor; opacity:.85;"></span>
               <span class="sp-line short" style="background:currentColor; opacity:.55;"></span>
               <span class="sp-line" style="background:currentColor; opacity:.75;"></span>
@@ -1502,30 +1513,30 @@
             </button>
             <div class="scheme-name" title={s.name}>{s.name}</div>
             <div class="scheme-menu">
-              <button class="icon" title="应用到全局（所有书默认）" onclick={() => applyScheme(s.id, "global")}>全局</button>
-              <button class="icon" title="仅应用到当前书" onclick={() => applyScheme(s.id, "book")}>本书</button>
-              <button class="icon" title="重命名" onclick={() => renameScheme(s)}>改</button>
-              <button class="icon" title="删除" onclick={() => delScheme(s)}>×</button>
+              <button class="icon" data-testid="scheme-global" title={t("settings.scheme.globalTitle")} onclick={() => applyScheme(s.id, "global")}>{t("settings.scheme.global")}</button>
+              <button class="icon" data-testid="scheme-book" title={t("settings.scheme.bookTitle")} onclick={() => applyScheme(s.id, "book")}>{t("settings.scheme.book")}</button>
+              <button class="icon" data-testid="scheme-rename" title={t("settings.scheme.rename")} onclick={() => renameScheme(s)}>{t("settings.scheme.renameShort")}</button>
+              <button class="icon" data-testid="scheme-delete" title={t("settings.scheme.delete")} onclick={() => delScheme(s)}>×</button>
             </div>
           </div>
         {/each}
       </div>
       {#if bookSchemeNote()}
         <div class="book-scheme-note">
-          <span>本书已单独套用方案，全局字体/配色不会影响它。</span>
-          <button class="link-btn" onclick={clearBookScheme}>清除本书方案（回到全局）</button>
+          <span>{t("settings.scheme.bookApplied")}</span>
+          <button class="link-btn" data-testid="scheme-clear-book" onclick={clearBookScheme}>{t("settings.scheme.clearBook")}</button>
         </div>
       {/if}
     </div>
 
     {#if schemeSaveOpen}
       <div class="scheme-save-backdrop" role="presentation" onclick={() => (schemeSaveOpen = false)}>
-        <div class="scheme-save" role="dialog" aria-label="保存阅读配色方案" onclick={(e) => e.stopPropagation()}>
-          <div class="ss-head">保存当前配置为方案</div>
-          <p class="tip">点已有方案 = 覆盖它；或新建一个方案。</p>
+        <div class="scheme-save" role="dialog" aria-label={t("settings.scheme.saveAria")} onclick={(e) => e.stopPropagation()}>
+          <div class="ss-head">{t("settings.scheme.saveHead")}</div>
+          <p class="tip">{t("settings.scheme.saveTip")}</p>
           <div class="scheme-grid compact">
             {#each config.readerSchemes as s (s.id)}
-              <button class="scheme-card save-target" onclick={() => saveOverScheme(s)} title={`覆盖「${s.name}」`}>
+              <button class="scheme-card save-target" onclick={() => saveOverScheme(s)} title={t("settings.scheme.overwriteTitle", { name: s.name })}>
                 <span class="scheme-preview" style="background:{s.cfg.bgColor || THEMES[s.cfg.theme].bg}; color:{s.cfg.fgColor || THEMES[s.cfg.theme].fg};">
                   <span class="sp-line" style="background:currentColor; opacity:.85;"></span>
                   <span class="sp-line short" style="background:currentColor; opacity:.55;"></span>
@@ -1536,8 +1547,8 @@
             {/each}
           </div>
           <div class="ss-new">
-            <input placeholder="新方案名称" bind:value={schemeNameInput} />
-            <button class="primary" onclick={openSchemeNew}>＋ 新建方案</button>
+            <input placeholder={t("settings.scheme.newPlaceholder")} bind:value={schemeNameInput} />
+            <button class="primary" onclick={openSchemeNew}>{t("settings.scheme.newBtn")}</button>
           </div>
         </div>
       </div>
@@ -1545,72 +1556,72 @@
 
     <div class="grid2">
       <div class="field">
-        <label>背景颜色</label>
+        <label>{t("settings.color.bg")}</label>
         <div class="color-row">
           <input
-            placeholder="如 #f5f1e8 / rgb(245,241,232)，留空用预设"
+            placeholder={t("settings.color.bgPlaceholder")}
             bind:value={config.reader.bgColor}
             oninput={saveConfig}
           />
-          <ColorPicker bind:value={config.reader.bgColor} allowEmpty emptyLabel="跟随预设" title="背景颜色" onchange={saveConfig} />
+          <ColorPicker bind:value={config.reader.bgColor} allowEmpty emptyLabel={t("settings.color.followPreset")} title={t("settings.color.bg")} onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
-        <label>文字颜色</label>
+        <label>{t("settings.color.fg")}</label>
         <div class="color-row">
           <input
-            placeholder="如 #3b3630 / #1a1a2e，留空用预设"
+            placeholder={t("settings.color.fgPlaceholder")}
             bind:value={config.reader.fgColor}
             oninput={saveConfig}
           />
-          <ColorPicker bind:value={config.reader.fgColor} allowEmpty emptyLabel="跟随预设" title="文字颜色" onchange={saveConfig} />
+          <ColorPicker bind:value={config.reader.fgColor} allowEmpty emptyLabel={t("settings.color.followPreset")} title={t("settings.color.fg")} onchange={saveConfig} />
         </div>
       </div>
     </div>
-    <p class="tip">自定义颜色优先于预设主题。</p>
+    <p class="tip">{t("settings.color.customTip")}</p>
 
     <div class="field">
-      <label>背景图片</label>
+      <label>{t("settings.bgImage.title")}</label>
       <div class="row-inline">
         {#if config.reader.bgImage}
           <img class="bg-thumb" src={"http://tidepage.localhost/bg/" + config.reader.bgImage} alt="" />
-          <button onclick={pickBgImage}>更换图片</button>
-          <button onclick={removeBgImage}>移除图片</button>
+          <button onclick={pickBgImage}>{t("settings.bgImage.change")}</button>
+          <button onclick={removeBgImage}>{t("settings.bgImage.remove")}</button>
         {:else}
-          <button onclick={pickBgImage}>选择图片…</button>
+          <button onclick={pickBgImage}>{t("settings.bgImage.pick")}</button>
         {/if}
       </div>
-      <p class="tip">可选，叠加在背景色之上。</p>
+      <p class="tip">{t("settings.bgImage.tip")}</p>
     </div>
 
     {#if config.reader.bgImage}
       <div class="field">
-        <label>图片不透明度 {Math.round(config.reader.bgOpacity * 100)}%</label>
+        <label>{t("settings.bgOpacity", { n: Math.round(config.reader.bgOpacity * 100) })}</label>
         <input type="range" min="0.05" max="1" step="0.05" bind:value={config.reader.bgOpacity} oninput={saveConfig} />
-        <p class="tip">100% 表示完全覆盖背景色。</p>
+        <p class="tip">{t("settings.bgOpacityTip")}</p>
       </div>
     {/if}
 
     <div class="field">
-      <label>字体</label>
+      <label>{t("settings.font.title")}</label>
       <div class="row-inline">
         <input
           class="font-input"
-          placeholder="输入字体名筛选…"
+          placeholder={t("settings.font.searchPlaceholder")}
           bind:value={fontFilter}
         />
         <input
           class="font-value"
-          placeholder="当前字体"
+          placeholder={t("settings.font.currentPlaceholder")}
           bind:value={config.reader.fontFamily}
           onchange={saveConfig}
         />
-        <button onclick={installFont}>安装字体文件…</button>
-        <button onclick={() => refreshFontNames()} title="读取字体文件中的真实名称，修复已装字体名不匹配">↻ 重读字体名</button>
+        <button onclick={installFont}>{t("settings.font.install")}</button>
+        <button onclick={() => refreshFontNames()} title={t("settings.font.reloadNamesTip")}>{t("settings.font.reloadNames")}</button>
       </div>
       <div class="font-list">
         {#if customFontOptions.length}
-          <div class="font-group-title">已安装字体</div>
+          <div class="font-group-title">{t("settings.font.installedGroup")}</div>
           {#each customFontOptions as f, fi (f.family + fi)}
             <span class="font-opt-wrap">
               <button
@@ -1621,13 +1632,13 @@
               >★ {f.family}</button>
               <button
                 class="font-del"
-                title="删除该字体"
+                title={t("settings.font.deleteTitle")}
                 onclick={(e) => { e.stopPropagation(); deleteCustomFont(f.family, f.file); }}
               >×</button>
             </span>
           {/each}
         {/if}
-        <div class="font-group-title">系统字体</div>
+        <div class="font-group-title">{t("settings.font.systemGroup")}</div>
         {#each fontOptions as f (f)}
           <button
             class="font-opt"
@@ -1640,17 +1651,17 @@
     </div>
 
     <div class="field">
-      <label>西文字体</label>
+      <label>{t("settings.font.latinTitle")}</label>
       <div class="row-inline">
         <input
           class="font-value"
           list="latin-font-options"
-          placeholder="留空=跟随正文字体；可输入任意系统字体名"
+          placeholder={t("settings.font.latinPlaceholder")}
           bind:value={config.reader.latinFont}
           onchange={saveConfig}
         />
         {#if config.reader.latinFont}
-          <button class="icon" title="清除" onclick={() => { config.reader.latinFont = ""; saveConfig(); }}>×</button>
+          <button class="icon" title={t("settings.font.clear")} onclick={() => { config.reader.latinFont = ""; saveConfig(); }}>×</button>
         {/if}
       </div>
       <datalist id="latin-font-options">
@@ -1658,20 +1669,20 @@
           <option value={f}></option>
         {/each}
       </datalist>
-      <p class="tip">用于改善中英混排时拉丁字符字形（如 Georgia / Times New Roman）；AI 窗口同步生效。</p>
+      <p class="tip">{t("settings.font.latinTip")}</p>
     </div>
 
     <div class="grid3">
       <div class="field">
-        <label>字号 {config.reader.fontSize}px</label>
+        <label>{t("settings.font.size", { n: config.reader.fontSize })}</label>
         <input type="range" min="10" max="64" bind:value={config.reader.fontSize} oninput={saveConfig} />
       </div>
       <div class="field">
-        <label>行距 {config.reader.lineHeight}</label>
+        <label>{t("settings.font.lineHeight", { n: config.reader.lineHeight })}</label>
         <input type="range" min="1.2" max="3" step="0.05" bind:value={config.reader.lineHeight} oninput={saveConfig} />
       </div>
       <div class="field">
-        <label>段距 {config.reader.paraSpacing}em</label>
+        <label>{t("settings.font.paraSpacing", { n: config.reader.paraSpacing })}</label>
         <input type="range" min="0" max="2" step="0.1" bind:value={config.reader.paraSpacing} oninput={saveConfig} />
       </div>
     </div>
@@ -1680,203 +1691,203 @@
     <div class="field">
       <label class="check">
         <input type="checkbox" bind:checked={grayAA} onchange={saveWebviewArgs} />
-        灰度抗锯齿
+        {t("settings.font.grayAA")}
       </label>
-      <p class="tip">勾选后使用灰度抗锯齿，消除文字彩边、笔画更均匀柔和；取消勾选则使用系统 ClearType 子像素渲染。修改后需重启生效。</p>
+      <p class="tip">{t("settings.font.grayAATip")}</p>
     </div>
 
     <div class="grid3">
       <div class="field">
-        <label>正文字重</label>
+        <label>{t("settings.font.weight")}</label>
         <select bind:value={config.reader.fontWeight} onchange={saveConfig}>
-          <option value={300}>细 300</option>
-          <option value={400}>常规 400</option>
-          <option value={500}>中 500</option>
+          <option value={300}>{t("settings.font.weight300")}</option>
+          <option value={400}>{t("settings.font.weight400")}</option>
+          <option value={500}>{t("settings.font.weight500")}</option>
         </select>
       </div>
       <div class="field">
-        <label>对齐方式</label>
+        <label>{t("settings.font.align")}</label>
         <select bind:value={config.reader.textAlign} onchange={saveConfig}>
-          <option value="justify">两端对齐</option>
-          <option value="left">左对齐</option>
+          <option value="justify">{t("settings.font.alignJustify")}</option>
+          <option value="left">{t("settings.font.alignLeft")}</option>
         </select>
       </div>
       <div class="field">
-        <label>每行字数上限 {config.reader.maxLineChars > 0 ? config.reader.maxLineChars + " 字" : "关闭"}</label>
+        <label>{config.reader.maxLineChars > 0 ? t("settings.font.maxLine", { n: config.reader.maxLineChars }) : t("settings.font.maxLineOff")}</label>
         <input type="range" min="0" max="60" step="2" bind:value={config.reader.maxLineChars} oninput={saveConfig} />
       </div>
     </div>
-    <p class="tip">每行字数上限大于 0 时忽略左右边距，按字号自动居中。</p>
+    <p class="tip">{t("settings.font.maxLineTip")}</p>
     <hr />
 
     <div class="grid3">
       <div class="field">
-        <label>左右边距 {config.reader.maxLineChars > 0 ? "已由每行字数上限接管" : config.reader.marginH + "px"}</label>
+        <label>{config.reader.maxLineChars > 0 ? t("settings.font.marginHTaken") : t("settings.font.marginH", { n: config.reader.marginH + "px" })}</label>
         <div class="row-inline">
           <input type="range" min="0" max="560" bind:value={config.reader.marginH} oninput={saveConfig} disabled={config.reader.maxLineChars > 0} />
           <input class="numbox" type="number" min="0" max="560" bind:value={config.reader.marginH} onchange={saveConfig} disabled={config.reader.maxLineChars > 0} />
         </div>
       </div>
       <div class="field">
-        <label>上下边距 {config.reader.marginV}px</label>
+        <label>{t("settings.font.marginV", { n: config.reader.marginV })}</label>
         <div class="row-inline">
           <input type="range" min="0" max="400" bind:value={config.reader.marginV} oninput={saveConfig} />
           <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.marginV} onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
-        <label>首行缩进</label>
+        <label>{t("settings.font.indent")}</label>
         <select bind:value={config.reader.indent} onchange={saveConfig}>
-          <option value="0em">不缩进</option>
-          <option value="1em">缩进 1 字</option>
-          <option value="2em">缩进 2 字</option>
-          <option value="3em">缩进 3 字</option>
+          <option value="0em">{t("settings.font.indent0")}</option>
+          <option value="1em">{t("settings.font.indent1")}</option>
+          <option value="2em">{t("settings.font.indent2")}</option>
+          <option value="3em">{t("settings.font.indent3")}</option>
         </select>
       </div>
     </div>
 
     <div class="checks">
-      <label><input type="checkbox" bind:checked={config.reader.overrideBookCss} onchange={saveConfig} /> 用阅读版式覆盖书籍自带排版</label>
-      <label><input type="checkbox" bind:checked={config.reader.pageTurnKeys} onchange={saveConfig} /> 键盘翻页</label>
+      <label><input type="checkbox" bind:checked={config.reader.overrideBookCss} onchange={saveConfig}  /> {t("settings.reader.overrideCss")}</label>
+      <label><input type="checkbox" bind:checked={config.reader.pageTurnKeys} onchange={saveConfig}  /> {t("settings.reader.pageTurnKeys")}</label>
     </div>
-    <p class="tip">开启后忽略 EPUB 自带排版，使用上方字号/行距/边距等设置。</p>
+    <p class="tip">{t("settings.reader.overrideCssTip")}</p>
 
     <hr />
     <div class="grid3">
       <div class="field">
-        <label>划线默认样式</label>
-        <select bind:value={config.reader.highlightStyle} onchange={saveConfig} title="选中文字后仍可临时选择其它样式">
+        <label>{t("settings.hl.defaultStyle")}</label>
+        <select bind:value={config.reader.highlightStyle} onchange={saveConfig} title={t("settings.hl.defaultStyleTip")}>
           {#each HIGHLIGHT_STYLES as s (s.id)}
             <option value={s.id}>{s.name}</option>
           {/each}
         </select>
       </div>
       <div class="field">
-        <label>划线颜色</label>
+        <label>{t("settings.hl.color")}</label>
         <div class="color-row">
-          <input placeholder="如 #c0392b / rgb(192,57,43)，留空用默认" bind:value={config.reader.highlightColor} oninput={saveConfig} />
-          <ColorPicker bind:value={config.reader.highlightColor} allowEmpty emptyLabel="默认红棕" title="划线默认颜色" onchange={saveConfig} />
+          <input placeholder={t("settings.hl.colorPlaceholder")} bind:value={config.reader.highlightColor} oninput={saveConfig} />
+          <ColorPicker bind:value={config.reader.highlightColor} allowEmpty emptyLabel={t("settings.hl.colorEmpty")} title={t("settings.hl.color")} onchange={saveConfig} />
         </div>
       </div>
       <div class="field">
-        <label>浏览器搜索链接</label>
-        <input placeholder="https://www.baidu.com/s?wd=%s" title="%s 会被替换为选中文字" bind:value={config.reader.browserSearchUrl} oninput={saveConfig} />
+        <label>{t("settings.reader.browserSearch")}</label>
+        <input placeholder="https://www.baidu.com/s?wd=%s" title={t("settings.reader.browserSearchTip")} bind:value={config.reader.browserSearchUrl} oninput={saveConfig} />
       </div>
     </div>
     <div class="field">
-      <label>自定义 CSS</label>
+      <label>{t("settings.reader.customCss")}</label>
       <textarea class="cssbox" rows="6" bind:value={config.reader.cssExtra} oninput={saveConfig} placeholder={"p { letter-spacing: 0.05em; }\nh1 { color: #a00; }"}></textarea>
-      <p class="tip">追加到正文样式之后，优先级最高；行距、字距等可在此微调。</p>
+      <p class="tip">{t("settings.reader.customCssTip")}</p>
     </div>
 
     <div class="close-row" style="margin-top:12px">
-      <button onclick={resetReader}>恢复阅读设置默认…</button>
+      <button onclick={resetReader}>{t("settings.reader.reset")}</button>
     </div>
   </div>
   <div class="set-pane" data-pane="manga" hidden={tab !== "manga"}>
-    <p class="tip">以下设置只影响漫画模式（自动识别的漫画书，或用顶栏「漫/文」按钮手动切换为漫画的书）；普通书不受影响。阅读界面右下角「图−/图＋」在漫画模式下直接调整这里的全局「图片大小」，当前书跟随；「适宽」为按书本覆盖。</p>
+    <p class="tip">{t("settings.manga.scopeTip")}</p>
 
     <div class="grid3 mg-grid">
       <div class="field">
-        <label>显示方式</label>
+        <label>{t("settings.manga.display")}</label>
         <select bind:value={config.reader.manga.layout} onchange={saveConfig}>
-          <option value="flow">上下滚动</option>
-          <option value="horizontal">横向连续</option>
+          <option value="flow">{t("settings.manga.displayFlow")}</option>
+          <option value="horizontal">{t("settings.manga.displayHorizontal")}</option>
         </select>
-        <p class="tip">上下滚动：图片纵向连续排布、向下滚动；横向连续：图片横向连续排布、可拖动平移。</p>
+        <p class="tip">{t("settings.manga.displayTip")}</p>
       </div>
       <div class="field">
-        <label>阅读方向{config.reader.manga.layout === "flow" ? "（仅横向可用）" : ""}</label>
+        <label>{t("settings.manga.direction", { note: config.reader.manga.layout === "flow" ? t("settings.manga.horizontalOnly") : "" })}</label>
         <select
           bind:value={config.reader.manga.direction}
           onchange={saveConfig}
           disabled={config.reader.manga.layout === "flow"}
         >
-          <option value="ltr">从左到右</option>
-          <option value="rtl">从右到左</option>
+          <option value="ltr">{t("settings.manga.dirLtr")}</option>
+          <option value="rtl">{t("settings.manga.dirRtl")}</option>
         </select>
       </div>
       <div class="field">
-        <label>正文文字显示</label>
+        <label>{t("settings.manga.textMode")}</label>
         <select bind:value={config.reader.manga.hideText} onchange={saveConfig}>
-          <option value={false}>显示</option>
-          <option value={true}>仅图片</option>
+          <option value={false}>{t("settings.manga.textShow")}</option>
+          <option value={true}>{t("settings.manga.textImageOnly")}</option>
         </select>
       </div>
     </div>
 
     <hr />
     <div class="field">
-      <label>图片大小（默认倍率）{config.reader.manga.imgScale.toFixed(1)}×</label>
+      <label>{t("settings.manga.imgScale", { n: config.reader.manga.imgScale.toFixed(1) })}</label>
       <input type="range" min="0.3" max="3" step="0.1" bind:value={config.reader.manga.imgScale} oninput={onMangaScaleInput} />
-      <p class="tip">默认 1.0×；漫画模式下阅读界面右下角「图−/图＋」直接调整此全局倍率（0.3~3.0），正在阅读的当前书会跟随。</p>
+      <p class="tip">{t("settings.manga.imgScaleTip")}</p>
     </div>
 
     <div class="checks">
-      <label><input type="checkbox" checked={config.reader.manga.fitWidth} onchange={(e) => setMangaFit("fitWidth", e.currentTarget.checked)} /> 默认适应阅读器宽度</label>
-      <label><input type="checkbox" checked={config.reader.manga.fitHeight} onchange={(e) => setMangaFit("fitHeight", e.currentTarget.checked)} /> 默认适应阅读器高度</label>
+      <label><input type="checkbox" checked={config.reader.manga.fitWidth} onchange={(e) => setMangaFit("fitWidth", e.currentTarget.checked)}  /> {t("settings.manga.fitWidth")}</label>
+      <label><input type="checkbox" checked={config.reader.manga.fitHeight} onchange={(e) => setMangaFit("fitHeight", e.currentTarget.checked)}  /> {t("settings.manga.fitHeight")}</label>
     </div>
 
     <hr />
     <div class="grid3 mg-grid">
       <div class="field" class:mg-off={config.reader.manga.layout === "horizontal"}>
-        <label>左右边距 {config.reader.manga.layout === "horizontal" ? "（横向不支持）" : config.reader.manga.marginH + "px"}</label>
+        <label>{config.reader.manga.layout === "horizontal" ? t("settings.manga.marginH", { n: t("settings.manga.horizontalUnsupported") }) : t("settings.manga.marginH", { n: config.reader.manga.marginH + "px" })}</label>
         <div class="row-inline">
           <input type="range" min="0" max="400" bind:value={config.reader.manga.marginH} oninput={saveConfig} disabled={config.reader.manga.layout === "horizontal"} />
           <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginH} onchange={saveConfig} disabled={config.reader.manga.layout === "horizontal"} />
         </div>
       </div>
       <div class="field" class:mg-off={config.reader.manga.layout === "flow"}>
-        <label>上下边距 {config.reader.manga.layout === "flow" ? "（上下滚动不支持）" : config.reader.manga.marginV + "px"}</label>
+        <label>{config.reader.manga.layout === "flow" ? t("settings.manga.marginV", { n: t("settings.manga.flowUnsupported") }) : t("settings.manga.marginV", { n: config.reader.manga.marginV + "px" })}</label>
         <div class="row-inline">
           <input type="range" min="0" max="400" bind:value={config.reader.manga.marginV} oninput={saveConfig} disabled={config.reader.manga.layout === "flow"} />
           <input class="numbox" type="number" min="0" max="400" bind:value={config.reader.manga.marginV} onchange={saveConfig} disabled={config.reader.manga.layout === "flow"} />
         </div>
       </div>
       <div class="field">
-        <label>图片间距 {config.reader.manga.imgGap}px</label>
+        <label>{t("settings.manga.imgGap", { n: config.reader.manga.imgGap })}</label>
         <div class="row-inline">
           <input type="range" min="0" max="80" bind:value={config.reader.manga.imgGap} oninput={saveConfig} />
           <input class="numbox" type="number" min="0" max="80" bind:value={config.reader.manga.imgGap} onchange={saveConfig} />
         </div>
-        <p class="tip">设为 0 时相邻图片无缝紧密连接，适合跨页图拼接。</p>
+        <p class="tip">{t("settings.manga.imgGapTip")}</p>
       </div>
     </div>
 
     <hr />
     <div class="field">
-      <label>漫画背景色</label>
+      <label>{t("settings.manga.bgColor")}</label>
       <div class="color-row">
-        <input placeholder="留空=跟随普通主题背景" bind:value={config.reader.manga.bgColor} oninput={saveConfig} />
-        <ColorPicker bind:value={config.reader.manga.bgColor} allowEmpty emptyLabel="跟随主题" title="漫画背景色" onchange={saveConfig} />
+        <input placeholder={t("settings.manga.bgColorPlaceholder")} bind:value={config.reader.manga.bgColor} oninput={saveConfig} />
+        <ColorPicker bind:value={config.reader.manga.bgColor} allowEmpty emptyLabel={t("settings.reader.followTheme")} title={t("settings.manga.bgColor")} onchange={saveConfig} />
       </div>
-      <p class="tip">独立于普通阅读主题，仅在漫画模式下生效。</p>
+      <p class="tip">{t("settings.manga.bgColorTip")}</p>
     </div>
   </div>
   <div class="set-pane" data-pane="split" hidden={tab !== "split"}>
     <p class="tip">
-      TXT 按正则划分章节：匹配到的每一行将作为章节标题，到下一个标题之间为章节内容。支持前后查找断言（lookbehind / lookahead）。留空使用内置默认规则。
+      {t("settings.split.desc")}
     </p>
 
     <div class="field">
-      <label>常用预设</label>
+      <label>{t("settings.split.presets")}</label>
       <div class="presets">
-        {#each SPLIT_PRESETS as p (p.name)}
-          <button onclick={() => (regexText = p.pattern)}>{p.name}</button>
+        {#each SPLIT_PRESETS as p (p.id)}
+          <button onclick={() => (regexText = p.pattern)}>{t(p.labelKey)}</button>
         {/each}
       </div>
     </div>
 
     <div class="field">
-      <label>正则表达式</label>
+      <label>{t("settings.split.regexLabel")}</label>
       <textarea rows="4" bind:value={regexText} spellcheck="false"></textarea>
     </div>
 
     <div class="row-inline" style="margin-bottom:12px">
-      <button onclick={pickRegexBook}>{regexBookPath ? "换一本书测试" : "选择 TXT 测试"}</button>
-      <button onclick={previewRegex} disabled={previewing}>{previewing ? "解析中…" : "预览章节"}</button>
+      <button onclick={pickRegexBook}>{regexBookPath ? t("settings.split.pickBookOther") : t("settings.split.pickBook")}</button>
+      <button onclick={previewRegex} disabled={previewing}>{previewing ? t("settings.split.previewing") : t("settings.split.preview")}</button>
       {#if previewToc !== null}
-        <span class="status" class:ok={previewToc.length > 1}>识别出 {previewToc.length} 个章节</span>
+        <span class="status" class:ok={previewToc.length > 1}>{t("settings.split.previewCount", { n: previewToc.length })}</span>
       {/if}
     </div>
 
@@ -1886,23 +1897,23 @@
           <div class="tp-row">{t.index + 1}. {t.title}</div>
         {/each}
         {#if previewToc.length > 100}
-          <div class="tp-row muted">… 共 {previewToc.length} 章</div>
+          <div class="tp-row muted">{t("settings.split.totalMore", { n: previewToc.length })}</div>
         {/if}
       </div>
     {/if}
 
     <div class="close-row">
-      <button class="primary" onclick={saveRegex}>保存规则</button>
+      <button class="primary" onclick={saveRegex}>{t("settings.split.save")}</button>
     </div>
   </div>
   <div class="set-pane" data-pane="keys" hidden={tab !== "keys"}>
     <p class="tip">
-      一个功能可以绑定多个按键。点「记录」后按下任意键（可含 Ctrl/Alt/Shift 组合）即添加；点按键标签删除。
+      {t("settings.keys.desc")}
     </p>
     <div class="checks" style="margin:8px 0">
-      <label><input type="checkbox" bind:checked={config.reader.wheelTurnPage} onchange={saveConfig} /> 翻页模式下滚轮翻页</label>
-      <label><input type="checkbox" bind:checked={config.reader.anim} onchange={saveConfig} /> 翻页动画</label>
-      <label><input type="checkbox" bind:checked={config.reader.immersive} onchange={saveConfig} /> 沉浸阅读（空闲自动隐藏顶栏/底栏）</label>
+      <label><input type="checkbox" bind:checked={config.reader.wheelTurnPage} onchange={saveConfig}  /> {t("settings.keys.wheelTurnPage")}</label>
+      <label><input type="checkbox" bind:checked={config.reader.anim} onchange={saveConfig}  /> {t("settings.keys.anim")}</label>
+      <label><input type="checkbox" bind:checked={config.reader.immersive} onchange={saveConfig}  /> {t("settings.keys.immersive")}</label>
     </div>
     <div class="bind-list">
       {#each BIND_DEFS as def (def.id)}
@@ -1910,20 +1921,20 @@
           <span class="bind-name">{def.name}</span>
           <div class="bind-keys">
             {#each config.reader.bindings[def.id] as k (k)}
-              <button class="key-chip" title="点击删除" onclick={() => removeBind(def.id, k)}>{k} ×</button>
+              <button class="key-chip" title={t("settings.keys.chipDelete")} onclick={() => removeBind(def.id, k)}>{k} ×</button>
             {/each}
             <button class="key-add" class:cap={capturing === def.id} onclick={() => (capturing = capturing === def.id ? null : def.id)}>
-              {capturing === def.id ? "请按键…" : "＋"}
+              {capturing === def.id ? t("settings.keys.capture") : "＋"} // i18n-allow:全角加号是图形符号（“添加”芯片），不是可翻译文案
             </button>
           </div>
         </div>
       {/each}
     </div>
 
-    <h4 class="sub-h">点击区域动作（阅读界面内轻点画面）</h4>
-    <p class="tip">选取文字后松开不触发；仅快速单击计为一次点击。可勾选「显示区域提示」查看各区域分布。</p>
+    <h4 class="sub-h">{t("settings.keys.zonesTitle")}</h4>
+    <p class="tip">{t("settings.keys.zonesTip")}</p>
     <div class="checks" style="margin:6px 0">
-      <label><input type="checkbox" bind:checked={config.reader.zoneHints} onchange={saveConfig} /> 显示区域提示</label>
+      <label><input type="checkbox" bind:checked={config.reader.zoneHints} onchange={saveConfig}  /> {t("settings.keys.zoneHints")}</label>
     </div>
     <div class="zone-grid">
       {#each ZONE_DEFS as z (z.id)}
@@ -1933,7 +1944,7 @@
             value={config.reader.zones[z.id]}
             onchange={(e) => { config.reader.zones[z.id] = (e.currentTarget as HTMLSelectElement).value as ZoneAction; saveConfig(); }}
           >
-            <option value="none">无</option>
+            <option value="none">{t("settings.keys.zoneNone")}</option>
             {#each BIND_DEFS as d (d.id)}
               <option value={d.id}>{d.name}</option>
             {/each}
@@ -1943,74 +1954,74 @@
     </div>
 
     <div class="close-row">
-      <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast("已恢复默认"); }}>恢复默认</button>
+      <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast(t("settings.keys.resetDone")); }}>{t("settings.keys.reset")}</button>
     </div>
   </div>
   <div class="set-pane" data-pane="tts" hidden={tab !== "tts"}>
     <div class="field">
-      <label>朗读引擎</label>
+      <label>{t("settings.tts.engine")}</label>
       <select bind:value={config.tts.engine} onchange={saveConfig}>
-        <option value="system">系统语音</option>
-        <option value="online">在线语音</option>
+        <option value="system">{t("settings.tts.engineSystem")}</option>
+        <option value="online">{t("settings.tts.engineOnline")}</option>
       </select>
     </div>
 
     {#if config.tts.engine === "online"}
       <div class="field">
-        <label>语音服务</label>
+        <label>{t("settings.tts.serviceList")}</label>
         <div class="row-inline">
           <select bind:value={config.tts.activeService} onchange={saveConfig}>
             {#each config.tts.services as s, i (s.id)}
-              <option value={i}>{s.name || `服务${i + 1}`}</option>
+              <option value={i}>{s.name || t("settings.tts.serviceFallback", { n: i + 1 })}</option>
             {/each}
           </select>
-          <button class="icon" title="新增语音服务" onclick={addTtsService}>＋ 新增</button>
-          <button class="icon" title="删除当前语音服务" onclick={delTtsService}>✕ 删除</button>
+          <button class="icon" title={t("settings.tts.addTitle")} onclick={addTtsService}>{t("settings.tts.add")}</button>
+          <button class="icon" title={t("settings.tts.delTitle")} onclick={delTtsService}>{t("settings.tts.del")}</button>
         </div>
       </div>
 
       <div class="field">
-        <label>接口协议</label>
+        <label>{t("settings.tts.protocol")}</label>
         <select bind:value={tsvc.provider} onchange={() => onTtsProtocolChange(tsvc)}>
           {#each TTS_PROVIDER_METAS as p (p.id)}
-            <option value={p.id}>{p.label}</option>
+            <option value={p.id}>{t(p.labelKey)}</option>
           {/each}
         </select>
       </div>
 
       <div class="grid2">
         <div class="field">
-          <label>名称</label>
-          <input bind:value={tsvc.name} onchange={saveConfig} placeholder="语音服务" />
+          <label>{t("settings.tts.name")}</label>
+          <input bind:value={tsvc.name} onchange={saveConfig} placeholder={t("settings.tts.namePlaceholder")} />
         </div>
         <div class="field">
-          <label>服务地址</label>
+          <label>{t("settings.tts.baseUrl")}</label>
           <input bind:value={tsvc.baseUrl} onchange={saveConfig} placeholder={tsvcMeta.baseHint} title={tsvcMeta.baseHint} />
         </div>
       </div>
       {#if !tsvcMeta.hideKeyModel}
         <div class="grid2">
           <div class="field">
-            <label>密钥 / API Key</label>
-            <input type="password" bind:value={tsvc.apiKey} onchange={saveConfig} placeholder="本地服务可留空" />
+            <label>{t("settings.tts.apiKey")}</label>
+            <input type="password" bind:value={tsvc.apiKey} onchange={saveConfig} placeholder={t("settings.tts.apiKeyPlaceholder")} />
           </div>
           <div class="field">
-            <label>模型</label>
-            <input bind:value={tsvc.model} onchange={saveConfig} placeholder={tsvcMeta.modelHint} title="留空由后端取默认" />
+            <label>{t("settings.tts.model")}</label>
+            <input bind:value={tsvc.model} onchange={saveConfig} placeholder={tsvcMeta.modelHintKey ? t(tsvcMeta.modelHintKey) : tsvcMeta.modelHint} title={t("settings.tts.modelTip")} />
           </div>
         </div>
       {/if}
       {#if tsvc.provider === "baidu"}
         <div class="field">
           <label>Secret Key</label>
-          <input type="password" bind:value={tsvc.secretKey} onchange={saveConfig} placeholder="百度语音 Secret Key" />
+          <input type="password" bind:value={tsvc.secretKey} onchange={saveConfig} placeholder={t("settings.tts.bdSecret")} />
         </div>
       {/if}
       {#if tsvc.provider === "volcano"}
         <div class="grid2">
           <div class="field">
             <label>AppID</label>
-            <input bind:value={tsvc.appId} onchange={saveConfig} placeholder="火山引擎 AppID" />
+            <input bind:value={tsvc.appId} onchange={saveConfig} placeholder={t("settings.tts.volcAppId")} />
           </div>
           <div class="field">
             <label>Cluster</label>
@@ -2020,20 +2031,20 @@
       {/if}
       <div class="grid2">
         <div class="field">
-          <label>音色</label>
+          <label>{t("settings.tts.voice")}</label>
           <div class="row-inline">
             {#if ttsVoiceList.length}
               <select bind:value={tsvc.voice} onchange={saveConfig}>
-                <option value="">默认</option>
+                <option value="">{t("settings.tts.voiceDefault")}</option>
                 {#if ttsVoiceProfiles.length}
-                  <optgroup label="固定音色">
+                  <optgroup label={t("settings.tts.voiceClonedGroup")}>
                     {#each ttsVoiceProfiles as v (v.id)}
                       <option value={v.id}>{v.name || v.id}{v.language ? ` · ${v.language}` : ""}</option>
                     {/each}
                   </optgroup>
                 {/if}
                 {#if ttsVoiceOthers.length}
-                  <optgroup label="其它音色">
+                  <optgroup label={t("settings.tts.voiceOtherGroup")}>
                     {#each ttsVoiceOthers as v (v.id)}
                       <option value={v.id}>{v.name && v.name !== v.id ? `${v.name} (${v.id})` : v.id}</option>
                     {/each}
@@ -2041,15 +2052,15 @@
                 {/if}
               </select>
             {:else}
-              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder={tsvcMeta.voiceHint} />
+              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder={tsvcMeta.voiceHintKey ? t(tsvcMeta.voiceHintKey) : tsvcMeta.voiceHint} />
             {/if}
             {#if tsvcMeta.voiceList}
-              <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? "读取中…" : "读取音色"}</button>
+              <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? t("settings.tts.loading") : t("settings.tts.loadVoices")}</button>
             {/if}
           </div>
         </div>
         <div class="field">
-          <label>音频格式</label>
+          <label>{t("settings.tts.format")}</label>
           <select bind:value={tsvc.format} onchange={saveConfig}>
             <option value="wav">wav</option>
             <option value="mp3">mp3</option>
@@ -2063,133 +2074,133 @@
         <p class="tip">{ttsVoiceMsg}</p>
       {/if}
     {:else if !ttsState.supported}
-      <p class="tip" style="color:var(--danger)">当前环境不支持系统语音朗读。</p>
+      <p class="tip" style="color:var(--danger)">{t("settings.tts.systemUnsupported")}</p>
     {:else}
       <div class="field">
-        <label>系统语音</label>
-        <select bind:value={config.tts.voice} onchange={saveConfig} title="留空则按语言自动选择">
-          <option value="">自动</option>
+        <label>{t("settings.tts.systemVoice")}</label>
+        <select bind:value={config.tts.voice} onchange={saveConfig} title={t("settings.tts.systemVoiceTip")}>
+          <option value="">{t("settings.tts.auto")}</option>
           {#each ttsState.voices as v (v.voiceURI)}
-            <option value={v.name}>{v.name} · {v.lang}{v.default ? " · 默认" : ""}</option>
+            <option value={v.name}>{v.name} · {v.lang}{v.default ? ` · ${t("settings.tts.voiceDefault")}` : ""}</option>
           {/each}
         </select>
         {#if !ttsState.voices.length}
-          <p class="tip">未检测到语音，请确认系统已安装语音包（设置 → 时间和语言 → 语音）。</p>
+          <p class="tip">{t("settings.tts.noVoice")}</p>
         {/if}
       </div>
     {/if}
 
     {#if config.tts.engine === "system"}
       <div class="field">
-        <label>自动选择语言</label>
-        <input bind:value={config.tts.lang} onchange={saveConfig} placeholder="zh-CN" title="未指定语音时按此语言挑选系统语音" />
+        <label>{t("settings.tts.autoLang")}</label>
+        <input bind:value={config.tts.lang} onchange={saveConfig} placeholder="zh-CN" title={t("settings.tts.autoLangTip")} />
       </div>
     {/if}
 
     <div class="grid3">
       <div class="field">
-        <label>语速 {config.tts.rate.toFixed(2)}</label>
+        <label>{t("settings.tts.rate", { n: config.tts.rate.toFixed(2) })}</label>
         <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
       </div>
       <div class="field">
-        <label>音调 {config.tts.pitch.toFixed(2)}{config.tts.engine === "online" ? " · 在线无效" : ""}</label>
+        <label>{t("settings.tts.pitch", { n: config.tts.pitch.toFixed(2) })}{config.tts.engine === "online" ? t("settings.tts.pitchOnlineNote") : ""}</label>
         <input type="range" min="0" max="2" step="0.05" bind:value={config.tts.pitch} oninput={saveConfig} disabled={config.tts.engine === "online"} />
       </div>
       <div class="field">
-        <label>音量 {Math.round(config.tts.volume * 100)}%</label>
+        <label>{t("settings.tts.volume", { n: Math.round(config.tts.volume * 100) })}</label>
         <input type="range" min="0" max="1" step="0.05" bind:value={config.tts.volume} oninput={saveConfig} />
       </div>
     </div>
 
     <div class="field">
-      <label>定时停止默认值</label>
+      <label>{t("settings.tts.timerStop")}</label>
       <select bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
-        <option value={0}>关闭</option>
-        <option value={5}>5 分钟</option>
-        <option value={10}>10 分钟</option>
-        <option value={15}>15 分钟</option>
-        <option value={30}>30 分钟</option>
-        <option value={60}>60 分钟</option>
+        <option value={0}>{t("settings.tts.off")}</option>
+        <option value={5}>{t("tts.minutes", { n: 5 })}</option>
+        <option value={10}>{t("tts.minutes", { n: 10 })}</option>
+        <option value={15}>{t("tts.minutes", { n: 15 })}</option>
+        <option value={30}>{t("tts.minutes", { n: 30 })}</option>
+        <option value={60}>{t("tts.minutes", { n: 60 })}</option>
       </select>
     </div>
 
     <div class="checks">
-      <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 一章读完自动续读下一章</label>
-      <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 朗读时高亮当前句并滚动跟随</label>
+      <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig}  /> {t("settings.tts.autoNext")}</label>
+      <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig}  /> {t("settings.tts.highlight")}</label>
     </div>
   </div>
   <div class="set-pane" data-pane="webdav" hidden={tab !== "webdav"}>
     <div class="checks" style="margin-bottom:12px">
-      <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig} /> 启用 WebDAV</label>
-      <label><input type="checkbox" bind:checked={config.webdav.syncOnOpen} onchange={saveConfig} /> 打开/退出书籍时自动同步进度（关闭后仍可手动同步）</label>
-      <label><input type="checkbox" bind:checked={config.webdav.uploadBooks} onchange={saveConfig} /> 打开书籍时自动上传书文件</label>
+      <label><input type="checkbox" bind:checked={config.webdav.enabled} onchange={saveConfig}  /> {t("settings.dav.enabled")}</label>
+      <label><input type="checkbox" bind:checked={config.webdav.syncOnOpen} onchange={saveConfig}  /> {t("settings.dav.syncOnOpen")}</label>
+      <label><input type="checkbox" bind:checked={config.webdav.uploadBooks} onchange={saveConfig}  /> {t("settings.dav.uploadBooks")}</label>
     </div>
 
     <div class="field">
-      <label>服务器地址</label>
+      <label>{t("settings.dav.server")}</label>
       <input placeholder="https://dav.jianguoyun.com/dav/" bind:value={config.webdav.base} onchange={saveConfig} />
     </div>
     <div class="grid2">
       <div class="field">
-        <label>账号</label>
+        <label>{t("settings.dav.account")}</label>
         <input bind:value={config.webdav.user} onchange={saveConfig} />
       </div>
       <div class="field">
-        <label>密码 / 应用密码</label>
+        <label>{t("settings.dav.password")}</label>
         <input type="password" bind:value={config.webdav.pass} onchange={saveConfig} />
       </div>
     </div>
 
     <div class="field">
-      <label>书籍下载目录</label>
+      <label>{t("settings.dav.downloadDir")}</label>
       <div class="row-inline">
-        <span class="flex1" title={config.webdav.downloadDir}>{config.webdav.downloadDir || "未设置"}</span>
-        <button onclick={pickWebdavDir}>选择…</button>
+        <span class="flex1" title={config.webdav.downloadDir}>{config.webdav.downloadDir || t("settings.dav.notSet")}</span>
+        <button onclick={pickWebdavDir}>{t("settings.dav.pick")}</button>
       </div>
     </div>
 
     <div class="row-inline" style="margin: 6px 0 16px">
-      <button onclick={testWebdav} disabled={webdavTesting}>测试连接</button>
+      <button onclick={testWebdav} disabled={webdavTesting}>{t("settings.dav.test")}</button>
       {#if webdavStatus}<span class="status">{webdavStatus}</span>{/if}
     </div>
 
-    <p class="sec-title" style="margin-top:18px">设置备份</p>
+    <p class="sec-title" style="margin-top:18px">{t("settings.dav.backupTitle")}</p>
     <div class="row-inline" style="margin: 6px 0 10px">
-      <button onclick={backupWebdavSettingsNow} disabled={webdavBackupBusy}>{webdavBackupBusy ? "备份中…" : "立即备份设置"}</button>
-      <button onclick={loadBackupList} disabled={backupListBusy}>{backupListBusy ? "读取中…" : "刷新备份列表"}</button>
+      <button onclick={backupWebdavSettingsNow} disabled={webdavBackupBusy}>{webdavBackupBusy ? t("settings.dav.backuping") : t("settings.dav.backupNow")}</button>
+      <button onclick={loadBackupList} disabled={backupListBusy}>{backupListBusy ? t("settings.tts.loading") : t("settings.dav.reloadList")}</button>
     </div>
     <div class="row-inline" style="margin: 6px 0 10px">
       <select class="flex1" bind:value={selectedBackup} disabled={!backupList.length}>
-        {#if !backupList.length}<option value="">无备份</option>{/if}
+        {#if !backupList.length}<option value="">{t("settings.dav.noBackup")}</option>{/if}
         {#each backupList as b (b.name)}
           <option value={b.name}>{backupLabel(b)}</option>
         {/each}
       </select>
-      <button onclick={restoreWebdavSettings} disabled={webdavRestoreBusy || !selectedBackup}>{webdavRestoreBusy ? "恢复中…" : "恢复所选备份"}</button>
+      <button onclick={restoreWebdavSettings} disabled={webdavRestoreBusy || !selectedBackup}>{webdavRestoreBusy ? t("settings.dav.restoring") : t("settings.dav.restore")}</button>
     </div>
     <div class="checks">
-      <label><input type="checkbox" bind:checked={config.webdav.backup.enabled} onchange={saveConfig} /> 启用改动备份</label>
+      <label><input type="checkbox" bind:checked={config.webdav.backup.enabled} onchange={saveConfig}  /> {t("settings.dav.backupEnabled")}</label>
     </div>
     <div class="grid2" style="margin-top:6px">
       <div class="field">
-        <label>检测周期</label>
+        <label>{t("settings.dav.interval")}</label>
         <select bind:value={config.webdav.backup.intervalHours} onchange={saveConfig}>
-          <option value={6}>6 小时</option>
-          <option value={12}>12 小时</option>
-          <option value={24}>24 小时</option>
-          <option value={48}>48 小时</option>
+          <option value={6}>{t("common.hours", { n: 6 })}</option>
+          <option value={12}>{t("common.hours", { n: 12 })}</option>
+          <option value={24}>{t("common.hours", { n: 24 })}</option>
+          <option value={48}>{t("common.hours", { n: 48 })}</option>
         </select>
       </div>
       <div class="field">
-        <label>上次备份</label>
-        <span class="status" style="padding:6px 0;display:block">{lastBackupText}{config.webdav.backup.lastError ? `（最近失败：${config.webdav.backup.lastError}）` : ""}</span>
+        <label>{t("settings.dav.lastBackup")}</label>
+        <span class="status" style="padding:6px 0;display:block">{lastBackupText}{config.webdav.backup.lastError ? t("settings.dav.recentFail", { err: config.webdav.backup.lastError }) : ""}</span>
       </div>
     </div>
   </div>
   <div class="set-pane" data-pane="ai" hidden={tab !== "ai"}>
     <div class="checks" style="margin-bottom:12px">
-      <label><input type="checkbox" bind:checked={config.ai.enabled} onchange={saveConfig} /> 启用 AI 助手</label>
-      <label><input type="checkbox" bind:checked={config.ai.autoOnChapter} onchange={saveConfig} /> 打开新章节自动执行第一个提示词</label>
+      <label><input type="checkbox" bind:checked={config.ai.enabled} onchange={saveConfig}  /> {t("settings.ai.enabled")}</label>
+      <label><input type="checkbox" bind:checked={config.ai.autoOnChapter} onchange={saveConfig}  /> {t("settings.ai.autoOnChapter")}</label>
     </div>
 
     <!-- 三个可折叠、可拖拽排序的分类；折叠态不持久化（本组件每次打开重挂载，天然全展开）。 -->
@@ -2205,26 +2216,26 @@
             <div class="ai-group-body" transition:slide={{ duration: 200 }} onpointerdown={(e) => e.stopPropagation()}>
               {#if g.id === "node"}
                 <div class="field">
-                  <label>当前端点</label>
+                  <label>{t("settings.ai.currentEndpoint")}</label>
                   <div class="row-inline">
                     <select bind:value={config.ai.active} onchange={saveConfigNow}>
                       {#each config.ai.profiles as p, i (p.id)}
-                        <option value={i}>{p.name || `端点${i + 1}`}</option>
+                        <option value={i}>{p.name || t("settings.ai.endpointFallback", { n: i + 1 })}</option>
                       {/each}
                     </select>
-                    <button class="icon" title="新增端点" onclick={addProfile}>＋ 新增</button>
-                    <button class="icon" title="删除当前端点" onclick={delProfile}>✕ 删除</button>
+                    <button class="icon" title={t("settings.ai.addEndpointTitle")} onclick={addProfile}>{t("settings.ai.add")}</button>
+                    <button class="icon" title={t("settings.ai.delEndpointTitle")} onclick={delProfile}>{t("settings.ai.del")}</button>
                   </div>
-                  <p class="tip">阅读界面 AI 面板也可快速切换；故障转移按此列表顺序依次尝试，当前端点优先。</p>
+                  <p class="tip">{t("settings.ai.endpointTip")}</p>
                 </div>
 
                 <div class="grid2">
                   <div class="field">
-                    <label>端点名称</label>
+                    <label>{t("settings.ai.endpointName")}</label>
                     <input bind:value={ap.name} onchange={saveConfig} />
                   </div>
                   <div class="field">
-                    <label for="ai-provider-sel">服务商</label>
+                    <label for="ai-provider-sel">{t("settings.ai.provider")}</label>
                     <select id="ai-provider-sel" bind:value={ap.provider} onchange={saveConfig}>
                       {#each AI_PROVIDERS as prov (prov.id)}
                         <option value={prov.id}>{prov.label}</option>
@@ -2234,19 +2245,19 @@
                 </div>
 
                 <div class="field">
-                  <label>API 地址</label>
-                  <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={apMeta.baseUrlHint} title={apMeta.id === "ollama" ? "Ollama 服务地址" : apMeta.azure ? "Azure 资源端点" : apMeta.id === "gemini" ? "Google 生成式语言 API 域名" : apMeta.id === "anthropic" ? "Anthropic 域名" : "填到域名即可，自动补 /v1"} />
-                  <p class="tip">{apMeta.id === "ollama" ? "Ollama 服务地址。" : apMeta.azure ? "填 Azure 资源端点。" : apMeta.id === "gemini" ? "填 Google 生成式语言 API 域名。" : apMeta.id === "anthropic" ? "填 Anthropic 域名。" : "填到域名即可，自动补 /v1。"}</p>
+                  <label>{t("settings.ai.baseUrl")}</label>
+                  <input bind:value={ap.baseUrl} onchange={saveConfig} placeholder={apMeta.baseUrlHint} title={apMeta.id === "ollama" ? t("settings.ai.baseUrlOllama") : apMeta.azure ? t("settings.ai.baseUrlAzure") : apMeta.id === "gemini" ? t("settings.ai.baseUrlGemini") : apMeta.id === "anthropic" ? t("settings.ai.baseUrlAnthropic") : t("settings.ai.baseUrlGeneric")} />
+                  <p class="tip">{apMeta.id === "ollama" ? t("settings.ai.baseUrlTipOllama") : apMeta.azure ? t("settings.ai.baseUrlTipAzure") : apMeta.id === "gemini" ? t("settings.ai.baseUrlTipGemini") : apMeta.id === "anthropic" ? t("settings.ai.baseUrlTipAnthropic") : t("settings.ai.baseUrlTipGeneric")}</p>
                 </div>
 
                 {#if apMeta.azure}
                   <div class="grid2">
                     <div class="field">
-                      <label>部署名</label>
-                      <input bind:value={ap.deployment} onchange={saveConfig} placeholder="gpt-4o-deploy" title="Azure 部署名 deployment" />
+                      <label>{t("settings.ai.deployment")}</label>
+                      <input bind:value={ap.deployment} onchange={saveConfig} placeholder="gpt-4o-deploy" title={t("settings.ai.deploymentTip")} />
                     </div>
                     <div class="field">
-                      <label>API 版本</label>
+                      <label>{t("settings.ai.apiVersion")}</label>
                       <input bind:value={ap.apiVersion} onchange={saveConfig} placeholder="2024-06-01" title="Azure api-version" />
                     </div>
                   </div>
@@ -2254,7 +2265,7 @@
 
                 <div class="grid2">
                   <div class="field">
-                    <label>模型</label>
+                    <label>{t("settings.tts.model")}</label>
                     <input bind:value={ap.model} onchange={saveConfig} placeholder={apMeta.modelHint} />
                   </div>
                   {#if apMeta.needsKey}
@@ -2267,16 +2278,16 @@
 
                 <div class="grid2">
                   <div class="field">
-                    <label>网络代理</label>
+                    <label>{t("settings.ai.proxy")}</label>
                     <select bind:value={ap.proxyMode} onchange={saveConfig}>
-                      <option value="auto">自动</option>
-                      <option value="direct">强制直连</option>
-                      <option value="custom">自定义代理</option>
+                      <option value="auto">{t("settings.ai.proxyAuto")}</option>
+                      <option value="direct">{t("settings.ai.proxyDirect")}</option>
+                      <option value="custom">{t("settings.ai.proxyCustom")}</option>
                     </select>
                   </div>
                   {#if ap.proxyMode === "custom"}
                     <div class="field">
-                      <label>代理地址</label>
+                      <label>{t("settings.ai.proxyUrl")}</label>
                       <input bind:value={ap.proxyUrl} onchange={saveConfig} placeholder="http://127.0.0.1:7897" />
                     </div>
                   {/if}
@@ -2285,140 +2296,140 @@
                 <div class="field">
                   <label class="check">
                     <input type="checkbox" bind:checked={config.ai.failover} onchange={saveConfigNow} />
-                    端点失败时自动切换下一个端点并重跑刚才的操作
+                    {t("settings.ai.failover")}
                   </label>
                 </div>
 
                 <div class="row-inline">
-                  <button onclick={testAi} disabled={aiTesting}>{aiTesting ? "测试中…" : "测试当前端点"}</button>
+                  <button onclick={testAi} disabled={aiTesting}>{aiTesting ? t("settings.ai.testing") : t("settings.ai.test")}</button>
                   <div class="flex1"></div>
                 </div>
                 {#if aiTestResult}
                   <div class="ai-test-result" class:ok={aiTestResult.startsWith("✓")} class:bad={aiTestResult.startsWith("✗")}>{aiTestResult}</div>
                 {/if}
 
-                <p class="tip">端点顺序即故障转移优先级，按列表顺序最多尝试全部端点；测试结果会显示实际命中的链路与各链路失败原因。自动代理：优先环境变量，其次 Windows 系统代理，不解析 PAC；强制直连：忽略环境变量与系统代理，TUN 模式选此项。</p>
+                <p class="tip">{t("settings.ai.endpointOrderTip")}</p>
               {:else if g.id === "window"}
                 <div class="field">
-                  <label>AI 窗口样式</label>
+                  <label>{t("settings.ai.windowStyle")}</label>
                   <select bind:value={config.ai.display} onchange={saveConfig}>
-                    <option value="chat">对话样式</option>
-                    <option value="reader">阅读样式</option>
+                    <option value="chat">{t("settings.ai.styleChat")}</option>
+                    <option value="reader">{t("settings.ai.styleReader")}</option>
                   </select>
-                  <p class="tip">阅读样式：AI 内容按阅读版式分栏分页，←/→ 或滚轮翻页，新回复自动翻到最新页；可单独设置 AI 窗口版式，也可完全跟随阅读界面。TXT/ePub 导出按钮在 AI 窗口顶部。</p>
+                  <p class="tip">{t("settings.ai.windowStyleTip")}</p>
                 </div>
 
                 {#if config.ai.display === "reader"}
                   <div class="field">
                     <label class="check">
                       <input type="checkbox" bind:checked={config.ai.style.followReader} onchange={saveConfig} />
-                      跟随阅读界面设置
+                      {t("settings.ai.followReader")}
                     </label>
                   </div>
                   {#if !config.ai.style.followReader}
                     <div class="field">
                       <div class="row-inline">
-                        <button onclick={copyReaderStyleToAi} title="把「阅读」页当前字体/字号/颜色等复制为 AI 窗口专用设置">复制当前阅读设置 →</button>
-                        <span class="tip" style="align-self:center">不跟随时可单独调 AI 窗口版式</span>
+                        <button onclick={copyReaderStyleToAi} title={t("settings.ai.copyReaderStyleTitle")}>{t("settings.ai.copyReaderStyle")}</button>
+                        <span class="tip" style="align-self:center">{t("settings.ai.notFollowTip")}</span>
                       </div>
                     </div>
                     <div class="grid2">
                       <div class="field">
-                        <label>字体</label>
+                        <label>{t("settings.font.title")}</label>
                         <input bind:value={config.ai.style.fontFamily} onchange={saveConfig} placeholder={config.reader.fontFamily} />
                       </div>
                       <div class="field">
-                        <label>字号 {config.ai.style.fontSize || config.reader.fontSize}px</label>
+                        <label>{t("settings.ai.fontSize", { n: config.ai.style.fontSize || config.reader.fontSize })}</label>
                         <input type="range" min="0" max="64" bind:value={config.ai.style.fontSize} oninput={saveConfig} />
                       </div>
                     </div>
                     <div class="grid2">
                       <div class="field">
-                        <label>行距 {config.ai.style.lineHeight || config.reader.lineHeight}</label>
+                        <label>{t("settings.ai.lineHeight", { n: config.ai.style.lineHeight || config.reader.lineHeight })}</label>
                         <input type="range" min="0" max="3" step="0.05" bind:value={config.ai.style.lineHeight} oninput={saveConfig} />
                       </div>
                       <div class="field">
-                        <label>段距 {config.ai.style.paraSpacing || config.reader.paraSpacing}em</label>
+                        <label>{t("settings.ai.paraSpacing", { n: config.ai.style.paraSpacing || config.reader.paraSpacing })}</label>
                         <input type="range" min="0" max="2" step="0.1" bind:value={config.ai.style.paraSpacing} oninput={saveConfig} />
                       </div>
                     </div>
                     <div class="grid2">
                       <div class="field">
-                        <label>左右边距 {config.ai.style.marginH || config.reader.marginH}px</label>
+                        <label>{t("settings.ai.marginH", { n: config.ai.style.marginH || config.reader.marginH })}</label>
                         <input type="range" min="0" max="560" bind:value={config.ai.style.marginH} oninput={saveConfig} />
                       </div>
                       <div class="field">
-                        <label>上下边距 {config.ai.style.marginV || config.reader.marginV}px</label>
+                        <label>{t("settings.ai.marginV", { n: config.ai.style.marginV || config.reader.marginV })}</label>
                         <input type="range" min="0" max="400" bind:value={config.ai.style.marginV} oninput={saveConfig} />
                       </div>
                     </div>
-                    <p class="tip">以上数值为 0 时跟随阅读界面设置。</p>
+                    <p class="tip">{t("settings.ai.zeroFollows")}</p>
                     <div class="grid2">
                       <div class="field">
-                        <label>背景颜色</label>
+                        <label>{t("settings.color.bg")}</label>
                         <div class="color-row">
-                          <input placeholder="如 #f5f1e8 / rgb(245,241,232)" title="留空则跟随阅读配色" bind:value={config.ai.style.bgColor} oninput={saveConfig} />
-                          <ColorPicker bind:value={config.ai.style.bgColor} allowEmpty emptyLabel="跟随阅读" title="AI 背景颜色" onchange={saveConfig} />
+                          <input placeholder={t("settings.ai.bgPlaceholder")} title={t("settings.ai.bgTip")} bind:value={config.ai.style.bgColor} oninput={saveConfig} />
+                          <ColorPicker bind:value={config.ai.style.bgColor} allowEmpty emptyLabel={t("settings.ai.followReaderColor")} title={t("settings.ai.bgColorTitle")} onchange={saveConfig} />
                         </div>
                       </div>
                       <div class="field">
-                        <label>文字颜色</label>
+                        <label>{t("settings.color.fg")}</label>
                         <div class="color-row">
-                          <input placeholder="如 #3b3630 / rgb(59,54,48)" title="留空则跟随阅读配色" bind:value={config.ai.style.fgColor} oninput={saveConfig} />
-                          <ColorPicker bind:value={config.ai.style.fgColor} allowEmpty emptyLabel="跟随阅读" title="AI 文字颜色" onchange={saveConfig} />
+                          <input placeholder={t("settings.ai.fgPlaceholder")} title={t("settings.ai.fgTip")} bind:value={config.ai.style.fgColor} oninput={saveConfig} />
+                          <ColorPicker bind:value={config.ai.style.fgColor} allowEmpty emptyLabel={t("settings.ai.followReaderColor")} title={t("settings.ai.fgColorTitle")} onchange={saveConfig} />
                         </div>
                       </div>
                     </div>
                     <div class="field">
-                      <label>首行缩进</label>
+                      <label>{t("settings.font.indent")}</label>
                       <select bind:value={config.ai.style.indent} onchange={saveConfig}>
-                        <option value="0em">不缩进</option>
-                        <option value="1em">缩进 1 字</option>
-                        <option value="2em">缩进 2 字</option>
-                        <option value="3em">缩进 3 字</option>
+                        <option value="0em">{t("settings.font.indent0")}</option>
+                        <option value="1em">{t("settings.font.indent1")}</option>
+                        <option value="2em">{t("settings.font.indent2")}</option>
+                        <option value="3em">{t("settings.font.indent3")}</option>
                       </select>
                     </div>
                   {/if}
                   <div class="field">
-                    <label>AI 窗口自定义 CSS</label>
+                    <label>{t("settings.ai.css")}</label>
                     <textarea class="cssbox" rows="3" bind:value={config.ai.style.cssExtra} oninput={saveConfig} placeholder={".ai-mark { color: #333; }"}></textarea>
-                    <p class="tip">仅阅读样式生效，作用于正文 .ai-mark；勾选「跟随阅读界面」时，字号、行距、边距、缩进与正文完全一致，取消勾选后可单独设置。</p>
+                    <p class="tip">{t("settings.ai.cssTip")}</p>
                   </div>
                 {/if}
               {:else if g.id === "prompt"}
                 <div class="field">
-                  <label>System 提示词</label>
-                  <input bind:value={config.ai.system} onchange={saveConfig} title="全局生效的系统提示词" />
+                  <label>{t("settings.ai.systemPrompt")}</label>
+                  <input bind:value={config.ai.system} onchange={saveConfig} title={t("settings.ai.systemPromptTip")} />
                 </div>
 
                 <div class="field">
-                  <label>划词翻译 / 释义提示词</label>
+                  <label>{t("settings.ai.selPrompt")}</label>
                   <textarea rows="3" bind:value={config.ai.quickPrompt} oninput={saveConfig}></textarea>
-                  <p class="tip">阅读界面选中文字点「AI 释义」小窗执行，{"{selection}"} 为选中文字；独立于下方「我的提示词」，不影响 AI 面板的按钮与快捷键。</p>
+                  <p class="tip">{t("settings.ai.selPromptTip")}</p>
                 </div>
 
                 <div class="field">
-                  <label>我的提示词</label>
+                  <label>{t("settings.ai.myPrompts")}</label>
                   {#each config.ai.prompts as p, i (p.id)}
                     <div class="prompt-edit">
                       <div class="row-inline" style="margin-bottom:4px">
-                        <input class="pname" placeholder="名称" bind:value={p.name} onchange={saveConfig} />
-                        <button class="key-chip-inline" class:cap={capPromptIdx === i} title="绑定快捷键"
+                        <input class="pname" placeholder={t("settings.ai.promptName")} bind:value={p.name} onchange={saveConfig} />
+                        <button class="key-chip-inline" class:cap={capPromptIdx === i} title={t("settings.ai.bindKey")}
                           onclick={() => (capPromptIdx = capPromptIdx === i ? null : i)}>
-                          {p.key || "绑定快捷键"}{capPromptIdx === i ? "…" : ""}
+                          {p.key || t("settings.ai.bindKey")}{capPromptIdx === i ? "…" : ""}
                         </button>
                         {#if capPromptIdx === i}
-                          <button class="icon" onclick={() => (capPromptIdx = null)}>取消</button>
+                          <button class="icon" onclick={() => (capPromptIdx = null)}>{t("settings.ai.cancel")}</button>
                         {/if}
-                        <button class="icon" title="删除此提示词" onclick={() => delPrompt(i)}>×</button>
+                        <button class="icon" title={t("settings.ai.delPromptTitle")} onclick={() => delPrompt(i)}>×</button>
                       </div>
                       <textarea rows="3" bind:value={p.text} oninput={saveConfig}></textarea>
                     </div>
                   {/each}
-                  <button onclick={addPrompt} style="margin-top:6px">＋ 添加提示词</button>
+                  <button onclick={addPrompt} style="margin-top:6px">{t("settings.ai.addPrompt")}</button>
                 </div>
 
-                <p class="tip">{"{chapter}"} 为章节内容，{"{title}"} 为章节名；AI 面板在阅读界面点「AI」按钮打开，提示词芯片点击即执行，F1–F9 快捷键全局有效。</p>
+                <p class="tip">{t("settings.ai.promptTip")}</p>
               {/if}
             </div>
           {/if}
@@ -2427,7 +2438,7 @@
     </div>
   </div>
   <div class="set-pane" data-pane="prefs" hidden={tab !== "prefs"}>
-    <p class="sec-title">通用</p>
+    <p class="sec-title">{t("settings.tab.prefs")}</p>
     <div class="field">
       <label>{t("settings.language.label")}</label>
       <select
@@ -2444,9 +2455,9 @@
     <div class="field">
       <label class="check">
         <input type="checkbox" bind:checked={config.reader.multiWindow} onchange={saveConfig} />
-        多窗口同时打开多本书
+        {t("settings.prefs.multiWindow")}
       </label>
-      <p class="tip">开启后主窗口保留在书库，双击书籍用新窗口打开。</p>
+      <p class="tip">{t("settings.prefs.multiWindowTip")}</p>
     </div>
 
     <div class="field">
@@ -2456,62 +2467,62 @@
           checked={!config.library.showCoverProgress}
           onchange={(e) => { config.library.showCoverProgress = !(e.currentTarget as HTMLInputElement).checked; saveConfig(); }}
         />
-        关闭封面进度环
+        {t("settings.prefs.hideCoverProgress")}
       </label>
-      <p class="tip">关闭后书库封面左下角不再显示阅读进度环角标（网格与列表视图均隐藏）。</p>
+      <p class="tip">{t("settings.prefs.hideCoverProgressTip")}</p>
     </div>
 
-    <p class="sec-title" style="margin-top:18px">存储空间</p>
+    <p class="sec-title" style="margin-top:18px">{t("settings.storage.title")}</p>
     {#if storage}
       <div class="storage-card">
         <div class="st-row">
-          <span class="st-label">数据目录</span>
+          <span class="st-label">{t("settings.storage.dataDir")}</span>
           <span class="st-val path" title={storage.data_dir}>{storage.data_dir}</span>
-          <button class="icon" title="复制路径" onclick={copyDataDir}>⧉</button>
+          <button class="icon" title={t("settings.storage.copyPath")} onclick={copyDataDir}>⧉</button>
         </div>
         <div class="st-row">
-          <span class="st-label">合计占用</span>
+          <span class="st-label">{t("settings.storage.total")}</span>
           <span class="st-val strong">{fmtBytes(storage.total_bytes)}</span>
         </div>
         <div class="st-row">
-          <span class="st-label">封面缓存</span>
+          <span class="st-label">{t("settings.storage.covers")}</span>
           <span class="st-val">{fmtBytes(storage.covers_bytes)}</span>
         </div>
         <div class="st-row">
-          <span class="st-label">提取资源</span>
+          <span class="st-label">{t("settings.storage.res")}</span>
           <span class="st-val">{fmtBytes(storage.res_bytes)}</span>
         </div>
         <div class="st-row">
-          <span class="st-label">字体</span>
+          <span class="st-label">{t("settings.storage.fonts")}</span>
           <span class="st-val">{fmtBytes(storage.fonts_bytes)}</span>
         </div>
         <div class="st-row">
-          <span class="st-label">数据库</span>
+          <span class="st-label">{t("settings.storage.db")}</span>
           <span class="st-val">{fmtBytes(storage.db_bytes)}</span>
         </div>
         <div class="st-actions">
-          <span class="st-cache">可清理缓存 {fmtBytes(storage.cache_bytes)}</span>
-          <button onclick={() => clearCache("covers")} disabled={storageBusy}>清理封面</button>
-          <button onclick={() => clearCache("res")} disabled={storageBusy}>清理提取资源</button>
-          <button class="danger" onclick={() => clearCache("all")} disabled={storageBusy}>清理全部缓存</button>
+          <span class="st-cache">{t("settings.storage.clearable", { size: fmtBytes(storage.cache_bytes) })}</span>
+          <button onclick={() => clearCache("covers")} disabled={storageBusy}>{t("settings.storage.clearCovers")}</button>
+          <button onclick={() => clearCache("res")} disabled={storageBusy}>{t("settings.storage.clearRes")}</button>
+          <button class="danger" onclick={() => clearCache("all")} disabled={storageBusy}>{t("settings.storage.clearAll")}</button>
         </div>
       </div>
     {:else}
-      <p class="tip">正在读取…</p>
+      <p class="tip">{t("settings.storage.loading")}</p>
     {/if}
 
-    <p class="sec-title" style="margin-top:18px">数据备份</p>
+    <p class="sec-title" style="margin-top:18px">{t("settings.backup.title")}</p>
     <div class="row-inline" style="margin-bottom:10px">
-      <button onclick={exportConfig}>复制配置备份</button>
-      <button onclick={importConfig}>从剪贴板导入配置</button>
-      <button onclick={rebuildIndex} disabled={rebuildingFts}>{rebuildingFts ? "重建中…" : "重建全文索引"}</button>
+      <button onclick={exportConfig}>{t("settings.backup.copy")}</button>
+      <button onclick={importConfig}>{t("settings.backup.paste")}</button>
+      <button onclick={rebuildIndex} disabled={rebuildingFts}>{rebuildingFts ? t("settings.backup.rebuilding") : t("settings.backup.rebuild")}</button>
     </div>
 
     <p class="sec-title" style="margin-top:18px">MOBI / AZW3 / TXT</p>
     <div class="field" style="margin-bottom:10px">
-      <label>正文字符编码</label>
+      <label>{t("settings.prefs.encoding")}</label>
       <select bind:value={mobiEnc} onchange={saveMobiEnc}>
-        <option value="auto">自动</option>
+        <option value="auto">{t("settings.ai.proxyAuto")}</option>
         <option value="utf-8">UTF-8</option>
         <option value="gbk">GBK / GB18030</option>
         <option value="big5">Big5</option>
@@ -2520,9 +2531,9 @@
     </div>
   </div>
   <div class="set-pane" data-pane="other" hidden={tab !== "other"}>
-    <p class="sec-title">关于</p>
+    <p class="sec-title">{t("settings.other.title")}</p>
     <div class="field">
-      <label>版本</label>
+      <label>{t("settings.other.version")}</label>
       <div class="sec-val">TidePage · {APP_VERSION}</div>
     </div>
   </div>
@@ -2531,7 +2542,7 @@
 
   <footer class="set-foot">
     <span class="ver">TidePage {APP_VERSION}</span>
-    <button class="primary" onclick={() => (ui.settingsOpen = false)}>完成</button>
+    <button class="primary" data-testid="set-done" onclick={() => (ui.settingsOpen = false)}>{t("settings.done")}</button>
   </footer>
 </div>
 

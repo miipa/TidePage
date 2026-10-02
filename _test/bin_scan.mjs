@@ -21,3 +21,7 @@ for (const f of process.argv.slice(2)) {
     hits: rows,
   }, null, 1));
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

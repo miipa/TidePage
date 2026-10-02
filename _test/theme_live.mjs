@@ -30,8 +30,9 @@ const qa=(s)=>[...document.querySelectorAll(s)];
 const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
 const bcRead=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const cssvar=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };
-const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(300); };
+const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); document.querySelector('[data-testid="set-tab-'+tab+'"]')?.click(); await sleep(350); };
+const closeSettings=async()=>{ document.querySelector('[data-testid=\"set-done\"]')?.click(); await sleep(300); };
+const backToLibrary=async()=>{ const b=document.querySelector('[data-testid=\"reader-back\"]'); if(b){ b.click(); await sleep(900); } };
 `;
 const H = (body) => `(async()=>{ ${HELPER}\n${body} })()`;
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
@@ -59,7 +60,7 @@ try {
   out.steps.builtin = await M.evalJs(H(`
     for(let i=0;i<30;i++){ const c=cfgRead(); if((c.readerSchemes||[]).length) break; await sleep(200); }
     const c=cfgRead();
-    await openSettings('阅读');
+    await openSettings('reader');
     const nCards=qa('.scheme-card').length, nPreviews=qa('.scheme-preview').length;
     await closeSettings();
     return { schemes: (c.readerSchemes||[]).map(s=>s.name), cards:nCards, previews:nPreviews, uiTheme:c.uiTheme, light:c.uiSkinLight, dark:c.uiSkinDark, glass:c.glass,
@@ -69,7 +70,7 @@ try {
 
   // ---- 2) 外观页：切换深色 + 换深色皮肤，观察变量变化 ----
   out.steps.skin = await M.evalJs(H(`
-    await openSettings('外观');
+    await openSettings('appearance');
     const before={ theme:document.documentElement.dataset.theme, bg:cssvar('--bg') };
     // 切深色
     [...document.querySelectorAll('.fr-seg button')].find(b=>b.textContent.trim()==='深色')?.click();
@@ -114,7 +115,9 @@ try {
     await wait(()=>q('#chapter-content'),'chapter',500); await sleep(1200); return 1;
   `));
   out.steps.scheme = await M.evalJs(H(`
-    await openSettings('阅读');
+    // 上一步双击打开了书（阅读态）；设置按钮只在书库顶栏，先回书库再开设置
+    await backToLibrary();
+    await openSettings('reader');
     const names=()=>cfgRead().readerSchemes.map(s=>s.name);
     const before=names();
     // 保存当前配置为新方案
@@ -132,6 +135,13 @@ try {
     return { before, afterNew, bookSchemeTheme: entry.schemeTheme, bookSchemeBg: entry.schemeBg };
   `));
   log("scheme: " + JSON.stringify(out.steps.scheme));
+  // 重新打开书，后续步骤依赖阅读界面
+  await M.evalJs(H(`
+    const c=await cards(400);
+    const b=c.find(x=>x.textContent.includes('zhen_dian'))||c[0];
+    if(b){ b.dispatchEvent(new MouseEvent('dblclick',{bubbles:true})); await wait(()=>q('#chapter-content'),'chapter',500); await sleep(1000); }
+    return 1;
+  `));
 
   // 修改字号，方案不应变
   out.steps.noMutate = await M.evalJs(H(`
@@ -165,7 +175,7 @@ try {
     const before=cfgRead().readerSchemes.length;
     // 删除"我的测试方案"（找居中的 × 按钮）
     const card=[...document.querySelectorAll('.scheme-card')].find(c=>c.textContent.includes('我的测试方案'));
-    card?.querySelector('button[title="删除"]')?.click();
+    card?.querySelector('[data-testid="scheme-delete"]')?.click();
     await sleep(300);
     // 确认弹窗
     const ok=document.querySelector('[data-testid="confirm-ok"]');
@@ -185,6 +195,7 @@ try {
 
   M.close();
 } catch (e) {
+    process.exitCode = 1; /* 失败必须体现在退出码上 */
   out.error = String(e);
   console.error(e);
 } finally {
@@ -192,3 +203,7 @@ try {
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

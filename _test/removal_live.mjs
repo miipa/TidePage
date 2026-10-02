@@ -91,3 +91,7 @@ out.RF_fileExists = await M.evalJs(`(async()=>{
 M.close();
 fs.writeFileSync(path.join(SANDBOX_ROOT, "removal_out.json"), JSON.stringify(out, null, 1));
 console.log("REMOVAL DONE");
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

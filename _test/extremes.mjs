@@ -62,5 +62,9 @@ try {
     console.log(tag, JSON.stringify(out[tag]));
   }
   M.close();
-} catch(e){ out.error=String(e); console.error(e); }
+} catch(e){ process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error=String(e); console.error(e); }
 finally { if(app){killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles");} fs.writeFileSync(path.join(SANDBOX_ROOT,"ex_out.json"),JSON.stringify(out,null,1)); console.log("PNGs in",outDir); }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

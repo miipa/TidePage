@@ -50,8 +50,8 @@ const bodyText=()=>(document.body.innerText||'');
 const libTitles=()=>qa('.library [title]').map(e=>e.getAttribute('title'));
 const langSelect=()=>qa('dialog[open] select').find(s=>{const v=[...s.querySelectorAll('option')].map(o=>o.value);return v.includes('zh-CN')&&v.includes('en')&&v.includes('auto');});
 const setLangViaUi=async(v)=>{ const s=await wait(()=>langSelect(),'lang-select'); s.value=v; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(700); return true; };
-const openSettings=async()=>{ tid('lib-btn-settings')?.click(); await wait(()=>q('dialog[open]'),'dialog'); await sleep(200); };
-const closeSettings=async()=>{ q('dialog button.primary')?.click(); await sleep(250); };
+const openSettings=async(tab)=>{ tid('lib-btn-settings')?.click(); await wait(()=>q('dialog[open]'),'dialog'); if(tab) document.querySelector('[data-testid="set-tab-'+tab+'"]')?.click(); await sleep(tab?500:200); };
+const closeSettings=async()=>{ document.querySelector('[data-testid="set-done"]')?.click(); await sleep(250); };
 const legacy=()=>({
   sort: localStorage.getItem('tidepage.lib.sort'),
   view: localStorage.getItem('tidepage.lib.view'),
@@ -446,6 +446,35 @@ try {
   log("sweepZh: " + J(out.steps.sweepZh));
   check("H3 zh-CN：切回后界面恢复中文", out.steps.sweepZh.sample.length > 0, out.steps.sweepZh.sample.slice(0, 80));
 
+  /* ============ I：分栏预设下拉（第三阶段回归：5 个选项、中文/英文各自正确、无重复项） ============ */
+  out.steps.presetsZh = await M.evalJs(H(`
+    await openSettings(); await setLangViaUi('zh-CN'); closeSettings(); await sleep(500);
+    await openSettings('split'); await sleep(600);
+    const btns=[...document.querySelectorAll('.presets button')].map(b=>b.textContent.trim());
+    closeSettings();
+    return btns;
+  `));
+  log("presetsZh: " + J(out.steps.presetsZh));
+  check("I1 zh：分章预设 5 项齐全", out.steps.presetsZh.length === 5, out.steps.presetsZh);
+  check("I2 zh：无重复项（chapterN / chapterEn 各一份）", new Set(out.steps.presetsZh).size === out.steps.presetsZh.length, out.steps.presetsZh);
+  check("I3 zh：中文项显示中文（含「第X章（中文）」）", out.steps.presetsZh.includes("章节+特殊篇") && out.steps.presetsZh.includes("第X章（中文）") && out.steps.presetsZh.includes("数字编号") && out.steps.presetsZh.includes("分隔符"), out.steps.presetsZh);
+  check("I4 zh：英文项 Chapter N 只出现一次", out.steps.presetsZh.filter((x) => x === "Chapter N").length === 1, out.steps.presetsZh);
+
+  out.steps.presetsEn = await M.evalJs(H(`
+    await openSettings(); await setLangViaUi('en'); closeSettings(); await sleep(500);
+    await openSettings('split'); await sleep(600);
+    const btns=[...document.querySelectorAll('.presets button')].map(b=>b.textContent.trim());
+    closeSettings();
+    return btns;
+  `));
+  log("presetsEn: " + J(out.steps.presetsEn));
+  check("I5 en：分章预设 5 项、无重复", out.steps.presetsEn.length === 5 && new Set(out.steps.presetsEn).size === 5, out.steps.presetsEn);
+  check("I6 en：无裸键/undefined/[object Object]", !out.steps.presetsEn.some((x) => /undefined|\[object Object\]|\bsettings\.|\bdict\./.test(x)), out.steps.presetsEn);
+  check("I7 en：Chapter N 恰好一项、其余为英文", out.steps.presetsEn.filter((x) => x === "Chapter N").length === 1 && out.steps.presetsEn.some((x) => /Chapter X/.test(x)), out.steps.presetsEn);
+
+  // 切回中文，供后续 F 段沿用
+  await M.evalJs(H(`await openSettings(); await setLangViaUi('zh-CN'); closeSettings(); return 1;`));
+
   /* ============ 控制台无 i18n 缺键告警 ============ */
   const warns = M.consoleLogs().filter((l) => l.includes("[i18n]"));
   out.steps.i18nWarns = warns;
@@ -453,6 +482,7 @@ try {
 
   out.error = null;
 } catch (e) {
+    process.exitCode = 1; /* 失败必须体现在退出码上 */
   out.error = String(e);
   failed++;
   console.error(e);
@@ -468,3 +498,7 @@ try {
   console.log(failed === 0 ? "RESULT: ALL CHECKS PASSED" : `RESULT: ${failed} CHECK(S) FAILED`);
 }
 process.exit(failed === 0 ? 0 : 1);
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

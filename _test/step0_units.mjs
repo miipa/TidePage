@@ -42,3 +42,7 @@ ok("cfg-deepseek", () => assertTestConfig({ ai: { profiles: [{ name: "d", provid
 try { assertTestConfig({ ai: { profiles: [{ baseUrl: "http://127.0.0.1:18081" }] } }); console.log("PASS      cfg-localhost accepted"); } catch (e) { must(false, "localhost cfg: " + e.message); }
 console.log(fail === 0 ? "\nSTEP0 ALL PASS (0 spawn attempts beyond spy=0, no app, no port)" : `\nSTEP0 FAILURES: ${fail}`);
 process.exit(fail ? 1 : 0);
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

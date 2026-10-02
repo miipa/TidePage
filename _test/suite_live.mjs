@@ -24,14 +24,25 @@ const wait=async(fn,name,rounds=150)=>{for(let i=0;i<rounds;i++){const v=fn();if
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
 const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
 const openBook=async()=>{ if(!document.querySelector('#chapter-content')){ const c=await wait(()=>document.querySelector('.card,.row'),'card'); c.dispatchEvent(new MouseEvent('dblclick',{bubbles:true})); await wait(()=>document.querySelector('#chapter-content'),'chapter'); } await sleep(500); };
-const openDrawer=async()=>{ localStorage.setItem('fr.ai.mode','drawer'); if(!document.querySelector('.ai-panel')) [...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='AI')?.click(); const d=await wait(()=>document.querySelector('.ai-panel'),'panel'); if(!d.classList.contains('reader')){[...d.querySelectorAll('button')].find(x=>x.textContent.includes('阅读样式'))?.click();await sleep(400);} return d; };
-const openSettings=async(tab)=>{ document.querySelector('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>document.querySelector('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(250); };
-const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(200); };
+const openDrawer=async()=>{ localStorage.setItem('fr.ai.mode','drawer'); if(!document.querySelector('.ai-panel')){ // 阅读页顶栏 AI 按钮：按 data-testid 定位（按钮是纯图标，没有文本）
+  document.querySelector('[data-testid=\"tb-ai\"]')?.click(); } const d=await wait(()=>document.querySelector('.ai-panel'),'panel'); if(!d.classList.contains('reader')){ [...d.querySelectorAll('button')].find(x=>/阅读样式|Reading style/.test(x.textContent))?.click(); await sleep(400);} return d; };
+const openSettings=async(tab)=>{ // 设置按钮只在书库顶栏：若当前在阅读页（AI 抽屉/书），先回书库
+  const back=document.querySelector('[data-testid="reader-back"]'); if(back){ back.click(); await sleep(900); }
+  document.querySelector('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>document.querySelector('dialog[open]'),'dialog'); document.querySelector('[data-testid="set-tab-'+tab+'"]')?.click(); await sleep(250); };
+const closeSettings=async()=>{ document.querySelector('[data-testid=\"set-done\"]')?.click(); await sleep(200); };
+// 回书库开设置会把阅读态关掉：需要时重新打开书并拉起 AI 抽屉
+const reopenBook=async()=>{ if(!document.querySelector('#chapter-content')){ const c=await wait(()=>document.querySelector('.card,.row'),'card'); c.dispatchEvent(new MouseEvent('dblclick',{bubbles:true})); await wait(()=>document.querySelector('#chapter-content'),'chapter',500); await sleep(900); } await openDrawer(); };
 const uiSet=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('select'),'uiSet '+labelText); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
 const uiInput=async(labelText,val)=>{ const s=await wait(()=>field(labelText)?.querySelector('input'),'uiInput '+labelText); s.value=val; s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(150); };
+// 设置面板字段标签：集中一处，跟随界面语言（en 下用英文标签）
+const SL = {
+  get MAX_LINE() { return /Max characters per line/.test(document.body.innerText) ? 'Max characters per line' : '每行字数上限'; },
+  get PROVIDER() { return /Provider/.test(document.body.innerText) ? 'Provider' : '服务商'; },
+  get MODEL() { return /Model/.test(document.body.innerText) ? 'Model' : '模型'; },
+};
 const labelField=(t)=>[...document.querySelectorAll('.field')].find(f=>f.querySelector('label')?.textContent.includes(t));
 const toastsNow=()=>[...document.querySelectorAll('.toast-card')].map(t=>t.textContent).join(' | ');
-const widthToggle=async()=>{ await openSettings('阅读'); const cur=Number(field('每行字数上限')?.querySelector('input')?.value)||0; const want=cur===0?32:0; await uiInput('每行字数上限', String(want)); await sleep(400); return want; };
+const widthToggle=async()=>{ await openSettings('reader'); const cur=Number(field(SL.MAX_LINE)?.querySelector('input')?.value)||0; const want=cur===0?32:0; await uiInput(SL.MAX_LINE, String(want)); await sleep(400); return want; };
 `;
 const H = (body) => `(async()=>{ ${HELPER}\n${body} })()`;
 
@@ -130,16 +141,15 @@ try {
     out.S_ollama_identicalShape = JSON.stringify(mockReqs()[mockReqs().length - 2]?.keys) === JSON.stringify(mockReqs()[mockReqs().length - 1]?.keys);
     out.S_noThinkingUI = await M.evalJs(H(`return { thinkUI: document.querySelectorAll('[class*=think],[class*=reason]').length, errorToast: toastsNow().includes('[错误]') };`));
     // openai 兼容路径：不注入 think/query/header，模型不被替换
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','openai'); await uiInput('模型','mock'); closeSettings(); await sleep(300); return 1`));
+    await M.evalJs(H(`await openSettings('ai'); await uiSet(SL.PROVIDER,'openai'); await uiInput(SL.MODEL,'mock'); closeSettings(); await sleep(300); await reopenBook(); return 1`));
     n0 = mockReqs().length;
     out.S_openai = { send: await sendTestPrompt(M), req: brief(mockReqs()[n0]) };
-    await M.evalJs(H(`await openSettings('AI'); await uiSet('服务商','ollama'); closeSettings(); await sleep(300); return 1`));
+    await M.evalJs(H(`await openSettings('ai'); await uiSet(SL.PROVIDER,'ollama'); closeSettings(); await sleep(300); await reopenBook(); return 1`));
   }
 
   log("G AI 分页不跳末页");
   {
-    await M.evalJs(H(`await widthToggle(); closeSettings(); await sleep(600); return 1`));
-    await M.evalJs(H(`await openDrawer(); return 1`));
+    await M.evalJs(H(`await widthToggle(); closeSettings(); await sleep(600); await reopenBook(); return 1`));
     const hasMark = await M.evalJs(H(`return !!document.querySelector('.ai-panel .ai-mark')`));
     if (!hasMark) await sendTestPrompt(M);
     out.G_start = await M.evalJs(H(`
@@ -152,6 +162,7 @@ try {
     `));
     const flip = async () => {
       const want = await M.evalJs(H(`return await widthToggle();`));
+      await M.evalJs(H(`await reopenBook(); return 1`));
       await M.evalJs(H(`closeSettings(); await sleep(1300); return 1`));
       const st8 = await M.evalJs(H(`
         const d=document.querySelector('.ai-panel');
@@ -198,3 +209,7 @@ try {
   fs.writeFileSync(path.join(SANDBOX_ROOT, "suite_out.json"), JSON.stringify(out, null, 1));
   console.log(process.env.FR_FAULT_INJECT === "1" ? "FAULT-INJECT RUN DONE" : "SUITE DONE");
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

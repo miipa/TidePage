@@ -53,10 +53,11 @@ try {
   log("search: " + JSON.stringify(out.steps.search));
 
   out.steps.tabs = await M.evalJs(H(`
-    const names=['界面外观','阅读排版','漫画模式','语音朗读','分章规则','AI 助手','按键与手势','WebDAV','其他与关于'];
+    // 按 ASCII 分区 id（data-testid）遍历，不依赖中文标签
+    const names=['appearance','reader','manga','tts','split','ai','keys','webdav','other'];
     const res={};
     for(const n of names){
-      [...document.querySelectorAll('.set-nav-item')].find(b=>b.textContent.includes(n))?.click();
+      document.querySelector('[data-testid="set-tab-'+n+'"]')?.click();
       await sleep(250);
       res[n]={ fields: qa('.set-content .field').length, crumb:q('.set-crumb-now')?.textContent, contentH:Math.round(q('.set-content')?.scrollHeight||0) };
     }
@@ -65,9 +66,13 @@ try {
   log("tabs: " + JSON.stringify(out.steps.tabs));
 
   M.close();
-} catch (e) { out.error = String(e); console.error(e); }
+} catch (e) { process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error = String(e); console.error(e); }
 finally {
   if (app) { killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles"); }
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

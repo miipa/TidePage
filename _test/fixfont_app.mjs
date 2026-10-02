@@ -26,7 +26,7 @@ const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelector
 const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
 const openSettings=async()=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
-const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(300); };
+const closeSettings=async()=>{ document.querySelector('[data-testid=\"set-done\"]')?.click(); await sleep(300); };
 `;
 const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
 
@@ -107,6 +107,7 @@ try {
   log("after: " + JSON.stringify(out.steps.after));
   M.close();
 } catch (e) {
+    process.exitCode = 1; /* 失败必须体现在退出码上 */
   out.error = String(e); console.error(e);
 } finally {
   if (child) {
@@ -116,3 +117,7 @@ try {
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

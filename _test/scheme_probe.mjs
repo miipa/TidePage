@@ -52,3 +52,7 @@ try {
   console.log(JSON.stringify(r,null,1));
   M.close();
 } finally { if(app){killTree(app.child.pid); await sleep(1200); sweepSandboxWebviews("fr_test_profiles");} }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

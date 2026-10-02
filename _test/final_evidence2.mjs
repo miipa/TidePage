@@ -118,8 +118,8 @@ try {
 
   // C：文案检查（三处 AI 味解释应已不在 DOM）
   out.steps.copy = await M.evalJs(H(`
-    const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dlg'); [...document.querySelectorAll('.set-nav-item')].find(x=>x.textContent.includes(t))?.click(); await sleep(350); };
-    await openSettings('界面外观');
+    const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dlg'); document.querySelector('[data-testid="set-tab-'+t+'"]')?.click(); await sleep(350); };
+    await openSettings('appearance');
     const html=document.body.innerHTML;
     const bad=['与阅读正文的字号/字体/配色完全独立','浅色/深色各自保存所选皮肤'];
     const foundAppearance=bad.filter(t=>html.includes(t));
@@ -131,9 +131,13 @@ try {
 
   console.log(JSON.stringify(out.steps, null, 1));
   M.close();
-} catch (e) { out.error = String(e); console.error(e); }
+} catch (e) { process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error = String(e); console.error(e); }
 finally {
   if (app) { killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles"); }
   fs.writeFileSync(path.join(SANDBOX_ROOT, "fin2_out.json"), JSON.stringify(out, null, 1));
   console.log("evidence:", evid);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

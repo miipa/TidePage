@@ -50,3 +50,7 @@ out.openai_keys_setEqual = JSON.stringify([...out.openai.keys].sort()) === JSON.
 M.close();
 fs.writeFileSync(path.join(SANDBOX_ROOT, "outbound_out.json"), JSON.stringify(out, null, 1));
 console.log(JSON.stringify({ ollama_keys: out.ollama.keys, openai_keys: out.openai.keys, ollama_forbidden: out.ollama_summary.forbiddenPresent, openai_forbidden: out.openai_summary.forbiddenPresent, ollama_send_ok: !out.ollama_send.err, openai_send_ok: !out.openai_send.err }, null, 1));
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

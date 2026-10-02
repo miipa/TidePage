@@ -64,16 +64,20 @@ try {
 
   out.steps.cleared = await M.evalJs(H(`
     await openSettings();
-    const btn=qa('button.link-btn').find(b=>b.textContent.includes('清除本书方案'));
+    const btn=document.querySelector('[data-testid="scheme-clear-book"]');
     if(!btn) return { err:'no clear button', buttons: qa('button.link-btn').map(b=>b.textContent.trim()) };
     btn.click(); await sleep(800);
     return { entry: bc()["${id}"]||null, font: fontOf() };
   `));
   log("cleared: " + JSON.stringify(out.steps.cleared));
   M.close();
-} catch (e) { out.error = String(e); console.error(e); }
+} catch (e) { process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error = String(e); console.error(e); }
 finally {
   if (child) { try { execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* ignore */ } try { execFileSync("taskkill", ["/IM", "msedgewebview2.exe", "/F"], { stdio: "ignore" }); } catch { /* ignore */ } }
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

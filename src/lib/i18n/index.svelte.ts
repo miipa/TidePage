@@ -145,13 +145,22 @@ const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
   ["database table is locked", "err.dbLocked"],
   ["no such column", "err.dbBadColumn"],
   ["UNIQUE constraint failed", "err.dbUnique"],
+  // 前端 stores 抛出的稳定 ASCII 码（备份入口；见 stores.svelte.ts runSettingsBackup）
+  ["backup_running", "err.backupRunning"],
+  ["backup_need_creds", "err.backupNeedCreds"],
 ];
 
 /** toast(String(e), "error") 的本地化替代：已知错误码给译文，未知原样透传。 */
 export function errText(e: unknown): string {
+  // 前端 stores 抛出的错误会带稳定 ASCII `code`（见 stores.svelte.ts 备份入口）：
+  // 优先按 code 查表，这样不必把中文原文塞进 Error.message。
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === "string") {
+    for (const [c, key] of ERR_CODES) if (code === c || code.startsWith(c)) return t(key);
+  }
   const raw = String(e);
-  for (const [code, key] of ERR_CODES) {
-    if (raw === code || raw.startsWith(code)) return t(key);
+  for (const [c, key] of ERR_CODES) {
+    if (raw === c || raw.startsWith(c)) return t(key);
   }
   return raw;
 }

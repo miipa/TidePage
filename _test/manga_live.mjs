@@ -37,8 +37,8 @@ const rdVar=()=>getComputedStyle(q('.reader')).getPropertyValue('--rdr-img-scale
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
 const setSelect=async(label,val)=>{ const s=field(label)?.querySelector('select'); if(!s) throw new Error('no select '+label); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(180); };
 const setInput=async(label,val)=>{ const i=field(label)?.querySelector('input'); if(!i) throw new Error('no input '+label); i.value=String(val); i.dispatchEvent(new Event('input',{bubbles:true})); i.dispatchEvent(new Event('change',{bubbles:true})); await sleep(180); };
-const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(300); };
-const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(250); };
+const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); document.querySelector('[data-testid="set-tab-'+tab+'"]')?.click(); await sleep(300); };
+const closeSettings=async()=>{ document.querySelector('[data-testid=\"set-done\"]')?.click(); await sleep(250); };
 const tbBtn=(id)=>document.querySelector('[data-testid="tb-'+id+'"]');
 const ptr=(el,type,x,y,id)=>{ el.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,clientX:Math.round(x),clientY:Math.round(y),button:0,buttons:type==='pointerup'?0:1,pointerId:id||11,pointerType:'mouse',isPrimary:true})); };
 const dragTo=async(from,to,place,id)=>{ const a=rect(from), b=rect(to); const sx=a.x+a.w/2, sy=a.y+a.h/2; ptr(from,'pointerdown',sx,sy,id); await sleep(40); window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,cancelable:true,clientX:Math.round(sx+9),clientY:Math.round(sy+2),button:0,buttons:1,pointerId:id||11})); await sleep(40); const tx = place==='after' ? b.x+b.w+4 : b.x-4; window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,cancelable:true,clientX:Math.round(tx),clientY:Math.round(b.y+b.h/2),button:0,buttons:1,pointerId:id||11})); await sleep(60); window.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,cancelable:true,clientX:Math.round(tx),clientY:Math.round(b.y+b.h/2),button:0,buttons:0,pointerId:id||11})); await sleep(200); };
@@ -178,7 +178,7 @@ try {
   out.steps.settings = await M.evalJs(H(`
     if(!q('.reader')?.classList.contains('manga')){ tbBtn('manga')?.click(); await sleep(700); }
     const flowDom = { viewportBefore: !!q('.manga-h-viewport'), scrollBefore: !!q('.scroll-area') };
-    await openSettings('漫画模式');
+    await openSettings('manga');
     const labels=[...document.querySelectorAll('.field label')].map(l=>l.textContent.trim());
     const has=(t)=>labels.some(x=>x.includes(t));
     const dirSel0=field('阅读方向')?.querySelector('select');
@@ -258,7 +258,7 @@ try {
     await wait(()=>q('#chapter-content'),'chapter',400); await sleep(1500);
     // 通过设置把全局漫画倍率设为上限 3.0（真实 UI 路径，写入响应式 config）
     if(!q('.reader')?.classList.contains('manga')){ tbBtn('manga')?.click(); await sleep(700); }
-    await openSettings('漫画模式');
+    await openSettings('manga');
     await setInput('图片大小','3');
     await sleep(500);
     await closeSettings(); await sleep(700);
@@ -298,6 +298,7 @@ try {
 
   M.close();
 } catch (e) {
+    process.exitCode = 1; /* 失败必须体现在退出码上 */
   out.error = String(e);
   console.error(e);
 } finally {
@@ -305,3 +306,7 @@ try {
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

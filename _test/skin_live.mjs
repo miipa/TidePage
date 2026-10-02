@@ -15,7 +15,7 @@ for (const d of [sbx, data]) for (const f of fs.readdirSync(d)) fs.rmSync(path.j
 const outFile = path.join(SANDBOX_ROOT, "skin_out.json");
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
 
-const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===t)?.click(); await sleep(350); };\n${b} })()`;
+const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); document.querySelector('[data-testid="set-tab-'+t+'"]')?.click(); await sleep(350); };\n${b} })()`;
 
 const out = { steps: {} };
 let app = null;
@@ -40,8 +40,8 @@ try {
   log("migrate: " + JSON.stringify(out.steps.migrate));
 
   out.steps.skins = await M.evalJs(H(`
-    await openSettings('外观');
-    const light=qa('.skin-card').filter(b=>['奶油','麻布','冷雾'].includes(b.textContent.replace(/[✓\\s]/g,''))).map(b=>b.textContent.replace(/[✓\\s]/g,''));
+    await openSettings('appearance');
+    const light=qa('.skin-card').filter(b=>['cream','graphite','lagoon'].includes(b.dataset.skinId)).map(b=>b.dataset.skinId);
     return { cards: qa('.skin-card').map(b=>b.textContent.replace(/[✓\\s]/g,'')).filter(Boolean),
       hasGlassSwitch: !!qa('input.fr-switch').length, accent: cv('--accent'), bg: cv('--bg'), fg: cv('--fg') };
   `));
@@ -49,15 +49,15 @@ try {
 
   // 依次切换每套皮肤，记录变量差异
   out.steps.each = await M.evalJs(H(`
-    const names=['奶油','麻布','冷雾','夜行','石墨'];
+    const names=['cream','lagoon','nocturne','graphite'];
     const res={};
-    const darkByName={夜行:1,石墨:1};
+    const darkByName={nocturne:1,graphite:1};
     for(const n of names){
       // 选明暗模式
       const modeBtns=[...document.querySelectorAll('.fr-seg button')];
-      modeBtns.find(b=>b.textContent.trim()===(darkByName[n]?'深色':'浅色'))?.click();
+      document.querySelector('[data-testid="ui-theme-'+(darkByName[n]?'dark':'light')+'"]')?.click();
       await sleep(250);
-      const card=qa('.skin-card').find(b=>b.textContent.replace(/[✓\\s]/g,'')===n);
+      const card=document.querySelector('.skin-card[data-skin-id="'+n+'"]');
       card?.click(); await sleep(350);
       res[n]={ bg:cv('--bg'), accent:cv('--accent'), fg:cv('--fg'), accentFg:cv('--accent-fg'), radius:cv('--radius-card'), shadow:cv('--shadow-card') };
     }
@@ -68,7 +68,7 @@ try {
   // 按钮对比度：主按钮与图标按钮
   out.steps.buttons = await M.evalJs(H(`
     // 主按钮（设置弹窗"关闭"是 primary）
-    const primary=document.querySelector('dialog button.primary');
+    const primary=document.querySelector('[data-testid=\"set-done\"]');
     const icon=qa('dialog button.icon')[0] || qa('button.icon')[0];
     const gc=(el,p)=>el?getComputedStyle(el).getPropertyValue(p).trim():null;
     return {
@@ -96,9 +96,13 @@ try {
   log("persist: " + JSON.stringify(out.steps.persist));
 
   M.close();
-} catch (e) { out.error = String(e); console.error(e); }
+} catch (e) { process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error = String(e); console.error(e); }
 finally {
   if (app) { killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles"); }
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   console.log("WROTE " + outFile);
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

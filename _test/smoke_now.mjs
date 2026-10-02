@@ -17,3 +17,7 @@ try{
   if(M){ const r=await M.evalJs("!!window.__TAURI_INTERNALS__"); console.log("tauri:",r); M.close(); }
 }catch(e){console.error("ERR",e.message)}
 finally{ if(app){killTree(app.child.pid); await sleep(1500); sweepSandboxWebviews("fr_test_profiles");} }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });

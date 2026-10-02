@@ -114,9 +114,13 @@ try {
   log("final: " + out.final + " startCount=" + JSON.stringify(out.startCountFinal));
   log("enqueue log sample: " + JSON.stringify(out.enqueueLogLines.slice(0, 8)));
   M.close();
-} catch (e) { out.error = String(e); console.error(e); }
+} catch (e) { process.exitCode = 1; /* 失败必须体现在退出码上 */ out.error = String(e); console.error(e); }
 finally {
   if (child) { try { execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch {} try { execFileSync("taskkill", ["/IM", "msedgewebview2.exe", "/F"], { stdio: "ignore" }); } catch {} }
   fs.writeFileSync(path.join(TMP, "prio_out.json"), JSON.stringify(out, null, 1));
   console.log("WROTE " + path.join(TMP, "prio_out.json"));
 }
+
+// 退出码兜底：任何未捕获异常/未处理 rejection 都必须让 CI 判定失败（否则失败也报“成功”）
+process.on("uncaughtException", (e) => { console.error(e); process.exitCode = 1; });
+process.on("unhandledRejection", (e) => { console.error(e); process.exitCode = 1; });
