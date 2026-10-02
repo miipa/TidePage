@@ -25,7 +25,7 @@ try {
   await sleep(800);
 
   out.steps.shell = await M.evalJs(H(`
-    for(let k=0;k<20 && !q('dialog[open]');k++){ q('button[title="设置"]')?.click(); await sleep(400); }
+    for(let k=0;k<20 && !q('dialog[open]');k++){ q('[data-testid="lib-btn-settings"]')?.click(); await sleep(400); }
     const root=q('.settings-root'); const head=q('.set-head'); const nav=q('.set-nav'); const content=q('.set-content'); const foot=q('.set-foot');
     return { root:rect(root), head:!!head, nav:rect(nav), content:rect(content), foot:!!foot,
       navItems:qa('.set-nav-item').length, groups:qa('.set-nav-group').map(g=>g.textContent.trim()),

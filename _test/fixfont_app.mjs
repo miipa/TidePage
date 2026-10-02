@@ -25,7 +25,7 @@ const wait=async(fn,name,rounds=400)=>{for(let i=0;i<rounds;i++){const v=fn();if
 const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)];
 const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
-const openSettings=async()=>{ (q('button[data-tip="设置"]')||q('button[aria-label="设置"]')||q('button[title="设置"]'))?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
+const openSettings=async()=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
 const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(300); };
 `;
 const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;

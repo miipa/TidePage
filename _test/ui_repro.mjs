@@ -193,12 +193,12 @@ async function main() {
       await sleep(2500);
       out.f = await main.evalJs(H(`
         const out={};
-        const btnByTitle=(s)=>qa('.tb-r .icon').find(b=>(b.getAttribute('title')||'').includes(s));
+        const btnById=(id)=>document.querySelector('[data-testid="tb-'+id+'"]');
         const cfg=()=>JSON.parse(localStorage.getItem('tidepage.config.v1'));
         const bcfg=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
         const bid=String(${(added.find((a) => a.n.includes(BOOK_MATCH)) || added[0]).id});
         // --- manager ---
-        btnByTitle('顶栏按钮管理')?.click(); await sleep(250);
+        btnById('manager')?.click(); await sleep(250);
         out.managerOpen=!!q('.tb-panel'); out.managerRows=qa('.tb-panel .tb-row').length;
         const aiRow=qa('.tb-panel .tb-row').find(r=>r.textContent.includes('AI 助手'));
         const cb=aiRow?.querySelector('input[type=checkbox]');
@@ -210,7 +210,7 @@ async function main() {
         out.aiBack=qa('.tb-r .icon').some(b=>b.textContent.trim()==='AI');
         qa('.tb-panel .icon').find(b=>b.textContent.trim()==='×')?.click(); await sleep(150);
         // --- image menu: 全部关闭 ---
-        btnByTitle('本书图片')?.click(); await sleep(250);
+        btnById('images')?.click(); await sleep(250);
         out.imgMenuItems=qa('.tb-panel .tb-menu-item').map(x=>x.textContent.trim());
         qa('.tb-panel .tb-menu-item').find(x=>x.textContent.includes('全部关闭'))?.click(); await sleep(400);
         out.noImages=q('.reader')?.classList.contains('no-images');
@@ -230,7 +230,7 @@ async function main() {
         }
         out.blockedCount=(bcfg()[bid]?.blockedImages||[]).length;
         out.blockedHidden=im2?getComputedStyle(im2).display:'noimg';
-        btnByTitle('本书图片')?.click(); await sleep(200);
+        btnById('images')?.click(); await sleep(200);
         qa('.tb-panel .tb-menu-item').find(x=>x.textContent.includes('已屏蔽图片'))?.click(); await sleep(300);
         out.blockedListRows=qa('.tb-panel .tb-block-row').length;
         qa('.tb-panel .tb-block-row .tb-menu-item')[0]?.click(); await sleep(300);
@@ -238,13 +238,13 @@ async function main() {
         qa('.tb-panel .icon').find(b=>b.textContent.trim()==='×')?.click(); await sleep(150);
         // --- css toggle ---
         const ovr0=q('.reader').classList.contains('ovr');
-        btnByTitle('全局样式')?.click(); await sleep(700);
+        btnById('css')?.click(); await sleep(700);
         out.ovr=[ovr0, q('.reader').classList.contains('ovr')];
         out.ovrOv=bcfg()[bid]?.overrideBookCss;
         // --- drag reorder: AI before 添加书签 ---
         try{
           const from=qa('.tb-r .icon').find(b=>b.textContent.trim()==='AI');
-          const to=btnByTitle('添加书签');
+          const to=btnById('bookmarkAdd');
           const dt=new DataTransfer();
           from.dispatchEvent(new DragEvent('dragstart',{bubbles:true,dataTransfer:dt}));
           to.dispatchEvent(new DragEvent('dragover',{bubbles:true,cancelable:true,dataTransfer:dt}));
@@ -318,7 +318,7 @@ async function main() {
       log("bigFolder " + JSON.stringify(out.bigFolder));
       // click refresh and sample the statusbar progress bar while it runs
       await main.evalJs(H(`
-        const btn=qa('.toolbar button').find(b=>b.textContent.includes('刷新'));
+        const btn=q('[data-testid="lib-btn-refresh"]');
         btn.click();
         window.__samples=[];
         for(let i=0;i<80;i++){ await sleep(50); const p=q('.scan-progress'); window.__samples.push({t:i*50, bar:!!p, text:p?p.textContent.trim():''}); }
@@ -327,7 +327,7 @@ async function main() {
       out.libBtns = await main.evalJs(H(`return qa('.toolbar .lib-tb-btn').map(b=>b.getAttribute('title'));`));
       out.libDrag = await main.evalJs(H(`
         const btns=qa('.toolbar .lib-tb-btn');
-        const from=btns.find(b=>(b.getAttribute('title')||'').includes('随机'));
+        const from=document.querySelector('[data-testid="lib-btn-random"]');
         const to=btns.find(b=>(b.getAttribute('title')||'').includes('WebDAV'));
         try{ const dt=new DataTransfer();
           from.dispatchEvent(new DragEvent('dragstart',{bubbles:true,dataTransfer:dt}));

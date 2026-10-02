@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { activeTtsService, config, saveConfig, toast } from "../lib/stores.svelte";
   import {
     refreshOnlineVoices,
@@ -52,15 +53,16 @@
     }
     sleepEnd = Date.now() + min * 60000;
     sleepLeft = Math.round(min * 60);
-    const t = setInterval(() => {
+    // 局部变量改名 timer：避免与 i18n 的 t() 同名遮蔽
+    const timer = setInterval(() => {
       sleepLeft = Math.max(0, Math.round((sleepEnd - Date.now()) / 1000));
       if (sleepLeft <= 0) {
-        clearInterval(t);
+        clearInterval(timer);
         ttsStop();
-        toast("已到定时停止时间，朗读结束");
+        toast(t("tts.stopTimerDone"));
       }
     }, 1000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   });
 
   function fmtLeft(s: number): string {
@@ -78,12 +80,12 @@
 </script>
 
 <div class="tts-bar" class:expanded>
-  <button class="tb-btn" title="上一句" onclick={ttsPrev}>⏮</button>
-  <button class="tb-btn primary" title={ttsState.paused ? "继续" : "暂停"} onclick={ttsPauseResume}>
+  <button class="tb-btn" data-testid="tts-prev" title={t("tts.prevSentence")} onclick={ttsPrev}>⏮</button>
+  <button class="tb-btn primary" data-testid="tts-pause" title={ttsState.paused ? t("tts.resume") : t("tts.pause")} onclick={ttsPauseResume}>
     {ttsState.paused ? "▶" : "⏸"}
   </button>
-  <button class="tb-btn" title="下一句" onclick={ttsNext}>⏭</button>
-  <button class="tb-btn stop" title="停止朗读" onclick={ttsStop}>⏹</button>
+  <button class="tb-btn" data-testid="tts-next" title={t("tts.nextSentence")} onclick={ttsNext}>⏭</button>
+  <button class="tb-btn stop" data-testid="tts-stop" title={t("tts.stop")} onclick={ttsStop}>⏹</button>
 
   <div class="tb-info" title={current?.text || ""}>
     <span class="tb-count">
@@ -91,32 +93,32 @@
     </span>
     <span class="tb-text">{current?.text || "…"}</span>
     {#if ttsState.buffering}
-      <span class="tb-buffering" title="正在生成音频">缓冲中…</span>
+      <span class="tb-buffering" title={t("tts.generating")}>{t("tts.buffering")}</span>
     {/if}
   </div>
 
   {#if sleepLeft > 0}
-    <span class="tb-sleep" title="距定时停止">⏰ {fmtLeft(sleepLeft)}</span>
+    <span class="tb-sleep" title={t("tts.timerRemain")}>⏰ {fmtLeft(sleepLeft)}</span>
   {/if}
 
-  <button class="tb-btn" title="朗读设置" onclick={() => (expanded = !expanded)}>⚙</button>
+  <button class="tb-btn" data-testid="tts-settings" title={t("tts.settings")} onclick={() => (expanded = !expanded)}>⚙</button>
 
   {#if expanded}
     <div class="tb-panel">
       <div class="tb-row">
-        <label>{config.tts.engine === "online" ? "音色" : "语音"}</label>
+        <label>{config.tts.engine === "online" ? t("tts.voiceLabel") : t("tts.voice")}</label>
         {#if config.tts.engine === "online"}
           <select bind:value={onlineSvc.voice} onchange={saveConfig}>
-            <option value="">默认</option>
+            <option value="">{t("tts.defaultVoice")}</option>
             {#if onlineVoiceProfiles.length}
-              <optgroup label="固定音色">
+              <optgroup label={t("tts.clonedVoice")}>
                 {#each onlineVoiceProfiles as v (v.id)}
                   <option value={v.id}>{v.name || v.id}{v.language ? ` · ${v.language}` : ""}</option>
                 {/each}
               </optgroup>
             {/if}
             {#if onlineVoiceOthers.length}
-              <optgroup label="其它音色">
+              <optgroup label={t("tts.otherVoices")}>
                 {#each onlineVoiceOthers as v (v.id)}
                   <option value={v.id}>{v.name && v.name !== v.id ? `${v.name} (${v.id})` : v.id}</option>
                 {/each}
@@ -125,22 +127,23 @@
           </select>
           <button
             class="tb-mini"
-            title="从服务读取音色"
+            data-testid="tts-load-voices"
+            title={t("tts.loadVoices")}
             onclick={() => refreshOnlineVoices()}
             disabled={ttsState.onlineVoiceLoading}
           >{ttsState.onlineVoiceLoading ? "…" : "↻"}</button>
         {:else}
           <select bind:value={config.tts.voice} onchange={saveConfig}>
-            <option value="">自动</option>
+            <option value="">{t("tts.auto")}</option>
             {#if zhVoices.length}
-              <optgroup label="中文">
+              <optgroup label={t("tts.lang.zh")}>
                 {#each zhVoices as v (v.voiceURI)}
                   <option value={v.name}>{v.name} · {v.lang}</option>
                 {/each}
               </optgroup>
             {/if}
             {#if otherVoices.length}
-              <optgroup label="其它语言">
+              <optgroup label={t("tts.langOther")}>
                 {#each otherVoices as v (v.voiceURI)}
                   <option value={v.name}>{v.name} · {v.lang}</option>
                 {/each}
@@ -150,25 +153,25 @@
         {/if}
       </div>
       <div class="tb-grid">
-        <label>语速 {config.tts.rate.toFixed(2)}</label>
+        <label>{t("tts.rate")} {config.tts.rate.toFixed(2)}</label>
         <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
-        <label>音调 {config.tts.pitch.toFixed(2)}</label>
+        <label>{t("tts.pitch")} {config.tts.pitch.toFixed(2)}</label>
         <input type="range" min="0" max="2" step="0.05" bind:value={config.tts.pitch} oninput={saveConfig} />
-        <label>音量 {Math.round(config.tts.volume * 100)}%</label>
+        <label>{t("tts.volume")} {Math.round(config.tts.volume * 100)}%</label>
         <input type="range" min="0" max="1" step="0.05" bind:value={config.tts.volume} oninput={saveConfig} />
-        <label>定时停止</label>
-        <select bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
-          <option value={0}>关闭</option>
-          <option value={5}>5 分钟</option>
-          <option value={10}>10 分钟</option>
-          <option value={15}>15 分钟</option>
-          <option value={30}>30 分钟</option>
-          <option value={60}>60 分钟</option>
+        <label>{t("tts.timerStop")}</label>
+        <select data-testid="tts-sleep" bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
+          <option value={0}>{t("common.action.close")}</option>
+          <option value={5}>{t("tts.minutes", { n: 5 })}</option>
+          <option value={10}>{t("tts.minutes", { n: 10 })}</option>
+          <option value={15}>{t("tts.minutes", { n: 15 })}</option>
+          <option value={30}>{t("tts.minutes", { n: 30 })}</option>
+          <option value={60}>{t("tts.minutes", { n: 60 })}</option>
         </select>
       </div>
       <div class="tb-checks">
-        <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> 高亮并滚动跟随</label>
-        <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> 读完自动下一章</label>
+        <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> {t("tts.highlightFollow")}</label>
+        <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> {t("tts.autoNext")}</label>
       </div>
     </div>
   {/if}

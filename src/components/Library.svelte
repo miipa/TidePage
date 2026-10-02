@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
+  import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
   import { dragSort } from "../lib/dragSort";
   import { listen } from "@tauri-apps/api/event";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
@@ -55,6 +56,8 @@
   let rangeStart = $state(0);
 
   let folders: string[] = $state([]);
+  /** 文件夹列表读取失败（list_folders 抛错）：胶囊排仍要留「全部」+ 报错，否则用户无法切回全部。 */
+  let foldersFailed = $state(false);
   // 文件夹单选作用域（null=「全部」）。持久化到 tidepage.lib.folder（仿 tidepage.lib.filter 的存取）。
   // 选中后：排序 / 分类筛选 / 随机打开 均只在该文件夹目录内生效（后端按路径前缀下推 SQLite）。
   let selectedFolder = $state<string | null>(
@@ -103,24 +106,34 @@
   let refreshMenu = $state(false);
 
   // 书库顶栏右侧图标按钮注册表（可拖拽排序；顺序持久化到 config.library.topbarOrder）。
+  // 注意：这里只存 i18n 键（labelKey/titleKey），不存译文 —— 译文在 orderedLibBtns 里现取，
+  // 否则模块初始化时定下的中文切语言后不会更新。
   interface LibBtn {
     id: LibraryTopbarId;
-    label: string;
-    title: string;
+    labelKey: MessageKey;
+    titleKey: MessageKey;
     icon: TablerIcon;
     run: () => void;
   }
+  interface ResolvedLibBtn extends Omit<LibBtn, "labelKey" | "titleKey"> {
+    label: string;
+    title: string;
+  }
   const LIB_BTNS: LibBtn[] = [
-    { id: "webdav", label: "WebDAV 文件管理", title: "WebDAV 文件管理（向左滑也可打开）", icon: IconCloud, run: () => (ui.webdavOpen = true) },
-    { id: "random", label: "随机打开", title: "随机打开一本", icon: IconDice, run: () => openRandom() },
+    { id: "webdav", labelKey: "library.topbar.webdav.label", titleKey: "library.topbar.webdav.title", icon: IconCloud, run: () => (ui.webdavOpen = true) },
+    { id: "random", labelKey: "library.topbar.random.label", titleKey: "library.topbar.random.title", icon: IconDice, run: () => openRandom() },
     // 顶栏不再放「全文搜索」按钮（阅读界面仍有全文搜索）；原位置给「笔记」，进入与书库同款的笔记书籍视图。
-    { id: "notes", label: "笔记", title: "笔记（有划线或感想的书籍，按书汇总）", icon: IconNotebook, run: () => (ui.notesOpen = true) },
-    { id: "stats", label: "阅读统计", title: "阅读统计", icon: IconChartBar, run: () => (ui.statsOpen = true) },
-    { id: "settings", label: "设置", title: "设置", icon: IconSettings, run: () => (ui.settingsOpen = true) },
+    { id: "notes", labelKey: "library.topbar.notes.label", titleKey: "library.topbar.notes.title", icon: IconNotebook, run: () => (ui.notesOpen = true) },
+    { id: "stats", labelKey: "library.topbar.stats.label", titleKey: "library.topbar.stats.title", icon: IconChartBar, run: () => (ui.statsOpen = true) },
+    { id: "settings", labelKey: "library.topbar.settings.label", titleKey: "library.topbar.settings.title", icon: IconSettings, run: () => (ui.settingsOpen = true) },
   ];
   const libBtn = (id: string): LibBtn | undefined => LIB_BTNS.find((b) => b.id === id);
-  const orderedLibBtns = $derived(
-    config.library.topbarOrder.map((id) => libBtn(id)).filter((b): b is LibBtn => !!b),
+  const orderedLibBtns: ResolvedLibBtn[] = $derived(
+    config.library.topbarOrder
+      .map((id) => libBtn(id))
+      .filter((b): b is LibBtn => !!b)
+      // t() 读 locale 这个 $state，故此 $derived 会随语言切换重算。
+      .map((b) => ({ id: b.id, icon: b.icon, run: b.run, label: t(b.labelKey), title: t(b.titleKey) })),
   );
   /** 真实拖拽排序：把 from 插入到 target 之前/之后（顺序持久化到 config.library.topbarOrder）。 */
   function libDrop(from: string, target: string, place: "before" | "after") {
@@ -137,9 +150,9 @@
   }
 
   const refreshPhaseText = (p: { phase: string; done: number; total: number }): string => {
-    if (p.phase === "check") return `对账缺失 ${p.done}/${p.total}`;
-    if (p.phase === "scan") return `扫描新增 ${p.done}/${p.total}`;
-    return "完成";
+    if (p.phase === "check") return t("library.refresh.phase.check", { done: p.done, total: p.total });
+    if (p.phase === "scan") return t("library.refresh.phase.scan", { done: p.done, total: p.total });
+    return t("library.refresh.phase.done");
   };
   const refreshPct = $derived(
     refreshProgress && refreshProgress.total > 0
@@ -175,7 +188,13 @@
   const READ_FULL_PCT = 99.5;
   type ReadState = "unread" | "reading" | "read";
   const ALL_STATES: ReadState[] = ["unread", "reading", "read"];
-  const STATE_LABELS: Record<ReadState, string> = { unread: "未读", reading: "在读", read: "已读" };
+  // 显示名按 id 查本地化表（状态 id 本身是要写进查询参数的持久值，绝不能翻译）。
+  const STATE_LABEL_KEYS: Record<ReadState, MessageKey> = {
+    unread: "library.state.unread",
+    reading: "library.state.reading",
+    read: "library.state.read",
+  };
+  const stateLabel = (s: ReadState): string => t(STATE_LABEL_KEYS[s]);
 
   // 从 localStorage 恢复筛选（key 与 tidepage.lib.sort 同款）；脏值过滤。
   const _initFilter = (() => {
@@ -668,48 +687,57 @@
     const count = selection.size;
     const action = await appChoose(
       fromDisk
-        ? `已选中 ${count} 本。\n本地文件将移入回收站。\n\n请选择笔记的处理方式：`
-        : `已选中 ${count} 本。\n将从书库移除（本地文件保留）。\n\n请选择笔记的处理方式：`,
+        ? t("library.batch.msg.fromDisk", { count })
+        : t("library.batch.msg.fromLib", { count }),
       [
-        { id: "keep", label: "保留笔记并操作", kind: "plain" },
-        { id: "del", label: "连笔记一起删", kind: "danger" },
-        { id: "cancel", label: "取消", kind: "plain" },
+        { id: "keep", label: t("library.batch.action.keep"), kind: "plain" },
+        { id: "del", label: t("library.batch.action.del"), kind: "danger" },
+        { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" },
       ],
     );
     if (!action || action === "cancel") return;
     const keepNotes = action === "keep";
     const ids = [...selection];
     const paths: string[] = [];
-    const seq = generation;
     for (let i = 0; i < ids.length; i += IDS_CHUNK) {
       const chunk = ids.slice(i, i + IDS_CHUNK);
       let rows: (BookRow | null)[];
       try {
         rows = await api.listBooksByIds(chunk);
       } catch (e) {
-        toast(String(e), "error");
+        toast(errText(e), "error");
         return;
       }
-      if (seq !== generation) return;
+      // 注意：这里**不能**因 generation 变化（期间有重建/换档）就 return ——
+      // 用户已在确认弹窗里明确同意删除整批，静默丢弃会让「已选中 N 本」凭空消失且无任何提示。
+      // ids→path 是按 id 直查的，索引重建不影响其正确性。
       for (const r of rows) if (r) paths.push(r.path);
     }
     if (!paths.length) {
-      toast("未找到可操作的书籍", "error");
+      toast(t("toast.book.notFound"), "error");
       return;
     }
+    let ok = false;
     try {
       await api.deleteBooks(paths, fromDisk, keepNotes);
+      ok = true;
       toast(
         fromDisk
-          ? (keepNotes ? `已删除 ${paths.length} 本，笔记已保留` : `已删除 ${paths.length} 本及笔记`)
-          : (keepNotes ? `已移出书库 ${paths.length} 本，笔记已保留` : `已移出书库 ${paths.length} 本及笔记`),
+          ? (keepNotes
+              ? t("toast.book.deletedKeepNotes", { count: paths.length })
+              : t("toast.book.deletedWithNotes", { count: paths.length }))
+          : (keepNotes
+              ? t("toast.book.removedKeepNotes", { count: paths.length })
+              : t("toast.book.removedWithNotes", { count: paths.length })),
       );
     } catch (e) {
-      toast(String(e), "error");
-      return;
+      toast(errText(e), "error");
     }
+    // 成功路径不显式 reloadWindow：后端 delete_books 成功必 emit library-changed，由监听统一刷一次。
+    // 失败路径自己刷：DB 可能已提交删除（只是 trash 阶段失败）→ 刷新后选中集里的 id 已成死 id，
+    // 故两条路径都退出多选，避免工具栏「已选 N 本」与实际不符。
+    if (!ok) await reloadWindow();
     exitSelect();
-    await reloadWindow();
   }
 
   function onLibKey(e: KeyboardEvent) {
@@ -808,7 +836,7 @@
       rangeStart = offset;
       booksWindow = r.rows;
     } catch (e) {
-      if (seq === generation) toast(String(e), "error");
+      if (seq === generation) toast(errText(e), "error");
     } finally {
       if (seq === generation) loading = false;
     }
@@ -834,21 +862,40 @@
     for (const id of rowMap.keys()) if (!keep.has(id)) rowMap.delete(id);
   }
 
+  /** 在飞取数按 (generation, 起, 止) 合并：重建后的显式取数与取窗口 $effect 的重跑会命中
+   *  同一把 key → 只发一次 list_books_by_ids（否则同一屏重复往返）。
+   *  key 带 generation：重建后旧 promise 天然失效，不会挡住新索引的取数。 */
+  const inflightWindows = new Map<string, Promise<void>>();
+
   /** 索引档：确保可见区间 [first,last) 的行已在 rowMap（缺哪取哪，分批 ≤ IDS_CHUNK）。 */
-  async function ensureWindowIndex(first: number, last: number) {
-    if (!idIndex) return;
+  function ensureWindowIndex(first: number, last: number): Promise<void> {
+    if (!idIndex) return Promise.resolve();
     const len = idIndex.length;
-    if (len === 0) return;
+    if (len === 0) return Promise.resolve();
     const s = Math.max(0, Math.min(first, len));
     const e = Math.max(0, Math.min(last, len));
-    if (e <= s) return;
+    if (e <= s) return Promise.resolve();
     const need: number[] = [];
     for (let i = s; i < e; i++) {
       const id = Number(idIndex[i]);
       if (!rowMap.has(id)) need.push(id);
     }
-    if (!need.length) return;
+    if (!need.length) return Promise.resolve();
     const seq = generation;
+    const key = `${seq}:${s}:${e}`;
+    const same = inflightWindows.get(key);
+    if (same) return same;
+    const p = fetchWindowRows(s, e, need, seq);
+    inflightWindows.set(key, p);
+    const done = () => { if (inflightWindows.get(key) === p) inflightWindows.delete(key); };
+    p.then(done, done);
+    return p;
+  }
+
+  /** 取回 need 里的行写进 rowMap（批次 ≤ IDS_CHUNK）。
+   *  STALE（期间发生重建/换档）：静默丢弃 —— 新一轮 rebuildIndex 末尾会显式 refetchVisibleWindow 接手。
+   *  取数失败：winVersion++ 让模板重算 + 有限重试，绝不留下「取数失败 = 永久空卡槽」。 */
+  async function fetchWindowRows(s: number, e: number, need: number[], seq: number): Promise<void> {
     let nulls = 0;
     for (let i = 0; i < need.length; i += IDS_CHUNK) {
       const chunk = need.slice(i, i + IDS_CHUNK);
@@ -856,16 +903,21 @@
       try {
         rows = await api.listBooksByIds(chunk);
       } catch (err) {
-        if (seq === generation) toast(String(err), "error");
+        if (seq === generation) {
+          toast(errText(err), "error");
+          winVersion++;
+          scheduleWindowRetry();
+        }
         return;
       }
-      if (seq !== generation) return; // STALE：期间发生了重建/换档，丢弃
+      if (seq !== generation) return; // STALE：期间发生了重建/换档，丢弃（由新重建接手）
       for (let j = 0; j < chunk.length; j++) {
         const v = rows[j] ?? null;
         rowMap.set(chunk[j], v);
         if (v === null) nulls++;
       }
     }
+    windowRetry = 0;
     pruneRowMap(s, e);
     winVersion++;
     // ❌ 死 id 收敛：idIndex 是快照，删书后其 rank 会长期留 null（空行 + 滚动高度偏大 +
@@ -878,6 +930,33 @@
     }
   }
 
+  /** 取数失败后的有限重试（400/900/1800ms，最多 3 次，成功即清零）。
+   *  没有它：一次 list_books_by_ids 抖动就留下永久空卡槽 —— total/scrollTop 都没变，
+   *  取窗口的 $effect 不会重跑，也没有任何事件会自愈。 */
+  const WINDOW_RETRY_DELAYS = [400, 900, 1800];
+  let windowRetry = 0;
+  let windowRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleWindowRetry() {
+    if (windowRetry >= WINDOW_RETRY_DELAYS.length) return;
+    const delay = WINDOW_RETRY_DELAYS[windowRetry++];
+    clearTimeout(windowRetryTimer);
+    windowRetryTimer = setTimeout(() => {
+      windowRetryTimer = undefined;
+      if (!indexMode || !idIndex) return;
+      void refetchVisibleWindow();
+    }, delay);
+  }
+
+  /** 索引档可见窗口取数：按当前 view + 视口区间发起取行。
+   *  由取窗口的 $effect 与 rebuildIndex 共用 —— 后者在整块清空 rowMap 后**显式**调一次，
+   *  不再依赖 effect 因 total/scrollTop「恰好变了」而重跑（文件夹内删书时两者常常都不变）。 */
+  function refetchVisibleWindow(): Promise<void> {
+    if (!indexMode || !idIndex || total === 0) return Promise.resolve();
+    const first = view === "grid" ? gFirst * cols : lFirst;
+    const last = view === "grid" ? Math.min(total, gLast * cols) : lLast;
+    return ensureWindowIndex(first, last);
+  }
+
   // 死 id 收敛：防抖 1s 重建 idIndex（length 自然收敛，滚动高度/「共 N 本」随之校正）。
   let nullStreak = 0;
   let nullRebuildTimer: ReturnType<typeof setTimeout> | undefined;
@@ -885,7 +964,7 @@
     if (nullRebuildTimer) return;
     nullRebuildTimer = setTimeout(() => {
       nullRebuildTimer = undefined;
-      if (indexMode) void rebuildIndex(topAnchorId());
+      if (indexMode) void rebuildIndex(topAnchor());
     }, 1000);
   }
 
@@ -908,22 +987,26 @@
       try {
         rows = await api.listBooksByIds(chunk);
       } catch {
+        // 覆盖写取数失败：同样不能「取回来却无人重取」→ 重算模板 + 走有限重试。
+        winVersion++;
+        scheduleWindowRetry();
         return;
       }
-      if (seq !== generation) return;
+      if (seq !== generation) return; // STALE：期间发生重建，新重建末尾会显式重取可见窗口
       for (let j = 0; j < chunk.length; j++) rowMap.set(chunk[j], rows[j] ?? null);
     }
     winVersion++;
   }
 
-  /** 当前顶部可见行对应的 id（重建索引后据此重定位，保持视线不跳）。 */
-  function topAnchorId(): number | undefined {
+  /** 当前顶部可见行的锚点：同时给出 id 与**旧秩**。
+   *  删书重建时锚点 id 多半就是刚被删掉的那本（不在新索引里）→ 用秩兜底保持视线。 */
+  function topAnchor(): { id: number; rank: number } | undefined {
     if (!indexMode || !idIndex || idIndex.length === 0) return undefined;
     const step = view === "grid" ? cellH : ROW_H;
     const topRow = Math.floor(scrollTop / Math.max(1, step));
     const rank = view === "grid" ? topRow * cols : topRow;
     const r = Math.max(0, Math.min(rank, idIndex.length - 1));
-    return Number(idIndex[r]);
+    return { id: Number(idIndex[r]), rank: r };
   }
 
   /** 把某个 rank 滚到顶部（clamp 到 [0,len-1]）。 */
@@ -938,10 +1021,13 @@
     scrollTop = top;
   }
 
-  /** 重建有序 id 索引（换排序 / 换查询 / 增删书 / 首次进入）。anchorId 存在则重定位，否则回顶。 */
-  async function rebuildIndex(anchorId?: number) {
+  /** 重建有序 id 索引（换排序 / 换查询 / 增删书 / 首次进入）。
+   *  锚点处理：按 id 重定位；id 在新索引里找不到（多半就是刚被删掉的那本）时按秩兜底
+   *  （min(旧秩, 新长度-1)），绝不直接回顶。 */
+  async function rebuildIndex(anchor?: { id: number; rank: number }) {
     const seq = ++generation;
     loading = true;
+    windowRetry = 0;
     // 计时打点②：整库有序 id 索引重建（后端取序列 + 前端建 BigInt64Array + 锚点定位）耗时。
     console.time("[tidepage] rebuildIndex");
     try {
@@ -955,17 +1041,21 @@
       clearTimeout(nullRebuildTimer);
       nullRebuildTimer = undefined;
       winVersion++;
-      // 重定位：锚点 id 用一次线性扫定位（禁止建 id→rank 全量 Map）。找不到则回顶。
-      if (anchorId != null && idIndex.length > 0) {
+      // 重定位：锚点 id 用一次线性扫定位（禁止建 id→rank 全量 Map）。找不到则按秩兜底。
+      if (anchor && idIndex.length > 0) {
         let rank = -1;
         for (let i = 0; i < idIndex.length; i++) {
-          if (Number(idIndex[i]) === anchorId) { rank = i; break; }
+          if (Number(idIndex[i]) === anchor.id) { rank = i; break; }
         }
-        if (rank >= 0) scrollToRank(rank);
-        else resetScroll();
+        scrollToRank(rank >= 0 ? rank : Math.min(anchor.rank, idIndex.length - 1));
       } else {
         resetScroll();
       }
+      // rowMap 已整块清空 → 可见窗口作废，必须**显式**取一次。
+      // 旧实现把这件事交给取窗口的 $effect，而它只依赖 total/scrollTop/视图几何：
+      //  文件夹内删一本时 total 与 scrollTop 常常都不变（N-1 后锚点又落回原值），
+      //  effect 不重跑 → rowMap 永远空 → 整页空白且此后无事件自愈。
+      await refetchVisibleWindow();
     } catch (err) {
       const msg = String(err);
       if (seq !== generation) return;
@@ -977,6 +1067,15 @@
         await loadRange(0);
       } else {
         toast(msg, "error");
+        // 其它错误（IPC 抖动/DB 忙）：rowMap 可能已被上一次重建清空，继续留在索引档就是永久空白。
+        // 落到 OFFSET 回落档并拉首屏，保证至少看得见书；下次 reload()/换档会自动回到索引档。
+        if (rowMap.size === 0) {
+          indexMode = false;
+          idIndex = null;
+          total = 0;
+          await loadRange(0);
+          loading = false; // loadRange 自增了 generation，finally 里的 loading=false 不再命中
+        }
       }
     } finally {
       if (seq === generation) loading = false;
@@ -999,7 +1098,7 @@
    *  回落档 —— 重拉当前 OFFSET 窗口与 total。 */
   async function reloadWindow() {
     if (indexMode) {
-      await rebuildIndex(topAnchorId());
+      await rebuildIndex(topAnchor());
     } else {
       const offset = Math.floor(Math.max(0, rangeStart) / FETCH) * FETCH;
       await loadRange(offset);
@@ -1024,10 +1123,11 @@
   // 可见范围变化时按需拉取窗口（effect 内只发起异步请求，不阻塞主线程）。
   $effect(() => {
     if (total === 0) return;
-    const first = view === "grid" ? gFirst * cols : lFirst;
-    const last = view === "grid" ? Math.min(total, gLast * cols) : lLast;
-    if (indexMode) ensureWindowIndex(first, last);
-    else ensureRange(first, last);
+    if (indexMode) {
+      void refetchVisibleWindow();
+      return;
+    }
+    ensureRange(view === "grid" ? gFirst * cols : lFirst, view === "grid" ? Math.min(total, gLast * cols) : lLast);
   });
 
   // 方案 A：视口 index 区间变化时，把可见的未扫描书籍提升为高优先级扫描目标。
@@ -1108,40 +1208,41 @@
   async function loadFolders() {
     try {
       folders = await api.listFolders();
+      foldersFailed = false;
       // 选中的文件夹已不存在（如上次会话移除 / 外部改动）→ 回到「全部」并重载。
       if (selectedFolder && !folders.includes(selectedFolder)) {
         selectedFolder = null;
         saveFolder();
         reload();
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      // 绝不能 `catch {}` 吞掉：folders 为空会让整排胶囊（含「全部」）消失，
+      // 用户连回退作用域的入口都没有，而且没有任何提示。改为保留「全部」+ 报错。
+      foldersFailed = true;
+      toast(t("toast.library.foldersFailed", { detail: errText(e) }), "error");
+    }
   }
 
   async function addFolder() {
-    const p = await api.pickFolder("选择书籍文件夹");
+    const p = await api.pickFolder(t("library.dialog.pickFolder"));
     if (!p) return;
     try {
       await api.addFolder(p);
-      folders = await api.listFolders();
-      toast("已添加，正在扫描…");
+      await loadFolders();
+      toast(t("toast.library.addedScanning"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
   async function removeFolder(p: string) {
-    const ok = await appConfirm(`从书库移除文件夹「${p}」？\n不会删除磁盘上的文件。`);
+    const ok = await appConfirm(t("library.folder.removeConfirm", { path: p }));
     if (!ok) return;
-    // remove_folder 已在后端分块删除完成；列表刷新交给 library-changed 监听（reloadWindow+loadFormats），
-    // 这里只更新目录胶囊，避免显式 reloadWindow 与监听叠加造成两次全量重建索引。
+    // remove_folder 已在后端分块删除完成；书籍列表刷新交给 library-changed 监听
+    // （reloadWindow+loadFormats），这里只更新目录胶囊，避免显式 reloadWindow 与监听叠加造成
+    // 两次全量重建索引。选中的文件夹被移除时，loadFolders 内部会回到「全部」并 reload()。
     await api.removeFolder(p);
-    folders = await api.listFolders();
-    // 移除的正是当前选中文件夹 → 回到「全部」并重载（library-changed 也会触发窗口刷新）。
-    if (selectedFolder === p) {
-      selectedFolder = null;
-      saveFolder();
-      reload();
-    }
+    await loadFolders();
   }
 
   function openBook(b: BookRow) {
@@ -1167,13 +1268,13 @@
       openBook(b);
       return;
     }
-    const ok = await appConfirm(`文件已不存在：\n${b.path}\n\n是否刷新目录？`);
+    const ok = await appConfirm(t("library.book.missingConfirm", { path: b.path }));
     if (!ok) return;
     try {
       const r = await api.refreshLibrary();
-      toast(`书库已刷新：新增 ${r.added} 本、减少 ${r.removed} 本`);
+      toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
     // 无论该书是否仍在索引，都停在这里（不进入空白阅读）
   }
@@ -1187,10 +1288,10 @@
     refreshProgress = { phase: "check", done: 0, total: 0 };
     try {
       const r = await api.refreshLibrary();
-      toast(`书库已刷新：新增 ${r.added} 本、减少 ${r.removed} 本`);
+      toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
       await reloadWindow();
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       refreshing = false;
       refreshProgress = null;
@@ -1223,9 +1324,9 @@
     try {
       const b = await api.randomBookFiltered(query, sortKey, filterFormats, filterStates, selectedFolder ?? undefined);
       if (b) tryOpenBook(b);
-      else toast("当前筛选为空");
+      else toast(t("toast.library.filterEmpty"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1244,12 +1345,12 @@
       // 三个明确动作：保留笔记并删除 / 删除笔记并删除 / 取消。绝不把选择藏进「确定/取消」。
       const action = await appChoose(
         fromDisk
-          ? `《${b.title}》有 ${noteCount} 条笔记。\n本地文件将移入回收站。\n\n请选择笔记的处理方式：`
-          : `《${b.title}》有 ${noteCount} 条笔记。\n将从书库移除（本地文件保留）。\n\n请选择笔记的处理方式：`,
+          ? t("library.delete.noteMsg.fromDisk", { title: b.title, count: noteCount })
+          : t("library.delete.noteMsg.fromLib", { title: b.title, count: noteCount }),
         [
-          { id: "keep", label: "保留笔记并删除", kind: "plain" },
-          { id: "del", label: "删除笔记并删除", kind: "danger" },
-          { id: "cancel", label: "取消", kind: "plain" },
+          { id: "keep", label: t("library.delete.action.keep"), kind: "plain" },
+          { id: "del", label: t("library.delete.action.del"), kind: "danger" },
+          { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" },
         ],
       );
       if (!action || action === "cancel") return;
@@ -1257,8 +1358,8 @@
     } else {
       const ok = await appConfirm(
         fromDisk
-          ? `删除《${b.title}》？\n\n本地文件将移入回收站：\n${b.path}`
-          : `从书库中移除《${b.title}》？\n本地文件保留。`,
+          ? t("library.delete.msg.fromDisk", { title: b.title, path: b.path })
+          : t("library.delete.msg.fromLib", { title: b.title }),
       );
       if (!ok) return;
     }
@@ -1267,27 +1368,39 @@
       await api.deleteBooks([b.path], fromDisk, keepNotes);
       toast(
         fromDisk
-          ? (hasNotes && keepNotes ? "已删除文件，笔记已保留" : hasNotes ? "已删除文件及笔记" : "已删除，文件已移入回收站")
-          : (hasNotes && keepNotes ? "已移出书库，笔记已保留" : hasNotes ? "已移出书库及笔记" : "已从书库移除"),
+          ? (hasNotes && keepNotes
+              ? t("toast.book.deletedFileKeepNotes")
+              : hasNotes
+                ? t("toast.book.deletedFileWithNotes")
+                : t("toast.book.deletedFile"))
+          : (hasNotes && keepNotes
+              ? t("toast.book.removedKeepNotesOne")
+              : hasNotes
+                ? t("toast.book.removedWithNotesOne")
+                : t("toast.book.removedOne")),
       );
-      await reloadWindow();
+      // 成功路径**不**再显式 reloadWindow：后端 delete_books 返回 Ok 前必 emit library-changed，
+      // 由监听（120ms 防抖）统一刷新一次。这里再刷一次就是「两次重建 + 两次 rowMap 清空」。
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
+      // 失败路径必须自己刷一次：后端可能已提交 DB 删除、只在 trash::delete 阶段失败
+      // （此时不会 emit library-changed）→ 否则界面留着已删的书（idIndex 里是死 id）。
+      await reloadWindow();
     }
   }
 
   async function setCover(b: BookRow) {
-    const p = await api.pickFile("选择封面图片", [
-      { name: "图片", exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
+    const p = await api.pickFile(t("library.dialog.pickCover"), [
+      { name: t("library.dialog.imageFilter"), exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
     ]);
     if (!p) return;
     try {
       await api.setCustomCover(b.id, p);
       // 换新对象身份（不就地改属性），令 coverUrl 重算并触发封面 <img> 重挂即时刷新。
       replaceBook(b.id, { cover_path: `custom-${b.id}.png`, cover_ver: (b.cover_ver ?? 0) + 1 });
-      toast("封面已更新");
+      toast(t("toast.library.coverUpdated"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1296,9 +1409,9 @@
       const name = await api.reextractCover(b.id);
       // 换新对象身份（不就地改属性），令封面 <img> 重挂即时刷新。
       replaceBook(b.id, { cover_path: name, cover_ver: (b.cover_ver ?? 0) + 1 });
-      toast("封面已重新提取");
+      toast(t("toast.library.coverReextracted"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1351,9 +1464,9 @@
         // 换新对象身份刷新该行：就地改属性不会被追踪，角标环不会重算（问题根因）。
         replaceBook(b.id, { read_state: newState, read_pct: newPct });
       }
-      toast(state === "read" ? "已标记为已读" : "已标记为未读");
+      toast(state === "read" ? t("toast.library.markedRead") : t("toast.library.markedUnread"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1365,7 +1478,8 @@
 
   function fmtTime(ms: number): string {
     if (!ms) return "—";
-    return new Date(ms).toLocaleDateString("zh-CN");
+    // 日期格式跟随界面语言（不再写死 "zh-CN"）；读 dateLocale() 保证切语言后列表重渲染。
+    return new Date(ms).toLocaleDateString(dateLocale());
   }
 
   const BOOK_EXT = ["txt", "epub", "mobi", "azw3", "prc"];
@@ -1387,7 +1501,7 @@
           await api.addFolder(p);
           addedFolders++;
         } catch (e) {
-          toast(`添加目录失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
+          toast(t("toast.library.addFolderFailed", { name: String(p.split(/[\\/]/).pop() ?? ""), detail: errText(e) }), "error");
         }
         continue;
       }
@@ -1397,7 +1511,7 @@
           last = await api.addDroppedBook(p);
           addedBooks++;
         } catch (e) {
-          toast(`添加失败 ${p.split(/[\\/]/).pop()}：${e}`, "error");
+          toast(t("toast.library.addBookFailed", { name: String(p.split(/[\\/]/).pop() ?? ""), detail: errText(e) }), "error");
         }
       }
     }
@@ -1412,10 +1526,10 @@
     }
     if (addedFolders) {
       await loadFolders();
-      toast(`已添加 ${addedFolders} 个目录，正在扫描…`);
+      toast(t("toast.library.foldersAdded", { count: addedFolders }));
     }
     if (last) {
-      toast(`已添加《${last.title}》到书库，原文件未移动`);
+      toast(t("toast.library.bookAdded", { title: last.title }));
       await tryOpenBook(last);
     }
   }
@@ -1485,7 +1599,7 @@
         folderScan = p;
       } else {
         folderScan = null;
-        toast(p.added > 0 ? `已添加目录，新增 ${p.added} 本书` : "已添加目录，未发现新书");
+        toast(p.added > 0 ? t("toast.library.folderScanAdded", { count: p.added }) : t("toast.library.folderScanNone"));
         // 扫描完成后按当前排序全量刷新：resetScroll() + 按 sortKey/query/desc 重建 id 索引，
         // 确保新书出现在其排序位置并回到顶部（reloadWindow 会锚定原顶部 id，新书可能不在可视区）。
         if (p.added > 0) reload();
@@ -1521,6 +1635,9 @@
     return () => {
       clearTimeout(metaHideTimer);
       clearTimeout(libChangedTimer);
+      clearTimeout(windowRetryTimer);
+      clearTimeout(nullRebuildTimer);
+      clearTimeout(prioTimer);
       u1.then((f) => f());
       u2.then((f) => f());
       u4.then((f) => f());
@@ -1538,17 +1655,17 @@
 <div class="library" onpointerdown={onPtrDown} onpointerup={libPointerUp} onpointermove={libPointerMove} onpointercancel={clearLongPress}>
   <div class="toolbar" data-tauri-drag-region bind:clientHeight={tbH}>
     {#if selectMode}
-      <span class="sel-count">已选 {selCount()} 本</span>
-      <button onclick={selectAll}>全选</button>
-      <button onclick={invertSelection}>反选</button>
-      <button onclick={() => batchDelete(false)}>移出书库</button>
-      <button class="danger" onclick={() => batchDelete(true)}>删除</button>
-      <button onclick={exitSelect}>取消</button>
-      {#if selectPartial}<span class="sel-note">（结果过大，仅选中已加载部分）</span>{/if}
+      <span class="sel-count" data-testid="lib-sel-count">{t("library.toolbar.selCount", { count: selCount() })}</span>
+      <button data-testid="lib-sel-all" onclick={selectAll}>{t("library.toolbar.selectAll")}</button>
+      <button data-testid="lib-sel-invert" onclick={invertSelection}>{t("library.toolbar.invert")}</button>
+      <button data-testid="lib-sel-remove" onclick={() => batchDelete(false)}>{t("library.ctx.removeOnly")}</button>
+      <button class="danger" data-testid="lib-sel-delete" onclick={() => batchDelete(true)}>{t("common.action.delete")}</button>
+      <button data-testid="lib-sel-cancel" onclick={exitSelect}>{t("common.confirm.cancel")}</button>
+      {#if selectPartial}<span class="sel-note" data-testid="lib-sel-partial">{t("library.toolbar.selectPartial")}</span>{/if}
       <div class="spacer" data-tauri-drag-region></div>
     {:else}
     <span class="logo">TidePage</span>
-    <button class="primary" onclick={addFolder}>＋ 添加文件夹</button>
+    <button class="primary" data-testid="lib-btn-add-folder" onclick={addFolder}>{t("library.toolbar.addFolder")}</button>
     <div class="refresh-wrap">
       <button
         onpointerdown={refreshDown}
@@ -1557,24 +1674,25 @@
         onpointercancel={refreshUp}
         onclick={refreshClick}
         disabled={refreshing}
-        title="点击：只读取书籍；长按：刷新封面"
-      >{refreshing ? "刷新中…" : "⟳ 刷新"}</button>
+        data-testid="lib-btn-refresh"
+        title={t("library.toolbar.refreshTip")}
+      >{refreshing ? t("library.toolbar.refreshing") : t("library.toolbar.refresh")}</button>
       {#if refreshMenu}
         <div class="refresh-menu" role="menu">
-          <button class="rm-item" onclick={() => { refreshMenu = false; refreshAll(); }}>重新扫描书库</button>
+          <button class="rm-item" data-testid="lib-btn-rescan" onclick={() => { refreshMenu = false; refreshAll(); }}>{t("library.toolbar.rescan")}</button>
         </div>
         <div class="rm-backdrop" onclick={() => (refreshMenu = false)}></div>
       {/if}
     </div>
-    <input class="search" placeholder="搜索书名 / 作者…" bind:value={queryInput} />
-    <select bind:value={sortKey} onchange={onSortChange}>
-      <option value="lastread">按最近阅读</option>
-      <option value="added">按添加时间</option>
-      <option value="title">按书名</option>
-      <option value="recent">按文件时间</option>
-      <option value="size">按文件大小</option>
+    <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={queryInput} />
+    <select data-testid="lib-sort" bind:value={sortKey} onchange={onSortChange}>
+      <option value="lastread">{t("library.sort.lastread")}</option>
+      <option value="added">{t("library.sort.added")}</option>
+      <option value="title">{t("library.sort.title")}</option>
+      <option value="recent">{t("library.sort.recent")}</option>
+      <option value="size">{t("library.sort.size")}</option>
     </select>
-    <button class="icon" data-tip="反向排序" aria-label="反向排序" onclick={toggleReverse}>
+    <button class="icon" data-testid="lib-btn-reverse" data-tip={t("library.toolbar.reverseTip")} aria-label={t("library.toolbar.reverseTip")} onclick={toggleReverse}>
       <IconArrowsSort size={20} stroke={1.75} />
     </button>
     <div class="filter-wrap">
@@ -1582,11 +1700,12 @@
         class="cat-btn"
         class:active={filterPanelOpen || hasFilter}
         aria-expanded={filterPanelOpen}
+        data-testid="lib-btn-filter"
         onclick={() => (filterPanelOpen = !filterPanelOpen)}
-      >分类{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
+      >{t("library.toolbar.category")}{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
       {#if hasFilter}
-        <button class="filter-chip" title="清除全部筛选" onclick={clearFilter}>
-          已筛选 <span class="fx">×</span>
+        <button class="filter-chip" data-testid="lib-filter-chip" title={t("library.toolbar.clearFilterTip")} onclick={clearFilter}>
+          {t("library.toolbar.filtered")} <span class="fx">×</span>
         </button>
       {/if}
     </div>
@@ -1597,6 +1716,7 @@
         <button
           class="icon lib-tb-btn tip-left"
           data-drag-id={b.id}
+          data-testid={"lib-btn-" + b.id}
           aria-label={b.title}
           data-tip={b.title}
           onclick={b.run}
@@ -1611,47 +1731,49 @@
   {#if filterPanelOpen}
     <div class="filter-panel">
       <div class="fp-group">
-        <span class="fp-label">格式</span>
+        <span class="fp-label">{t("library.filter.format")}</span>
         <div class="fp-tags">
           {#each availableFormats as f (f)}
             <button class="tag" class:active={filterFormats.includes(f)} onclick={() => toggleFormat(f)}>
               {f.toUpperCase()}
             </button>
           {/each}
-          {#if !availableFormats.length}<span class="fp-empty">（暂无）</span>{/if}
+          {#if !availableFormats.length}<span class="fp-empty">{t("library.filter.empty")}</span>{/if}
         </div>
       </div>
       <div class="fp-group">
-        <span class="fp-label">阅读状态</span>
+        <span class="fp-label">{t("library.filter.readState")}</span>
         <div class="fp-tags">
           {#each ALL_STATES as s (s)}
             <button class="tag" class:active={filterStates.includes(s)} onclick={() => toggleState(s)}>
-              {STATE_LABELS[s]}
+              {stateLabel(s)}
             </button>
           {/each}
         </div>
       </div>
       {#if hasFilter}
-        <button class="fp-clear" onclick={clearFilter}>清除筛选</button>
+        <button class="fp-clear" data-testid="lib-filter-clear" onclick={clearFilter}>{t("library.filter.clear")}</button>
       {/if}
     </div>
   {/if}
 
-  {#if folders.length}
+  {#if folders.length || foldersFailed}
     <div class="folders">
       <button
         class="folder-chip"
         class:active={selectedFolder === null}
-        title="全部文件夹"
+        data-testid="lib-folder-all"
+        title={t("library.folder.allTip")}
         onclick={() => selectFolder(null)}
-      >全部</button>
+      >{t("library.folder.all")}</button>
       {#each folders as f (f)}
         <span
           class="folder-chip"
           class:active={selectedFolder === f}
           role="button"
           tabindex="0"
-          title={`${f}\n点击选中筛选，点 × 移除`}
+          data-testid="lib-folder-chip"
+          title={t("library.folder.chipTip", { path: f })}
           onclick={() => selectFolder(f)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFolder(f); } }}
         >
@@ -1659,6 +1781,7 @@
           <button class="x" onclick={(e) => { e.stopPropagation(); removeFolder(f); }}>×</button>
         </span>
       {/each}
+      {#if foldersFailed}<span class="fp-empty" data-testid="lib-folders-failed">{t("library.folders.failed")}</span>{/if}
     </div>
   {/if}
 
@@ -1676,10 +1799,10 @@
     onpointerleave={onGridPointerLeave}
   >
     {#if loading && total === 0}
-      <div class="hint">加载中…</div>
+      <div class="hint" data-testid="lib-hint-loading">{t("library.empty.loading")}</div>
     {:else if total === 0}
-      <div class="hint">
-        {query.trim() ? "无匹配结果" : "书库为空\n点击「添加文件夹」导入本地书籍\n支持 TXT / EPUB / MOBI / AZW3"}
+      <div class="hint" data-testid="lib-hint-empty">
+        {query.trim() ? t("library.empty.noMatch") : t("library.empty.blank")}
       </div>
     {:else if view === "grid"}
       <div class="grid-inner" style="height:{gridRows * cellH}px;">
@@ -1711,7 +1834,7 @@
                            换默认底图（仅无内嵌封面书的 URL 含 &db= 变化）或换/重提取封面（cover_ver 变化）即时生效；
                            有内嵌封面书 URL 不变、不重挂、不闪白。 -->
                       {#key cu}
-                        <img src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" draggable="false" />
+                        <img src={cu} alt={t("library.book.coverAlt", { title: b.title })} loading="lazy" decoding="async" draggable="false" />
                       {/key}
                       <span class="fmt">{b.format.toUpperCase()}</span>
                       {#if selectMode}
@@ -1760,7 +1883,7 @@
               {/if}
               <div class="row-cover-wrap">
                 {#key cu}
-                  <img class="row-cover" src={cu} alt="《{b.title}》封面" loading="lazy" decoding="async" />
+                  <img class="row-cover" src={cu} alt={t("library.book.coverAlt", { title: b.title })} loading="lazy" decoding="async" />
                 {/key}
                 {#if ri.show && config.library.showCoverProgress}
                   <ProgressRing pct={ri.pct} full={ri.full} size={22} />
@@ -1771,7 +1894,7 @@
                 <div class="a">{b.author}</div>
               </div>
               <div class="row-size">{fmtSize(b.size)}</div>
-              <div class="row-date">{b.last_read ? "读于 " + fmtTime(b.last_read) : fmtTime(b.added_at)}</div>
+              <div class="row-date">{b.last_read ? t("library.book.readAt", { date: fmtTime(b.last_read) }) : fmtTime(b.added_at)}</div>
             </div>
           {/if}
         {/each}
@@ -1779,11 +1902,11 @@
     {/if}
   </div>
 
-  <div class="statusbar">
-    <span>{total} 本书</span>
-    <span class="build" title="TidePage 版本">TidePage {APP_VERSION}</span>
+  <div class="statusbar" data-testid="lib-statusbar">
+    <span data-testid="lib-statusbar-count">{t("library.statusbar.count", { count: total })}</span>
+    <span class="build" title={t("common.app.versionTip")}>TidePage {APP_VERSION}</span>
     {#if refreshProgress && refreshProgress.phase !== "done"}
-      <div class="scan-progress" title="书库刷新扫描进度">
+      <div class="scan-progress" title={t("library.statusbar.refreshScanTip")}>
         <div class="scan-bar">
           {#if refreshProgress.total > 0}
             <div class="scan-fill" style="width:{refreshPct}%"></div>
@@ -1797,20 +1920,20 @@
       </div>
     {/if}
     {#if folderScan && folderScan.running}
-      <div class="scan-progress" title="正在扫描目录">
+      <div class="scan-progress" title={t("library.statusbar.folderScanTip")}>
         <div class="scan-bar"><div class="scan-fill indeterminate"></div></div>
-        <span class="scan-text">正在扫描目录… 已扫描 {folderScan.scanned} 个</span>
+        <span class="scan-text" data-testid="lib-statusbar-folderscan">{t("library.statusbar.folderScanText", { count: folderScan.scanned })}</span>
       </div>
     {/if}
     {#if metaProgress && metaProgress.phase !== "done" && metaProgress.total > 0}
-      <div class="scan-progress meta-progress" title="封面/元数据后台生成进度（不影响使用）">
+      <div class="scan-progress meta-progress" title={t("library.statusbar.metaTip")}>
         <div class="scan-bar"><div class="scan-fill meta-fill" style="width:{metaPct}%"></div></div>
-        <span class="scan-text">生成封面 {metaProgress.done}/{metaProgress.total} · {metaPct}%</span>
+        <span class="scan-text" data-testid="lib-statusbar-meta">{t("library.statusbar.metaText", { done: metaProgress.done, total: metaProgress.total, pct: metaPct })}</span>
       </div>
     {/if}
     <div class="spacer"></div>
-    <button class="icon view-btn" class:active={view === "grid"} title="网格视图" aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
-    <button class="icon view-btn" class:active={view === "list"} title="列表视图" aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
+    <button class="icon view-btn" class:active={view === "grid"} data-testid="lib-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
+    <button class="icon view-btn" class:active={view === "list"} data-testid="lib-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
   </div>
 
   <div class="sel-box" class:on={boxActive} bind:this={boxEl}></div>
@@ -1818,24 +1941,24 @@
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
       <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
-        <button onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={17} stroke={1.75} /></span>打开</button>
-        <button onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={17} stroke={1.75} /></span>详细信息</button>
+        <button data-testid="lib-ctx-open" onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={17} stroke={1.75} /></span>{t("library.ctx.open")}</button>
+        <button data-testid="lib-ctx-detail" onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={17} stroke={1.75} /></span>{t("library.ctx.detail")}</button>
         {#if ctxMenu.book.format === "txt"}
-          <button onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={17} stroke={1.75} /></span>转换为 EPUB</button>
+          <button data-testid="lib-ctx-convert" onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={17} stroke={1.75} /></span>{t("library.ctx.convert")}</button>
         {/if}
         <div class="ctx-sep"></div>
-        <button onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={17} stroke={1.75} /></span>设置封面</button>
-        <button onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={17} stroke={1.75} /></span>重新提取封面</button>
+        <button data-testid="lib-ctx-cover" onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={17} stroke={1.75} /></span>{t("library.ctx.setCover")}</button>
+        <button data-testid="lib-ctx-reextract" onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={17} stroke={1.75} /></span>{t("library.ctx.reextract")}</button>
         {#if effectiveState(ctxMenu.book) !== "read"}
-          <button onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={17} stroke={1.75} /></span>标记为已读</button>
+          <button data-testid="lib-ctx-mark-read" onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={17} stroke={1.75} /></span>{t("library.ctx.markRead")}</button>
         {/if}
         {#if effectiveState(ctxMenu.book) !== "unread"}
-          <button onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={17} stroke={1.75} /></span>标记为未读</button>
+          <button data-testid="lib-ctx-mark-unread" onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={17} stroke={1.75} /></span>{t("library.ctx.markUnread")}</button>
         {/if}
-        <button onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={17} stroke={1.75} /></span>所在文件夹</button>
+        <button data-testid="lib-ctx-reveal" onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={17} stroke={1.75} /></span>{t("library.ctx.reveal")}</button>
         <div class="ctx-sep"></div>
-        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={17} stroke={1.75} /></span>仅移出书库</button>
-        <button class="danger" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>删除本地文件</button>
+        <button class="danger" data-testid="lib-ctx-remove" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={17} stroke={1.75} /></span>{t("library.ctx.removeOnly")}</button>
+        <button class="danger" data-testid="lib-ctx-delete-file" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>{t("library.ctx.deleteFile")}</button>
       </div>
     </div>
   {/if}

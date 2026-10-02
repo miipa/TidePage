@@ -15,7 +15,7 @@ for (const d of [sbx, data]) for (const f of fs.readdirSync(d)) fs.rmSync(path.j
 const outFile = path.join(SANDBOX_ROOT, "skin_out.json");
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
 
-const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===t)?.click(); await sleep(350); };\n${b} })()`;
+const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}'); const cv=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(); const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===t)?.click(); await sleep(350); };\n${b} })()`;
 
 const out = { steps: {} };
 let app = null;

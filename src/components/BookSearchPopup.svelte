@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { toast } from "../lib/stores.svelte";
@@ -130,35 +131,36 @@
 </script>
 
 <div class="sb-pop" use:portal bind:this={popEl} style={posStyle}>
-  <div class="sb-head" onpointerdown={startDrag} title="按住拖动可移动此框">
-    <span class="sb-drag">⠿ 全书搜索</span>
+  <div class="sb-head" data-testid="bsp-head" onpointerdown={startDrag} title={t("search.popup.moveTip")}>
+    <span class="sb-drag">{t("search.popup.title")}</span>
     <div class="sb-head-acts">
       {#if canBack}
-        <button class="mini" onclick={onback} title="返回跳转前的位置">↩ 返回</button>
+        <button class="mini" data-testid="bsp-back" onclick={onback} title={t("search.popup.backTip")}>{t("search.popup.back")}</button>
       {/if}
-      <button class="x" onclick={onclose} title="关闭">×</button>
+      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}>×</button>
     </div>
   </div>
   <div class="sb-row">
     <input
+      data-testid="bsp-input"
       bind:value={query}
-      placeholder="在本书中搜索…"
+      placeholder={t("search.popup.placeholder")}
       onkeydown={(e) => e.key === "Enter" && run()}
     />
-    <button class="primary" onclick={run} disabled={searching}>{searching ? "…" : "搜索"}</button>
+    <button class="primary" data-testid="bsp-go" onclick={run} disabled={searching}>{searching ? "…" : t("common.action.search")}</button>
   </div>
   <div class="sb-list">
     {#if searched && !hits.length}
-      <div class="sb-empty">
-        本书未找到匹配内容
+      <div class="sb-empty" data-testid="bsp-empty">
+        {t("search.popup.empty")}
         <div style="margin-top:8px">
-          <button onclick={buildIndex} disabled={indexing}>{indexing ? "载入中…" : "重新载入全文后重试"}</button>
+          <button data-testid="bsp-reload" onclick={buildIndex} disabled={indexing}>{indexing ? t("search.popup.loading") : t("search.popup.reloadHint")}</button>
         </div>
       </div>
     {/if}
     {#each hits as h, i (i)}
       <div class="sb-hit" class:active={activeIdx === i} onclick={() => pick(i, h)}>
-        <div class="sb-ch">{h.chapter_title || `第 ${h.chapter_index + 1} 节`}</div>
+        <div class="sb-ch">{h.chapter_title || t("common.sectionN", { n: h.chapter_index + 1 })}</div>
         <div class="sb-sn">{@html h.snippet.replaceAll("<mark>", '<mark class="mk">')}</div>
       </div>
     {/each}

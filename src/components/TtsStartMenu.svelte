@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
 
   let {
@@ -38,9 +39,9 @@
 </script>
 
 <div class="ts-menu" bind:this={menuEl} style={posStyle}>
-  <div class="ts-title">从哪里开始朗读？</div>
-  <button class="ts-btn" onclick={onpage}>从本页开始</button>
-  <button class="ts-btn" onclick={onchapter}>从章节开头开始</button>
+  <div class="ts-title">{t("tts.start.ask")}</div>
+  <button class="ts-btn" data-testid="ts-page" onclick={onpage}>{t("tts.start.page")}</button>
+  <button class="ts-btn" data-testid="ts-chapter" onclick={onchapter}>{t("tts.start.chapter")}</button>
 </div>
 
 <style>

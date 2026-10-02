@@ -25,7 +25,7 @@ const inv=(cmd,args={})=>window.__TAURI_INTERNALS__.invoke(cmd,args);
 const cfg=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
 const bc=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const fontOf=()=>{const p=q('#chapter-content p,#chapter-content div,#chapter-content font');return p?getComputedStyle(p).fontFamily:null};
-const openSettings=async()=>{ (q('button[data-tip="设置"]')||q('button[aria-label="设置"]')||q('button[title="设置"]'))?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
+const openSettings=async()=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); };
 `;
 const H = (b) => `(async()=>{ ${HELPER}\n${b} })()`;
 const out = { steps: {} };

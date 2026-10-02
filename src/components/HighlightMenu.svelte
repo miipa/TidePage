@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
+  import { labelOfId } from "../lib/i18n/index.svelte";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
@@ -61,38 +63,39 @@
     <ColorPalette
       bind:colors={config.reader.highlightColors}
       value={highlight.color}
-      applyLabel="应用"
+      applyLabel={t("common.action.apply")}
       onapply={oncolor}
       onpalette={saveConfig}
     />
   </div>
   <div class="hm-row">
-    <label>样式</label>
+    <label>{t("highlight.menu.style")}</label>
     <select
       value={highlight.style || "underline"}
       onchange={(e) => onstyle((e.currentTarget as HTMLSelectElement).value)}
     >
       {#each HIGHLIGHT_STYLES as s (s.id)}
-        <option value={s.id}>{s.name}</option>
+        <option value={s.id}>{labelOfId("hlStyle", s.id)}</option>
       {/each}
     </select>
-    <button onclick={onai} title="AI 翻译/释义（结果可添加到笔记）">AI</button>
-    <button onclick={() => (noteOpen = !noteOpen)} title="添加/编辑感想（会进入笔记列表）">
-      {highlight.note ? "编辑感想" : "添加感想"}
+    <button data-testid="hm-ai" onclick={onai} title={t("highlight.menu.aiTip")}>AI</button>
+    <button data-testid="hm-note" onclick={() => (noteOpen = !noteOpen)} title={t("highlight.menu.noteTip")}>
+      {highlight.note ? t("highlight.menu.noteEdit") : t("highlight.menu.noteAdd")}
     </button>
-    <button class="danger" onclick={ondelete} title="删除此划线">删除</button>
+    <button class="danger" data-testid="hm-delete" onclick={ondelete} title={t("highlight.deleteThis")}>{t("common.action.delete")}</button>
   </div>
   {#if noteOpen}
     <div class="hm-note">
       <textarea
         rows="3"
-        placeholder="写下你的感想…（留空则取消笔记）"
+        data-testid="hm-note-text"
+        placeholder={t("highlight.menu.notePlaceholder")}
         bind:value={noteText}
         onkeydown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) onnote(noteText); }}
       ></textarea>
       <div class="hm-note-acts">
-        <button class="primary" onclick={() => onnote(noteText)}>保存感想</button>
-        <button onclick={() => (noteOpen = false)}>取消</button>
+        <button class="primary" data-testid="hm-note-save" onclick={() => onnote(noteText)}>{t("highlight.menu.noteSave")}</button>
+        <button data-testid="hm-note-cancel" onclick={() => (noteOpen = false)}>{t("common.confirm.cancel")}</button>
       </div>
     </div>
   {/if}

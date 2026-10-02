@@ -52,13 +52,13 @@ fs.writeFileSync(newFile, "C".repeat(50));
 const n0 = reqs().length;
 out.refresh = await M.evalJs(H(`
   const I=window.__TAURI_INTERNALS__.invoke;
-  const btn=[...document.querySelectorAll('.toolbar button')].find(b=>b.textContent.includes('刷新'));
+  const btn=document.querySelector('[data-testid="lib-btn-refresh"]');
   if(!btn) return { err:'no refresh button' };
   const disabledBefore=btn.disabled;
   btn.click();
   let toast='';
   for(let i=0;i<300;i++){ await sleep(200); toast=toastsNow(); if(toast) break; }
-  const btn2=[...document.querySelectorAll('.toolbar button')].find(b=>b.textContent.includes('刷新'));
+  const btn2=document.querySelector('[data-testid="lib-btn-refresh"]');
   return { toast: toast.slice(0,80), btnDisabledBefore: disabledBefore, btnDisabledAfter: btn2?btn2.disabled:'gone' };
 `));
 
@@ -74,7 +74,7 @@ out.mockOutboundUrls = reqs().slice(n0).map((r) => r.url);
 fs.unlinkSync(newFile);
 const n1 = reqs().length;
 out.refresh2 = await M.evalJs(H(`
-  const btn=[...document.querySelectorAll('.toolbar button')].find(b=>b.textContent.includes('刷新'));
+  const btn=document.querySelector('[data-testid="lib-btn-refresh"]');
   btn.click();
   await sleep(2500);
   return { toast: toastsNow().slice(0,120) };

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { dragOutHandle } from "../lib/windowSnap";
@@ -63,10 +64,10 @@
     const h = Math.floor(sec / 3600);
     const m = Math.round((sec % 3600) / 60);
     const s = sec % 60;
-    if (h) return `${h}小时${m}分`;
-    if (m && s) return `${m}分${s}秒`;
-    if (m) return `${m}分`;
-    return `${s}秒`;
+    if (h) return t("common.dur.hmShort", { h, m });
+    if (m && s) return t("common.dur.ms", { m, s });
+    if (m) return t("common.dur.mShort", { m });
+    return t("common.dur.sShort", { s });
   }
 
   function fmtTime(ts: number): string {
@@ -75,73 +76,73 @@
   }
 
   function fmtChars(n: number): string {
-    if (n >= 10000) return (n / 10000).toFixed(1) + "万";
+    if (n >= 10000) return (n / 10000).toFixed(1) + t("common.unit.tenThousand");
     return String(n);
   }
 
   function sessionSpeed(s: BookSession): string {
     if (s.seconds < 30 || s.chars <= 0) return "—";
-    return Math.round(s.chars / (s.seconds / 60)) + " 字/分";
+    return Math.round(s.chars / (s.seconds / 60)) + " " + t("common.unit.perMin");
   }
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
-    <span>本书统计</span>
+  <div class="sp-head" data-testid="bsm-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
+    <span>{t("bookStats.title")}</span>
     <div style="display:flex; gap:6px; align-items:center;">
-      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="bsm-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
+      {#if onclose}<button class="icon" data-testid="bsm-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="stats-body">
     {#if !loaded}
-      <div class="empty">加载中…</div>
+      <div class="empty">{t("common.loading")}</div>
     {:else}
       <div class="book-title">{bookTitle}</div>
       {#if !wc}
-        <div class="empty">字数统计生成中…稍后再看。</div>
+        <div class="empty">{t("bookStats.calculating")}</div>
       {:else}
       <div class="summary">
         <div class="sum-item">
           <div class="v">{fmtChars(wc.total)}</div>
-          <div class="k">全书字数</div>
+          <div class="k">{t("bookStats.totalChars")}</div>
         </div>
         <div class="sum-item">
           <div class="v">{fmtChars(wc.pure)}</div>
-          <div class="k">纯文字</div>
+          <div class="k">{t("bookStats.pureChars")}</div>
         </div>
         <div class="sum-item">
           <div class="v">{fmtChars(totalChars)}</div>
-          <div class="k">已读字数</div>
+          <div class="k">{t("bookStats.readChars")}</div>
         </div>
         <div class="sum-item">
           <div class="v">{wc.total > 0 ? Math.min(100, Math.round((totalChars / wc.total) * 100)) + "%" : "—"}</div>
-          <div class="k">按字数进度</div>
+          <div class="k">{t("bookStats.byChars")}</div>
         </div>
         <div class="sum-item">
           <div class="v">{fmt(totalSeconds)}</div>
-          <div class="k">总时长</div>
+          <div class="k">{t("bookStats.totalTime")}</div>
         </div>
         <div class="sum-item">
           <div class="v">{speed || "—"}</div>
-          <div class="k">平均 字/分</div>
+          <div class="k">{t("bookStats.avgSpeed", { v: speed })}</div>
         </div>
       </div>
 
       {#if !sessions.length}
-        <div class="empty">暂无阅读记录，阅读约 30 秒后开始统计。</div>
+        <div class="empty">{t("bookStats.empty")}</div>
       {:else}
       {#each groups as g (g.day)}
         <div class="day-block">
           <div class="day-head">
             <span class="day">{g.day}</span>
-            <span class="day-sum">{fmt(g.seconds)} · {fmtChars(g.chars)}字 · {g.items.length} 次</span>
+            <span class="day-sum">{fmt(g.seconds)} · {fmtChars(g.chars)}{t("common.unit.chars")}{t("bookStats.unitLine", { n: g.items.length })}</span>
           </div>
           {#each g.items as s (s.started_at)}
             <div class="s-row">
               <span class="s-time">{fmtTime(s.started_at)}</span>
               <span class="s-len">{fmt(s.seconds)}</span>
-              <span class="s-chars">{fmtChars(s.chars)}字</span>
+              <span class="s-chars">{fmtChars(s.chars)}{t("common.unit.chars")}</span>
               <span class="s-speed">{sessionSpeed(s)}</span>
             </div>
           {/each}

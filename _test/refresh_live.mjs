@@ -38,7 +38,7 @@ fs.writeFileSync(path.join(deep, "D-deep.txt"), "D");
 out.flow = await M.evalJs(H(`
   const I=window.__TAURI_INTERNALS__.invoke;
   const s=document.querySelector('input.search'); if(s){ s.value=''; s.dispatchEvent(new Event('input',{bubbles:true})); }
-  const btn=[...document.querySelectorAll('.toolbar button')].find(b=>b.textContent.includes('刷新'));
+  const btn=document.querySelector('[data-testid="lib-btn-refresh"]');
   if(!btn) return { err:'no refresh button' };
   btn.click();
   let toast='';

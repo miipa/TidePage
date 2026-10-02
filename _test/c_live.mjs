@@ -39,13 +39,13 @@ out.flow = await M.evalJs(H(`
   card.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
   const dlg = await wait(()=>document.querySelector('.confirm-msg'),'confirm');
   const dialogText = dlg.textContent.slice(0,100);
-  [...document.querySelectorAll('.confirm-row button')].find(b=>b.textContent.trim()==='取消').click();
+  document.querySelector('[data-testid="confirm-cancel"]').click();
   await sleep(400);
   const afterCancel = { inReader: !!document.querySelector('#chapter-content'), inLibrary: !!document.querySelector('.library') };
   // 确认路径
   card.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
   await wait(()=>document.querySelector('.confirm-msg'),'confirm2');
-  [...document.querySelectorAll('.confirm-row button')].find(b=>b.textContent.trim()==='确定').click();
+  document.querySelector('[data-testid="confirm-ok"]').click();
   let toastMsg = '', toastDom = '';
   for (let i=0;i<300;i++){
     await sleep(200);

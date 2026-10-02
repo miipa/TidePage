@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { HIGHLIGHT_STYLES, config, saveConfig } from "../lib/stores.svelte";
+  import { labelOfId } from "../lib/i18n/index.svelte";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import ColorPalette from "./ColorPalette.svelte";
 
@@ -48,28 +50,28 @@
 </script>
 
 <div class="sel-menu" bind:this={menuEl} style={posStyle} oncontextmenu={(e) => e.preventDefault()}>
-  <div class="hl-row" title="点击样式即按当前颜色划线">
+  <div class="hl-row" title={t("selection.styleTip")}>
     {#each HIGHLIGHT_STYLES as s (s.id)}
-      <button class="sw sw-{s.id}" title={s.name} onclick={() => onhighlight(s.id, activeColor)}>
-        <span class="sw-line" style="color:{activeColor};">文</span>
+      <button class="sw sw-{s.id}" data-testid={"sel-style-" + s.id} title={labelOfId("hlStyle", s.id)} onclick={() => onhighlight(s.id, activeColor)}>
+        <span class="sw-line" style="color:{activeColor};">{t("selection.text")}</span>
       </button>
     {/each}
   </div>
-  <div class="color-row" title="点击色点设置颜色；＋ 可新增，设置框内可删除">
+  <div class="color-row" title={t("selection.paletteTip")}>
     <ColorPalette
       bind:colors={config.reader.highlightColors}
       value={activeColor}
-      applyLabel="选用"
+      applyLabel={t("selection.use")}
       onapply={(c) => (activeColor = c)}
       onpalette={saveConfig}
     />
   </div>
   <div class="sel-sep"></div>
   <div class="act-row">
-    <button class="hl-main" onclick={() => onhighlight(config.reader.highlightStyle || "underline", activeColor)} title="按默认样式与当前颜色划线">划线</button>
-    <button onclick={onsearch} title="在本书中搜索选中文字">全文</button>
-    <button onclick={onbrowser} title="用浏览器搜索选中文字">浏览器</button>
-    <button class="ai" onclick={onai} title="AI 翻译 / 释义">AI 释义</button>
+    <button class="hl-main" data-testid="sel-hl" onclick={() => onhighlight(config.reader.highlightStyle || "underline", activeColor)} title={t("selection.hlTip")}>{t("highlight.hl")}</button>
+    <button data-testid="sel-search" onclick={onsearch} title={t("selection.searchBookTip")}>{t("selection.searchBook")}</button>
+    <button data-testid="sel-browser" onclick={onbrowser} title={t("selection.searchBrowserTip")}>{t("selection.searchBrowser")}</button>
+    <button class="ai" data-testid="sel-ai" onclick={onai} title={t("selection.aiTip")}>{t("selection.aiLabel")}</button>
   </div>
 </div>
 

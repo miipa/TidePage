@@ -12,6 +12,7 @@
   import NotesPanel from "../components/NotesPanel.svelte";
   import WindowControls from "../components/WindowControls.svelte";
   import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, openPanelWindow } from "../lib/stores.svelte";
+  import { t } from "../lib/i18n/index.svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
@@ -218,7 +219,7 @@
         <p class="confirm-msg">{choiceBox.msg}</p>
         <div class="choice-row">
           {#each choiceBox.actions as a (a.id)}
-            <button class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
+            <button data-testid={"choice-" + a.id} class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
           {/each}
         </div>
       </div>
@@ -229,8 +230,8 @@
     <!-- 笔记面板弹出入口：置于 NotesPanel 之外（不改其组件本体），成功后关闭内联笔记面板 -->
     <button
       class="notes-popout-btn"
-      title="弹出为独立窗口"
-      onclick={async () => { const ok = await openPanelWindow("notes", ui.currentBookId || 0, "笔记"); if (ok) ui.notesOpen = false; }}
+      title={t("notes.popoutTip")}
+      onclick={async () => { const ok = await openPanelWindow("notes", ui.currentBookId || 0, t("library.topbar.notes.label")); if (ok) ui.notesOpen = false; }}
     >⧉</button>
     <NotesPanel />
   {/if}
@@ -241,8 +242,8 @@
       <div class="modal-body confirm-body">
         <p class="confirm-msg">{confirmBox.msg}</p>
         <div class="confirm-row">
-          <button onclick={() => confirmAnswer(false)}>取消</button>
-          <button class="primary" onclick={() => confirmAnswer(true)}>确定</button>
+          <button data-testid="confirm-cancel" onclick={() => confirmAnswer(false)}>{t("common.confirm.cancel")}</button>
+          <button class="primary" data-testid="confirm-ok" onclick={() => confirmAnswer(true)}>{t("common.confirm.ok")}</button>
         </div>
       </div>
     </dialog>
@@ -258,12 +259,13 @@
 {/if}
 
 <div class="fr-toast-wrap">
-  {#each toasts.items as t (t.id)}
-    <div class="toast-card" class:error={t.kind === "error"}>
-      <div class="toast-msg">{t.msg}</div>
+  <!-- 循环变量改名 ti：避免与 i18n 的 t() 同名遮蔽（t() 依赖 locale，必须在模板里调用） -->
+  {#each toasts.items as ti (ti.id)}
+    <div class="toast-card" class:error={ti.kind === "error"}>
+      <div class="toast-msg">{ti.msg}</div>
       <div class="toast-acts">
-        <button class="icon" title="复制" onclick={() => copyText(t.msg)}>⧉</button>
-        <button class="icon" title="关闭" onclick={() => dismissToast(t.id)}>×</button>
+        <button class="icon" data-testid="toast-copy" title={t("common.toast.copy")} onclick={() => copyText(ti.msg)}>⧉</button>
+        <button class="icon" data-testid="toast-close" title={t("common.toast.close")} onclick={() => dismissToast(ti.id)}>×</button>
       </div>
     </div>
   {/each}

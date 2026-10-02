@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import type { TocEntry } from "../lib/types";
   import { dragOutHandle } from "../lib/windowSnap";
 
@@ -63,19 +64,19 @@
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
-    <span>目录</span>
+  <div class="sp-head" data-testid="toc-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
+    <span>{t("toc.title")}</span>
     <div class="sp-head-acts">
-      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="toc-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
+      {#if onclose}<button class="icon" data-testid="toc-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="sp-search">
-    <input placeholder="搜索章节…" bind:value={query} />
+    <input data-testid="toc-search" placeholder={t("reader.toc.searchPlaceholder")} bind:value={query} />
   </div>
   <div class="sp-list" bind:this={listEl} onscroll={onScroll}>
     {#if total === 0}
-      <div class="sp-empty">无匹配章节</div>
+      <div class="sp-empty" data-testid="toc-empty">{t("toc.empty")}</div>
     {:else}
       <div class="sp-inner" style="height:{total * ROW_H}px;">
         {#each visible as item, vi (item.pos)}

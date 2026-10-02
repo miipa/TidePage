@@ -10,7 +10,7 @@ const data = path.join(SANDBOX_ROOT, "probe_data");
 fs.mkdirSync(sbx, { recursive: true }); fs.mkdirSync(data, { recursive: true });
 for (const d of [sbx, data]) for (const f of fs.readdirSync(d)) fs.rmSync(path.join(d, f), { recursive: true, force: true });
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
-const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const openSettings=async(tab)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };\n${b} })()`;
+const H = (b) => `(async()=>{ const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const q=(s)=>document.querySelector(s); const qa=(s)=>[...document.querySelectorAll(s)]; const wait=async(fn,n,r=200)=>{for(let i=0;i<r;i++){const v=fn();if(v)return v;await sleep(100);}throw new Error('timeout '+n)}; const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };\n${b} })()`;
 let app=null;
 try {
   app = launchSandbox({ env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: sbx, TIDEPAGE_DATA_DIR: data }, cdpPort: PORT, logFile: path.join(SANDBOX_ROOT, "probe.log") });
@@ -18,8 +18,8 @@ try {
   for(let i=0;i<300;i++){try{const r=await M.evalJs(`!!window.__TAURI_INTERNALS__`);if(r)break}catch{}await sleep(400)}
   await sleep(800);
   const r = await M.evalJs(H(`
-    const out0={ settingsBtns: qa('button[title="设置"]').length, url: location.href };
-    for(let k=0;k<20 && !q('dialog[open]');k++){ q('button[title="设置"]')?.click(); await sleep(500); }
+    const out0={ settingsBtns: qa('[data-testid="lib-btn-settings"]').length, url: location.href };
+    for(let k=0;k<20 && !q('dialog[open]');k++){ q('[data-testid="lib-btn-settings"]')?.click(); await sleep(500); }
     out0.opened=!!q('dialog[open]');
     out0.tabs=qa('.tabs button').map(b=>b.textContent.trim());
     [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()==='阅读')?.click(); await sleep(350);

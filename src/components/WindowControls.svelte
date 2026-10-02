@@ -5,6 +5,7 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { IconMinus, IconSquare, IconSquares, IconX } from "@tabler/icons-svelte";
+  import { t } from "../lib/i18n/index.svelte";
 
   const win = getCurrentWindow();
   let maximized = $state(false);
@@ -50,13 +51,14 @@
 </script>
 
 <div class="win-ctl">
-  <button class="wc-btn" aria-label="最小化" title="最小化" onclick={onMinimize}>
+  <button class="wc-btn" data-testid="wc-min" aria-label={t("common.window.minimize")} title={t("common.window.minimize")} onclick={onMinimize}>
     <IconMinus size={20} stroke={1.75} />
   </button>
   <button
     class="wc-btn"
-    aria-label={maximized ? "还原" : "最大化"}
-    title={maximized ? "还原" : "最大化"}
+    data-testid="wc-max"
+    aria-label={maximized ? t("common.window.restore") : t("common.window.maximize")}
+    title={maximized ? t("common.window.restore") : t("common.window.maximize")}
     onclick={onToggleMaximize}
   >
     {#if maximized}
@@ -65,7 +67,7 @@
       <IconSquare size={20} stroke={1.75} />
     {/if}
   </button>
-  <button class="wc-btn wc-close" aria-label="关闭" title="关闭" onclick={onClose}>
+  <button class="wc-btn wc-close" data-testid="wc-close" aria-label={t("common.action.close")} title={t("common.action.close")} onclick={onClose}>
     <IconX size={20} stroke={1.75} />
   </button>
 </div>

@@ -39,7 +39,7 @@ try {
 
   // 打开 设置 → 外观
   await M.evalJs(H(`
-    q('button[title="设置"]')?.click();
+    q('[data-testid="lib-btn-settings"]')?.click();
     await wait(()=>q('dialog[open]'),'dlg');
     [...document.querySelectorAll('.set-nav-item')].find(x=>x.textContent.includes('界面外观'))?.click();
     await sleep(600); return 1;

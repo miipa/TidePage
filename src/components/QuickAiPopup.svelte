@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { config, copyText, saveConfigNow, toast } from "../lib/stores.svelte";
@@ -42,10 +43,10 @@
         // 兜底：无回调时沿用旧行为（仅已有划线可追加）
         await api.appendHighlightNote(targetHighlightId, out);
         added = true;
-        toast("已添加到感想");
+        toast(t("quickAi.addedToNote"));
         onadded?.();
       } else {
-        toast("无可用选区", "error");
+        toast(t("quickAi.noSelection"), "error");
       }
     } catch (e) {
       toast(String(e), "error");
@@ -65,14 +66,14 @@
 
   function errLabel(kind: string): string {
     switch (kind) {
-      case "network": return "网络错误";
-      case "timeout": return "连接超时";
-      case "http_4xx": return "鉴权/请求错误(4xx)";
-      case "http_5xx": return "服务端错误(5xx)";
-      case "protocol": return "响应协议不匹配";
-      case "model_id": return "模型ID非法";
-      case "config": return "配置不完整";
-      default: return "未知错误";
+      case "network": return t("ai.errKind.network");
+      case "timeout": return t("ai.errKind.timeout");
+      case "http_4xx": return t("ai.errKind.http4xx");
+      case "http_5xx": return t("ai.errKind.http5xx");
+      case "protocol": return t("ai.errKind.protocol");
+      case "model_id": return t("ai.errKind.modelId");
+      case "config": return t("ai.errKind.config");
+      default: return t("ai.errKind.unknown");
     }
   }
 
@@ -102,7 +103,7 @@
   async function run() {
     const profiles = config.ai.profiles;
     if (!profiles.length) {
-      toast("请先在设置 → AI 配置端点", "error");
+      toast(t("ai.noEndpoint"), "error");
       return;
     }
     busy = true;
@@ -120,7 +121,7 @@
       const idx = order[a];
       const p = profiles[idx];
       if (!p || !p.baseUrl || !p.model) {
-        failures.push(`${p?.name || "端点"}：未填写地址或模型`);
+        failures.push(t("ai.failureNoAddr", { name: p?.name || t("ai.endpointPlain"), msg: t("ai.noAddrOrModel") }));
         continue;
       }
       if (a > 0) output = "";
@@ -164,12 +165,12 @@
         un?.();
         activeUn = null;
         const err = normErr(e);
-        failures.push(`${p.name || "端点"}：${errLabel(err.kind)}：${err.message}`);
+        failures.push(t("ai.errLine", { name: p.name || t("ai.endpointPlain"), kind: errLabel(err.kind), msg: err.message }));
         if (!config.ai.failover) break;
       }
     }
     failed = true;
-    output = `[全部端点均失败]\n${failures.map((f) => `• ${f}`).join("\n")}`;
+    output = `${t("ai.allFailedTitle")}\n${failures.map((f) => `• ${f}`).join("\n")}`;
     busy = false;
   }
 
@@ -214,28 +215,29 @@
 
 <div class="qa-pop" bind:this={popEl} style={posStyle}>
   <div class="qa-head">
-    <span>AI 翻译 / 释义</span>
+    <span data-testid="qa-title">{t("quickAi.title")}</span>
     <div class="qa-acts">
       {#if !busy && output}
-        <button class="mini" title="重新生成" onclick={retry}>↻</button>
-        <button class="mini" title="复制结果" onclick={() => copyText(output)}>复制</button>
+        <button class="mini" data-testid="qa-retry" title={t("quickAi.regenerate")} onclick={retry}>↻</button>
+        <button class="mini" data-testid="qa-copy" title={t("quickAi.copyResult")} onclick={() => copyText(output)}>{t("common.action.copy")}</button>
       {/if}
       <button
         class="mini primary"
-        title="把 AI 释义添加到感想（划线的 note）"
+        data-testid="qa-add-note"
+    title={t("quickAi.addNoteTip")}
         onclick={addToNote}
         disabled={busy || !output.trim() || failed || added || adding}
       >
-        {added ? "已添加" : "添加到感想"}
+        {added ? t("common.toast.added") : t("quickAi.addToNote")}
       </button>
-      <button class="mini" title="关闭" onclick={onclose}>×</button>
+      <button class="mini" data-testid="qa-close" title={t("common.action.close")} onclick={onclose}>×</button>
     </div>
   </div>
   <div class="qa-body" bind:this={bodyEl}>
     {#if output}
       <div class="qa-mark" class:err={failed}>{@html failed ? `<pre>${esc(output)}</pre>` : mdToHtml(output)}</div>
     {:else}
-      <div class="qa-loading">{busy ? "正在生成…" : "…"}</div>
+      <div class="qa-loading">{busy ? t("ai.thinking") : "…"}</div>
     {/if}
   </div>
 </div>

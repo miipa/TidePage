@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dateLocale, t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { IconClipboard, IconCopy, IconCut, IconTrash } from "@tabler/icons-svelte";
@@ -61,11 +62,11 @@
     list.sort((a, b) => {
       if (foldersFirst && a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       let cmp = 0;
-      if (sortBy === "name") cmp = a.name.localeCompare(b.name, "zh");
+      if (sortBy === "name") cmp = a.name.localeCompare(b.name, dateLocale());
       else if (sortBy === "time") cmp = (a.mtime || 0) - (b.mtime || 0);
       else cmp = (a.size || 0) - (b.size || 0);
       // 同值时用名称兜底，保证顺序稳定
-      if (cmp === 0) cmp = a.name.localeCompare(b.name, "zh");
+      if (cmp === 0) cmp = a.name.localeCompare(b.name, dateLocale());
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
@@ -120,11 +121,11 @@
   }
 
   async function pickDir() {
-    const d = await api.pickFolder("选择书籍下载目录");
+    const d = await api.pickFolder(t("webdav.pickDownloadDir"));
     if (!d) return;
     config.webdav.downloadDir = d;
     saveConfig();
-    toast(`下载目录：${d}`);
+    toast(t("webdav.downloadDirToast", { dir: d }));
   }
 
   function isBook(e: Entry) {
@@ -185,7 +186,7 @@
   function setClip(op: "copy" | "move", e: Entry) {
     clipboard = { op, name: e.name, path: fullPath(e), is_dir: e.is_dir, srcDir: path };
     ctxMenu = null;
-    toast(op === "copy" ? `已复制「${e.name}」到剪贴板` : `已剪切「${e.name}」到剪贴板`);
+    toast(op === "copy" ? t("webdav.copiedToClipboard", { name: e.name }) : t("webdav.cutToClipboard", { name: e.name }));
   }
 
   /** 粘贴到当前目录：复制走 webdavCopy，移动走 webdavMove；失败保留剪贴板便于重试。 */
@@ -194,7 +195,7 @@
     if (!clipboard) return;
     const clip = clipboard;
     if (path === clip.srcDir) {
-      toast("目标目录与来源相同，未执行");
+      toast(t("webdav.sameDir"));
       return;
     }
     const dst = path ? `${path}/${clip.name}` : clip.name;
@@ -204,12 +205,12 @@
       } else {
         await api.webdavMove(config.webdav.base, config.webdav.user, config.webdav.pass, clip.path, dst);
       }
-      toast(clip.op === "copy" ? "已复制" : "已移动");
+      toast(clip.op === "copy" ? t("webdav.copied") : t("webdav.moved"));
       clipboard = null;
       await load();
     } catch (e) {
       const s = String(e);
-      if (s.includes("412") || s.includes("409")) toast("目标位置已有同名项，请先重命名或删除", "error");
+      if (s.includes("412") || s.includes("409")) toast(t("webdav.nameConflict"), "error");
       else toast(s, "error");
     }
   }
@@ -221,7 +222,7 @@
     confirmDel = null;
     try {
       await api.webdavDelete(config.webdav.base, config.webdav.user, config.webdav.pass, fullPath(entry));
-      toast("已删除");
+      toast(t("common.toast.deleted"));
       await load();
     } catch (e) {
       toast(String(e), "error");
@@ -230,7 +231,7 @@
 
   async function download(e: Entry) {
     if (!config.webdav.downloadDir) {
-      toast("请先选择下载目录", "error");
+      toast(t("webdav.pickDirFirst"), "error");
       return;
     }
     const remote = path ? `${path}/${e.name}` : e.name;
@@ -268,7 +269,7 @@
       if (it) { it.state = "error"; it.msg = String(e2); }
       dlUnlisteners[key]?.();
       delete dlUnlisteners[key];
-      toast(`下载失败：${e2}`, "error");
+      toast(t("webdav.downloadFailed", { err: String(e2) }), "error");
     }
   }
 
@@ -294,59 +295,60 @@
 
 <div class="wd-browse" bind:this={browseEl}>
   <div class="wd-head">
-    <span class="wd-title">WebDAV 文件管理</span>
-    <button class="icon" title="关闭" aria-label="关闭" onclick={() => (ui.webdavOpen = false)}>×</button>
+    <span class="wd-title">{t("library.topbar.webdav.label")}</span>
+    <button class="icon" data-testid="wd-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (ui.webdavOpen = false)}>×</button>
   </div>
 
   {#if !configReady}
     <div class="wd-empty-cfg">
       <div class="wd-empty-ico">🔌</div>
-      <p class="wd-empty-t">尚未配置 WebDAV 服务器</p>
-      <p class="wd-empty-d">请先在 <b>设置 → WebDAV</b> 中填写服务器地址与账号密码并启用，之后打开本面板即可自动连接。</p>
+      <p class="wd-empty-t">{t("webdav.notConfigured")}</p>
+      <p class="wd-empty-d">{t("webdav.notConfiguredHint")}</p>
     </div>
   {:else}
     <!-- 工具行：导航 + 当前路径 + 排序控件（窄抽屉下自动换行，路径省略号不撑破） -->
     <div class="wd-tools">
-      <button class="wd-btn" onclick={() => load("")} disabled={!path} title="根目录" aria-label="根目录">⌂</button>
-      <button class="wd-btn" onclick={up} disabled={!hasUp} title="上级目录" aria-label="上级目录">↑</button>
-      <button class="wd-btn" onclick={() => load()} title="刷新当前目录" aria-label="刷新">⟳</button>
+      <button class="wd-btn" data-testid="wd-root" onclick={() => load("")} disabled={!path} title={t("webdav.rootDir")} aria-label={t("webdav.rootDir")}>⌂</button>
+      <button class="wd-btn" data-testid="wd-up" onclick={up} disabled={!hasUp} title={t("webdav.parentDir")} aria-label={t("webdav.parentDir")}>↑</button>
+      <button class="wd-btn" data-testid="wd-refresh" onclick={() => load()} title={t("webdav.refreshDir")} aria-label={t("common.action.refresh")}>⟳</button>
       {#if clipboard}
-        <button class="wd-btn" onclick={paste} title={`粘贴「${clipboard.name}」到当前目录`} aria-label="粘贴到当前目录">粘贴</button>
+        <button class="wd-btn" data-testid="wd-paste" onclick={paste} title={t("webdav.pasteHereTip", { name: clipboard.name })} aria-label={t("webdav.pasteHereAria")}>{t("common.action.paste")}</button>
       {/if}
       <span class="wd-path" title={path || "/"}>{path || "/"}</span>
       <span class="wd-tools-gap"></span>
-      <select class="wd-sel" bind:value={sortBy} title="排序方式" aria-label="排序方式">
-        <option value="name">名称</option>
-        <option value="time">时间</option>
-        <option value="size">大小</option>
+      <select class="wd-sel" data-testid="wd-sort" bind:value={sortBy} title={t("webdav.sortBy")} aria-label={t("webdav.sortBy")}>
+        <option value="name">{t("webdav.sortName")}</option>
+        <option value="time">{t("webdav.sortTime")}</option>
+        <option value="size">{t("webdav.sortSize")}</option>
       </select>
       <button
         class="wd-btn"
         onclick={() => (sortDir = sortDir === "asc" ? "desc" : "asc")}
-        title={sortDir === "asc" ? "升序（点击改降序）" : "降序（点击改升序）"}
-        aria-label="切换升降序"
+        data-testid="wd-sortdir"
+        title={sortDir === "asc" ? t("webdav.ascTip") : t("webdav.descTip")}
+        aria-label={t("webdav.toggleOrderAria")}
       >{sortDir === "asc" ? "↑" : "↓"}</button>
-      <label class="wd-check" title="目录始终排在文件前面">
-        <input type="checkbox" bind:checked={foldersFirst} /> 文件夹置顶
+      <label class="wd-check" title={t("webdav.dirsFirstTip")}>
+        <input type="checkbox" bind:checked={foldersFirst} /> {t("webdav.foldersFirst")}
       </label>
     </div>
 
     <div class="wd-info">
-      <span class="wd-info-label">下载目录</span>
-      <span class="wd-info-val" title={config.webdav.downloadDir || "未设置"}>{config.webdav.downloadDir || "未设置"}</span>
-      <button class="wd-btn" onclick={pickDir}>选择…</button>
+      <span class="wd-info-label">{t("webdav.downloadDirLabel")}</span>
+      <span class="wd-info-val" title={config.webdav.downloadDir || t("common.notSet")}>{config.webdav.downloadDir || t("common.notSet")}</span>
+      <button class="wd-btn" data-testid="wd-pickdir" onclick={pickDir}>{t("webdav.choose")}</button>
     </div>
 
     <div class="wd-list" oncontextmenu={onListCtx} role="presentation">
       {#if loading || (!attempted && !error)}
-        <div class="wd-state"><span class="wd-spin">⟳</span> 加载中…</div>
+        <div class="wd-state"><span class="wd-spin">⟳</span> {t("common.loading")}</div>
       {:else if error}
         <div class="wd-state wd-state-error">
-          <div class="wd-err-msg">列目录失败：{error}</div>
-          <button class="wd-btn wd-retry" onclick={() => load()}>重试</button>
+          <div class="wd-err-msg">{t("webdav.listFailed")}{error}</div>
+          <button class="wd-btn wd-retry" data-testid="wd-retry" onclick={() => load()}>{t("webdav.retry")}</button>
         </div>
       {:else if sortedEntries.length === 0}
-        <div class="wd-state">空目录或无权限</div>
+        <div class="wd-state">{t("webdav.emptyDir")}</div>
       {:else}
         {#each sortedEntries as e (path + "/" + e.name + String(e.size))}
           {#if e.is_dir}
@@ -360,7 +362,7 @@
               <span class="wd-name" title={e.name}>{e.name}</span>
               <span class="wd-meta">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span>
               <button class="wd-dl-btn" onclick={() => download(e)} disabled={activeDownloads >= 3}>
-                {isBook(e) ? "下载入书库" : "下载"}
+                {isBook(e) ? t("webdav.downloadToLib") : t("webdav.download")}
               </button>
             </div>
           {/if}
@@ -375,7 +377,7 @@
             <div class="wd-dl-top">
               <span class="wd-dl-name" title={d.name}>{d.name}</span>
               <span class="wd-dl-state" class:ok={d.state === "done"} class:bad={d.state === "error"}>
-                {d.state === "done" ? "✓ 下载已完成" : d.state === "error" ? "下载失败" : `${d.pct}%`}
+                {d.state === "done" ? t("webdav.downloadDone") : d.state === "error" ? t("webdav.downloadFailedShort") : `${d.pct}%`}
               </span>
             </div>
             <div class="wd-bar"><div class="wd-bar-fill" class:fin={d.state === "done"} class:fail={d.state === "error"} style="width:{d.pct}%"></div></div>
@@ -389,27 +391,27 @@
   {#if ctxMenu}
     <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
       {#if ctxMenu.entry}
-        <button onclick={() => setClip("copy", ctxMenu!.entry!)}><span class="ci"><IconCopy size={17} stroke={1.75} /></span>复制</button>
-        <button onclick={() => setClip("move", ctxMenu!.entry!)}><span class="ci"><IconCut size={17} stroke={1.75} /></span>移动</button>
+        <button data-testid="wd-ctx-copy" onclick={() => setClip("copy", ctxMenu!.entry!)}><span class="ci"><IconCopy size={17} stroke={1.75} /></span>{t("common.action.copy")}</button>
+        <button data-testid="wd-ctx-move" onclick={() => setClip("move", ctxMenu!.entry!)}><span class="ci"><IconCut size={17} stroke={1.75} /></span>{t("webdav.move")}</button>
         <div class="ctx-sep"></div>
-        <button class="danger" onclick={() => { confirmDel = ctxMenu!.entry!; ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>删除</button>
+        <button class="danger" data-testid="wd-ctx-del" onclick={() => { confirmDel = ctxMenu!.entry!; ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>{t("common.action.delete")}</button>
       {:else}
-        <button onclick={paste} disabled={!clipboard}><span class="ci"><IconClipboard size={17} stroke={1.75} /></span>粘贴到此处</button>
+        <button data-testid="wd-ctx-paste" onclick={paste} disabled={!clipboard}><span class="ci"><IconClipboard size={17} stroke={1.75} /></span>{t("webdav.pasteHere")}</button>
       {/if}
     </div>
   {/if}
 
   {#if confirmDel}
     <!-- 删除确认：仅覆盖 WebDAV 面板区域（绝对定位在 .wd-browse 内） -->
-    <div class="wd-confirm-wrap" role="dialog" aria-modal="true" aria-label="删除确认">
-      <button type="button" class="wd-confirm-mask" aria-label="取消删除" onclick={() => (confirmDel = null)}></button>
+    <div class="wd-confirm-wrap" role="dialog" aria-modal="true" aria-label={t("webdav.delConfirmAria")}>
+      <button type="button" class="wd-confirm-mask" aria-label={t("webdav.cancelDelAria")} onclick={() => (confirmDel = null)}></button>
       <div class="wd-confirm">
-        <p class="wd-confirm-t">确定删除「{confirmDel.name}」？</p>
-        {#if confirmDel.is_dir}<p class="wd-confirm-s">（将连同其中的内容一起删除）</p>{/if}
-        <p class="wd-confirm-s">此操作不可撤销。</p>
+        <p class="wd-confirm-t">{t("webdav.delConfirmTitle", { name: confirmDel.name })}</p>
+        {#if confirmDel.is_dir}<p class="wd-confirm-s">{t("webdav.delWithContent")}</p>{/if}
+        <p class="wd-confirm-s">{t("webdav.irreversible")}</p>
         <div class="wd-confirm-actions">
-          <button class="wd-btn" onclick={() => (confirmDel = null)}>取消</button>
-          <button class="wd-btn danger" onclick={doDelete}>删除</button>
+          <button class="wd-btn" data-testid="wd-del-cancel" onclick={() => (confirmDel = null)}>{t("common.confirm.cancel")}</button>
+          <button class="wd-btn danger" data-testid="wd-del-ok" onclick={doDelete}>{t("common.action.delete")}</button>
         </div>
       </div>
     </div>

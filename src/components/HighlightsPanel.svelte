@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { api } from "../lib/api";
   import { HIGHLIGHT_STYLES, appConfirm, config, saveConfig, toast } from "../lib/stores.svelte";
+  import { labelOfId } from "../lib/i18n/index.svelte";
   import { dragOutHandle } from "../lib/windowSnap";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
@@ -46,7 +48,7 @@
   });
 
   async function del(h: HighlightRow) {
-    const ok = await appConfirm(`删除这条划线？\n${h.text.slice(0, 60)}`);
+    const ok = await appConfirm(t("highlight.deleteConfirm", { text: h.text.slice(0, 60) }));
     if (!ok) return;
     try {
       await api.deleteHighlight(h.id);
@@ -87,28 +89,29 @@
 </script>
 
 <div class="sidepanel">
-  <div class="sp-head" use:dragOutHandle={onpopout} title="按住标题栏拖出面板外可弹为独立窗口">
-    <span>划线 / 批注</span>
+  <div class="sp-head" data-testid="hlp-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
+    <span>{t("highlight.panelTitle")}</span>
     <div style="display:flex; gap:6px; align-items:center;">
-      {#if onpopout}<button class="icon" title="弹出为独立窗口" onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" title="关闭" onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="hlp-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
+      {#if onclose}<button class="icon" data-testid="hlp-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
     </div>
   </div>
   <div class="sp-search">
     <input
-      placeholder="搜索划线，全库正文/书名/章节…"
+      data-testid="hlp-search"
+      placeholder={t("highlight.searchPlaceholder")}
       bind:value={query}
     />
   </div>
   <div class="sp-list">
     {#if loading && !rows.length}
-      <div class="sp-empty">加载中…</div>
+      <div class="sp-empty">{t("common.loading")}</div>
     {/if}
     {#each rows as h (h.id)}
       <div class="sp-item hl-item">
-        <div class="hl-top" onclick={() => onjump(h)} title="点击跳转到该划线位置">
+        <div class="hl-top" onclick={() => onjump(h)} title={t("highlight.jumpTip")}>
           <div class="bm-title">
-            {h.chapter_title || `第 ${h.chapter_index + 1} 节`}
+            {h.chapter_title || t("common.sectionN", { n: h.chapter_index + 1 })}
             {#if query.trim()}<span class="hl-book">· {h.book_title}</span>{/if}
           </div>
           <div class="bm-excerpt hl-text">{h.text}</div>
@@ -117,28 +120,29 @@
         </div>
         <div class="hl-acts">
           <select
-            title="修改划线样式"
+            data-testid="hlp-style"
+            title={t("highlight.styleTitle")}
             value={h.style}
             onchange={(e) => changeStyle(h, (e.currentTarget as HTMLSelectElement).value)}
           >
             {#each HIGHLIGHT_STYLES as s (s.id)}
-              <option value={s.id}>{s.name}</option>
+              <option value={s.id}>{labelOfId("hlStyle", s.id)}</option>
             {/each}
           </select>
           <ColorPalette
             bind:colors={config.reader.highlightColors}
             value={h.color}
-            applyLabel="应用"
+            applyLabel={t("common.action.apply")}
             onapply={(c) => changeColor(h, c)}
             onpalette={saveConfig}
           />
           <span class="flex1"></span>
-          <button class="icon" title="删除划线" onclick={() => del(h)}>×</button>
+          <button class="icon" data-testid="hlp-del" title={t("highlight.deleteTip")} onclick={() => del(h)}>×</button>
         </div>
       </div>
     {:else}
       {#if !loading}
-        <div class="sp-empty">暂无划线，选中正文文字即可划线。</div>
+        <div class="sp-empty">{t("highlight.empty")}</div>
       {/if}
     {/each}
   </div>

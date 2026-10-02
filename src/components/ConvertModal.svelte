@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errText, t } from "../lib/i18n/index.svelte";
   import { untrack } from "svelte";
   import { api } from "../lib/api";
   import { config, convertState, saveConfig, toast } from "../lib/stores.svelte";
@@ -55,22 +56,23 @@
   }
 
   function baseName(): string {
-    const t = (title || book?.title || "book")
+    // 局部变量改名 bn：避免与 i18n 的 t() 同名遮蔽
+    const bn = (title || book?.title || "book")
       .replace(/[\\/:*?"<>|]/g, "_")
       .replace(/\.(txt|epub|mobi|azw3|prc)$/i, "");
-    return t || "book";
+    return bn || "book";
   }
 
   async function pickCover() {
-    const p = await api.pickFile("选择封面图片", [
-      { name: "图片", exts: ["png", "jpg", "jpeg", "webp", "gif"] },
+    const p = await api.pickFile(t("library.dialog.pickCover"), [
+      { name: t("library.dialog.imageFilter"), exts: ["png", "jpg", "jpeg", "webp", "gif"] },
     ]);
     if (p) coverPath = p;
   }
 
   async function run() {
     if (!book || busy || targetOptions.length === 0) return;
-    const out = await api.pickSave(`保存 ${target.toUpperCase()} 文件`, target, `${baseName()}.${target}`);
+    const out = await api.pickSave(t("convert.saveFile", { ext: target.toUpperCase() }), target, `${baseName()}.${target}`);
     if (!out) return;
     busy = true;
     try {
@@ -87,12 +89,12 @@
         coverPath: coverPath,
       };
       saveConfig();
-      toast(`已转换：${out}`);
+      toast(t("convert.done", { out }));
       api.rescan().catch(() => {});
       convertState.open = false;
       convertState.book = null;
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       busy = false;
     }
@@ -101,17 +103,17 @@
 
 <div class="modal-body conv">
   <div class="conv-head">
-    <h3>格式转换</h3>
-    <button class="icon" title="关闭" onclick={close}>×</button>
+    <h3>{t("convert.title")}</h3>
+    <button class="icon" data-testid="conv-close" title={t("common.action.close")} onclick={close}>×</button>
   </div>
   {#if book}
-    <p class="src">源文件：{book.title} · {book.format.toUpperCase()}</p>
+    <p class="src">{t("convert.sourceFile")} {book.title} · {book.format.toUpperCase()}</p>
 
     {#if targetOptions.length > 1}
       <div class="row-inline" style="margin-bottom:12px">
-        <span class="lbl">目标格式</span>
-        {#each targetOptions as t (t)}
-          <button class="pill" class:active={target === t} onclick={() => (target = t)}>{t.toUpperCase()}</button>
+        <span class="lbl">{t("convert.targetFormat")}</span>
+        {#each targetOptions as fmt (fmt)}
+          <button class="pill" class:active={target === fmt} onclick={() => (target = fmt)}>{fmt.toUpperCase()}</button>
         {/each}
       </div>
     {/if}
@@ -119,43 +121,44 @@
     {#if showMeta}
       <div class="grid2">
         <div class="field">
-          <label>书名</label>
-          <input placeholder="默认取自文件名" bind:value={title} />
+          <label>{t("bookDetail.field.title")}</label>
+          <input data-testid="conv-title" placeholder={t("convert.titleHint")} bind:value={title} />
         </div>
         <div class="field">
-          <label>作者</label>
-          <input placeholder="留空则不设置" bind:value={author} title="自动从文件或正文提取" />
+          <label>{t("bookDetail.field.author")}</label>
+          <input data-testid="conv-author" placeholder={t("convert.authorHint")} bind:value={author} title={t("convert.authorAutoHint")} />
         </div>
       </div>
       <div class="field">
-        <label>封面</label>
+        <label>{t("convert.cover")}</label>
         <div class="row-inline">
-          <button onclick={pickCover}>{coverPath ? "更换封面图片…" : "选择封面图片…"}</button>
+          <button data-testid="conv-pick-cover" onclick={pickCover}>{coverPath ? t("convert.changeCover") : t("convert.pickCover")}</button>
           <button
             onclick={() => { coverPath = config.reader.conv?.coverPath || ""; }}
             disabled={!config.reader.conv?.coverPath}
-            title="使用上次转换的封面"
-          >↺ 上次封面</button>
+            data-testid="conv-last-cover"
+            title={t("convert.reuseCoverTip")}
+          >{t("convert.lastCover")}</button>
           {#if coverPath}
             <span class="covername" title={coverPath}>{coverPath.split(/[\\/]/).pop()}</span>
-            <button class="icon" title="清除" onclick={() => (coverPath = "")}>×</button>
+            <button class="icon" data-testid="conv-clear-cover" title={t("common.action.clear")} onclick={() => (coverPath = "")}>×</button>
           {/if}
         </div>
-        <p class="tip">封面会自动记忆上次选择。</p>
+        <p class="tip">{t("convert.coverAutoRemember")}</p>
       </div>
       <div class="field">
-        <label>EPUB 内嵌 CSS</label>
+        <label>{t("convert.embeddedCss")}</label>
         <textarea rows="8" bind:value={css} spellcheck="false" placeholder={"body { font-family: 'Songti SC', serif; }\np { line-height: 2; text-indent: 2em; }"}></textarea>
-        <p class="tip">自动记忆上次输入，与阅读样式无关。</p>
+        <p class="tip">{t("convert.cssAutoRemember")}</p>
       </div>
     {:else}
-      <p class="src">将去除样式，仅保留纯文本与章节标题。</p>
+      <p class="src">{t("convert.stripStyleHint")}</p>
     {/if}
   {/if}
 
   <div class="confirm-row">
-    <button onclick={close}>取消</button>
-    <button class="primary" onclick={run} disabled={busy || !book}>{busy ? "转换中…" : "选择保存路径并转换"}</button>
+    <button data-testid="conv-cancel" onclick={close}>{t("common.confirm.cancel")}</button>
+    <button class="primary" data-testid="conv-run" onclick={run} disabled={busy || !book}>{busy ? t("convert.working") : t("convert.pickAndRun")}</button>
   </div>
 </div>
 

@@ -118,7 +118,7 @@ try {
 
   // C：文案检查（三处 AI 味解释应已不在 DOM）
   out.steps.copy = await M.evalJs(H(`
-    const openSettings=async(t)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dlg'); [...document.querySelectorAll('.set-nav-item')].find(x=>x.textContent.includes(t))?.click(); await sleep(350); };
+    const openSettings=async(t)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dlg'); [...document.querySelectorAll('.set-nav-item')].find(x=>x.textContent.includes(t))?.click(); await sleep(350); };
     await openSettings('界面外观');
     const html=document.body.innerHTML;
     const bad=['与阅读正文的字号/字体/配色完全独立','浅色/深色各自保存所选皮肤'];

@@ -50,7 +50,7 @@ try {
 
   // B. 长按刷新 → 菜单出现；普通点击不出现菜单
   out.steps.longPress = await M.evalJs(H(`
-    const btn=[...document.querySelectorAll('.toolbar button')].find(b=>/刷新/.test(b.textContent));
+    const btn=document.querySelector('[data-testid="lib-btn-refresh"]');
     if(!btn) return { err:'no refresh btn' };
     // 普通点击
     btn.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:1}));
@@ -65,7 +65,7 @@ try {
     const items=qa('.refresh-menu .rm-item').map(x=>x.textContent.trim());
     btn.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,button:0,pointerId:2}));
     q('.rm-backdrop')?.click(); await sleep(200);
-    return { menuAfterClick, menuAfterHold, items, hasCoversItem: items.some(t=>t.includes('刷新封面')) };
+    return { menuAfterClick, menuAfterHold, items, hasCoversItem: items.some(t=>t.includes('rescan')||t.includes('Rescan')||t.includes('重新')) };
   `));
   log("longPress: " + JSON.stringify(out.steps.longPress));
 

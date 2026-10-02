@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errText, labelOfId, t } from "../lib/i18n/index.svelte";
   import { onMount, onDestroy, tick } from "svelte";
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
@@ -266,7 +267,7 @@
   // ===== 顶栏按钮注册表（可拖拽排序 / 可隐藏）=====
   interface TbBtn {
     id: ReaderTopbarId;
-    label: string;
+    label: string | (() => string);
     title: string | (() => string);
     /** 返回 Tabler 图标组件；用函数以便随状态切换（如播放/暂停）。 */
     icon: () => TablerIcon;
@@ -278,23 +279,24 @@
     longPress?: () => void;
   }
   const tbTitle = (b: TbBtn): string => (typeof b.title === "function" ? b.title() : b.title);
+  const tbLabel = (b: TbBtn): string => (typeof b.label === "function" ? b.label() : b.label);
   const TOPBAR_BTNS: TbBtn[] = [
-    { id: "webdav", label: "上传进度", title: "短按上传进度到云端，长按更多（上传书籍文件）", icon: () => IconCloudUp, visible: () => config.webdav.enabled, longPress: () => toggleWdMenu(), run: () => uploadProgress() },
-    { id: "webdavDownload", label: "下载进度", title: "从云端更新阅读进度（需确认）", icon: () => IconCloudDownload, visible: () => config.webdav.enabled, run: () => webdavDownload() },
-    { id: "convert", label: "转换格式", title: "转换格式", icon: () => IconArrowsExchange, visible: () => book?.book.format === "txt", run: () => convertThis() },
-    { id: "bookmarkAdd", label: "添加书签", title: "添加书签", icon: () => IconBookmarkPlus, visible: () => true, run: () => addBookmark() },
-    { id: "bookmarkList", label: "书签列表", title: "书签列表", icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
-    { id: "ttsPlay", label: "朗读", title: "朗读（可选中文字或从本页/本章开始）", icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), visible: () => true, run: () => toggleTts() },
-    { id: "ttsStop", label: "停止朗读", title: "停止朗读", icon: () => IconPlayerStop, visible: () => true, run: () => stopTts() },
-    { id: "highlight", label: "划线 / 批注", title: "划线 / 批注", icon: () => IconHighlight, visible: () => true, run: () => setRight("highlights") },
-    { id: "ai", label: "AI 助手", title: "AI 助手", icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
-    { id: "stats", label: "本书统计", title: "本书统计", icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
-    { id: "toc", label: "目录", title: "目录 (F3)", icon: () => IconList, visible: () => true, run: () => toggleToc() },
-    { id: "manga", label: "漫画模式", title: () => (isMangaMode() ? "退出漫画模式（本书）" : "切换到漫画模式（本书）"), icon: () => (isMangaMode() ? IconBooks : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
-    { id: "manager", label: "顶栏按钮管理", title: "顶栏按钮管理", icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => toggleManager() },
-    { id: "images", label: "本书图片", title: "本书图片显示", icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => toggleImgMenu() },
-    { id: "css", label: "全局样式开关", title: "使用阅读器全局样式（覆盖书籍排版，仅当前书）", icon: () => IconPalette, visible: () => true, run: () => toggleCss() },
-    { id: "settings", label: "设置", title: "设置", icon: () => IconSettings, visible: () => true, run: () => (ui.settingsOpen = true) },
+    { id: "webdav", label: () => t("reader.toolbar.webdav"), title: () => t("reader.toolbar.webdavTitle"), icon: () => IconCloudUp, visible: () => config.webdav.enabled, longPress: () => toggleWdMenu(), run: () => uploadProgress() },
+    { id: "webdavDownload", label: () => t("reader.toolbar.webdavDownload"), title: () => t("reader.toolbar.webdavDownloadTitle"), icon: () => IconCloudDownload, visible: () => config.webdav.enabled, run: () => webdavDownload() },
+    { id: "convert", label: () => t("reader.toolbar.convert"), title: () => t("reader.toolbar.convert"), icon: () => IconArrowsExchange, visible: () => book?.book.format === "txt", run: () => convertThis() },
+    { id: "bookmarkAdd", label: () => t("reader.toolbar.bookmarkAdd"), title: () => t("reader.toolbar.bookmarkAdd"), icon: () => IconBookmarkPlus, visible: () => true, run: () => addBookmark() },
+    { id: "bookmarkList", label: () => t("reader.toolbar.bookmarkList"), title: () => t("reader.toolbar.bookmarkList"), icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
+    { id: "ttsPlay", label: () => t("reader.toolbar.ttsPlay"), title: () => t("reader.toolbar.ttsPlayTitle"), icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), visible: () => true, run: () => toggleTts() },
+    { id: "ttsStop", label: () => t("reader.toolbar.ttsStop"), title: () => t("reader.toolbar.ttsStop"), icon: () => IconPlayerStop, visible: () => true, run: () => stopTts() },
+    { id: "highlight", label: () => t("reader.toolbar.highlight"), title: () => t("reader.toolbar.highlight"), icon: () => IconHighlight, visible: () => true, run: () => setRight("highlights") },
+    { id: "ai", label: () => t("reader.toolbar.ai"), title: () => t("reader.toolbar.ai"), icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
+    { id: "stats", label: () => t("reader.toolbar.bookStats"), title: () => t("reader.toolbar.bookStats"), icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
+    { id: "toc", label: () => t("reader.toolbar.toc"), title: () => t("reader.toolbar.tocTitle"), icon: () => IconList, visible: () => true, run: () => toggleToc() },
+    { id: "manga", label: () => t("reader.toolbar.manga"), title: () => (isMangaMode() ? t("reader.toolbar.mangaOnTitle") : t("reader.toolbar.mangaOffTitle")), icon: () => (isMangaMode() ? IconBooks : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
+    { id: "manager", label: () => t("reader.toolbar.manager"), title: () => t("reader.toolbar.manager"), icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => toggleManager() },
+    { id: "images", label: () => t("reader.toolbar.images"), title: () => t("reader.toolbar.imagesTitle"), icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => toggleImgMenu() },
+    { id: "css", label: () => t("reader.toolbar.css"), title: () => t("reader.toolbar.cssTitle"), icon: () => IconPalette, visible: () => true, run: () => toggleCss() },
+    { id: "settings", label: () => t("reader.toolbar.settings"), title: () => t("reader.toolbar.settings"), icon: () => IconSettings, visible: () => true, run: () => (ui.settingsOpen = true) },
   ];
   const topbarBtn = (id: string): TbBtn | undefined => TOPBAR_BTNS.find((b) => b.id === id);
   const visibleTopbarBtns = $derived(
@@ -321,7 +323,7 @@
   function toggleMangaMode() {
     const next = !isMangaMode();
     setOv({ mangaMode: next });
-    toast(next ? "已切换到漫画模式（本书）" : "已切换到普通模式（本书）");
+    toast(next ? t("reader.toast.mangaOn") : t("reader.toast.mangaOff"));
   }
 
   /** 首次漫画引导：拖动滑块直接改全局默认倍率 → 正文图片即时跟随预览。 */
@@ -390,19 +392,19 @@
   function toggleCss() {
     const next = !effOverrideCss();
     setOv({ overrideBookCss: next });
-    toast(next ? "已使用阅读器全局样式（本书）" : "已启用书籍自带样式（本书）");
+    toast(next ? t("reader.toast.cssOn") : t("reader.toast.cssOff"));
   }
 
   function toggleAllImages() {
     const next = !effShowImages();
     setOv({ showImages: next });
-    toast(next ? "已全部开启本书图片" : "已全部关闭本书图片");
+    toast(next ? t("reader.toast.imagesOn") : t("reader.toast.imagesOff"));
   }
 
   function startBlockPick() {
     imgMenuOpen = false;
     blockPickMode = true;
-    toast("屏蔽选择模式：点击正文中的图片即可屏蔽（Esc 取消）");
+    toast(t("reader.toast.blockHint"));
   }
 
   function unblockImage(src: string) {
@@ -583,7 +585,7 @@
   async function popOutPanel(kind: "toc" | "bookmarks" | "highlights" | "stats") {
     if (!book) return;
     const ok = await openPanelWindow(kind, book.book.id, book.book.title || "TidePage");
-    if (!ok) { toast("弹出窗口失败", "error"); return; }
+    if (!ok) { toast(t("reader.toast.popoutFailed"), "error"); return; }
     // 互斥回收：拉出为独立窗后从右侧互斥/目录移除，互斥逻辑不再管它
     if (kind === "toc") tocOpen = false;
     else rightPanel = null;
@@ -622,7 +624,7 @@
         showFsHint = false;
       }
     } catch (e) {
-      toast(`全屏切换失败：${e}`, "error");
+      toast(t("reader.toast.fullscreenFailed", { err: String(e) }), "error");
     }
   }
 
@@ -837,15 +839,15 @@
       }, 30_000);
       if (config.webdav.enabled && config.webdav.syncOnOpen) {
         webdavSync(restore)
-          .then((restored) => { if (restored) toast("已从 WebDAV 恢复阅读进度"); })
+          .then((restored) => { if (restored) toast(t("reader.toast.davRestored")); })
           .catch(() => {});
       }
     } catch (e) {
       const s = String(e);
       const friendly = s.includes("AWZ3EncryptedError")
-        ? "检测到 DRM 保护，无法直接阅读。请移除 DRM 后重试。"
+        ? t("reader.err.drm")
         : s.includes("ParseTimeoutOrCorrupted")
-          ? "文件畸形或过大，解析已中止（防卡死保护）。"
+          ? t("reader.err.malformed")
           : s;
       openError = friendly;
       toast(friendly, "error");
@@ -882,9 +884,9 @@
     };
     try {
       await api.webdavSyncProgress(w.base, w.user, w.pass, bid, bpath, p);
-      toast("退出时已同步进度到云端");
+      toast(t("reader.toast.davSyncOnExit"));
     } catch (e) {
-      toast(`退出时同步进度失败：${e}`, "error");
+      toast(t("reader.toast.davSyncOnExitFailed", { err: String(e) }), "error");
     }
   }
 
@@ -919,42 +921,49 @@
   /** 「上传进度」：直接把当前本地进度上传云端（本地 updated_at=now 必为较新，等价于直接上传）。 */
   async function uploadProgress() {
     if (!book) return;
-    if (!config.webdav.enabled) { toast("未启用 WebDAV", "error"); return; }
+    if (!config.webdav.enabled) { toast(t("reader.toast.davDisabled"), "error"); return; }
     const w = config.webdav;
-    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    if (!w.base || !w.user || !w.pass) { toast(t("reader.toast.davNeedSetup"), "error"); return; }
     try {
       await api.webdavSyncProgress(w.base, w.user, w.pass, book.book.id, book.book.path, localProgress());
-      toast("进度已上传");
+      toast(t("reader.toast.davUploaded"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
   /** 「下载进度」：要先弹确认框（会改动本地），再从云端更新本地进度。 */
   async function webdavDownload() {
     if (!book) return;
-    if (!config.webdav.enabled) { toast("未启用 WebDAV", "error"); return; }
+    if (!config.webdav.enabled) { toast(t("reader.toast.davDisabled"), "error"); return; }
     const w = config.webdav;
-    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    if (!w.base || !w.user || !w.pass) { toast(t("reader.toast.davNeedSetup"), "error"); return; }
     let remote: Progress | null = null;
     try {
       remote = await api.webdavReadProgress(w.base, w.user, w.pass, book.book.path);
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
       return;
     }
-    if (!remote) { toast("云端暂无进度"); return; }
+    if (!remote) { toast(t("reader.toast.davNoRemote")); return; }
     const ok = await appConfirm(
-      `云端进度：第 ${remote.chapter_index + 1} 章 ${remote.pct.toFixed(0)}%（${fmtProgressTime(remote.updated_at)}）\n本地进度：第 ${chapterNum + 1} 章 ${totalPct().toFixed(0)}%（${fmtProgressTime(Date.now())}）\n\n确定用云端进度更新本地吗？`,
+      t("reader.confirm.davCompare", {
+        rc: remote.chapter_index + 1,
+        rp: remote.pct.toFixed(0),
+        rt: fmtProgressTime(remote.updated_at),
+        lc: chapterNum + 1,
+        lp: totalPct().toFixed(0),
+        lt: fmtProgressTime(Date.now()),
+      }),
     );
     if (!ok) return;
     try {
       if (remote.chapter_index < book.toc.length) {
         await loadChapter(remote.chapter_index, remote);
       }
-      toast("已从云端更新进度");
+      toast(t("reader.toast.davApplied"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -963,17 +972,17 @@
     wdMenuOpen = false;
     if (!book) return;
     const w = config.webdav;
-    if (!w.base || !w.user || !w.pass) { toast("请先在 设置→WebDAV 填写服务器与账号", "error"); return; }
+    if (!w.base || !w.user || !w.pass) { toast(t("reader.toast.davNeedSetup"), "error"); return; }
     try {
       await api.webdavUploadBook(w.base, w.user, w.pass, book.book.path);
-      toast("已上传书籍到云端");
+      toast(t("reader.toast.davBookUploaded"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
   function fmtProgressTime(ms: number): string {
-    if (!ms) return "无";
+    if (!ms) return t("common.none");
     const d = new Date(ms);
     const p = (x: number) => String(x).padStart(2, "0");
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
@@ -1024,7 +1033,7 @@
     } catch (e) {
       if (gen === loadGeneration) {
         loadingChapter = false;
-        toast(String(e), "error");
+        toast(errText(e), "error");
       }
     }
   }
@@ -1146,7 +1155,7 @@
 
   function nextChapter(fromEnd = false) {
     if (book && chapterNum < book.toc.length - 1) loadChapter(chapterNum + 1);
-    else if (fromEnd) toast("已是最后一章");
+    else if (fromEnd) toast(t("reader.toast.lastChapter"));
   }
 
   function prevChapter(toEnd = false) {
@@ -1467,10 +1476,15 @@
 
   function handleScrollEdge(dir: number, carry: number) {
     if (!book) return;
-    // 漫画瀑布流：连续窗口在两端自动续章，不重建窗口（保持视觉连续）。
+    // 漫画模式（两种布局共用）：连续窗口在两端自动续章，不重建窗口（保持视觉连续）。
+    // 窗口两端是「人造边界」，不让 SmoothScroller 的 overshoot 表现成回弹：清掉越界量，
+    // 把越界行程留给续章（窗口补齐后由 onsettled 把 carry 补滚一次）。横向没有 scrollTop，
+    // 续章本身就会拉长 mangaMaxX，故同样只需清掉越界量。只影响漫画模式，
+    // 普通文本滚动的翻章/回弹行为完全不变（见下一段代码）。
     if (isMangaMode()) {
-      if (dir > 0) void extendMangaWindow(1);
-      else void extendMangaWindow(-1);
+      scroller?.consumeEdge();
+      if (scrollLayout() && carry > 0) pendingMangaCarry = Math.min(carry, 4000);
+      void extendMangaWindow(dir > 0 ? 1 : -1);
       return;
     }
     const now = Date.now();
@@ -1639,10 +1653,14 @@
   let mangaCanvas: HTMLDivElement | undefined = $state();
   let mangaFlowViewport: HTMLDivElement | undefined = $state();
   let mangaFlowCanvas: HTMLDivElement | undefined = $state();
+  /** 窗口条目：imgs 预先统计好，预算/预载判据只做求和（禁止对窗口内 HTML 全量正则）。 */
+  interface MangaItem { index: number; html: string; imgs: number }
   /** 跨章连续滚动窗口（按序连续章节区间）：漫画两种布局共用。 */
-  let mangaWindow = $state<{ index: number; html: string }[]>([]);
-  /** 下拉追加/前插的节流时间戳，避免连续滚动时反复触发 IPC。 */
+  let mangaWindow = $state<MangaItem[]>([]);
+  /** 续章节流（rAF 合并而非墙上时钟静默丢弃）：保证每次请求要么执行、要么排队补发。 */
   let mangaExtendLock = 0;
+  let mangaExtendBusy = false;
+  let mangaExtendPending: 1 | -1 | 0 = 0;
   let mangaPosX = 0; // 横向位置：0=阅读起点（与阅读方向无关的语义坐标）
   let mangaPosY = 0; // 纵向位置（放大后超出屏幕时可上下平移）
   let mangaMaxX = 0;
@@ -1656,6 +1674,8 @@
   let mangaDownTarget: EventTarget | null = null;
   let mangaWheelAcc = 0;
   let mangaWheelLock = 0;
+  /** 漫画纵向：窗口边界被 consumeEdge 丢弃的越界行程，待窗口补齐后补滚一次。 */
+  let pendingMangaCarry = 0;
 
   function clampManga() {
     mangaPosX = Math.max(0, Math.min(mangaPosX, mangaMaxX));
@@ -1669,7 +1689,10 @@
   }
 
   /** 把图片轴（视口内容盒）在视口内居中：固定视口层承载边距，内容变形层只做居中 + 平移。
-   *  单图/内容不满屏时主轴居中；超过时由 applyMangaPan 的平移查看。 */
+   *  单图/内容不满屏时主轴居中；超过时由 applyMangaPan 的平移查看。
+   *  纵向画布仅在 transform 值真正变化时写入（沿用 applyScroll 里 lastBounce 的做法），
+   *  否则每次 measureFlow 都会写一次无意义的 translateX(0px) 触发样式失效。 */
+  let lastFlowCenterXf = "";
   function applyCanvasCentering() {
     const el = mangaCanvas;
     if (el) {
@@ -1685,7 +1708,11 @@
       const vp = mangaFlowViewport;
       const mh = effMarginH();
       const w = fel.offsetWidth;
-      fel.style.transform = `translateX(${Math.max(0, (vp?.clientWidth ?? w) / 2 - mh - w / 2)}px)`;
+      const xf = `translateX(${Math.max(0, (vp?.clientWidth ?? w) / 2 - mh - w / 2)}px)`;
+      if (xf !== lastFlowCenterXf) {
+        lastFlowCenterXf = xf;
+        fel.style.transform = xf;
+      }
     }
   }
 
@@ -1734,15 +1761,57 @@
     applyMangaPan();
   }
 
-  /** 瀑布流（纵向连续窗口）：测滚动范围并同步滚动条。 */
+  /** 瀑布流（纵向连续窗口）：测滚动范围并同步滚动条。滚动范围宁可偏小也绝不偏大：
+   *  maxScroll 偏大会让 applyScroll 的夹取与 SmoothScroller 的越界判定都基于错值
+   *  （画面不动且 edge 永不触发），偏小只多滚一下滚轮即可自愈。 */
   function measureFlow() {
     const vp = mangaFlowViewport;
     if (!vp) return;
     const vh = vp.clientHeight;
-    if (vh > 0) imgMaxH = Math.max(120, vh - effMarginV() * 2);
+    // imgMaxH 会写进 --rdr-img-h 变量，改动即让全窗口所有图片重算 max-height：
+    // 只在真的变了时才写，避免每次续章/裁剪都引发一次整窗重排。
+    if (vh > 0) {
+      const ih = Math.max(120, vh - effMarginV() * 2);
+      if (ih !== imgMaxH) imgMaxH = ih;
+    }
     applyCanvasCentering();
-    maxScroll = Math.max(0, vp.scrollHeight - vp.clientHeight);
+    maxScroll = Math.max(0, vp.scrollHeight - vh);
     scroller?.setMax(maxScroll);
+  }
+
+  /** 漫画瀑布流：重测滚动范围 + 可选按锚点章补偿滚动位置。
+   *  锚点补偿后必须就地刷新 lastMangaAnchorTop，否则下一次重排会把同一份位移再算一遍。 */
+  function remapFlowScroll(withAnchor = false) {
+    const vp = mangaFlowViewport;
+    if (!vp || !mangaFlow()) return;
+    const before = vp.scrollTop;
+    measureFlow();
+    if (!withAnchor) return;
+    const block = vp.querySelector<HTMLElement>(`.manga-block[data-index="${chapterNum}"]`);
+    if (block && lastMangaAnchorTop >= 0) {
+      const delta = block.offsetTop - lastMangaAnchorTop;
+      if (delta !== 0) {
+        const p = Math.max(0, before + delta);
+        scroller?.jumpTo(p, true);
+        applyScroll(p);
+      }
+    }
+    lastMangaAnchorTop = block?.offsetTop ?? -1;
+  }
+
+  /** 滚动范围重测的 rAF 合并口：window/续章/裁剪/图片加载后调用。
+   *  不复用 scheduleRelayout 的 160ms 防抖——连续懒加载时那条防抖会被 img load 无限饿死。 */
+  let flowRemapRaf = 0;
+  let flowRemapAnchor = false;
+  function scheduleFlowRemap(anchor = false) {
+    if (anchor) flowRemapAnchor = true;
+    if (flowRemapRaf) return;
+    flowRemapRaf = requestAnimationFrame(() => {
+      flowRemapRaf = 0;
+      const wantAnchor = flowRemapAnchor;
+      flowRemapAnchor = false;
+      remapFlowScroll(wantAnchor);
+    });
   }
 
   /* ================= 漫画跨章连续窗口 ================= */
@@ -1752,6 +1821,8 @@
   // 对「每章很多图」的书则可能只含 1~2 章（DOM 立刻从几千降到百级）。
   const MANGA_IMG_INIT = 15; // 初始窗口累计到约这么多张图即停（至少含当前章）
   const MANGA_IMG_BUDGET = 50; // 续章后窗口累计图片预算上限，超出则从离屏远端裁掉整章
+  const MANGA_FLOW_LEAD = 1.5; // 尾块进入「视口底边 + 1.5 屏」即续章
+  const MANGA_EXTEND_MIN_GAP = 70; // 续章最小间隔（ms），配 rAF 合并替代 260ms 墙上时钟
 
   /** 粗略统计一段 html 里的图片数量（用于按图片数而非章数限定窗口）。 */
   function imgCount(html: string): number {
@@ -1761,50 +1832,95 @@
   /** 仅漫画路径：给没有 loading 的 <img 补 loading="lazy"（保留后端已加的 decoding="async"），
       使单章即便几百张图也只解码视口附近几张。页模式（普通阅读）绝不调用此函数。 */
   function injectMangaLazy(html: string): string {
-    if (!html) return html;
+    if (!html) return "";
     return html.replace(/<img\b(?![^>]*\bloading=)/gi, '<img loading="lazy"');
   }
 
-  /** 当前窗口累计图片数（预算裁剪的判据）。 */
+  /** 当前窗口累计图片数：条目构建时已把该章图片数算好，这里只求和（不做正则扫描）。 */
   function windowImgTotal(): number {
     let n = 0;
-    for (const it of mangaWindow) n += imgCount(it.html);
+    for (const it of mangaWindow) n += it.imgs;
     return n;
   }
 
-  function mangaWindowTrim(pos: { top: number; height: number }) {
+  /** 建一个窗口条目（懒加载注入 + 一次性图片计数，供 windowImgTotal 求和）。 */
+  function mangaItem(index: number, html: string): MangaItem {
+    const h = injectMangaLazy(html);
+    return { index, html: h, imgs: imgCount(h) };
+  }
+
+  /** 窗口尾块的真实底边（纵向续章判据一律用它，不再读裁剪前的 scrollHeight）。 */
+  function flowWindowTailBottom(): number {
+    const last = mangaFlowViewport?.querySelector<HTMLElement>(".manga-block:last-of-type");
+    return last ? last.offsetTop + last.offsetHeight : 0;
+  }
+
+  /** 需要向上续章？「视口顶距窗口首块不足 1.5 屏」即前插一章。
+   *  判据必须用「视口顶距窗口顶的绝对距离 = scrollTop」，**不能**写成
+   *  `firstTop <= scrollTop + 1.5h`：前插一章时 firstTop 与 scrollTop 同时 +块高，该式恒成立、
+   *  于是循环前插到书首（且 mangaExtendBusy 把向下续章全部饿死）→ 窗口最后被头裁剪吃光而卡死。
+   *  与头部裁剪共用同一个阈值且一侧用 `<`、另一侧用「裁完仍 ≥ 阈值」，两者形成迟滞、不会互相打架。
+   *  窗口已含全书第一章时直接返回 false（书首没有上方内容可补）。 */
+  function flowNeedTop(): boolean {
     const vp = mangaFlowViewport;
-    if (!vp) return pos;
+    if (!vp || !mangaWindow.length) return false;
+    if (mangaWindow[0].index <= 0) return false;
+    return vp.scrollTop < vp.clientHeight * MANGA_FLOW_LEAD;
+  }
+
+  /** 需要向下续章？尾块底边已进入视口底 + 1.5 屏（已含全书末章同理必须返回 false）。 */
+  function flowNeedBottom(): boolean {
+    const vp = mangaFlowViewport;
+    if (!vp || !mangaWindow.length) return false;
+    if (mangaWindow[mangaWindow.length - 1].index >= (book?.toc.length ?? 1) - 1) return false;
+    return flowWindowTailBottom() <= vp.scrollTop + vp.clientHeight * (1 + MANGA_FLOW_LEAD);
+  }
+
+  /** 记录「当前章块相对视口的 offsetTop」作为锚点基线。
+   *  任何做了滚动位置补偿的路径（裁剪 / 前插 / 预算裁剪）都必须就地同步，否则下一次重排
+   *  会把同一份位移再算一遍（relayout 里 delta = block.offsetTop - lastMangaAnchorTop）。 */
+  function syncMangaAnchor(): void {
+    lastMangaAnchorTop =
+      mangaFlowViewport?.querySelector<HTMLElement>(`.manga-block[data-index="${chapterNum}"]`)
+        ?.offsetTop ?? -1;
+  }
+
+
+  /** 唯一的头部裁剪者：只裁「完全离屏」的整章块；内容高度变化后立即重测滚动范围。
+   *  关键不变量：**这里不做尾部裁剪**。原实现在此把「视口以下的所有预载章」删光，与
+   *  loadMangaWindow 的 15 张预载、extendMangaWindow 的「提前 1.5 屏续章」直接矛盾：
+   *  内容高度塌到约一屏 → 浏览器把 scrollTop 夹回底部 → 不再发 scroll 事件 → 永久卡死。
+   *  尾部只由 mangaBudgetTrim 按图片预算裁（且只裁完全离屏的块），窗口因此始终有界。 */
+  async function mangaWindowTrim(pos: { top: number; height: number }) {
+    const vp = mangaFlowViewport;
+    if (!vp || mangaWindow.length <= 1) return pos;
     const blocks = Array.from(vp.querySelectorAll<HTMLElement>(".manga-block"));
-    let removed = 0;
-    while (mangaWindow.length > 1) {
-      const first = blocks.shift();
-      if (!first) break;
-      const nextTop = blocks[0]?.offsetTop ?? 0;
-      const nextH = blocks[0]?.offsetHeight ?? 0;
-      if (nextTop + nextH < pos.top) {
-        mangaWindow = mangaWindow.slice(1);
-        removed += first.offsetHeight;
-        continue;
-      }
-      break;
+    if (blocks.length < 2) return pos;
+    let removedTop = 0;
+    let lo = 0;
+    // 迟滞：只有「裁掉这块之后，视口顶之上仍留 ≥1.5 屏」才裁。否则每次下滚都会把刚补上的
+    // 上方缓冲又削掉，与 flowNeedTop 的前插判据互相触发（窗口原地抖动、CPU 空转）。
+    const lead = pos.height * MANGA_FLOW_LEAD;
+    while (blocks.length - lo > 1) {
+      const h = blocks[lo].offsetHeight;
+      if (blocks[lo].offsetTop + h > pos.top) break;
+      if (pos.top - removedTop - h < lead) break;
+      removedTop += h;
+      lo++;
     }
-    while (mangaWindow.length > 1) {
-      const last = blocks.pop();
-      if (!last) break;
-      const prev = blocks[blocks.length - 1];
-      const prevBottom = (prev?.offsetTop ?? 0) + (prev?.offsetHeight ?? 0);
-      if (prevBottom > pos.top + pos.height) {
-        mangaWindow = mangaWindow.slice(0, -1);
-        continue;
-      }
-      break;
+    if (lo === 0) return pos;
+    mangaWindow = mangaWindow.slice(lo);
+    if (removedTop) pos.top = Math.max(0, pos.top - removedTop);
+    // 裁剪改变了内容高度：必须在写回 scrollTop 之前重测，否则浏览器按旧范围夹取。
+    await tick();
+    if (scrollLayout()) remapFlowScroll(false);
+    else measureManga();
+    if (removedTop) {
+      if (scrollArea) scrollArea.scrollTop = pos.top;
+      scroller?.jumpTo(pos.top, true);
     }
-    if (removed) {
-      pos.top -= removed;
-      if (scrollArea) scrollArea.scrollTop = Math.max(0, pos.top);
-      scroller?.jumpTo(Math.max(0, pos.top), true);
-    }
+    // 锚点就地刷新（章号会在随后 updateChapterFromWindow 里更新），消除双重补偿。
+    syncMangaAnchor();
     return pos;
   }
 
@@ -1816,23 +1932,23 @@
     const total = book.toc.length;
     // 按「图片数量」建窗：先取当前章保证至少含它；不足初值则向两侧交替扩，累计图片达 MANGA_IMG_INIT 即停。
     // 一张图一章 → 约 MANGA_IMG_INIT 章；每章很多图 → 当前章一张就超初值 → 窗口仅 1~2 章。
-    const htmls = new Map<number, string>();
+    const items = new Map<number, MangaItem>();
     const objs = new Map<number, ChapterData | null>();
     const take = (i: number) =>
       fetchChapter(i)
         .catch(() => null)
         .then((ch) => {
           objs.set(i, ch);
-          htmls.set(i, injectMangaLazy(ch?.html ?? ""));
-          return htmls.get(i) ?? "";
+          const it = mangaItem(i, ch?.html ?? "");
+          items.set(i, it);
+          return it.imgs;
         });
     // 先占位当前章，首屏即出结构。
-    mangaWindow = [{ index: idx, html: "" }];
+    mangaWindow = [mangaItem(idx, "")];
     chapterNum = idx;
     chapter = cacheGet(idx) ?? null;
     await tick();
-    let imgs = imgCount(await take(idx));
-    if (gen !== loadGeneration) return;
+    let imgs = await take(idx);
     let lo = idx;
     let hi = idx;
     if (imgs < MANGA_IMG_INIT) {
@@ -1842,7 +1958,6 @@
       const cand: number[] = [];
       for (let i = loMin; i <= hiMax; i++) if (i !== idx) cand.push(i);
       await Promise.all(cand.map(take));
-      if (gen !== loadGeneration) return;
       let goLeft = true;
       // 只在已预取的候选范围内扩，避免某些章无图时把整本书纳入空窗口。
       while (imgs < MANGA_IMG_INIT && (lo > loMin || hi < hiMax)) {
@@ -1852,12 +1967,12 @@
         goLeft = !goLeft;
         if (left) lo--;
         else hi++;
-        imgs += imgCount(htmls.get(left ? lo : hi) ?? "");
+        imgs += items.get(left ? lo : hi)?.imgs ?? 0;
       }
     }
-    const idxs: number[] = [];
-    for (let i = lo; i <= hi; i++) idxs.push(i);
-    mangaWindow = idxs.map((i) => ({ index: i, html: htmls.get(i) ?? "" }));
+    const next: MangaItem[] = [];
+    for (let i = lo; i <= hi; i++) next.push(items.get(i) ?? mangaItem(i, ""));
+    mangaWindow = next;
     chapter = objs.get(idx) ?? chapter;
     loadingChapter = false;
     await tick();
@@ -1875,6 +1990,8 @@
       scroller?.jumpTo(pos, true);
       applyScroll(pos);
       lastMangaAnchorTop = block?.offsetTop ?? -1;
+      // 首屏定位后补一次续章判定：短章节的书初始窗口可能仍贴着视口底。
+      scheduleExtendCheck();
     } else if (mangaHorizontal()) {
       measureManga();
       // 定位到目标章块的「阅读起点」（LTR=左缘 / RTL=右缘的语义坐标），再按章内比例推进。
@@ -1896,58 +2013,102 @@
     saveProgressDebounced(false);
   }
 
-  /** 窗口向后/前追加一章（滚动接近两端时调用）；prepend 用滚动补偿避免跳动。 */
-  async function extendMangaWindow(dir: 1 | -1) {
+  /** 循环续章之间的最小间隔（把 IPC 压力摊开，同时远小于原 260ms，肉眼无「一卡一卡」）。 */
+  function sleepMangaGap(): Promise<void> {
+    return new Promise((r) => setTimeout(r, MANGA_EXTEND_MIN_GAP));
+  }
+
+  /** 窗口向后/前追加（滚动接近两端时调用）；prepend 用滚动补偿避免跳动。
+   *  续章请求不允许丢：锁期内的请求记到 pendingDir，当前续章结束（finally）后自动补发。 */
+  async function extendMangaWindow(dir: 1 | -1, bypass = false) {
     if (!book || !mangaWindow.length) return;
-    const now = Date.now();
-    if (now < mangaExtendLock) return;
-    mangaExtendLock = now + 260;
+    if (!bypass && (Date.now() < mangaExtendLock || mangaExtendBusy)) {
+      mangaExtendPending = dir;
+      return;
+    }
     const gen = loadGeneration;
-    if (dir > 0) {
-      const cur = mangaWindow[mangaWindow.length - 1].index;
-      const next = cur + 1;
-      if (next >= book.toc.length) return;
-      const ch = await fetchChapter(next).catch(() => null);
-      if (gen !== loadGeneration) return;
-      // 期间可能已由别处裁剪/重建：确认尾章仍是 cur 再追加。
-      if (!mangaWindow.length || mangaWindow[mangaWindow.length - 1].index !== cur) return;
-      mangaWindow = [...mangaWindow, { index: next, html: injectMangaLazy(ch?.html ?? "") }];
-    } else {
-      const cur = mangaWindow[0].index;
-      const prev = cur - 1;
-      if (prev < 0) return;
-      const ch = await fetchChapter(prev).catch(() => null);
-      if (gen !== loadGeneration) return;
-      if (!mangaWindow.length || mangaWindow[0].index !== cur) return;
-      mangaWindow = [{ index: prev, html: injectMangaLazy(ch?.html ?? "") }, ...mangaWindow];
-      await tick();
-      if (mangaHorizontal()) {
-        // 横向 prepend：新插入章排在阅读起点前，所有既有内容的语义坐标整体后移 newWidth，
-        // 用 measureManga 重算后把 mangaPosX 加上新章宽度，保持当前画面不跳。
-        const el = mangaCanvas;
-        const first = el?.querySelector<HTMLElement>(".manga-block");
-        const w = first?.offsetWidth ?? 0;
-        const gap = config.reader.manga.imgGap;
-        measureManga();
-        mangaPosX = Math.max(0, Math.min(mangaMaxX, mangaPosX + w + gap));
-        applyMangaPan();
-        prefetchAround(chapterNum);
-        await mangaBudgetTrim();
+    mangaExtendBusy = true;
+    try {
+      if (dir > 0) {
+        const total = book.toc.length;
+        const vp = mangaFlowViewport;
+        const h = vp?.clientHeight ?? 0;
+        // 一次补到「尾块底边 ≥ 视口底 + 2.5 屏」或书尾，消除按 260ms 粒度一卡一卡的追加，
+        // 同时给「章节正在被取」这段留足滚轮跑道（触发线是视口底 + 1.5 屏）。
+        while (mangaWindow.length > 0) {
+          const cur = mangaWindow[mangaWindow.length - 1].index;
+          const next = cur + 1;
+          if (next >= total) break;
+          const ch = await fetchChapter(next).catch(() => null);
+          if (gen !== loadGeneration) return;
+          // 期间可能已由别处裁剪/重建：确认尾章仍是 cur 再追加。
+          if (!mangaWindow.length || mangaWindow[mangaWindow.length - 1].index !== cur) break;
+          mangaWindow = [...mangaWindow, mangaItem(next, ch?.html ?? "")];
+          await tick();
+          if (gen !== loadGeneration) return;
+          if (scrollLayout()) {
+            // 窗口有界的唯一保证：每追加一章就按图片预算回收（章节极矮的书否则会被一次性追加几百章）。
+            await mangaBudgetTrim();
+            if (gen !== loadGeneration) return;
+            if (next >= total - 1) break; // 已到书尾
+            if (windowImgTotal() > MANGA_IMG_BUDGET) break;
+            if (vp && flowWindowTailBottom() >= vp.scrollTop + h * 3.5) break;
+          } else if (mangaHorizontal()) {
+            measureManga();
+            await mangaBudgetTrim();
+            break; // 横向维持「一次一章」的原有追加节奏
+          }
+          await sleepMangaGap();
+        }
         return;
       }
-      // 瀑布流 prepend 后补偿滚动位置，视觉不跳。
-      const vp = mangaFlowViewport;
-      if (vp) {
-        const first = vp.querySelector<HTMLElement>(".manga-block");
-        const h = first?.offsetHeight ?? 0;
-        if (scrollArea) scrollArea.scrollTop = Math.max(0, scrollArea.scrollTop + h);
-        scroller?.jumpTo(Math.max(0, (scroller?.targetPos ?? 0) + h), true);
+      while (mangaWindow.length > 0) {
+        const cur = mangaWindow[0].index;
+        const prev = cur - 1;
+        if (prev < 0) break;
+        const ch = await fetchChapter(prev).catch(() => null);
+        if (gen !== loadGeneration) return;
+        if (!mangaWindow.length || mangaWindow[0].index !== cur) break;
+        mangaWindow = [mangaItem(prev, ch?.html ?? ""), ...mangaWindow];
+        await tick();
+        if (gen !== loadGeneration) return;
+        if (mangaHorizontal()) {
+          // 横向 prepend：新插入章排在阅读起点前，所有既有内容的语义坐标整体后移 newWidth，
+          // 用 measureManga 重算后把 mangaPosX 加上新章宽度，保持当前画面不跳。
+          const el = mangaCanvas;
+          const first = el?.querySelector<HTMLElement>(".manga-block");
+          const w = first?.offsetWidth ?? 0;
+          const gap = config.reader.manga.imgGap;
+          measureManga();
+          mangaPosX = Math.max(0, Math.min(mangaMaxX, mangaPosX + w + gap));
+          applyMangaPan();
+          prefetchAround(chapterNum);
+          await mangaBudgetTrim();
+          return;
+        }
+        // 瀑布流 prepend 后补偿滚动位置，视觉不跳（先重测范围再写回，避免浏览器按旧范围夹取）。
+        const vp = mangaFlowViewport;
+        if (vp) {
+          remapFlowScroll(false);
+          const first = vp.querySelector<HTMLElement>(".manga-block");
+          const keep = Math.max(0, vp.scrollTop + (first?.offsetHeight ?? 0));
+          if (scrollArea) scrollArea.scrollTop = keep;
+          scroller?.jumpTo(keep, true);
+        }
+        syncMangaAnchor();
+        await mangaBudgetTrim();
+        if (gen !== loadGeneration) return;
+        if (windowImgTotal() > MANGA_IMG_BUDGET) break;
+        if (!flowNeedTop()) break;
+        await sleepMangaGap();
       }
+    } finally {
+      mangaExtendBusy = false;
+      mangaExtendLock = Date.now() + MANGA_EXTEND_MIN_GAP;
+      const pending = mangaExtendPending;
+      mangaExtendPending = 0;
+      if (pending) void extendMangaWindow(pending, true);
     }
-    await tick();
-    if (scrollLayout()) measureFlow();
-    else if (mangaHorizontal()) measureManga();
-    await mangaBudgetTrim();
   }
 
   /** 预算裁剪：窗口累计图片超 MANGA_IMG_BUDGET 时，从「已完全离屏」的远端裁掉整章块，带滚动/位移补偿；
@@ -1958,30 +2119,40 @@
       const vp = mangaFlowViewport;
       if (!vp) return;
       const blocks = Array.from(vp.querySelectorAll<HTMLElement>(".manga-block"));
+      // 图片总数随每次 slice 维护：避免在 while 条件里反复对窗口内全部 HTML 做正则扫描。
+      let total = windowImgTotal();
       let removedTop = 0;
+      let lo = 0;
+      let hi = blocks.length;
       // 头部：完全在视口上方的整章
-      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > MANGA_IMG_BUDGET) {
-        const first = blocks[0];
+      while (hi - lo > 1 && total > MANGA_IMG_BUDGET) {
+        const first = blocks[lo];
         if (first.offsetTop + first.offsetHeight <= vp.scrollTop) {
           removedTop += first.offsetHeight;
-          blocks.shift();
-          mangaWindow = mangaWindow.slice(1);
+          total -= mangaWindow[lo]?.imgs ?? 0;
+          lo++;
         } else break;
       }
-      // 尾部：完全在视口下方的整章
-      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > MANGA_IMG_BUDGET) {
-        const last = blocks[blocks.length - 1];
+      // 尾部：完全在视口下方的整章（纵向唯一的尾部裁剪者）
+      while (hi - lo > 1 && total > MANGA_IMG_BUDGET) {
+        const last = blocks[hi - 1];
         if (last.offsetTop >= vp.scrollTop + vp.clientHeight) {
-          blocks.pop();
-          mangaWindow = mangaWindow.slice(0, -1);
+          total -= mangaWindow[hi - 1]?.imgs ?? 0;
+          hi--;
         } else break;
       }
-      if (removedTop) {
-        if (scrollArea) scrollArea.scrollTop = Math.max(0, scrollArea.scrollTop - removedTop);
-        scroller?.jumpTo(Math.max(0, (scroller?.targetPos ?? 0) - removedTop), true);
+      if (lo !== 0 || hi !== blocks.length) {
+        mangaWindow = mangaWindow.slice(lo, hi);
+        await tick();
+        // 先重测滚动范围再写回 scrollTop：范围偏大会让浏览器按旧值夹取（卡死链的一环）。
+        remapFlowScroll(false);
+        if (removedTop) {
+          const keep = Math.max(0, vp.scrollTop - removedTop);
+          if (scrollArea) scrollArea.scrollTop = keep;
+          scroller?.jumpTo(keep, true);
+        }
+        syncMangaAnchor();
       }
-      await tick();
-      measureFlow();
     } else if (mangaHorizontal()) {
       const el = mangaCanvas;
       if (!el) return;
@@ -2024,19 +2195,44 @@
     }
   }
 
-  /** 滚动接近两端时续章（按视口高/宽倍数提前预载），并裁剪远端保持窗口有界。 */
+  /** 滚动接近两端时续章 + 裁剪远端保持窗口有界。
+   *  scroll 事件只负责「记录最新 scrollTop + 请求一帧」：裁剪 / 续章判据 / 更新章号统一在 rAF
+   *  里做（原先在 scroll 回调里同步做 2N 次强制布局读并同步改 $state，是掉帧主因）。 */
   function checkMangaWindowExtend() {
     const vp = mangaFlowViewport;
     if (!vp || !mangaWindow.length) return;
-    const top = vp.scrollTop;
-    const height = vp.clientHeight;
-    const full = vp.scrollHeight;
-    const pos = mangaWindowTrim({ top, height });
+    pendingFlowTop = vp.scrollTop;
+    if (flowScrollRaf) return;
+    flowScrollRaf = requestAnimationFrame(runFlowScrollFrame);
+  }
+
+  /** 首屏定位/重建窗口后主动补一次续章判定（无需等 scroll 事件）。 */
+  function scheduleExtendCheck() {
+    if (flowScrollRaf) return;
+    flowScrollRaf = requestAnimationFrame(runFlowScrollFrame);
+  }
+
+  let flowScrollRaf = 0;
+  let pendingFlowTop = 0;
+
+  async function runFlowScrollFrame() {
+    flowScrollRaf = 0;
+    const vp = mangaFlowViewport;
+    if (!vp || !mangaWindow.length) return;
+    // 裁剪导致的 scrollTop 写回也放在这里，不在 scroll 事件回调里。
+    await mangaWindowTrim({ top: pendingFlowTop, height: vp.clientHeight });
     updateChapterFromWindow();
-    // 预加载提前：按视口高度（约 1.5 屏）续章，使「一图一章」的书到达旧底/顶前 maxScroll 已增长，消除停顿/回弹。
-    const lead = height * 1.5;
-    if (pos.top <= lead) void extendMangaWindow(-1);
-    if (full - (pos.top + height) <= lead) void extendMangaWindow(1);
+    // 章号更新后再同步锚点基线：裁剪的补偿已写进 scrollTop，不同步会被下一次重排再算一遍。
+    syncMangaAnchor();
+    // 续章判据用「窗口首/尾块真实几何」，不再用裁剪前的 scrollHeight（此刻 DOM 已变，读数失真）。
+    const needTop = flowNeedTop();
+    const needBottom = flowNeedBottom();
+    if (needBottom) {
+      // 两端同时告急时先补下方：向下饿死才是卡死链的下游，且头部随即会被裁剪回收。
+      void extendMangaWindow(1);
+    } else if (needTop) {
+      void extendMangaWindow(-1);
+    }
   }
 
   /** 根据视口顶部所在章更新章号（保证 TOC 高亮 / 进度 / 朗读起点正确）。 */
@@ -2256,24 +2452,7 @@
     }
     // 漫画瀑布流：重测滚动范围；窗口内容在视口上方变高时按锚点补偿 scrollTop，避免跳动。
     if (scrollLayout() && isMangaMode()) {
-      const vp = mangaFlowViewport;
-      const anchorIndex = chapterNum;
-      const before = vp?.scrollTop ?? 0;
-      measureFlow();
-      const vp2 = mangaFlowViewport;
-      if (vp2) {
-        const block = vp2.querySelector<HTMLElement>(`.manga-block[data-index="${anchorIndex}"]`);
-        // 保持「锚点章节相对视口的位置」不变：用其 offsetTop 变化量补偿。
-        if (block && lastMangaAnchorTop >= 0) {
-          const delta = block.offsetTop - lastMangaAnchorTop;
-          if (delta !== 0) {
-            const p = Math.max(0, before + delta);
-            scroller?.jumpTo(p, true);
-            applyScroll(p);
-          }
-        }
-        lastMangaAnchorTop = block?.offsetTop ?? -1;
-      }
+      remapFlowScroll(true);
       return;
     }
     // 滚动模式下先同步节流的响应式位置，保证重排后按真实位置恢复
@@ -2540,7 +2719,7 @@
         if (src) {
           const list = blockedImages();
           if (!list.includes(src)) setOv({ blockedImages: [...list, src] });
-          toast("已屏蔽该图片（可在「已屏蔽图片」中恢复）");
+          toast(t("reader.toast.imageBlocked"));
         }
         blockPickMode = false;
         return;
@@ -2570,7 +2749,7 @@
     const href = a.getAttribute("href") || "";
     if (!href || href.startsWith("#")) return;
     if (/^https?:/i.test(href)) {
-      copyText(href).then(() => toast("外部链接地址已复制到剪贴板"));
+      copyText(href).then(() => toast(t("reader.toast.linkCopied")));
       return;
     }
     const clean = decodeURIComponent(href.split("#")[0]);
@@ -2580,7 +2759,7 @@
     if (idx >= 0) {
       loadChapter(idx);
     } else {
-      toast(`跳转失败：未找到 ${base}`);
+      toast(t("reader.toast.jumpFailed", { target: base }));
     }
   }
 
@@ -2601,7 +2780,9 @@
     // 开发期调试钩子：便于自动化验证搜索框/笔记交互（仅 DEV 构建，release 不含）。
     if (import.meta.env.DEV) {
       (window as any).__frDebug = {
-        openSearch: (q = "的") => {
+        // i18n-allow: 全文搜索的默认关键词（用户输入框的初值，不是界面文案）
+    // i18n-allow: 全文搜索输入框的默认关键词（用户输入初值，不是界面文案）
+    openSearch: (q = "的") => {
           searchPopup = { query: q, anchor: { top: 120, bottom: 121, cx: window.innerWidth / 2 } };
         },
         /** 打开某条划线的菜单（H1：删除/添加感想）。 */
@@ -2649,13 +2830,24 @@
       onEnd: () => { void onTtsChapterEnd(); },
     });
     scroller = new SmoothScroller(applyScroll);
-    scroller.onSettled(() => {
+    scroller.onSettled((ratio) => {
       // settle 时精确同步一次响应式位置（滚动中仅节流更新）
       const p = Math.round(scroller!.pos);
       lastUiSync = performance.now();
       scrollRender = p;
       if (scrollTop !== p) scrollTop = p;
       saveProgressDebounced();
+      // 漫画纵向：窗口边界上被 consumeEdge 丢弃的越界行程在这里补滚一次（此时窗口已补齐，
+      // 是续滚而不是回弹）。carry 本身来自人造边界，丢弃它会让连续滚轮一格一格顿挫。
+      if (isMangaMode() && scrollLayout()) {
+        const c = pendingMangaCarry;
+        pendingMangaCarry = 0;
+        if (c > 0 && maxScroll - scroller!.targetPos > 2) {
+          const res = scroller!.wheelBy(c);
+          if (res.edge !== 0) scroller!.consumeEdge();
+        }
+        void ratio;
+      }
     });
     const onJump = (e: Event) => {
       const idx = (e as CustomEvent<number>).detail;
@@ -2723,9 +2915,13 @@
     const onWin = () => scheduleRelayout();
     window.addEventListener("resize", onWin);
     // 按需/懒加载图片在渲染后才解码，加载完成会改变排版：捕获阶段监听 img load 重新测量。
+    // 漫画瀑布流走独立的 rAF 合并口：img load 的连续触发会把 160ms 防抖 scheduleRelayout 饿死，
+    // 导致滚动范围长期与真实 scrollHeight 不一致（maxScroll 偏大 → 卡死链）。
     const onImgLoad = (ev: Event) => {
       const t = ev.target as HTMLElement | null;
-      if (t && t.tagName === "IMG") scheduleRelayout();
+      if (!t || t.tagName !== "IMG") return;
+      if (mangaFlow()) scheduleFlowRemap(true);
+      else scheduleRelayout();
     };
     if (c) c.addEventListener("load", onImgLoad, true);
     return () => {
@@ -2997,8 +3193,8 @@ ${effCssExtra() || ""}
 
   function zoneName(k: ZoneKey): string {
     const a = config.reader.zones[k];
-    if (!a || a === "none") return "无";
-    return BIND_DEFS.find((d) => d.id === a)?.name ?? a;
+    if (!a || a === "none") return t("common.none");
+    return labelOfId("bind", a);
   }
 
   async function loadBookmarks() {
@@ -3011,7 +3207,7 @@ ${effCssExtra() || ""}
     if (!book || !chapter) return;
     const sel = window.getSelection()?.toString().slice(0, 80) ?? "";
     await api.addBookmark(book.book.id, chapterNum, chapter.title, sel);
-    toast("书签已添加");
+    toast(t("reader.toast.bookmarkAdded"));
     if (bookmarksOpen) bookmarks = await api.listBookmarks(book.book.id);
     // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
     void emit("tidepage-bookmarks-changed", { bookId: book.book.id });
@@ -3021,11 +3217,11 @@ ${effCssExtra() || ""}
     try {
       await api.deleteBookmark(id);
       bookmarks = bookmarks.filter((b) => b.id !== id);
-      toast("书签已删除");
+      toast(t("reader.toast.bookmarkDeleted"));
       // 广播给独立“书签”窗口（按 bookId 过滤后重拉列表）
       if (book) void emit("tidepage-bookmarks-changed", { bookId: book.book.id });
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3105,9 +3301,9 @@ ${effCssExtra() || ""}
       window.getSelection()?.removeAllRanges();
       await tick();
       paintNow();
-      toast("已划线");
+      toast(t("reader.toast.hlCreated"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3126,7 +3322,7 @@ ${effCssExtra() || ""}
       paintNow();
       if (hlMenu) hlMenu = { ...hlMenu, h };
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3139,7 +3335,7 @@ ${effCssExtra() || ""}
       paintNow();
       if (hlMenu) hlMenu = { ...hlMenu, h };
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3171,9 +3367,9 @@ ${effCssExtra() || ""}
       if (hlMenu) hlMenu = { ...hlMenu, h };
       await tick();
       paintNow();
-      toast(note.trim() ? "已保存感想" : "已取消笔记");
+      toast(note.trim() ? t("reader.toast.noteSaved") : t("reader.toast.noteCancelled"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3183,9 +3379,9 @@ ${effCssExtra() || ""}
       const next = await api.appendHighlightNote(h.id, addition);
       h.note = next;
       hlVersion++;
-      toast("已添加到笔记");
+      toast(t("reader.toast.addedToBookNote"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3200,9 +3396,9 @@ ${effCssExtra() || ""}
       hlVersion++;
       await tick();
       paintNow();
-      toast("已删除划线");
+      toast(t("reader.toast.hlDeleted"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -3262,14 +3458,14 @@ ${effCssExtra() || ""}
     const q = quickAiPopup;
     const add = output.trim();
     if (!q || !add) {
-      toast("无可添加内容", "error");
+      toast(t("reader.toast.noNoteToAdd"), "error");
       return false;
     }
     // 来源①：已有划线
     if (q.highlightId != null) {
       const h = highlights.find((x) => x.id === q.highlightId);
       if (h && noteHasSegment(h.note, add)) {
-        toast("感想中已有相同内容");
+        toast(t("reader.toast.noteAlreadySame"));
         return true;
       }
       try {
@@ -3278,17 +3474,17 @@ ${effCssExtra() || ""}
         hlVersion++;
         await tick();
         paintNow();
-        toast("已添加到感想");
+        toast(t("reader.toast.addedToNote"));
         return true;
       } catch (e) {
-        toast(String(e), "error");
+        toast(errText(e), "error");
         return false;
       }
     }
     // 来源②：新划选 → 先建划线（note 空）拿 id，再写入 note；写 note 失败则回滚删除，杜绝无 note 残留划线
     const s = q.sel;
     if (!s || !book || !chapter) {
-      toast("无有效选区，无法添加到感想", "error");
+      toast(t("reader.toast.noSelectionToNote"), "error");
       return false;
     }
     const style = config.reader.highlightStyle || "underline";
@@ -3357,7 +3553,7 @@ ${effCssExtra() || ""}
     window.getSelection()?.removeAllRanges();
     await tick();
     paintNow();
-    toast("已创建划线并添加到感想");
+    toast(t("reader.toast.hlCreatedWithNote"));
     return true;
   }
 
@@ -3402,7 +3598,7 @@ ${effCssExtra() || ""}
     if (!root) { alignStatsBaseline(); return; }
     const range = findTextRange(root, needle);
     if (!range) {
-      toast("已跳转到章节（未精确定位到文字）");
+      toast(t("reader.toast.jumpedToChapter"));
       alignStatsBaseline(); // 搜索跳转落点：对齐统计基准
       return;
     }
@@ -3448,7 +3644,7 @@ ${effCssExtra() || ""}
     if (!root) return;
     const range = charRangeToRange(root, h.pos_start, h.pos_end);
     if (range) scrollRangeIntoView(range);
-    else toast("未定位到划线位置");
+    else toast(t("reader.toast.hlNotFound"));
     alignStatsBaseline(); // 划线跳转落点：对齐统计基准
   }
 
@@ -3594,7 +3790,7 @@ ${effCssExtra() || ""}
    */
   function startTts(mode: TtsStartMode = "auto") {
     if (!ttsState.supported) {
-      toast("当前环境不支持系统语音朗读", "error");
+      toast(t("reader.toast.noSystemTts"), "error");
       return;
     }
     const root = contentRoot();
@@ -3602,7 +3798,7 @@ ${effCssExtra() || ""}
     const text = root.textContent ?? "";
     const segs = splitSegments(text);
     if (!segs.length) {
-      toast("本章没有可朗读的文字");
+      toast(t("reader.toast.noReadableText"));
       return;
     }
     let off: number | null = null;
@@ -3674,7 +3870,7 @@ ${effCssExtra() || ""}
     // 本章已读完，先把进度记到章末，重开时不会退回本章开头。
     void doSaveProgress(1);
     if (chapterNum >= book.toc.length - 1) {
-      toast("已朗读到最后一章");
+      toast(t("reader.toast.readLastChapter"));
       return;
     }
     // 此时 ttsState.playing 已为 false，loadChapter 不会误杀朗读
@@ -3844,11 +4040,11 @@ ${effCssExtra() || ""}
         return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
       }
       case "speed":
-        return readSpeed > 0 ? `${readSpeed}字/分` : "";
+        return readSpeed > 0 ? t("reader.speed", { n: readSpeed }) : "";
       case "mode":
-        if (mangaHorizontal()) return "横向";
-        if (mangaFlow()) return "上下滚动";
-        return config.reader.mode === "page" ? (config.reader.duo ? "双栏" : "翻页") : "滚动";
+        if (mangaHorizontal()) return t("reader.mode.horizontal");
+        if (mangaFlow()) return t("reader.mode.flow");
+        return config.reader.mode === "page" ? (config.reader.duo ? t("reader.mode.duo") : t("reader.mode.page")) : t("reader.mode.scroll");
       default:
         return "";
     }
@@ -3904,14 +4100,15 @@ ${effCssExtra() || ""}
     <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{bookScheme()?.schemeBgOpacity ?? config.reader.bgOpacity};"></div>
   {/if}
   {#if showFsHint}
-    <div class="fs-hint" transition:fade={{ duration: 220 }}>按 F11 退出全屏</div>
+    <div class="fs-hint" transition:fade={{ duration: 220 }}>{t("reader.fullscreenExit")}</div>
   {/if}
   <div class="topbar" class:dim={chromeHidden} style="background:var(--rdr-top);" data-tauri-drag-region bind:clientHeight={tbH}>
     <div class="tb-zone tb-l" data-tauri-drag-region>
       <button
         class="icon tb-btn tip-right"
-        aria-label={standalone ? "关闭" : "返回"}
-        data-tip={standalone ? "关闭 (Esc)" : "返回 (Esc)"}
+        data-testid="reader-back"
+        aria-label={standalone ? t("reader.close") : t("reader.back")}
+        data-tip={standalone ? t("reader.closeEsc") : t("reader.backEsc")}
         onclick={goBack}
       >
         <IconArrowLeft size={20} stroke={1.75} />
@@ -3943,6 +4140,7 @@ ${effCssExtra() || ""}
           class="icon tb-btn tip-left"
           class:on={b.on?.()}
           data-drag-id={b.id}
+          data-testid={"tb-" + b.id}
           aria-label={label}
           data-tip={label}
           onpointerdown={(e) => tbPointerDown(b, e)}
@@ -3958,8 +4156,8 @@ ${effCssExtra() || ""}
   </div>
 
   {#if tbManagerOpen}
-    <div class="tb-panel tb-manager" role="dialog" aria-label="顶栏按钮管理">
-      <div class="tb-panel-head"><span>顶栏按钮</span><button class="icon" title="关闭" onclick={() => (tbManagerOpen = false)}>×</button></div>
+    <div class="tb-panel tb-manager" role="dialog" aria-label={t("reader.toolbar.manager")}>
+      <div class="tb-panel-head"><span>{t("reader.manager.title")}</span><button class="icon" data-testid="tb-manager-close" title={t("common.action.close")} onclick={() => (tbManagerOpen = false)}>×</button></div>
       <div class="tb-panel-body">
         <div class="tb-chip-grid">
           {#each config.reader.topbarOrder as id (id)}
@@ -3973,48 +4171,48 @@ ${effCssExtra() || ""}
                   disabled={id === "manager"}
                   onchange={(e) => toggleTopbarHidden(id, e.currentTarget.checked)}
                 />
-                <span class="tb-chip-label">{b.label}</span>
+                <span class="tb-chip-label">{tbLabel(b)}</span>
               </label>
             {/if}
           {/each}
         </div>
-        <p class="tb-panel-hint">在顶栏直接拖动按钮可调整顺序；隐藏的按钮重新显示后回到其保存的顺序位置。</p>
+        <p class="tb-panel-hint">{t("reader.manager.hint")}</p>
       </div>
     </div>
   {/if}
 
   {#if imgMenuOpen}
-    <div class="tb-panel" role="menu" aria-label="本书图片">
-      <div class="tb-panel-head"><span>本书图片（仅当前书）</span><button class="icon" title="关闭" onclick={() => (imgMenuOpen = false)}>×</button></div>
+    <div class="tb-panel" role="menu" aria-label={t("reader.toolbar.images")}>
+      <div class="tb-panel-head"><span>{t("reader.menu.imagesTitle")}</span><button class="icon" data-testid="tb-img-close" title={t("common.action.close")} onclick={() => (imgMenuOpen = false)}>×</button></div>
       <div class="tb-panel-body">
-        <button class="tb-menu-item" onclick={toggleAllImages}>{effShowImages() ? "全部关闭图片" : "全部开启图片"}</button>
-        <button class="tb-menu-item" onclick={startBlockPick}>屏蔽选中图片</button>
-        <button class="tb-menu-item" onclick={() => { imgMenuOpen = false; blockedListOpen = true; }}>已屏蔽图片（{blockedImages().length}）</button>
+        <button class="tb-menu-item" data-testid="tb-img-all" onclick={toggleAllImages}>{effShowImages() ? t("reader.menu.allImagesOff") : t("reader.menu.allImagesOn")}</button>
+        <button class="tb-menu-item" data-testid="tb-img-block" onclick={startBlockPick}>{t("reader.menu.blockSelected")}</button>
+        <button class="tb-menu-item" data-testid="tb-img-blocked" onclick={() => { imgMenuOpen = false; blockedListOpen = true; }}>{t("reader.menu.blockedCount", { n: blockedImages().length })}</button>
       </div>
     </div>
   {/if}
 
   {#if wdMenuOpen}
     <!-- 关闭依赖窗口捕获阶段的外点监听（见下方 $effect），不再使用全屏遮罩元素。 -->
-    <div class="tb-panel wd-menu" bind:this={wdMenuEl} role="menu" aria-label="WebDAV 上传书籍" style="top:{wdMenuPos.top}px; right:{wdMenuPos.right}px">
-      <div class="tb-panel-head"><span>WebDAV（本书）</span><button class="icon" title="关闭" aria-label="关闭" onclick={() => (wdMenuOpen = false)}>×</button></div>
+    <div class="tb-panel wd-menu" bind:this={wdMenuEl} role="menu" aria-label={t("reader.toolbar.webdav")} style="top:{wdMenuPos.top}px; right:{wdMenuPos.right}px">
+      <div class="tb-panel-head"><span>{t("reader.menu.davTitle")}</span><button class="icon" data-testid="tb-dav-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (wdMenuOpen = false)}>×</button></div>
       <div class="tb-panel-body">
-        <button class="tb-menu-item" onclick={uploadBook} disabled={!book}>上传书籍到云端</button>
+        <button class="tb-menu-item" data-testid="tb-dav-upload" onclick={uploadBook} disabled={!book}>{t("reader.menu.davUploadBook")}</button>
       </div>
     </div>
   {/if}
 
   {#if blockedListOpen}
-    <div class="tb-panel" role="dialog" aria-label="已屏蔽图片">
-      <div class="tb-panel-head"><span>已屏蔽图片（仅当前书）</span><button class="icon" title="关闭" onclick={() => (blockedListOpen = false)}>×</button></div>
+    <div class="tb-panel" role="dialog" aria-label={t("reader.menu.blockedTitle")}>
+      <div class="tb-panel-head"><span>{t("reader.menu.blockedTitle")}</span><button class="icon" data-testid="tb-blocked-close" title={t("common.action.close")} onclick={() => (blockedListOpen = false)}>×</button></div>
       <div class="tb-panel-body">
         {#if blockedImages().length === 0}
-          <div class="tb-panel-empty">暂无已屏蔽图片</div>
+          <div class="tb-panel-empty">{t("reader.menu.blockedEmpty")}</div>
         {:else}
           {#each blockedImages() as src (src)}
             <div class="tb-block-row">
               <img class="tb-block-thumb" src={src} alt="" />
-              <button class="tb-menu-item" onclick={() => unblockImage(src)}>取消屏蔽</button>
+              <button class="tb-menu-item" data-testid="tb-unblock" onclick={() => unblockImage(src)}>{t("reader.menu.unblock")}</button>
             </div>
           {/each}
         {/if}
@@ -4023,12 +4221,12 @@ ${effCssExtra() || ""}
   {/if}
 
   {#if mangaGuideOpen}
-    <div class="tb-panel manga-guide" role="dialog" aria-label="漫画图片大小">
-      <div class="tb-panel-head"><span>检测到漫画书籍</span><button class="icon" title="关闭" onclick={closeMangaGuide}>×</button></div>
+    <div class="tb-panel manga-guide" role="dialog" aria-label={t("reader.manga.sizeLabel")}>
+      <div class="tb-panel-head"><span>{t("reader.manga.guideTitle")}</span><button class="icon" data-testid="tb-manga-close" title={t("common.action.close")} onclick={closeMangaGuide}>×</button></div>
       <div class="tb-panel-body">
-        <p class="tb-panel-hint">拖动即可**实时预览**本书图片大小。默认值对所有漫画生效（仅首次打开漫画时提示一次），之后可在设置「漫画模式」或阅读界面右下角按单本单独覆盖。</p>
+        <p class="tb-panel-hint">{t("reader.manga.guideHint")}</p>
         <div class="manga-slider">
-          <span>小</span>
+          <span>{t("reader.manga.small")}</span>
           <input
             type="range"
             min="0.3"
@@ -4037,12 +4235,12 @@ ${effCssExtra() || ""}
             value={mangaGuideScale}
             oninput={onMangaGuideInput}
           />
-          <span>大</span>
+          <span>{t("reader.manga.large")}</span>
           <span class="manga-val">{mangaGuideScale.toFixed(1)}×</span>
         </div>
         <div class="manga-actions">
-          <button class="tb-menu-item" onclick={closeMangaGuide}>完成</button>
-          <button class="tb-menu-item" onclick={resetMangaGuide}>恢复默认（1.0×）</button>
+          <button class="tb-menu-item" data-testid="tb-manga-done" onclick={closeMangaGuide}>{t("common.action.done")}</button>
+          <button class="tb-menu-item" data-testid="tb-manga-reset" onclick={resetMangaGuide}>{t("reader.manga.resetDefault")}</button>
         </div>
       </div>
     </div>
@@ -4052,13 +4250,13 @@ ${effCssExtra() || ""}
     {#if openError}
       <div class="empty error-box">
         <div>
-          <p>打开失败</p>
+          <p data-testid="reader-open-failed">{t("reader.open.failed")}</p>
           <p class="err-detail">{openError}</p>
-          <button onclick={() => (ui.view = "library")}>返回书库</button>
+          <button data-testid="reader-open-back" onclick={() => (ui.view = "library")}>{labelOfId("bind", "close")}</button>
         </div>
       </div>
     {:else if !book}
-      <div class="empty">正在打开…</div>
+      <div class="empty" data-testid="reader-opening">{t("reader.open.opening")}</div>
     {:else}
       <div class="stage">
         <div
@@ -4129,7 +4327,7 @@ ${effCssExtra() || ""}
             </div>
           {/if}
           {#if loadingChapter && !chapter}
-            <div class="loading" aria-label="加载中" aria-busy="true">
+            <div class="loading" aria-label={t("reader.loadingAria")} aria-busy="true">
               <span class="sk sk-title"></span>
               <span class="sk"></span>
               <span class="sk"></span>
@@ -4152,7 +4350,7 @@ ${effCssExtra() || ""}
           class="finfo finfo-l"
           role="button"
           tabindex="0"
-          aria-label="上一章"
+          aria-label={t("reader.prevChapter")}
           onclick={() => prevChapter()}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); prevChapter(); } }}
         >
@@ -4165,7 +4363,7 @@ ${effCssExtra() || ""}
           class:dragging={progDrag}
           role="slider"
           tabindex="0"
-          aria-label="阅读进度"
+          aria-label={t("reader.progress.aria")}
           aria-valuenow={Math.round(totalPct())}
           aria-valuemin={0}
           aria-valuemax={100}
@@ -4182,7 +4380,7 @@ ${effCssExtra() || ""}
           class="finfo finfo-r"
           role="button"
           tabindex="0"
-          aria-label="下一章"
+          aria-label={t("reader.nextChapter")}
           onclick={() => nextChapter()}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nextChapter(); } }}
         >
@@ -4199,18 +4397,18 @@ ${effCssExtra() || ""}
 
     {#if bookmarksOpen}
       <div class="sidepanel">
-        <div class="sp-head" use:dragOutHandle={() => popOutPanel("bookmarks")} title="按住标题栏拖出面板外可弹为独立窗口"><span>书签</span><div style="display:flex; gap:6px; align-items:center;"><button class="icon" title="弹出为独立窗口" onclick={() => popOutPanel("bookmarks")}>⧉</button><button class="icon" title="关闭" onclick={() => (rightPanel = null)}>×</button></div></div>
+        <div class="sp-head" data-testid="bm-head" use:dragOutHandle={() => popOutPanel("bookmarks")} title={t("common.panel.popoutTip")}><span>{t("reader.bookmarks.title")}</span><div style="display:flex; gap:6px; align-items:center;"><button class="icon" data-testid="bm-popout" title={t("common.panel.popout")} onclick={() => popOutPanel("bookmarks")}>⧉</button><button class="icon" data-testid="bm-close" title={t("common.action.close")} onclick={() => (rightPanel = null)}>×</button></div></div>
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
               <div class="bm-main" onclick={() => { void loadChapter(bm.chapter_index).then(alignStatsBaseline); rightPanel = null; }}>
-                <div class="bm-title">{bm.title || "未命名"}</div>
+                <div class="bm-title">{bm.title || t("common.untitled")}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
-              <button class="icon bm-del" title="删除书签" onclick={() => deleteBookmark(bm.id)}>×</button>
+              <button class="icon bm-del" data-testid="bm-del" title={t("reader.bookmarks.deleteTip")} onclick={() => deleteBookmark(bm.id)}>×</button>
             </div>
           {:else}
-            <div class="sp-empty">暂无书签，点 ?? 添加</div>
+            <div class="sp-empty" data-testid="bm-empty">{t("reader.bookmarks.empty")}</div>
           {/each}
         </div>
       </div>
@@ -4291,14 +4489,14 @@ ${effCssExtra() || ""}
     {#if book && !openError}
       <div class="font-ctl" class:show={fontCtlShow}>
         <div class="ctl-row">
-          <button class="icon" title="减小字号（长按连续）" use:repeatAction={() => bumpFont(-1)}>A−</button>
-          <button class="icon" title="增大字号（长按连续）" use:repeatAction={() => bumpFont(1)}>A＋</button>
+          <button class="icon" data-testid="font-dec" title={t("reader.font.decrease")} use:repeatAction={() => bumpFont(-1)}>{t("reader.font.decGlyph")}</button>
+          <button class="icon" data-testid="font-inc" title={t("reader.font.increase")} use:repeatAction={() => bumpFont(1)}>{t("reader.font.incGlyph")}</button>
         </div>
         <div class="ctl-row">
-          <button class="icon" title="缩小图片（长按连续）" use:repeatAction={() => bumpImgScale(-0.1)}>图−</button>
-          <button class="icon" title="放大图片（长按连续）" use:repeatAction={() => bumpImgScale(0.1)}>图＋</button>
-          <button class="icon" class:on={effFitWidth()} title="图片适应阅读器宽度" onclick={toggleFitWidth}>适宽</button>
-          <button class="icon" class:on={effFitHeight()} title="图片适应阅读器高度" onclick={toggleFitHeight}>适高</button>
+          <button class="icon" data-testid="img-dec" title={t("reader.img.decrease")} use:repeatAction={() => bumpImgScale(-0.1)}>{t("reader.img.decGlyph")}</button>
+          <button class="icon" data-testid="img-inc" title={t("reader.img.increase")} use:repeatAction={() => bumpImgScale(0.1)}>{t("reader.img.incGlyph")}</button>
+          <button class="icon" class:on={effFitWidth()} data-testid="img-fit-w" title={t("reader.img.fitWidth")} onclick={toggleFitWidth}>{t("reader.img.fitWidthShort")}</button>
+          <button class="icon" class:on={effFitHeight()} data-testid="img-fit-h" title={t("reader.img.fitHeight")} onclick={toggleFitHeight}>{t("reader.img.fitHeightShort")}</button>
         </div>
       </div>
     {/if}
@@ -4805,7 +5003,9 @@ ${effCssExtra() || ""}
 
   .manga-flow-canvas {
     width: 100%;
-    will-change: transform;
+    /* 不再常驻 will-change: transform：这里承载的是可能两万像素高的滚动内容，
+       强制提升为合成层等于要一块超纹理上限的图层（闪白/撕裂/掉帧），与 .scroll-area 同理。
+       横向布局的 .manga-h-canvas 是固定视口内的内容层，保留。 */
   }
 
   .reader.manga .manga-flow-canvas :global(.manga-block) {

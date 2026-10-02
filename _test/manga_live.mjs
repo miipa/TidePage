@@ -37,9 +37,9 @@ const rdVar=()=>getComputedStyle(q('.reader')).getPropertyValue('--rdr-img-scale
 const field=(t)=>[...document.querySelectorAll('.field')].find(f=>f.textContent.includes(t));
 const setSelect=async(label,val)=>{ const s=field(label)?.querySelector('select'); if(!s) throw new Error('no select '+label); s.value=val; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(180); };
 const setInput=async(label,val)=>{ const i=field(label)?.querySelector('input'); if(!i) throw new Error('no input '+label); i.value=String(val); i.dispatchEvent(new Event('input',{bubbles:true})); i.dispatchEvent(new Event('change',{bubbles:true})); await sleep(180); };
-const openSettings=async(tab)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(300); };
+const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(300); };
 const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(250); };
-const tbBtn=(t)=>qa('.tb-r button').find(b=>(b.getAttribute('title')||'').includes(t));
+const tbBtn=(id)=>document.querySelector('[data-testid="tb-'+id+'"]');
 const ptr=(el,type,x,y,id)=>{ el.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,clientX:Math.round(x),clientY:Math.round(y),button:0,buttons:type==='pointerup'?0:1,pointerId:id||11,pointerType:'mouse',isPrimary:true})); };
 const dragTo=async(from,to,place,id)=>{ const a=rect(from), b=rect(to); const sx=a.x+a.w/2, sy=a.y+a.h/2; ptr(from,'pointerdown',sx,sy,id); await sleep(40); window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,cancelable:true,clientX:Math.round(sx+9),clientY:Math.round(sy+2),button:0,buttons:1,pointerId:id||11})); await sleep(40); const tx = place==='after' ? b.x+b.w+4 : b.x-4; window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,cancelable:true,clientX:Math.round(tx),clientY:Math.round(b.y+b.h/2),button:0,buttons:1,pointerId:id||11})); await sleep(60); window.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,cancelable:true,clientX:Math.round(tx),clientY:Math.round(b.y+b.h/2),button:0,buttons:0,pointerId:id||11})); await sleep(200); };
 `;
@@ -162,13 +162,13 @@ try {
   // ---- 2) topbar manga button toggle + per-book persistence ----
   out.steps.mangaBtn = await M.evalJs(H(`
     const wasManga=q('.reader').classList.contains('manga');
-    let b=tbBtn('漫画模式');
+    let b=tbBtn('manga');
     if(!b) return { err:'no manga button', btns: qa('.tb-r button').map(x=>x.getAttribute('title')) };
     b.click(); await sleep(700);
     const nowManga=q('.reader').classList.contains('manga');
     const bc=bcRead(); const id=Object.keys(bc).find(k=>bc[k].mangaMode!==undefined);
     const persisted=id?bc[id].mangaMode:undefined;
-    b=tbBtn('漫画模式'); b.click(); await sleep(700);
+    b=tbBtn('manga'); b.click(); await sleep(700);
     const backManga=q('.reader').classList.contains('manga');
     return { wasManga, toggled:nowManga, persisted, backManga };
   `));
@@ -176,7 +176,7 @@ try {
 
   // ---- 3) dedicated Manga settings tab + double-page horizontal ----
   out.steps.settings = await M.evalJs(H(`
-    if(!q('.reader')?.classList.contains('manga')){ tbBtn('漫画模式')?.click(); await sleep(700); }
+    if(!q('.reader')?.classList.contains('manga')){ tbBtn('manga')?.click(); await sleep(700); }
     const flowDom = { viewportBefore: !!q('.manga-h-viewport'), scrollBefore: !!q('.scroll-area') };
     await openSettings('漫画模式');
     const labels=[...document.querySelectorAll('.field label')].map(l=>l.textContent.trim());
@@ -230,7 +230,7 @@ try {
   // ---- 5) real topbar drag reorder + no misclick + persisted ----
   out.steps.drag = await M.evalJs(H(`
     const before=cfgRead().reader.topbarOrder.slice();
-    const toc=tbBtn('目录'); const set=tbBtn('设置');
+    const toc=tbBtn('toc'); const set=tbBtn('settings');
     if(!toc||!set) return { err:'missing buttons' };
     await dragTo(toc,set,'after',31);
     await sleep(800);
@@ -257,7 +257,7 @@ try {
     b.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
     await wait(()=>q('#chapter-content'),'chapter',400); await sleep(1500);
     // 通过设置把全局漫画倍率设为上限 3.0（真实 UI 路径，写入响应式 config）
-    if(!q('.reader')?.classList.contains('manga')){ tbBtn('漫画模式')?.click(); await sleep(700); }
+    if(!q('.reader')?.classList.contains('manga')){ tbBtn('manga')?.click(); await sleep(700); }
     await openSettings('漫画模式');
     await setInput('图片大小','3');
     await sleep(500);

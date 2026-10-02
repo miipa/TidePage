@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api, coverUrl } from "../lib/api";
   import { appConfirm, copyText, toast } from "../lib/stores.svelte";
@@ -33,19 +34,19 @@
 
   function fmtTime(ms: number): string {
     if (!ms) return "—";
-    return new Date(ms).toLocaleString("zh-CN");
+    return new Date(ms).toLocaleString(dateLocale());
   }
 
   function fmtDur(sec: number): string {
     const h = Math.floor(sec / 3600);
     const m = Math.round((sec % 3600) / 60);
-    if (h) return `${h} 小时 ${m} 分`;
-    if (m) return `${m} 分`;
-    return `${sec} 秒`;
+    if (h) return t("common.dur.hm", { h, m });
+    if (m) return t("common.dur.mShort", { m });
+    return t("common.dur.s", { sec });
   }
 
   function fmtChars(n: number): string {
-    if (n >= 10000) return (n / 10000).toFixed(1) + "万";
+    if (n >= 10000) return (n / 10000).toFixed(1) + t("common.unit.tenThousand");
     return String(n);
   }
 
@@ -55,9 +56,9 @@
       await api.updateBookMeta(book.id, title.trim(), author.trim());
       book.title = title.trim();
       book.author = author.trim();
-      toast("书籍信息已保存，仅在软件内显示");
+      toast(t("bookDetail.savedInApp"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       saving = false;
     }
@@ -66,7 +67,7 @@
   let writing = $state(false);
   async function saveToFile() {
     const ok = await appConfirm(
-      `把书名/作者直接写回原始 EPUB 文件？\n将覆盖原文件且不备份：\n${book.path}`,
+      t("bookDetail.writeBackConfirm", { path: book.path }),
     );
     if (!ok) return;
     writing = true;
@@ -74,9 +75,9 @@
       await api.writeBookMeta(book.id, title.trim(), author.trim());
       book.title = title.trim();
       book.author = author.trim();
-      toast("已写入原始 EPUB 文件");
+      toast(t("bookDetail.written"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       writing = false;
     }
@@ -84,25 +85,25 @@
 
   function infoText(): string {
     return [
-      `书名：${title}`,
-      `作者：${author || "—"}`,
-      `格式：${book.format.toUpperCase()}`,
-      `大小：${fmtSize(book.size)}`,
-      `路径：${book.path}`,
-      `添加时间：${fmtTime(book.added_at)}`,
-      `最近阅读：${fmtTime(book.last_read)}`,
-      wc ? `全书字数：${wc.total}，纯文字 ${wc.pure}` : "",
-      `累计阅读：${fmtDur(totalSeconds)} · ${fmtChars(totalChars)} 字`,
+      t("bookDetail.copy.title", { title }),
+      t("bookDetail.copy.author", { author: author || "—" }),
+      t("bookDetail.copy.format", { format: book.format.toUpperCase() }),
+      t("bookDetail.copy.size", { size: fmtSize(book.size) }),
+      t("bookDetail.copy.path", { path: book.path }),
+      t("bookDetail.copy.added", { time: fmtTime(book.added_at) }),
+      t("bookDetail.copy.lastRead", { time: fmtTime(book.last_read) }),
+      wc ? t("bookDetail.copy.totalChars", { total: wc.total, pure: wc.pure }) : "",
+      t("bookDetail.copy.readTotal", { duration: fmtDur(totalSeconds), chars: fmtChars(totalChars) }),
     ].filter(Boolean).join("\n");
   }
 
   function copyAll() {
-    copyText(infoText()).then(() => toast("书籍信息已复制"));
+    copyText(infoText()).then(() => toast(t("bookDetail.copied")));
   }
 
   async function setCover() {
-    const p = await api.pickFile("选择封面图片", [
-      { name: "图片", exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
+    const p = await api.pickFile(t("library.dialog.pickCover"), [
+      { name: t("library.dialog.imageFilter"), exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
     ]);
     if (!p) return;
     try {
@@ -110,9 +111,9 @@
       book.cover_path = `custom-${book.id}.png`;
       book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
-      toast("封面已更新");
+      toast(t("toast.library.coverUpdated"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -122,94 +123,94 @@
       book.cover_path = name;
       book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
-      toast("封面已重新提取");
+      toast(t("toast.library.coverReextracted"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 </script>
 
 <div class="bd-overlay" onpointerdown={(e) => { if (e.target === e.currentTarget) onclose(); }}>
-  <div class="bd-panel" role="dialog" aria-label="书籍详细信息">
+  <div class="bd-panel" role="dialog" aria-label={t("bookDetail.title")}>
     <div class="bd-head">
-      <span>书籍详细信息</span>
-      <button class="icon" title="关闭" onclick={onclose}>×</button>
+      <span>{t("bookDetail.title")}</span>
+      <button class="icon" data-testid="bd-close" title={t("common.action.close")} onclick={onclose}>×</button>
     </div>
 
     <div class="bd-body">
       <div class="bd-left">
-        <img class="bd-cover" src={cover} alt="《{book.title}》封面" />
+        <img class="bd-cover" src={cover} alt={t("library.book.coverAlt", { title: book.title })} />
         <div class="bd-cover-acts">
-          <button onclick={setCover}>设置封面</button>
-          <button onclick={reextract}>重新提取</button>
+          <button data-testid="bd-set-cover" onclick={setCover}>{t("library.ctx.setCover")}</button>
+          <button data-testid="bd-reextract" onclick={reextract}>{t("bookDetail.reextract")}</button>
         </div>
       </div>
 
       <div class="bd-right">
         <div class="bd-field">
-          <label>书名</label>
+          <label>{t("bookDetail.field.title")}</label>
           <div class="bd-row">
-            <input bind:value={title} />
-            <button class="icon" title="复制书名" onclick={() => copyText(title).then(() => toast("已复制"))}>⧉</button>
+            <input data-testid="bd-title" bind:value={title} />
+            <button class="icon" data-testid="bd-copy-title" title={t("bookDetail.copyTitle")} onclick={() => copyText(title).then(() => toast(t("common.toast.copied")))}>⧉</button>
           </div>
         </div>
         <div class="bd-field">
-          <label>作者</label>
+          <label>{t("bookDetail.field.author")}</label>
           <div class="bd-row">
-            <input bind:value={author} placeholder="未知" />
-            <button class="icon" title="复制作者" onclick={() => copyText(author).then(() => toast("已复制"))}>⧉</button>
+            <input data-testid="bd-author" bind:value={author} placeholder={t("common.unknown")} />
+            <button class="icon" data-testid="bd-copy-author" title={t("bookDetail.copyAuthor")} onclick={() => copyText(author).then(() => toast(t("common.toast.copied")))}>⧉</button>
           </div>
         </div>
 
         <div class="bd-grid">
-          <div class="bd-kv"><span>格式</span><b>{book.format.toUpperCase()}</b></div>
-          <div class="bd-kv"><span>大小</span><b>{fmtSize(book.size)}</b></div>
-          <div class="bd-kv"><span>添加时间</span><b>{fmtTime(book.added_at)}</b></div>
-          <div class="bd-kv"><span>最近阅读</span><b>{fmtTime(book.last_read)}</b></div>
+          <div class="bd-kv"><span>{t("bookDetail.field.format")}</span><b>{book.format.toUpperCase()}</b></div>
+          <div class="bd-kv"><span>{t("bookDetail.field.size")}</span><b>{fmtSize(book.size)}</b></div>
+          <div class="bd-kv"><span>{t("bookDetail.field.added")}</span><b>{fmtTime(book.added_at)}</b></div>
+          <div class="bd-kv"><span>{t("bookDetail.field.lastRead")}</span><b>{fmtTime(book.last_read)}</b></div>
           {#if wc}
-            <div class="bd-kv"><span>全书字数</span><b>{fmtChars(wc.total)}</b></div>
-            <div class="bd-kv"><span>纯文字</span><b>{fmtChars(wc.pure)}</b></div>
+            <div class="bd-kv"><span>{t("bookDetail.field.totalChars")}</span><b>{fmtChars(wc.total)}</b></div>
+            <div class="bd-kv"><span>{t("bookDetail.field.pureChars")}</span><b>{fmtChars(wc.pure)}</b></div>
           {/if}
         </div>
 
         <div class="bd-field">
-          <label>路径</label>
+          <label>{t("bookDetail.field.path")}</label>
           <div class="bd-row">
-            <input class="path" value={book.path} readonly />
-            <button class="icon" title="复制路径" onclick={() => copyText(book.path).then(() => toast("已复制路径"))}>⧉</button>
-            <button class="icon" title="在文件夹中显示" onclick={() => api.revealInExplorer(book.path)}>📂</button>
+            <input class="path" data-testid="bd-path" value={book.path} readonly />
+            <button class="icon" data-testid="bd-copy-path" title={t("bookDetail.copyPath")} onclick={() => copyText(book.path).then(() => toast(t("bookDetail.pathCopied")))}>⧉</button>
+            <button class="icon" data-testid="bd-reveal" title={t("bookDetail.reveal")} onclick={() => api.revealInExplorer(book.path)}>📂</button>
           </div>
         </div>
 
-        <div class="bd-sec">阅读记录</div>
+        <div class="bd-sec">{t("bookDetail.history")}</div>
         <div class="bd-summary">
-          <div class="bd-s"><b>{fmtDur(totalSeconds)}</b><span>累计时长</span></div>
-          <div class="bd-s"><b>{fmtChars(totalChars)}</b><span>已读字数</span></div>
-          <div class="bd-s"><b>{progress ? progress.pct.toFixed(1) + "%" : "—"}</b><span>阅读进度</span></div>
-          <div class="bd-s"><b>{sessions.length}</b><span>阅读次数</span></div>
+          <div class="bd-s"><b>{fmtDur(totalSeconds)}</b><span>{t("bookDetail.stat.totalTime")}</span></div>
+          <div class="bd-s"><b>{fmtChars(totalChars)}</b><span>{t("bookDetail.stat.readChars")}</span></div>
+          <div class="bd-s"><b>{progress ? progress.pct.toFixed(1) + "%" : "—"}</b><span>{t("bookDetail.stat.progress")}</span></div>
+          <div class="bd-s"><b>{sessions.length}</b><span>{t("bookDetail.stat.times")}</span></div>
         </div>
         <div class="bd-sessions">
           {#each sessions.slice(0, 20) as s (s.started_at)}
             <div class="bd-srow">
               <span class="bd-day">{s.day}</span>
-              <span>{new Date(s.started_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</span>
+              <span>{new Date(s.started_at).toLocaleTimeString(dateLocale(), { hour: "2-digit", minute: "2-digit" })}</span>
               <span>{fmtDur(s.seconds)}</span>
-              <span>{fmtChars(s.chars)} 字</span>
+              <span>{fmtChars(s.chars)} {t("common.unit.chars")}</span>
             </div>
           {:else}
-            <div class="bd-empty">暂无阅读记录</div>
+            <div class="bd-empty">{t("bookDetail.historyEmpty")}</div>
           {/each}
         </div>
       </div>
     </div>
 
     <div class="bd-foot">
-      <button onclick={copyAll}>复制全部信息</button>
+      <button data-testid="bd-copy-all" onclick={copyAll}>{t("bookDetail.copyAll")}</button>
       <div class="flex1"></div>
-      <button onclick={onclose}>关闭</button>
-      <button onclick={save} disabled={saving}>{saving ? "保存中…" : "保存信息"}</button>
-      <button class="primary" onclick={saveToFile} disabled={writing} title="把书名/作者直接写回原始 EPUB 文件，覆盖且不备份">
-        {writing ? "写入中…" : "保存到书籍"}
+      <button data-testid="bd-cancel" onclick={onclose}>{t("common.action.close")}</button>
+      <button data-testid="bd-save" onclick={save} disabled={saving}>{saving ? t("common.saving") : t("bookDetail.saveInfo")}</button>
+      <button class="primary" data-testid="bd-save-file" onclick={saveToFile} disabled={writing} title={t("bookDetail.writeBackTip")}>
+        {writing ? t("bookDetail.writing") : t("bookDetail.saveToBook")}
       </button>
     </div>
   </div>

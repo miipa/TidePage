@@ -65,7 +65,7 @@ try {
   `)));
   await SHOT(M, "dialog_3buttons.png");
   out.steps.pathKeep = step("pathKeep", await M.evalJs(H(`
-    [...document.querySelectorAll('.choice-row button')].find(b=>b.textContent.includes('保留笔记并删除'))?.click();
+    document.querySelector('[data-testid="choice-keep"]')?.click();
     await sleep(1000);
     const id=${ids.keep};
     const hl=await inv('list_highlights',{bookId:id});
@@ -77,7 +77,7 @@ try {
   // ===== 打回1-B：删除笔记并删除 =====
   await M.evalJs(H(`await window.__frLibDebug.deleteByPath(${JSON.stringify(fD.replace(/\\/g, "\\\\"))},false); await wait(()=>q('.choice-row button'),'choice2',60); return 1;`));
   out.steps.pathDel = step("pathDel", await M.evalJs(H(`
-    [...document.querySelectorAll('.choice-row button')].find(b=>b.textContent.includes('删除笔记并删除'))?.click();
+    document.querySelector('[data-testid="choice-del"]')?.click();
     await sleep(1000);
     const id=${ids.del};
     const hl=await inv('list_highlights',{bookId:id});
@@ -92,7 +92,7 @@ try {
     return { msg:q('.confirm-msg')?.textContent?.replace(/\\s+/g,' ').trim(), buttons:qa('.choice-row button').map(b=>b.textContent.trim()) };
   `)));
   await SHOT(M, "dialog_disk_3buttons.png");
-  await M.evalJs(H(`[...document.querySelectorAll('.choice-row button')].find(b=>b.textContent.trim()==='取消')?.click(); await sleep(400); return 1;`));
+  await M.evalJs(H(`document.querySelector('[data-testid="choice-cancel"]')?.click(); await sleep(400); return 1;`));
 
   // ===== 打回2：D 存储清理前后 =====
   const covDir = path.join(data, "covers"); fs.mkdirSync(covDir, { recursive: true });

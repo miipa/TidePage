@@ -30,7 +30,7 @@ const qa=(s)=>[...document.querySelectorAll(s)];
 const cfgRead=()=>JSON.parse(localStorage.getItem('tidepage.config.v1')||'{}');
 const bcRead=()=>JSON.parse(localStorage.getItem('tidepage.bookcfg.v1')||'{}');
 const cssvar=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const openSettings=async(tab)=>{ q('button[title="设置"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };
+const openSettings=async(tab)=>{ q('[data-testid="lib-btn-settings"]')?.click(); await wait(()=>q('dialog[open]'),'dialog'); [...document.querySelectorAll('.tabs button')].find(x=>x.textContent.trim()===tab)?.click(); await sleep(350); };
 const closeSettings=async()=>{ document.querySelector('dialog button.primary')?.click(); await sleep(300); };
 `;
 const H = (body) => `(async()=>{ ${HELPER}\n${body} })()`;
@@ -168,7 +168,7 @@ try {
     card?.querySelector('button[title="删除"]')?.click();
     await sleep(300);
     // 确认弹窗
-    const ok=[...document.querySelectorAll('.confirm-row button')].find(b=>b.textContent.includes('确定'));
+    const ok=document.querySelector('[data-testid="confirm-ok"]');
     ok?.click(); await sleep(500);
     return { before, after:cfgRead().readerSchemes.length, names:cfgRead().readerSchemes.map(s=>s.name) };
   `));

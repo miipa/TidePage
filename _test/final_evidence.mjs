@@ -67,7 +67,7 @@ try {
   await SHOT(M, "h1_menu.png");
   out.steps.h1Saved = await M.evalJs(H(`
     // 点"添加感想"
-    const btn=qa('.hl-menu button').find(b=>b.textContent.includes('添加感想'));
+    const btn=q('[data-testid="hm-note"]');
     btn?.click(); await sleep(400);
     const ta=q('.hl-menu textarea');
     if(ta){ ta.value='这是我手动输入的感想内容'; ta.dispatchEvent(new Event('input',{bubbles:true})); }

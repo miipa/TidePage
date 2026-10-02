@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { ui } from "../lib/stores.svelte";
@@ -17,16 +18,16 @@
   function fmt(sec: number): string {
     const h = Math.floor(sec / 3600);
     const m = Math.round((sec % 3600) / 60);
-    return h ? `${h} 小时 ${m} 分` : `${m} 分钟`;
+    return h ? t("common.dur.hm", { h, m }) : t("common.dur.m", { m });
   }
 </script>
 
 <div class="modal-body">
-  <h3>近 14 天阅读统计</h3>
+  <h3>{t("stats.recent", { n: 14 })}</h3>
   {#if !stats.length}
-    <div class="empty">暂无数据，开始阅读后每 30 秒记录一次。</div>
+    <div class="empty">{t("stats.empty")}</div>
   {:else}
-    <div class="total">共阅读 {fmt(total)}</div>
+    <div class="total">{t("stats.totalPrefix")}{fmt(total)}</div>
     <div class="bars">
       {#each stats as [day, sec] (day)}
         <div class="bar-col" title="{day}: {fmt(sec)}">
@@ -37,7 +38,7 @@
     </div>
   {/if}
   <div class="close-row">
-    <button onclick={() => (ui.statsOpen = false)}>关闭</button>
+    <button data-testid="stats-close" onclick={() => (ui.statsOpen = false)}>{t("common.action.close")}</button>
   </div>
 </div>
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errText, t } from "../lib/i18n/index.svelte";
   import { api } from "../lib/api";
   import { pendingOpen, ui, toast } from "../lib/stores.svelte";
   import type { SearchHit } from "../lib/types";
@@ -16,17 +17,17 @@
       hits = await api.searchAll(query.trim());
       searched = true;
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       searching = false;
     }
   }
 
   async function rebuild() {
-    indexBtn = "重建中…";
+    indexBtn = t("search.rebuilding");
     try {
       await api.rebuildFts();
-      toast("索引已清空，现在开始重新索引全部书籍，后台进行");
+      toast(t("search.rebuildStarted"));
       const books = await api.listBooks();
       let n = 0;
       for (const b of books) {
@@ -35,9 +36,9 @@
           n += c;
         } catch { /* skip */ }
       }
-      toast(`全文索引完成，共索引 ${n} 章`);
+      toast(t("search.rebuildDone", { n }));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       indexBtn = "";
     }
@@ -55,25 +56,26 @@
 </script>
 
 <div class="modal-body">
-  <h3>全文搜索</h3>
+  <h3>{t("search.title")}</h3>
   <div class="row-inline" style="margin-bottom:12px">
     <input
-      placeholder="输入关键词，至少 2 字…"
+      data-testid="search-input"
+      placeholder={t("search.placeholder")}
       bind:value={query}
       onkeydown={(e) => e.key === "Enter" && doSearch()}
       style="flex:1"
     />
-    <button class="primary" onclick={doSearch} disabled={searching}>搜索</button>
-    <button onclick={rebuild} disabled={!!indexBtn}>{indexBtn || "重建索引"}</button>
+    <button class="primary" data-testid="search-go" onclick={doSearch} disabled={searching}>{t("common.action.search")}</button>
+    <button data-testid="search-rebuild" onclick={rebuild} disabled={!!indexBtn}>{indexBtn || t("search.rebuild")}</button>
   </div>
 
   {#if searched && !hits.length}
-    <div class="empty">无结果。若书籍很多，先点「重建索引」。</div>
+    <div class="empty">{t("search.empty")}</div>
   {:else}
     <div class="hits">
       {#each hits as h (h.book_id + ":" + h.chapter_index + h.snippet)}
         <div class="hit" onclick={() => openHit(h)}>
-          <div class="hb">{h.book_title} <span class="hc">· {h.chapter_title || h.chapter_index + 1 + " 章"}</span></div>
+          <div class="hb">{h.book_title} <span class="hc">· {h.chapter_title || t("common.chapterN", { n: h.chapter_index + 1 })}</span></div>
           <div class="hs">{@html h.snippet.replaceAll('<mark>', '<mark class="mk">')}</div>
         </div>
       {/each}
@@ -81,7 +83,7 @@
   {/if}
 
   <div class="close-row">
-    <button onclick={() => (ui.searchOpen = false)}>关闭</button>
+    <button data-testid="search-close" onclick={() => (ui.searchOpen = false)}>{t("common.action.close")}</button>
   </div>
 </div>
 

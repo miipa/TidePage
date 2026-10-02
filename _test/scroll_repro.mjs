@@ -270,7 +270,7 @@ async function main() {
         const out=[]; for(let i=0;i<6;i++){ window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true})); await sleep(350); out.push(x()); }
         return out;`));
       out.tocPage = await main.evalJs(H(`
-        document.querySelector('button[title^="目录"]')?.click();
+        document.querySelector('[data-testid="tb-toc"]')?.click();
         const items = await wait(()=>{const x=[...document.querySelectorAll('.toc-item')];return x.length?x:null;},'toc items');
         const target = items[Math.min(items.length-1, Math.floor(items.length*0.5))];
         const t=target.textContent.trim(); target.click(); await sleep(1500);
@@ -282,7 +282,7 @@ async function main() {
     } else if (SCENARIO === "toc") {
       out.before = await main.evalJs(H(`return state();`));
       out.toc = await main.evalJs(H(`
-        document.querySelector('button[title^="目录"]')?.click();
+        document.querySelector('[data-testid="tb-toc"]')?.click();
         const items = await wait(()=>{const x=[...document.querySelectorAll('.toc-item')];return x.length?x:null;},'toc items');
         const target = items[Math.min(items.length-1, Math.floor(items.length*0.6))];
         const t = target.textContent.trim();

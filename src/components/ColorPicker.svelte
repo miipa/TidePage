@@ -1,6 +1,7 @@
 <script lang="ts">
   import { normalizeColor, parseColor, toHex, toRgbString } from "../lib/color";
   import { portal } from "../lib/portal";
+  import { t } from "../lib/i18n/index.svelte";
 
   let {
     value = $bindable(""),
@@ -15,8 +16,9 @@
       "#7f8c8d",
     ],
     allowEmpty = false,
-    emptyLabel = "跟随默认",
-    title = "颜色",
+    // 默认文案在**使用点**用 t() 现取（不能在 $props() 默认值里求值：那样切语言不会更新）。
+    emptyLabel = undefined,
+    title = undefined,
     onchange,
   }: {
     value?: string;
@@ -95,6 +97,9 @@
     window.addEventListener("pointerdown", h, true);
     return () => window.removeEventListener("pointerdown", h, true);
   });
+  /** 标题/空值的默认文案：调用点没传就用本地化默认值（放在函数里求值，切语言即时生效）。 */
+  const titleText = $derived(title ?? t("common.color.name"));
+  const emptyText = $derived(emptyLabel ?? t("common.color.followDefault"));
 </script>
 
 <button
@@ -102,19 +107,19 @@
   class="cp-trigger"
   bind:this={btnEl}
   onclick={toggle}
-  title={title + (value ? `：${value}` : "")}
+  title={value ? t("common.color.titleWithValue", { name: titleText, value }) : titleText}
 >
   {#if swatch}
     <span class="cp-dot" style="background:{swatch};"></span>
   {:else}
     <span class="cp-dot cp-none"></span>
   {/if}
-  <span class="cp-val">{value || emptyLabel}</span>
+  <span class="cp-val">{value || emptyText}</span>
 </button>
 
 {#if open}
   <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{pos.x}px; top:{pos.y}px;">
-    <div class="cp-title">{title}</div>
+    <div class="cp-title">{titleText}</div>
     <div class="cp-grid">
       {#each presets as p (p)}
         <button
@@ -127,7 +132,7 @@
         ></button>
       {/each}
       {#if allowEmpty}
-        <button type="button" class="cp-swatch cp-clear" class:active={!value} title={emptyLabel} onclick={() => apply("")}>∅</button>
+        <button type="button" class="cp-swatch cp-clear" class:active={!value} title={emptyText} onclick={() => apply("")}>∅</button>
       {/if}
     </div>
 
@@ -140,7 +145,7 @@
       <input bind:value={rgbText} oninput={onRgbInput} placeholder="rgb(255, 0, 0)" spellcheck="false" />
     </div>
     <div class="cp-row">
-      <label>取色</label>
+      <label>{t("common.color.pick")}</label>
       <input
         type="color"
         class="cp-native"
@@ -148,7 +153,7 @@
         oninput={(e) => apply(normalizeColor(e.currentTarget.value) ?? e.currentTarget.value)}
       />
     </div>
-    <div class="cp-tip">支持 #hex 与 rgb()/rgba() 两种写法</div>
+    <div class="cp-tip">{t("common.color.hint")}</div>
   </div>
 {/if}
 

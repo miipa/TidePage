@@ -3,6 +3,8 @@
   import { onMount } from "svelte";
   import { toast } from "../lib/stores.svelte";
   import ContextMenu, { type CtxItem } from "../components/ContextMenu.svelte";
+  // i18n 的 t() 与本文件里的局部变量 t 撞名，故导入别名 tr（本文件只有这两处用中文文案）。
+  import { t as tr } from "../lib/i18n/index.svelte";
 
   let { children } = $props();
 
@@ -107,21 +109,21 @@
     const dis = isTextField(el) && (t.disabled || false);
     const canSel = hasSelection(el);
     return [
-      { label: "剪切", disabled: !canSel || ro || dis, action: () => cutSel(el) },
-      { label: "复制", disabled: !canSel, action: () => copySel(el) },
-      { label: "粘贴", disabled: ro || dis, action: () => void pasteSel(el) },
+      { label: tr("common.action.cut"), disabled: !canSel || ro || dis, action: () => cutSel(el) },
+      { label: tr("common.action.copy"), disabled: !canSel, action: () => copySel(el) },
+      { label: tr("common.action.paste"), disabled: ro || dis, action: () => void pasteSel(el) },
       { separator: true },
-      { label: "全选", action: () => selectAllEl(el) },
+      { label: tr("common.action.selectAll"), action: () => selectAllEl(el) },
     ];
   }
 
   onMount(() => {
     const onErr = (e: ErrorEvent) => {
-      toast(`脚本错误: ${e.message}`, "error");
+      toast(tr("common.error.script", { msg: e.message }), "error");
       console.error(e.error);
     };
     const onRej = (e: PromiseRejectionEvent) => {
-      toast(`未处理的错误: ${String(e.reason)}`, "error");
+      toast(tr("common.error.unhandled", { reason: String(e.reason) }), "error");
       console.error(e.reason);
     };
     // 捕获阶段统一处理右键：可编辑元素弹自绘菜单；其它区域仅阻止默认菜单，

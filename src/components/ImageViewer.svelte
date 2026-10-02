@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { BookImage } from "../lib/types";
+  import { t } from "../lib/i18n/index.svelte";
 
   let {
     images = [],
@@ -68,7 +69,7 @@
 <div
   class="iv-backdrop"
   role="dialog"
-  aria-label="图片查看器"
+  aria-label={t("common.imgViewer.title")}
   tabindex="-1"
   onpointerdown={(e) => e.stopPropagation()}
   onwheel={onWheel}
@@ -80,7 +81,7 @@
     </span>
   </div>
 
-  <button class="iv-nav left" title="上一张 (←)" onclick={prev} disabled={total <= 1}>‹</button>
+  <button class="iv-nav left" data-testid="iv-prev" title={t("common.imgViewer.prev")} onclick={prev} disabled={total <= 1}>‹</button>
 
   <div class="iv-stage" onclick={(e) => { if (e.target === e.currentTarget) onclose(); }}>
     {#if current}
@@ -92,13 +93,13 @@
         onclick={(e) => { e.stopPropagation(); zoomed = !zoomed; }}
       />
     {:else}
-      <div class="iv-empty">本书未找到图片</div>
+      <div class="iv-empty" data-testid="iv-empty">{t("common.imgViewer.empty")}</div>
     {/if}
   </div>
 
-  <button class="iv-nav right" title="下一张 (→)" onclick={next} disabled={total <= 1}>›</button>
+  <button class="iv-nav right" data-testid="iv-next" title={t("common.imgViewer.next")} onclick={next} disabled={total <= 1}>›</button>
 
-  <div class="iv-hint">滚轮 / ← → 切换，点击图片缩放，点击图片外空白处或 Esc 关闭</div>
+  <div class="iv-hint">{t("common.imgViewer.hint")}</div>
 </div>
 
 <style>

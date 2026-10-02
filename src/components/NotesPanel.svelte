@@ -2,6 +2,7 @@
      网格/列表/状态栏沿用书库的视觉与几何；列宽交给 CSS 自适应
      （minmax(min(168px,100%),1fr)），任何窗口尺寸下封面都不会越界被窗口边缘裁掉。 -->
 <script lang="ts">
+  import { dateLocale, errText, labelOfId, t } from "../lib/i18n/index.svelte";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { toast, ui, requestOpenBook, APP_VERSION } from "../lib/stores.svelte";
   import { onMount } from "svelte";
@@ -44,7 +45,7 @@
     const arr = books.filter(
       (b) => !q || b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q),
     );
-    if (sortKey === "title") arr.sort((a, b) => a.title.localeCompare(b.title, "zh"));
+    if (sortKey === "title") arr.sort((a, b) => a.title.localeCompare(b.title, dateLocale()));
     else if (sortKey === "count") arr.sort((a, b) => b.hlCount - a.hlCount || b.lastAt - a.lastAt);
     else arr.sort((a, b) => b.lastAt - a.lastAt);
     return arr;
@@ -57,7 +58,7 @@
     try {
       books = await api.listNoteBooks();
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       loading = false;
     }
@@ -79,7 +80,7 @@
     try {
       detailNotes = await api.listNotesOfBook(b.bookId);
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       detailLoading = false;
     }
@@ -88,7 +89,7 @@
   /** 打开原书：先关掉本窗口（它是整屏覆盖层，留着会盖住阅读界面）。 */
   function openBook(b: NoteBook) {
     if (b.deleted || b.bookId < 0) {
-      toast("原书已删除，仅保留划线/感想", "error");
+      toast(t("notes.bookDeleted"), "error");
       return;
     }
     detail = null;
@@ -103,7 +104,7 @@
       detailNotes = detailNotes.map((x) => (x.id === n.id ? { ...x, note: "" } : x));
       await load();
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -115,13 +116,13 @@
       await load();
       if (detail && detailNotes.length === 0) detail = null;
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
   function fmtDate(ms: number): string {
     if (!ms) return "";
-    return new Date(ms).toLocaleDateString("zh-CN");
+    return new Date(ms).toLocaleDateString(dateLocale());
   }
 
   /** 封面 URL 与书库同源：有内嵌封面走 per-book 端点，否则共享默认封面端点。
@@ -148,26 +149,26 @@
 
 <div class="nl">
   <div class="nl-bar">
-    <span class="nl-title">笔记</span>
+    <span class="nl-title" data-testid="nl-title">{t("notes.title")}</span>
     <span class="nl-count">{shown.length}</span>
-    <input class="nl-search" placeholder="搜索书名 / 作者…" bind:value={query} />
-    <select value={sortKey} onchange={(e) => setSort(e.currentTarget.value)}>
-      <option value="recent">按最近划线</option>
-      <option value="title">按书名</option>
-      <option value="count">按划线条数</option>
+    <input class="nl-search" data-testid="nl-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={query} />
+    <select data-testid="nl-sort" value={sortKey} onchange={(e) => setSort(e.currentTarget.value)}>
+      <option value="recent">{t("notes.sort.recent")}</option>
+      <option value="title">{t("notes.sort.title")}</option>
+      <option value="count">{t("notes.sort.count")}</option>
     </select>
     <div class="spacer"></div>
-    <button class="icon" title="刷新" aria-label="刷新" onclick={load}>⟳</button>
-    {#if !standalone}<button class="icon" title="返回书库" aria-label="返回书库" onclick={() => (ui.notesOpen = false)}>×</button>{/if}
+    <button class="icon" data-testid="nl-refresh" title={t("common.action.refresh")} aria-label={t("common.action.refresh")} onclick={load}>⟳</button>
+    {#if !standalone}<button class="icon" data-testid="nl-close" title={labelOfId("bind", "close")} aria-label={labelOfId("bind", "close")} onclick={() => (ui.notesOpen = false)}>×</button>{/if}
   </div>
 
   <div class="nl-body">
     {#if loading}
-      <div class="hint">加载中…</div>
+      <div class="hint">{t("common.loading")}</div>
     {:else if !shown.length}
-      <div class="hint">{query.trim()
-        ? "无匹配结果"
-        : "还没有划线或笔记\n阅读时划线或写感想，这里会按书汇总"}</div>
+      <div class="hint" data-testid="nl-empty">{query.trim()
+        ? t("library.empty.noMatch")
+        : t("notes.empty")}</div>
     {:else if view === "grid"}
       <div class="nl-grid">
         {#each shown as b (b.bookId)}
@@ -176,27 +177,27 @@
             class:active={detail?.bookId === b.bookId}
             role="button"
             tabindex="0"
-            title={b.title || "已删除"}
+            title={b.title || t("common.toast.deleted")}
             ondblclick={() => openBook(b)}
             onclick={() => openDetail(b)}
             onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") openDetail(b); }}
           >
             <div class="cover">
               {#if cover(b)}
-                <img src={cover(b)} alt="《{b.title || "已删除"}》封面" loading="lazy" decoding="async" draggable="false" />
+                <img src={cover(b)} alt={t("library.book.coverAlt", { title: b.title || t("common.toast.deleted") })} loading="lazy" decoding="async" draggable="false" />
               {:else}
                 <span class="cover-fallback">
-                  <span class="cf-t">{b.title || "已删除"}</span>
+                  <span class="cf-t">{b.title || t("common.toast.deleted")}</span>
                   {#if b.author}<span class="cf-a">{b.author}</span>{/if}
                 </span>
               {/if}
-              {#if b.deleted}<span class="tag tag-del">已删除</span>{/if}
-              <span class="tag tag-hl">划线 {b.hlCount}</span>
-              {#if b.noteCount > 0}<span class="tag tag-note">感想 {b.noteCount}</span>{/if}
+              {#if b.deleted}<span class="tag tag-del">{t("common.toast.deleted")}</span>{/if}
+              <span class="tag tag-hl">{t("common.hlWord")} {b.hlCount}</span>
+              {#if b.noteCount > 0}<span class="tag tag-note">{t("common.noteWord")} {b.noteCount}</span>{/if}
             </div>
             <div class="meta">
-              <div class="t">{b.title || "已删除"}</div>
-              <div class="a">{b.author || (b.deleted ? "" : "未知作者")}</div>
+              <div class="t">{b.title || t("common.toast.deleted")}</div>
+              <div class="a">{b.author || (b.deleted ? "" : t("notes.unknownAuthor"))}</div>
             </div>
           </div>
         {/each}
@@ -213,15 +214,15 @@
             onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") openDetail(b); }}
           >
             {#if cover(b)}
-              <img class="row-cover" src={cover(b)} alt="《{b.title || "已删除"}》封面" loading="lazy" decoding="async" draggable="false" />
+              <img class="row-cover" src={cover(b)} alt={t("library.book.coverAlt", { title: b.title || t("common.toast.deleted") })} loading="lazy" decoding="async" draggable="false" />
             {:else}
-              <span class="row-cover row-cover-fallback">{b.title || "已删除"}</span>
+              <span class="row-cover row-cover-fallback">{b.title || t("common.toast.deleted")}</span>
             {/if}
             <div class="row-meta">
-              <div class="t">{b.title || "已删除"}</div>
-              <div class="a">{b.author || (b.deleted ? "原书已删除" : "未知作者")}</div>
+              <div class="t">{b.title || t("common.toast.deleted")}</div>
+              <div class="a">{b.author || (b.deleted ? t("notes.bookDeletedShort") : t("notes.unknownAuthor"))}</div>
             </div>
-            <div class="row-num">划线 {b.hlCount}{b.noteCount > 0 ? ` · 感想 ${b.noteCount}` : ""}</div>
+            <div class="row-num">{t("common.hlWord")} {b.hlCount}{b.noteCount > 0 ? t("notes.noteCountLine", { n: b.noteCount }) : ""}</div>
             <div class="row-date">{fmtDate(b.lastAt)}</div>
           </div>
         {/each}
@@ -230,35 +231,35 @@
   </div>
 
   <div class="nl-status">
-    <span>{shown.length} 本书 · 划线 {totalHl} 条 · 感想 {totalNotes} 条</span>
-    <span class="build" title="TidePage 版本">TidePage {APP_VERSION}</span>
+    <span>{shown.length}{t("notes.statLine", { hl: totalHl, note: totalNotes })}</span>
+    <span class="build" title={t("common.app.versionTip")}>TidePage {APP_VERSION}</span>
     <div class="spacer"></div>
-    <button class="icon view-btn" class:active={view === "grid"} title="网格视图" aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
-    <button class="icon view-btn" class:active={view === "list"} title="列表视图" aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
+    <button class="icon view-btn" class:active={view === "grid"} data-testid="nl-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
+    <button class="icon view-btn" class:active={view === "list"} data-testid="nl-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
   </div>
 
   {#if detail}
     <div class="drawer-backdrop" onclick={() => (detail = null)}></div>
-    <aside class="drawer" role="dialog" aria-label="划线明细">
+    <aside class="drawer" role="dialog" aria-label={t("notes.detailTitle")}>
       <div class="drawer-head">
         <div class="dh-main">
-          <div class="dh-title">{detail.title || "已删除"}</div>
+          <div class="dh-title">{detail.title || t("common.toast.deleted")}</div>
           <div class="dh-sub">
             {detail.deleted
-              ? "原书已删除 · 划线/感想保留"
-              : `划线 ${detail.hlCount} 条 · 感想 ${detail.noteCount} 条`}
+              ? t("notes.detailDeleted")
+              : t("notes.detailCounts", { hl: detail.hlCount, note: detail.noteCount })}
           </div>
         </div>
         {#if !detail.deleted}
-          <button onclick={() => openBook(detail!)}>打开原书</button>
+          <button data-testid="nl-open-book" onclick={() => openBook(detail!)}>{t("notes.openBook")}</button>
         {/if}
-        <button class="icon" title="关闭" onclick={() => (detail = null)}>×</button>
+        <button class="icon" data-testid="nl-detail-close" title={t("common.action.close")} onclick={() => (detail = null)}>×</button>
       </div>
       <div class="drawer-list">
         {#if detailLoading}
-          <div class="hint">加载中…</div>
+          <div class="hint">{t("common.loading")}</div>
         {:else if !detailNotes.length}
-          <div class="hint">这本书已经没有划线了</div>
+          <div class="hint">{t("notes.detailEmpty")}</div>
         {:else}
           {#each detailNotes as n (n.id)}
             <div class="item">
@@ -266,14 +267,14 @@
               {#if n.note}
                 <div class="note">{n.note}</div>
               {:else}
-                <div class="note none">（无感想）</div>
+                <div class="note none">{t("notes.noNote")}</div>
               {/if}
               <div class="foot">
-                <span class="ch">{n.chapterTitle || `第 ${n.chapterIndex + 1} 节`} · {fmtDate(n.createdAt)}</span>
+                <span class="ch">{n.chapterTitle || t("common.sectionN", { n: n.chapterIndex + 1 })} · {fmtDate(n.createdAt)}</span>
                 {#if n.note}
-                  <button class="icon" title="删除这条感想（保留划线）" onclick={() => removeNote(n)}>🗑</button>
+                  <button class="icon" data-testid="nl-del-note" title={t("notes.delNoteTip")} onclick={() => removeNote(n)}>🗑</button>
                 {:else}
-                  <button class="icon" title="删除这条划线" onclick={() => removeHighlight(n)}>🗑</button>
+                  <button class="icon" data-testid="nl-del-hl" title={t("highlight.deleteTip")} onclick={() => removeHighlight(n)}>🗑</button>
                 {/if}
               </div>
             </div>

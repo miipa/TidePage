@@ -63,6 +63,8 @@
   import ColorPicker from "./ColorPicker.svelte";
   import { dragSort } from "../lib/dragSort";
   import { slide } from "svelte/transition";
+  // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
+  import { localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
   import { onMount, tick, untrack } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
@@ -2427,12 +2429,16 @@
   <div class="set-pane" data-pane="prefs" hidden={tab !== "prefs"}>
     <p class="sec-title">通用</p>
     <div class="field">
-      <label>界面语言</label>
-      <select bind:value={config.language} onchange={saveConfig}>
-        <option value="auto">自动</option>
-        <option value="zh-CN">简体中文</option>
+      <label>{t("settings.language.label")}</label>
+      <select
+        value={localeSetting.get()}
+        onchange={(e) => setLocale((e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="auto">{t("settings.language.auto")}</option>
+        <option value="zh-CN">{t("settings.language.zhCN")}</option>
+        <option value="en">{t("settings.language.en")}</option>
       </select>
-      <p class="tip">仅记录偏好，暂未接入界面翻译，当前界面语言不随此项变化。</p>
+      <p class="tip">{t("settings.language.tip")}</p>
     </div>
 
     <div class="field">

@@ -1,5 +1,6 @@
 import { activeTtsService, config, saveConfig, toast } from "./stores.svelte";
 import { api } from "./api";
+import { t } from "./i18n/index.svelte";
 
 export interface FlatSegment {
   /** 用于朗读的文本（已去首尾空白） */
@@ -11,8 +12,11 @@ export interface FlatSegment {
 
 /* ---------------- 文本切句 ---------------- */
 
+// i18n-allow: 中文句末标点集合（切句算法输入，与界面语言无关）
 const SENT_END = "。！？!?…";
+// i18n-allow: 中文闭合标点集合（切句算法输入，与界面语言无关）
 const CLOSERS = "」』”\"'）)】》〉」";
+// i18n-allow: 中文软断句标点集合（切句算法输入，与界面语言无关）
 const SOFT_BREAK = "，,、；;：:";
 
 /** 把章节纯文本切成适合朗读的句子片段（保留原文偏移）。 */
@@ -322,7 +326,7 @@ const loading = new Map<string, Promise<string>>();
 
 async function fetchAudio(text: string): Promise<string> {
   const ep = resolveEndpoint();
-  if (!ep) throw new Error("未配置语音服务");
+  if (!ep) throw new Error(t("err.ttsNotConfigured"));
   const fmt = ep.format || "mp3";
   const b64 = await api.ttsSynth({
     provider: ep.provider,
@@ -415,7 +419,7 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
       const dur = audioEl?.duration ?? 0;
       if (!audioEl || !isFinite(dur) || dur <= 0.05) {
         cleanup();
-        reject(new Error("音频无效（时长为 0）"));
+        reject(new Error(t("err.audioZeroDuration")));
       }
     };
 
@@ -438,7 +442,7 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
       }
       cleanup();
       // 在线语音解码失败：绝不回退系统语音（会让音色/音量突变），提示并停止。
-      reject(new Error("音频解码失败"));
+      reject(new Error(t("err.audioDecode")));
     };
 
     audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
@@ -480,7 +484,7 @@ function failOnline(err: unknown) {
       : String(err);
   if (!onlineWarned) {
     onlineWarned = true;
-    toast(`在线语音失败，已停止朗读：${msg}`, "error");
+    toast(t("tts.onlineFailed", { msg }), "error");
   }
   ttsStop();
 }
@@ -665,7 +669,7 @@ function selectFixedVoice(list: OnlineVoice[]) {
   saveConfig();
   if (!voiceAutoFixed) {
     voiceAutoFixed = true;
-    toast(`已改用固定音色「${match.name || match.id}」，避免逐句音色变化`);
+    toast(t("tts.switchedClonedVoice", { name: match.name || match.id }));
   }
 }
 
@@ -717,11 +721,11 @@ async function ensureFixedVoice(): Promise<boolean> {
         s.voice = res.id;
         saveConfig();
         if (res.created) {
-          toast(`已为${target === "Chinese" ? "中文" : target}创建固定音色，整章将保持同一说话人`);
+          toast(t("tts.createdClonedVoice", { target: target === "Chinese" ? t("tts.lang.zh") : target }));
         }
         return true;
       } catch (e) {
-        toast(`创建固定音色失败，将沿用服务音色（可能逐句变化）：${e}`, "error");
+        toast(t("tts.createClonedVoiceFailed", { err: String(e) }), "error");
         return false;
       } finally {
         fixedVoicePromise = null;
@@ -751,7 +755,7 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
       s?.cluster || "",
     );
     ttsState.onlineVoices = list;
-    ttsState.onlineVoiceError = list.length ? "" : "服务未返回音色列表";
+    ttsState.onlineVoiceError = list.length ? "" : t("tts.noVoiceList");
     selectFixedVoice(list);
     return list;
   } catch (e) {

@@ -78,9 +78,9 @@ try {
   })();
   log("hover: " + JSON.stringify(out.steps.hover));
 
-  // 列表视图
+  // 列表视图（选择器改用稳定 data-testid，避免依赖中文文案：切到英文界面后原断言会失效）
   out.steps.list = await M.evalJs(H(`
-    [...document.querySelectorAll('.statusbar button')].find(b=>b.getAttribute('title')==='列表视图')?.click();
+    document.querySelector('[data-testid="lib-view-list"]')?.click();
     await sleep(500);
     const row=q('.row');
     return { list:!!q('.list-inner'), rows:qa('.row').length, rowRadius:cs(row,'border-radius'), rowH:cs(row,'height') };

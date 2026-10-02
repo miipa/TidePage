@@ -4,11 +4,11 @@ export type ZoneKey = "tl" | "tr" | "bl" | "br" | "c";
 export type ZoneAction = BindAction | "none";
 
 export const ZONE_DEFS: { id: ZoneKey; name: string }[] = [
-  { id: "tl", name: "左上区域" },
-  { id: "tr", name: "右上区域" },
-  { id: "bl", name: "左下区域" },
-  { id: "br", name: "右下区域" },
-  { id: "c", name: "中间小区域" },
+  { id: "tl", name: "左上区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "tr", name: "右上区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "bl", name: "左下区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "br", name: "右下区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "c", name: "中间小区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
 ];
 
 export const DEFAULT_ZONES: Record<ZoneKey, ZoneAction> = {
@@ -39,23 +39,23 @@ export type BindAction =
   | "close";
 
 export const BIND_DEFS: { id: BindAction; name: string }[] = [
-  { id: "next", name: "下一页 / 下滚一屏" },
-  { id: "prev", name: "上一页 / 上滚一屏" },
-  { id: "scrollDown", name: "下滚一段" },
-  { id: "scrollUp", name: "上滚一段" },
-  { id: "chapterNext", name: "下一章" },
-  { id: "chapterPrev", name: "上一章" },
-  { id: "toc", name: "打开/关闭目录" },
-  { id: "addBookmark", name: "添加书签" },
-  { id: "bookmarkList", name: "书签列表" },
-  { id: "ai", name: "AI 面板" },
-  { id: "bookStats", name: "本书统计" },
-  { id: "ttsPlayPause", name: "朗读：播放/暂停" },
-  { id: "ttsStop", name: "朗读：停止" },
-  { id: "ttsNext", name: "朗读：下一句" },
-  { id: "ttsPrev", name: "朗读：上一句" },
-  { id: "settings", name: "设置" },
-  { id: "close", name: "返回书库" },
+  { id: "next", name: "下一页 / 下滚一屏" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "prev", name: "上一页 / 上滚一屏" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "scrollDown", name: "下滚一段" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "scrollUp", name: "上滚一段" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterNext", name: "下一章" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterPrev", name: "上一章" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "toc", name: "打开/关闭目录" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "addBookmark", name: "添加书签" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "bookmarkList", name: "书签列表" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ai", name: "AI 面板" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "bookStats", name: "本书统计" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ttsPlayPause", name: "朗读：播放/暂停" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ttsStop", name: "朗读：停止" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ttsNext", name: "朗读：下一句" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ttsPrev", name: "朗读：上一句" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "settings", name: "设置" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "close", name: "返回书库" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
 ];
 
 export const DEFAULT_BINDINGS: Record<BindAction, string[]> = {
@@ -126,18 +126,18 @@ export interface StatusItem {
 
 /** 状态项清单（设置页勾选；顶栏顺序即可在阅读界面拖动排序）。 */
 export const STATUS_ITEM_DEFS: { id: StatusItemId; name: string }[] = [
-  { id: "bookTitle", name: "书名" },
-  { id: "chapterName", name: "章节名" },
-  { id: "chapterIndex", name: "当前章号（第X章）" },
-  { id: "chapterCount", name: "总章数（共Y章）" },
-  { id: "chapterPages", name: "本节页数 / 百分比" },
-  { id: "bookPages", name: "全书总页数（估算）" },
-  { id: "pagePercent", name: "本节进度" },
-  { id: "bookProgress", name: "全书进度" },
-  { id: "chars", name: "本章字数" },
-  { id: "clock", name: "时间" },
-  { id: "speed", name: "阅读速度（字/分）" },
-  { id: "mode", name: "阅读模式" },
+  { id: "bookTitle", name: "书名" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterName", name: "章节名" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterIndex", name: "当前章号（第X章）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterCount", name: "总章数（共Y章）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chapterPages", name: "本节页数 / 百分比" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "bookPages", name: "全书总页数（估算）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "pagePercent", name: "本节进度" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "bookProgress", name: "全书进度" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "chars", name: "本章字数" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "clock", name: "时间" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "speed", name: "阅读速度（字/分）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "mode", name: "阅读模式" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
 ];
 
 export const STATUS_ITEM_IDS: Set<string> = new Set(STATUS_ITEM_DEFS.map((d) => d.id));
@@ -147,9 +147,9 @@ export const SCROLL_BOUNCE_PRESETS: Record<
   ScrollBounceLevel,
   { strength: number; threshold: number; label: string }
 > = {
-  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" },
-  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" },
-  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" },
+  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
 };
 
 /** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
@@ -260,13 +260,13 @@ export interface ReaderConfig {
 }
 
 export const HIGHLIGHT_STYLES: { id: string; name: string }[] = [
-  { id: "underline", name: "下划线" },
-  { id: "wavy", name: "波浪线" },
-  { id: "dotted", name: "点线" },
-  { id: "double", name: "双下划线" },
-  { id: "background", name: "荧光笔" },
-  { id: "strike", name: "删除线" },
-  { id: "box", name: "方框" },
+  { id: "underline", name: "下划线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "wavy", name: "波浪线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "dotted", name: "点线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "double", name: "双下划线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "background", name: "荧光笔" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "strike", name: "删除线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "box", name: "方框" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
 ];
 
 /** 划词菜单与划线设置里的预设颜色。 */
@@ -338,9 +338,9 @@ export interface AiProviderMeta {
 
 // 服务商适配表（前端）：下拉/表单字段/占位提示统一由此驱动，新增 provider 只需在此加一行。
 export const AI_PROVIDERS: AiProviderMeta[] = [
-  { id: "openai", label: "OpenAI 兼容 API", baseUrlHint: "https://api.deepseek.com", modelHint: "deepseek-chat", needsKey: true },
-  { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false },
-  { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true },
+  { id: "openai", label: "OpenAI 兼容 API", baseUrlHint: "https://api.deepseek.com", modelHint: "deepseek-chat", needsKey: true }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
+  { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
   { id: "gemini", label: "Google Gemini", baseUrlHint: "https://generativelanguage.googleapis.com", modelHint: "gemini-1.5-flash", needsKey: true },
   { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true },
 ];
@@ -485,12 +485,12 @@ export function normalizeProfiles(list: any): AiProfile[] {
 /** 生成不与现有端点重名的名称：优先「新端点」，否则「新端点2/3…」。 */
 export function uniqueEndpointName(profiles: AiProfile[]): string {
   const names = new Set(profiles.map((p) => (p.name || "").trim()));
-  if (!names.has("新端点")) return "新端点";
+  if (!names.has("新端点")) return "新端点"; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
   for (let n = 2; n < 100000; n++) {
-    const cand = `新端点${n}`;
+    const cand = `新端点${n}`; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
     if (!names.has(cand)) return cand;
   }
-  return `新端点${Date.now()}`;
+  return `新端点${Date.now()}`; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
 }
 
 /** 干净的新端点：不复制上一个端点的地址与凭证，provider 默认沿用当前类型。 */
@@ -512,27 +512,27 @@ export function newAiProfile(profiles: AiProfile[], provider: AiProvider = "open
 export const DEFAULT_PROMPTS: PromptItem[] = [
   {
     id: 1,
-    name: "剧情总结",
+    name: "剧情总结", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
     key: "F1",
-    text: "请用简洁的中文总结以下小说章节的主要剧情（120字以内），并猜猜接下来的发展：\n\n{chapter}",
+    text: "请用简洁的中文总结以下小说章节的主要剧情（120字以内），并猜猜接下来的发展：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
   },
   {
     id: 2,
-    name: "翻译为中文",
+    name: "翻译为中文", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
     key: "F2",
-    text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}",
+    text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
   },
   {
     id: 3,
-    name: "精校润色",
+    name: "精校润色", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
     key: "F3",
-    text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}",
+    text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
   },
   {
     id: 4,
-    name: "人物情节梳理",
+    name: "人物情节梳理", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
     key: "F4",
-    text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}",
+    text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
   },
 ];
 
@@ -649,12 +649,12 @@ export function normalizeTtsService(s: any): TtsService {
 /** 生成不与现有服务重名的名称：优先「新服务」，否则「新服务2/3…」。 */
 export function uniqueTtsServiceName(list: TtsService[]): string {
   const names = new Set(list.map((s) => (s.name || "").trim()));
-  if (!names.has("新服务")) return "新服务";
+  if (!names.has("新服务")) return "新服务"; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
   for (let n = 2; n < 100000; n++) {
-    const cand = `新服务${n}`;
+    const cand = `新服务${n}`; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
     if (!names.has(cand)) return cand;
   }
-  return `新服务${Date.now()}`;
+  return `新服务${Date.now()}`; // i18n-allow:新建实体的默认名；唯一消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
 }
 
 /** 干净的新服务档案：不复制上一条的地址与凭证。 */
@@ -732,7 +732,7 @@ export const UI_SKINS: UiSkin[] = [
   // 奶油（保留 · 微调）：暖奶油纸底 + 中性深咖主色，作为「中性暖」一极，与其余彩色皮肤区分。
   {
     id: "cream",
-    name: "奶油",
+    name: "奶油", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "light",
     bg: "#FFF1E2", panel: "#FFFFFF", panel2: "#FBEADA",
     fg: "#292320", fg2: "#7A6E64", line: "rgba(41,35,32,0.10)",
@@ -743,7 +743,7 @@ export const UI_SKINS: UiSkin[] = [
   // 赤陶：暖陶土橙（~20°），温润手作气质。
   {
     id: "clay",
-    name: "赤陶",
+    name: "赤陶", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "light",
     bg: "#FBF3EC", panel: "#FFFFFF", panel2: "#F3E6DB",
     fg: "#2C2622", fg2: "#756759", line: "rgba(44,38,34,0.10)",
@@ -754,7 +754,7 @@ export const UI_SKINS: UiSkin[] = [
   // 松林：沉静森绿（~155°），清新自然。
   {
     id: "pine",
-    name: "松林",
+    name: "松林", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "light",
     bg: "#EFF5F0", panel: "#FFFFFF", panel2: "#E2EDE5",
     fg: "#1F2622", fg2: "#63726A", line: "rgba(31,38,34,0.10)",
@@ -765,7 +765,7 @@ export const UI_SKINS: UiSkin[] = [
   // 湖光：清爽湖蓝（~205°），冷静专注。
   {
     id: "lagoon",
-    name: "湖光",
+    name: "湖光", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "light",
     bg: "#EDF3F9", panel: "#FFFFFF", panel2: "#E0E9F3",
     fg: "#1E252E", fg2: "#5E6975", line: "rgba(30,37,46,0.09)",
@@ -776,7 +776,7 @@ export const UI_SKINS: UiSkin[] = [
   // 紫藤：柔雅紫红（~315°），优雅有格调。
   {
     id: "lilac",
-    name: "紫藤",
+    name: "紫藤", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "light",
     bg: "#F7F1F6", panel: "#FFFFFF", panel2: "#EEE2EC",
     fg: "#2A2430", fg2: "#726A78", line: "rgba(42,36,48,0.10)",
@@ -788,7 +788,7 @@ export const UI_SKINS: UiSkin[] = [
   // 石墨（保留）：中性冷灰底 + 薄荷青主色（~168°）。
   {
     id: "graphite",
-    name: "石墨",
+    name: "石墨", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "dark",
     bg: "#16181D", panel: "#1E2126", panel2: "#252932",
     fg: "#E6E8EC", fg2: "#9AA0A8", line: "rgba(255,255,255,0.10)",
@@ -799,7 +799,7 @@ export const UI_SKINS: UiSkin[] = [
   // 琥珀：暖褐底 + 琥珀金主色（~42°），温暖夜读。
   {
     id: "amber",
-    name: "琥珀",
+    name: "琥珀", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "dark",
     bg: "#1A1712", panel: "#221E17", panel2: "#2B261D",
     fg: "#ECE6DA", fg2: "#ADA491", line: "rgba(255,246,230,0.10)",
@@ -810,7 +810,7 @@ export const UI_SKINS: UiSkin[] = [
   // 深海：冷蓝黑底 + 亮蓝主色（~215°），深邃沉浸。
   {
     id: "abyss",
-    name: "深海",
+    name: "深海", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "dark",
     bg: "#121620", panel: "#1A1F2B", panel2: "#222839",
     fg: "#E4E8F0", fg2: "#949DB0", line: "rgba(210,224,255,0.10)",
@@ -821,7 +821,7 @@ export const UI_SKINS: UiSkin[] = [
   // 绯夜：暖黑底 + 绯红主色（~353°），醒目而不刺眼。
   {
     id: "crimson",
-    name: "绯夜",
+    name: "绯夜", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "dark",
     bg: "#1C1418", panel: "#241A1F", panel2: "#2E2129",
     fg: "#EEE2E6", fg2: "#AE9BA2", line: "rgba(255,230,238,0.10)",
@@ -832,7 +832,7 @@ export const UI_SKINS: UiSkin[] = [
   // 夜行（保留 id · 主色提亮）：紫黑底 + 紫水晶主色（~272°）。
   {
     id: "nocturne",
-    name: "夜行",
+    name: "夜行", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
     mode: "dark",
     bg: "#16121F", panel: "#1E1A2A", panel2: "#262138",
     fg: "#ECE8F5", fg2: "#A29BB4", line: "rgba(228,220,255,0.10)",
@@ -876,6 +876,12 @@ export interface ReaderScheme {
 /** 内置阅读方案当前预设版本；递增即可让存量安装的内置方案刷新为新预设。 */
 const BUILTIN_SCHEME_REV = 2;
 
+/** 界面语言取值的唯一归一化点：auto（跟随系统）/ zh-CN / en。
+ *  刻意不在此 import src/lib/i18n —— stores 是 i18n 的数据源，反向依赖会成环。 */
+export function normLanguageSetting(v: unknown): "auto" | "zh-CN" | "en" {
+  return v === "zh-CN" || v === "en" ? v : "auto";
+}
+
 export interface AppConfig {
   reader: ReaderConfig;
   library: LibraryConfig;
@@ -890,7 +896,8 @@ export interface AppConfig {
   uiSkinDark: string;
   /** 阅读配色方案库（全局共享）。 */
   readerSchemes: ReaderScheme[];
-  /** 界面语言（仅存储，暂不接入 i18n）：auto=跟随系统 / zh-CN=简体中文。 */
+  /** 界面语言：auto=跟随系统 / zh-CN=简体中文 / en=English。
+   *  接入 i18n 后由 src/lib/i18n 消费；非法值一律归一为 "auto"（见 load/applyConfigJson）。 */
   language: string;
   /** 设置面板分区（扁平列表）显示顺序；可在设置里拖拽排序。id 取 SETTINGS_TABS。 */
   settingsOrder: string[];
@@ -984,8 +991,8 @@ const DEFAULTS: AppConfig = {
     zoneHints: false,
     immersive: false,
     customFonts: [
-      { family: "仓耳云黑-w03", file: "仓耳云黑-w03.ttf" },
-      { family: "方正兰亭圆_gbk", file: "方正兰亭圆_gbk.ttf" },
+      { family: "仓耳云黑-w03", file: "仓耳云黑-w03.ttf" }, // i18n-allow:字体族名，必须与字体文件/系统字体名逐字一致，禁止翻译
+      { family: "方正兰亭圆_gbk", file: "方正兰亭圆_gbk.ttf" }, // i18n-allow:字体族名，必须与字体文件/系统字体名逐字一致，禁止翻译
       { family: "lxgwneoxiheiscreen", file: "lxgwneoxiheiscreen.ttf" },
       { family: "lxgwwenkai-regular", file: "lxgwwenkai-regular.ttf" },
     ],
@@ -1071,39 +1078,39 @@ p {
   ai: {
     enabled: true,
     autoOnChapter: true,
-    system: "你是一位专业的阅读助手。回答务必简洁准确，使用中文。",
+    system: "你是一位专业的阅读助手。回答务必简洁准确，使用中文。", // i18n-allow:AI 系统提示词正文（用户内容），规则要求永不翻译
     profiles: structuredClone(DEFAULT_AI_PROFILES),
     active: 0,
     prompts: [
       {
         id: 1,
-        name: "剧情总结",
+        name: "剧情总结", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
         key: "F1",
-        text: "直观说出文本写了什么，不要做阅读理解，不要脑补，不要分段，不要分点，200字内。\n{chapter}",
+        text: "直观说出文本写了什么，不要做阅读理解，不要脑补，不要分段，不要分点，200字内。\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
       },
       {
         id: 2,
-        name: "翻译为中文",
+        name: "翻译为中文", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
         key: "F2",
-        text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}",
+        text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
       },
       {
         id: 3,
-        name: "精校润色",
+        name: "精校润色", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
         key: "F3",
-        text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}",
+        text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
       },
       {
         id: 4,
-        name: "人物情节梳理",
+        name: "人物情节梳理", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
         key: "F4",
-        text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}",
+        text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
       },
     ],
     display: "reader",
     style: {
       followReader: false,
-      fontFamily: "仓耳云黑-w03",
+      fontFamily: "仓耳云黑-w03", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
       fontSize: 28,
       lineHeight: 1.65,
       paraSpacing: 0,
@@ -1116,7 +1123,7 @@ p {
     },
     failover: true,
     quickPrompt:
-      "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}",
+      "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
     groupOrder: [...AI_GROUPS],
   },
   tts: {
@@ -1124,7 +1131,7 @@ p {
     services: [
       {
         id: 1,
-        name: "默认语音服务",
+        name: "默认语音服务", // i18n-allow:TTS 服务档名（已持久化进 config.tts.services），禁止翻译
         provider: "openai",
         baseUrl: "http://127.0.0.1:3900",
         apiKey: "",
@@ -1173,35 +1180,35 @@ function builtinSchemes(): ReaderScheme[] {
   const SERIF = "lxgwwenkai-regular";
   const SANS = '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif';
   return [
-    mk("s-paper", "纸质", {
+    mk("s-paper", "纸质", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
       theme: "paper", bgColor: "#FDF5E6", fgColor: "#2c2c2c",
       fontFamily: SERIF, latinFont: "Georgia",
       fontSize: 32, lineHeight: 1.75, paraSpacing: 0.6,
       marginH: 320, maxLineChars: 0, marginV: 80,
       indent: "1em", textAlign: "justify",
     }),
-    mk("s-modern", "现代", {
+    mk("s-modern", "现代", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
       theme: "white", bgColor: "#FAFAF9", fgColor: "#22252A",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.9,
       marginH: 0, maxLineChars: 38, marginV: 72,
       indent: "0em", textAlign: "left",
     }),
-    mk("s-green", "护眼绿", {
+    mk("s-green", "护眼绿", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
       theme: "green", bgColor: "#c7e6c9", fgColor: "#2d3a2d",
       fontFamily: SERIF, latinFont: "Georgia",
       fontSize: 32, lineHeight: 1.8, paraSpacing: 0.6,
       marginH: 320, maxLineChars: 0, marginV: 80,
       indent: "1em", textAlign: "justify",
     }),
-    mk("s-night", "夜间", {
+    mk("s-night", "夜间", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
       theme: "dark", bgColor: "#23262b", fgColor: "#b8bcc2",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
       marginH: 0, maxLineChars: 40, marginV: 72,
       indent: "0em", textAlign: "left",
     }),
-    mk("s-ink", "纯黑", {
+    mk("s-ink", "纯黑", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
       theme: "night", bgColor: "#0f1115", fgColor: "#8a8f96",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
@@ -1481,7 +1488,7 @@ function migrateAi(savedAi: any): AiConfig {
     const pm = savedAi?.proxyMode === "custom" ? "custom" : "auto";
     profiles = normalizeProfiles([
       {
-        name: "默认",
+        name: "默认", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留给尚未迁移的 SettingsModal
         provider: savedAi?.provider ?? "openai",
         baseUrl: savedAi?.baseUrl ?? "",
         apiKey: savedAi?.apiKey ?? "",
@@ -1499,7 +1506,7 @@ function migrateAi(savedAi: any): AiConfig {
   if (savedAi?.promptSummary) prompts[0].text = savedAi.promptSummary;
   if (savedAi?.promptTranslate) prompts[1].text = savedAi.promptTranslate;
   if (savedAi?.action === "custom" && savedAi?.customPrompt) {
-    prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt });
+    prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt }); // i18n-allow:旧版 customPrompt 迁移出来的默认提示词名（用户可编辑的种子数据），保留
   }
   return {
     enabled: !!savedAi?.enabled,
@@ -1552,7 +1559,7 @@ function migrateTts(savedTts: any): TtsConfig {
     const src = savedTts && typeof savedTts === "object" ? savedTts : {};
     const svc = normalizeTtsService({
       id: 1,
-      name: "默认语音服务",
+      name: "默认语音服务", // i18n-allow:TTS 服务档名（已持久化进 config.tts.services），禁止翻译
       provider:
         typeof src.customProvider === "string" && src.customProvider
           ? src.customProvider
@@ -1588,7 +1595,7 @@ function normalizeSchemes(list: any): ReaderScheme[] {
       let id = typeof s.id === "string" && s.id ? s.id : `s-${Math.random().toString(36).slice(2, 9)}`;
       if (seen.has(id)) id = `s-${Math.random().toString(36).slice(2, 9)}`;
       seen.add(id);
-      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案";
+      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案"; // i18n-allow:方案名兜底：该 name 会被持久化到 config.readerSchemes，禁止翻译
       const cfgSrc = s.cfg && typeof s.cfg === "object" ? s.cfg : {};
       const cfg: ReaderConfig = {
         ...structuredClone(DEFAULTS.reader),
@@ -1664,7 +1671,8 @@ function load(): AppConfig {
       uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
       uiSkinDark: resolveSkinId(saved.uiSkinDark, "dark"),
       readerSchemes: normalizeSchemes(saved.readerSchemes),
-      language: typeof saved.language === "string" ? saved.language : "auto",
+      // i18n 接线：只认 auto / zh-CN / en，旧配置里的任意字符串（含早期空串）一律回落 auto。
+      language: normLanguageSetting(saved.language),
       settingsOrder: normSettingsOrder(saved.settingsOrder),
     };
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
@@ -1958,7 +1966,7 @@ export function createReaderScheme(name: string): string {
   const id = `s-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   config.readerSchemes = [
     ...config.readerSchemes,
-    { id, name: name.trim().slice(0, 40) || "未命名方案", cfg: snapshotReader() },
+    { id, name: name.trim().slice(0, 40) || "未命名方案", cfg: snapshotReader() }, // i18n-allow:方案名兜底：该 name 会被持久化到 config.readerSchemes，禁止翻译
   ];
   saveConfig();
   return id;
@@ -2041,7 +2049,7 @@ export function applyConfigJson(json: string) {
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");
     obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
-    obj.language = typeof obj.language === "string" ? obj.language : "auto";
+    obj.language = normLanguageSetting(obj.language);
     obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
     // 跨窗广播/导出的都是「已脱敏 config」，敏感字段均为空。先记下本窗当前密钥，
     // 应用后对传入为空者回填，避免用空值覆盖已回填/待回填的凭据；
@@ -2178,10 +2186,10 @@ function backupStamp(d: Date): string {
  * 非密文配置脱敏。备份不限量，不再清理历史。返回写入的远端路径。
  */
 export async function runSettingsBackup(): Promise<string> {
-  if (settingsBackupRunning) throw new Error("已有备份任务进行中");
+  if (settingsBackupRunning) throw new Error("已有备份任务进行中"); // i18n-allow:备份入口的错误文案；消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
   const wd = config.webdav;
   if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
-    throw new Error("请先填写 WebDAV 地址、账号与密码");
+    throw new Error("请先填写 WebDAV 地址、账号与密码"); // i18n-allow:备份入口的错误文案；消费方 SettingsModal 在本阶段范围外，第三阶段一并迁
   }
   settingsBackupRunning = true;
   try {

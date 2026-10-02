@@ -6,6 +6,7 @@
      跳转类操作通过 Tauri event 广播回主窗（tidepage-goto-chapter / tidepage-goto-highlight）。
      吸附：本窗作为卫星窗 startSnap()，onDestroy 时 stopSnap() 清理监听与吸附组引用。 -->
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { onMount, onDestroy } from "svelte";
   import { api } from "../lib/api";
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -102,17 +103,17 @@
     <TocPanel {toc} current={curChapter} onpick={(i) => gotoChapter(i)} />
   {:else if panel === "bookmarks"}
     <div class="sidepanel">
-      <div class="sp-head"><span>书签{title ? ` · ${title}` : ""}</span></div>
+      <div class="sp-head"><span>{t("reader.bookmarks.title")}{title ? ` · ${title}` : ""}</span></div>
       <div class="sp-list">
         {#each bookmarks as bm (bm.id)}
           <div class="sp-item bm-item">
             <div class="bm-main" onclick={() => gotoChapter(bm.chapter_index)}>
-              <div class="bm-title">{bm.title || "未命名"}</div>
+              <div class="bm-title">{bm.title || t("common.untitled")}</div>
               {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
             </div>
           </div>
         {:else}
-          <div class="sp-empty">暂无书签</div>
+          <div class="sp-empty" data-testid="sp-empty">{t("common.bookmarksEmpty")}</div>
         {/each}
       </div>
     </div>
@@ -123,7 +124,7 @@
   {:else if panel === "notes"}
     <NotesPanel standalone />
   {:else}
-    <div class="pw-empty">未知面板：{panel}</div>
+    <div class="pw-empty">{t("panel.unknown", { kind: panel })}</div>
   {/if}
 </div>
 

@@ -54,7 +54,7 @@ try {
   // 视图按钮 active 状态
   out.steps.viewBtn = await M.evalJs(H(`
     const btns=qa('.view-btn');
-    const grid=btns.find(b=>b.title==='网格视图'), list=btns.find(b=>b.title==='列表视图');
+    const grid=q('[data-testid="lib-view-grid"]'), list=q('[data-testid="lib-view-list"]');
     const before={ grid:grid?.classList.contains('active'), list:list?.classList.contains('active') };
     list?.click(); await sleep(400);
     const after={ grid:grid?.classList.contains('active'), list:list?.classList.contains('active'),
@@ -64,7 +64,7 @@ try {
   log("viewBtn: " + JSON.stringify(out.steps.viewBtn));
 
   // 悬停（真实鼠标）
-  await M.evalJs(H(`qa('.view-btn').find(b=>b.title==='网格视图')?.click(); await sleep(400); return 1;`));
+  await M.evalJs(H(`document.querySelector('[data-testid="lib-view-grid"]')?.click(); await sleep(400); return 1;`));
   const rect = await M.evalJs(H(`const c=q('.card').getBoundingClientRect(); return {x:Math.round(c.left+c.width/2), y:Math.round(c.top+c.height/2)};`));
   const before = await M.evalJs(H(`const c=q('.card'); return { tf:gc(c,'transform'), sh:gc(c,'box-shadow') };`));
   await M.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
@@ -218,7 +219,7 @@
     const div = document.createElement("div");
     div.innerHTML = stripNonTextHtml(html);
     const text = (div.textContent ?? "").replace(/\s+/g, " ").trim();
-    return text.length > limit ? text.slice(0, limit) + "……(后文截断)" : text;
+    return text.length > limit ? text.slice(0, limit) + t("ai.truncated") : text;
   }
 
   function push(role: Msg["role"], content: string): Msg {
@@ -228,14 +229,14 @@
 
   function errKindLabel(kind: string): string {
     switch (kind) {
-      case "network": return "网络错误";
-      case "timeout": return "连接超时";
-      case "http_4xx": return "鉴权/请求错误(4xx)";
-      case "http_5xx": return "服务端错误(5xx)";
-      case "protocol": return "响应协议不匹配";
-      case "model_id": return "模型ID非法";
-      case "config": return "配置不完整";
-      default: return "未知错误";
+      case "network": return t("ai.errKind.network");
+      case "timeout": return t("ai.errKind.timeout");
+      case "http_4xx": return t("ai.errKind.http4xx");
+      case "http_5xx": return t("ai.errKind.http5xx");
+      case "protocol": return t("ai.errKind.protocol");
+      case "model_id": return t("ai.errKind.modelId");
+      case "config": return t("ai.errKind.config");
+      default: return t("ai.errKind.unknown");
     }
   }
 
@@ -269,12 +270,12 @@
 
   async function run(system: string, userText: string) {
     if (streaming) {
-      toast("AI 正在回复中…");
+      toast(t("ai.busy"));
       return;
     }
     const profiles = config.ai.profiles;
     if (!profiles.length) {
-      toast("请先在设置 → AI 配置端点", "error");
+      toast(t("ai.noEndpoint"), "error");
       return;
     }
 
@@ -294,15 +295,15 @@
       const idx = order[a];
       const p = profiles[idx];
       if (!p || !p.baseUrl || !p.model) {
-        failures.push({ name: p?.name || `端点${idx + 1}`, kind: "config", message: "未填写地址或模型" });
+        failures.push({ name: p?.name || t("ai.endpointDefault", { n: idx + 1 }), kind: "config", message: t("ai.noAddrOrModel") });
         continue;
       }
-      const label = p.name || `端点${idx + 1}`;
+      const label = p.name || t("ai.endpointDefault", { n: idx + 1 });
       if (a > 0) {
         const prev = failures[failures.length - 1];
         // 重试前清空上一个端点可能已流式写入的内容，避免拼接错乱
         reply.content = "";
-        toast(`端点「${prev.name}」失败：${errKindLabel(prev.kind)}，已切换至「${label}」重试`);
+        toast(t("ai.failoverToast", { prev: prev.name, kind: errKindLabel(prev.kind), next: label }));
       }
       const id = `s${++sessionSeq}-${Date.now()}`;
       let active = true;
@@ -350,13 +351,13 @@
     }
 
     reply.content = failures.length
-      ? `[全部端点均失败]\n${failures
-          .map((f) => `• 端点「${f.name}」：${errKindLabel(f.kind)}：${f.message}`)
+      ? `${t("ai.allFailedTitle")}\n${failures
+          .map((f) => t("ai.endpointFailedLine", { name: f.name, kind: errKindLabel(f.kind), msg: f.message }))
           .join("\n")}`
-      : "[错误] 没有可用端点";
+      : t("ai.noEndpointAvailable");
     streaming = false;
     scheduleMeasure();
-    toast("全部端点均失败，详见回复内容", "error");
+    toast(t("ai.allFailedToast"), "error");
   }
 
   function renderPrompt(p: PromptItem, limit = 9000): string {
@@ -369,7 +370,7 @@
 
   function firePrompt(p: PromptItem) {
     if (!ctx.html) {
-      toast("等待章节加载…");
+      toast(t("ai.waitChapter"));
       return;
     }
     run(config.ai.system, renderPrompt(p));
@@ -418,6 +419,7 @@
     const q = input.trim();
     if (!q) return;
     input = "";
+    // i18n-allow: AI 提示词正文（用户内容，规则要求永不翻译）
     const context = `当前正在阅读《${ctx.title}》，内容节选：\n${chapterText(ctx.html, 5000)}\n\n我的问题：${q}`;
     run(config.ai.system, context);
   }
@@ -777,32 +779,33 @@ ${readerStyle.extra}
     for (let i = 0; i < msgs.length; i++) {
       const m = msgs[i];
       if (m.role !== "assistant" || !m.content.trim()) continue;
-      let t = "AI 回复";
-      if (i > 0 && msgs[i - 1].role === "user" && ctx.title.includes(" · ")) t += " · " + ctx.title;
-      t += ` (${items.length + 1})`;
-      items.push({ title: t, html: mdToHtml(m.content) });
+      // 局部变量改名 itemTitle：避免与 i18n 的 t() 同名遮蔽
+      let itemTitle = t("ai.replyTitle");
+      if (i > 0 && msgs[i - 1].role === "user" && ctx.title.includes(" · ")) itemTitle += " · " + ctx.title;
+      itemTitle += ` (${items.length + 1})`;
+      items.push({ title: itemTitle, html: mdToHtml(m.content) });
     }
     return items;
   }
 
   async function exportKind(kind: "txt" | "epub") {
     if (streaming) {
-      toast("AI 正在回复中，稍后再导出");
+      toast(t("ai.busyExport"));
       return;
     }
     const items = collectExport();
     if (!items.length) {
-      toast("窗口中还没有 AI 内容", "error");
+      toast(t("ai.emptyWindow"), "error");
       return;
     }
-    const base = (ctx.title || "AI 笔记").replace(/[\\/:*?"<>|]/g, "_");
-    const path = await api.pickSave("导出 AI 内容", kind, `${base}-AI.${kind}`);
+    const base = (ctx.title || t("ai.notesTitle")).replace(/[\\/:*?"<>|]/g, "_");
+    const path = await api.pickSave(t("ai.exportDialogTitle"), kind, `${base}-AI.${kind}`);
     if (!path) return;
     try {
-      await api.exportAi(path, kind, ctx.title || "AI 笔记", "TidePage AI", items);
-      toast(`已导出 ${items.length} 条 AI 内容：${path}`);
+      await api.exportAi(path, kind, ctx.title || t("ai.notesTitle"), "TidePage AI", items);
+      toast(t("ai.exported", { n: items.length, path }));
     } catch (e) {
-      toast(`导出失败：${e}`, "error");
+      toast(t("ai.exportFailed", { err: String(e) }), "error");
     }
   }
 
@@ -811,7 +814,7 @@ ${readerStyle.extra}
     aiPage = 0;
     lastAi = -1;
     scheduleMeasure(true);
-    toast("已清空窗口中的 AI 内容");
+    toast(t("ai.cleared"));
   }
 
   function toggleDisplay() {
@@ -832,9 +835,9 @@ ${readerStyle.extra}
 {#snippet aiHead()}
   <div class="ai-head">
     <div class="ai-head-top" class:sa-head={standalone} data-tauri-drag-region={standalone ? "" : null} bind:clientHeight={saHeadH}>
-      <span class="ai-title">{ctx.title || "AI 助手"}</span>
+      <span class="ai-title">{ctx.title || t("ai.assistantLabel")}</span>
       {#if standalone}
-        <button class="mini" title="停靠回主窗口" onclick={async () => {
+        <button class="mini" data-testid="ai-dock" title={t("ai.dockTip")} onclick={async () => {
           saveAiMode("drawer");
           try {
             await import("@tauri-apps/api/event").then((m) => m.emit("ai-dock", {}));
@@ -845,25 +848,25 @@ ${readerStyle.extra}
           } catch {
             try { window.close(); } catch { /* ignore */ }
           }
-        }}>⇲ 停靠</button>
+        }}>{t("ai.dock")}</button>
       {:else}
         <button class="icon" onclick={() => onclose?.()}>×</button>
       {/if}
     </div>
     <div class="ai-actions">
-      <select class="ep-sel" title="切换端点" bind:value={config.ai.active} onchange={saveConfigNow}>
+      <select class="ep-sel" data-testid="ai-endpoint" title={t("ai.switchEndpoint")} bind:value={config.ai.active} onchange={saveConfigNow}>
         {#each config.ai.profiles as p, i (p.id)}
-          <option value={i}>{p.name || `端点${i + 1}`}</option>
+          <option value={i}>{p.name || t("ai.endpointDefault", { n: i + 1 })}</option>
         {/each}
       </select>
-      <button class="mini" title={isReader ? "切回对话气泡样式" : "切换为阅读样式，像正文一样翻页并隐藏自己的提问"} onclick={toggleDisplay}>
-        {isReader ? "对话样式" : "阅读样式"}
+      <button class="mini" data-testid="ai-display" title={isReader ? t("ai.displayBubbleTip") : t("ai.displayReaderTip")} onclick={toggleDisplay}>
+        {isReader ? t("ai.displayBubble") : t("ai.displayReader")}
       </button>
-      <button class="mini" title="导出 TXT" onclick={() => exportKind("txt")}>TXT</button>
-      <button class="mini" title="导出 EPUB" onclick={() => exportKind("epub")}>EPUB</button>
-      <button class="mini" title="清空本窗口内容" onclick={clearAll}>清空</button>
+      <button class="mini" data-testid="ai-export-txt" title={t("ai.exportTxt")} onclick={() => exportKind("txt")}>TXT</button>
+      <button class="mini" data-testid="ai-export-epub" title={t("ai.exportEpub")} onclick={() => exportKind("epub")}>EPUB</button>
+      <button class="mini" data-testid="ai-clear" title={t("ai.clearTip")} onclick={clearAll}>{t("ai.clear")}</button>
       {#if !standalone}
-        <button class="mini" title="弹出为独立窗口" onclick={popOut}>⧉</button>
+        <button class="mini" data-testid="ai-popout" title={t("common.panel.popout")} onclick={popOut}>⧉</button>
       {/if}
     </div>
   </div>
@@ -877,13 +880,13 @@ ${readerStyle.extra}
         {p.name}<span class="pkey">{p.key}</span>
       </button>
     {/each}
-    <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title="在设置→AI 中切换窗口样式/管理提示词">⚙</button>
+    <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title={t("ai.settingsTip")}>⚙</button>
     {#if showPager}
       <div class="flex-fill"></div>
       <span class="pg-ind">{aiPages > 1 ? `${aiPage + 1}/${aiPages}` : ""}</span>
       {#if aiPages > 1}
-        <button class="mini" onclick={() => aiFlip(-1)} title="上一页 (←)">‹</button>
-        <button class="mini" onclick={() => aiFlip(1)} title="下一页 (→)">›</button>
+        <button class="mini" data-testid="ai-prev-page" onclick={() => aiFlip(-1)} title={t("ai.prevPage")}>‹</button>
+        <button class="mini" data-testid="ai-next-page" onclick={() => aiFlip(1)} title={t("ai.nextPage")}>›</button>
       {/if}
     {/if}
   </div>
@@ -899,11 +902,11 @@ ${readerStyle.extra}
           <div class="ai-page">
             <div class="ai-empty">
               {#if config.ai.enabled}
-                端点：{profile?.name || "未配置"}｜正在阅读：{ctx.title || "—"}<br />
-                点击上方提示词或输入问题，AI 回复将以阅读样式逐页呈现，←/→ 或滚轮翻页。<br />
-                窗口关闭后内容自动清空；可用上方 TXT/ePub 按钮导出。
+                {t("ai.metaLine", { endpoint: profile?.name || t("ai.notConfigured"), title: ctx.title || "—" })}<br />
+                {t("ai.readerStyleHint")}<br />
+                {t("ai.readerExportHint")}
               {:else}
-                AI 未启用，请在设置中开启并配置端点。
+                {t("ai.readerDisabled")}
               {/if}
             </div>
           </div>
@@ -911,22 +914,22 @@ ${readerStyle.extra}
         {#each replyIdxs as [m, gi] (gi)}
           <div class="ai-page ai-reply">
             {#if gi > 0 && msgs[gi - 1].role === "user"}
-              <div class="ai-q-title">问：{qShort(msgs[gi - 1])}</div>
+              <div class="ai-q-title">{t("ai.askLabel")} {qShort(msgs[gi - 1])}</div>
             {/if}
-            <div class="ai-q-title">《{ctx.title || "AI 回复"}》</div>
+            <div class="ai-q-title">{t("ai.bookTitleLine", { title: ctx.title || t("ai.replyTitle") })}</div>
             <div class="ai-mark">{@html m.content ? mdToHtml(m.content) : "<p>…</p>"}</div>
           </div>
         {/each}
       </div>
     </div>
     <div class="ai-footer">
-      <span class="ai-pg-text">{aiPages > 1 ? `第 ${aiPage + 1}/${aiPages} 页` : "AI 阅读进度"}</span>
+      <span class="ai-pg-text" data-testid="ai-page">{aiPages > 1 ? t("ai.pageLabel", { cur: aiPage + 1, total: aiPages }) : t("ai.progressLabel")}</span>
       <div
         class="ai-prog-track"
         class:dragging={aiProgDrag}
         role="slider"
         tabindex="-1"
-        aria-label="翻页进度"
+        aria-label={t("ai.pageProgressAria")}
         aria-valuemin={1}
         aria-valuemax={aiPages}
         aria-valuenow={aiPage + 1}
@@ -940,7 +943,7 @@ ${readerStyle.extra}
             <div
               class="ai-pg-seg"
               class:cur={aiReplyOfPage === gi}
-              title={(gi > 0 && msgs[gi - 1]?.role === "user" ? qShort(msgs[gi - 1]) : "回复 " + (gi + 1))}
+              title={(gi > 0 && msgs[gi - 1]?.role === "user" ? qShort(msgs[gi - 1]) : t("ai.replyNo", { n: gi + 1 }))}
               style={`flex:${segWeight(gi)} 1 0`}
               onclick={(e) => { e.stopPropagation(); followEnd = false; aiPage = segPageOf(gi); applyAiPage(); }}
             ></div>
@@ -953,13 +956,14 @@ ${readerStyle.extra}
     </div>
     <div class="ai-input">
       <input
-        placeholder="向 AI 提问，Enter 发送"
+        data-testid="ai-input"
+        placeholder={t("ai.inputPlaceholderFull")}
         bind:value={input}
         onkeydown={(e) => e.key === "Enter" && send()}
         disabled={streaming}
-        title="结合本章上下文提问"
+        title={t("ai.askWithContextTip")}
       />
-      <button class="primary" onclick={send} disabled={streaming}>发送</button>
+      <button class="primary" data-testid="ai-send" onclick={send} disabled={streaming}>{t("ai.send")}</button>
     </div>
   {:else}
     {@render aiHead()}
@@ -972,23 +976,24 @@ ${readerStyle.extra}
       {:else}
         <div class="ai-empty">
           {#if config.ai.enabled}
-            端点：{profile?.name || "未配置"}｜正在阅读：{ctx.title || "—"}<br />
-            上方提示词可一键执行，默认 F1–F9 快捷键可自定义；打开新章节自动执行第一个提示词；也可直接提问。
+            {t("ai.metaLine", { endpoint: profile?.name || t("ai.notConfigured"), title: ctx.title || "—" })}<br />
+            {t("ai.promptHint")}
           {:else}
-            AI 未启用，请在设置中开启并配置端点。
+            {t("ai.readerDisabled")}
           {/if}
         </div>
       {/each}
     </div>
     <div class="ai-input">
       <input
-        placeholder="向 AI 提问…"
+        data-testid="ai-input"
+        placeholder={t("ai.inputPlaceholder")}
         bind:value={input}
         onkeydown={(e) => e.key === "Enter" && send()}
         disabled={streaming}
-        title="结合本章上下文提问"
+        title={t("ai.askWithContextTip")}
       />
-      <button class="primary" onclick={send} disabled={streaming}>发送</button>
+      <button class="primary" data-testid="ai-send" onclick={send} disabled={streaming}>{t("ai.send")}</button>
     </div>
   {/if}
 </div>

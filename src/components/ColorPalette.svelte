@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
   import { tick } from "svelte";
   import { normalizeColor, parseColor, toHex, toRgbString } from "../lib/color";
   import { portal } from "../lib/portal";
@@ -6,7 +7,7 @@
   let {
     colors = $bindable([] as string[]),
     value = "",
-    applyLabel = "应用",
+    applyLabel = undefined,
     onapply,
     onpalette,
   }: {
@@ -118,7 +119,8 @@
       class:active={activeHex && activeHex === normalizeColor(c)}
       data-ci={i}
       style="background:{c};"
-      title="左键选用此颜色 · 右键修改/删除"
+      data-testid="cpal-swatch"
+      title={t("palette.tip")}
       onclick={() => onapply(c)}
       oncontextmenu={(e) => { e.preventDefault(); openEditor(i); }}
     ></button>
@@ -126,10 +128,11 @@
   <button
     type="button"
     class="cp-add"
-    title="新增颜色"
+    data-testid="cpal-add"
+    title={t("palette.add")}
     onclick={addColor}
     oncontextmenu={(e) => e.preventDefault()}
-  >＋</button>
+  >{t("palette.addGlyph")}</button>
 
   {#if editIdx >= 0}
     <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{popPos.x}px; top:{popPos.y}px;">
@@ -142,7 +145,7 @@
         <input bind:value={rgbText} oninput={onRgb} placeholder="rgb(255, 0, 0)" spellcheck="false" />
       </div>
       <div class="cp-row">
-        <label>取色</label>
+        <label>{t("common.color.pick")}</label>
         <input
           type="color"
           class="cp-native"
@@ -151,9 +154,9 @@
         />
       </div>
       <div class="cp-acts">
-        <button type="button" class="danger" onclick={removeColor} title="从调色板删除此颜色">删除</button>
+        <button type="button" class="danger" data-testid="cpal-del" onclick={removeColor} title={t("palette.deleteTip")}>{t("common.action.delete")}</button>
         <span class="flex1"></span>
-        <button type="button" class="primary" onclick={apply}>{applyLabel}</button>
+        <button type="button" class="primary" data-testid="cpal-apply" onclick={apply}>{applyLabel ?? t("common.action.apply")}</button>
       </div>
     </div>
   {/if}
