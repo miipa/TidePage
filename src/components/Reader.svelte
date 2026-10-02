@@ -2780,9 +2780,8 @@
     // 开发期调试钩子：便于自动化验证搜索框/笔记交互（仅 DEV 构建，release 不含）。
     if (import.meta.env.DEV) {
       (window as any).__frDebug = {
-        // i18n-allow: 全文搜索的默认关键词（用户输入框的初值，不是界面文案）
-    // i18n-allow: 全文搜索输入框的默认关键词（用户输入初值，不是界面文案）
-    openSearch: (q = "的") => {
+        // i18n-allow:用户内容：全文搜索输入框的默认关键词，是用户输入的初值而非界面文案。
+        openSearch: (q = "的") => {
           searchPopup = { query: q, anchor: { top: 120, bottom: 121, cx: window.innerWidth / 2 } };
         },
         /** 打开某条划线的菜单（H1：删除/添加感想）。 */
@@ -2994,13 +2993,13 @@
 `;
     // 漫画两种布局的图片规则统一在组件样式区的 .manga-h-* / .manga-flow-* 中定义
     // （固定视口层承载边距 + 内容变形层平移/滚动），不再依赖会随 transform 移动的 #chapter-content padding。
-    const hideTextRule = isMangaMode() && r.manga.hideText // i18n-allow:下面模板里带中文的是注入样式表的 CSS 注释（随 CSS 文本进样式块，不是界面文案）
+    const hideTextRule = isMangaMode() && r.manga.hideText // i18n-allow:算法输入：下面模板里带中文的是注入样式表的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
       ? `
 /* 漫画模式「仅图片」：隐藏不含图片的文本块 */
 .reader.manga #chapter-content :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
 `
       : "";
-    // i18n-allow:注入样式表里的 CSS 注释（随 CSS 文本进样式块，不是界面文案）
+    // i18n-allow:算法输入：注入样式表里的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
     return `
 ${overrideRule}
 ${imgRules}
@@ -3387,8 +3386,7 @@ ${effCssExtra() || ""}
   }
 
   async function hlDelete(h: HighlightRow) {
-    // i18n-allow:历史未迁移的界面文案（Reader 划线确认框，本轮 i18n 收尾范围只在设置分区，尚未接线）
-    const ok = await appConfirm(`删除这条划线？\n${h.text.slice(0, 60)}`);
+    const ok = await appConfirm(t("reader.confirm.hlDelete", { text: h.text.slice(0, 60) }));
     if (!ok) return;
     try {
       await api.deleteHighlight(h.id);
@@ -3505,7 +3503,7 @@ ${effCssExtra() || ""}
         note: "",
       });
     } catch (e) {
-      toast(`创建划线失败：${e}`, "error"); // i18n-allow:历史未迁移的界面文案（Reader 划线失败 toast，本轮范围外）
+      toast(t("reader.toast.hlCreateFailed", { err: String(e) }), "error");
       return false;
     }
     // 本地先插入（note 空），便于回滚时精确移除
@@ -3537,13 +3535,13 @@ ${effCssExtra() || ""}
         hlVersion++;
         await tick();
         paintNow();
-        toast(`写入感想失败，已回滚新建划线：${e}`, "error"); // i18n-allow:历史未迁移的界面文案（Reader 划线失败 toast，本轮范围外）
+        toast(t("reader.toast.noteRollbackFailed", { err: String(e) }), "error");
       } else {
         // 服务端未删成功 → 保留本地行（note 空，与服务端一致），如实提示可能残留
         hlVersion++;
         await tick();
         paintNow();
-        toast(`写入感想失败，且划线可能残留（自动删除未成功），请在划线面板手动删除`, "error"); // i18n-allow:历史未迁移的界面文案（Reader 划线失败 toast，本轮范围外）
+        toast(t("reader.toast.noteResidual"), "error");
       }
       return false;
     }
@@ -4017,18 +4015,17 @@ ${effCssExtra() || ""}
         return book.book.title || "";
       case "chapterName":
         return chapter?.title || "";
-      // 以下 5 条是历史未迁移的界面文案（阅读器状态栏数值，本轮 i18n 收尾范围只在设置分区，尚未接线）
       case "chapterIndex":
-        return `第${chapterNum + 1}章`; // i18n-allow:历史未迁移的界面文案（状态栏数值，本轮范围外）
+        return t("common.chapterN", { n: chapterNum + 1 });
       case "chapterCount":
-        return `共${book.toc.length}章`; // i18n-allow:历史未迁移的界面文案（状态栏数值，本轮范围外）
+        return t("reader.status.chaptersTotal", { n: book.toc.length });
       case "chapterPages":
         return !scrollLayout() && !mangaHorizontal()
-          ? `${page + 1}/${pageCount}页` // i18n-allow:历史未迁移的界面文案（状态栏数值，本轮范围外）
+          ? t("reader.status.pageOf", { p: page + 1, n: pageCount })
           : `${Math.round(currentRatio() * 100)}%`;
       case "bookPages": {
         const tp = estTotalPages();
-        return tp ? `共约${tp}页` : ""; // i18n-allow:历史未迁移的界面文案（状态栏数值，本轮范围外）
+        return tp ? t("reader.status.pagesEst", { n: tp }) : "";
       }
       case "pagePercent":
         return `${Math.round(currentRatio() * 100)}%`;
@@ -4036,7 +4033,7 @@ ${effCssExtra() || ""}
         return `${totalPct().toFixed(1)}%`;
       case "chars": {
         const n = book.toc[chapterNum]?.chars || 0;
-        return n ? `${n}字` : ""; // i18n-allow:历史未迁移的界面文案（状态栏数值，本轮范围外）
+        return n ? t("common.unit.charsN", { n }) : "";
       }
       case "clock": {
         const d = new Date(nowTs);

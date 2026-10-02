@@ -419,7 +419,7 @@
     const q = input.trim();
     if (!q) return;
     input = "";
-    // i18n-allow: AI 提示词正文（用户内容，规则要求永不翻译）
+    // i18n-allow: 用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
     const context = `当前正在阅读《${ctx.title}》，内容节选：\n${chapterText(ctx.html, 5000)}\n\n我的问题：${q}`;
     run(config.ai.system, context);
   }

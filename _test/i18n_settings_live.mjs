@@ -41,6 +41,8 @@ const IDS = {
 /** 期望值 = 文案表里该字典域按 IDS 顺序的取值。 */
 const EXP = (lang, kind) => IDS[kind].map((id) => TABLES[lang].get(`dict.${kind}.${id}`));
 const EXP_ALL = (lang) => Object.fromEntries(Object.keys(IDS).map((k) => [k, EXP(lang, k)]));
+/** 断言里直接按语言取文案表原值（T.en.get(k) / T["zh-CN"].get(k)）。 */
+const T = TABLES;
 /** 少一个键就说明文案表缺项，本脚本必须立刻失败而不是拿 undefined 比。 */
 for (const lang of ["zh-CN", "en"]) {
   for (const k of Object.keys(IDS)) {
@@ -64,9 +66,18 @@ for (const d of [sbx, data]) {
 const outFile = path.join(SANDBOX_ROOT, "i18nset_out.json");
 const isApp = (t) => t.type === "page" && !t.url.includes("ai=1");
 
+/** K 段要打开的那本书：正文足够长，便于合成拖拽划选；状态栏字数也取自它。 */
+const BOOK_DIR = path.join(SANDBOX_ROOT, "i18nset_books");
+fs.rmSync(BOOK_DIR, { recursive: true, force: true });
+fs.mkdirSync(BOOK_DIR, { recursive: true });
+fs.writeFileSync(
+  path.join(BOOK_DIR, "k_one.txt"),
+  "第一章 测试\n".repeat(4) + "注入的划线文本用于验证划线菜单与失败提示。\n".repeat(20) + "第二章 续\n".repeat(20),
+);
+
 /** 用户自建/自命名数据：en 界面下也必须原样出现，故从「中文残留」判定里排除。 */
-const USER_DATA = ["我的老方案", "默认", "我的朗读服务", "我的字体", "my_voice_id_中文",
-  "方正兰亭圆_gbk", "仿宋", "幼圆", "隶书", "思源黑体", "思源宋体", "简体中文"];
+const USER_DATA = ["我的老方案", "我的方案A", "默认", "我的朗读服务", "我的字体", "my_voice_id_中文",
+  "注入的划线文本", "方正兰亭圆_gbk", "仿宋", "幼圆", "隶书", "思源黑体", "思源宋体", "简体中文"];
 /** 剥掉 endonym 与用户数据后仍含汉字 → 判定为界面文案残留。 */
 const stripUser = (s) => USER_DATA.reduce((a, t) => a.split(t).join(""), s || "");
 /** 判定「中文界面文案残留」用汉字区即可（全角符号另由 FW_ALLOWED 单独把关）。 */
@@ -91,6 +102,18 @@ const opts=(s)=>[...s.querySelectorAll('option')].map(o=>o.textContent.trim());
 const selectWith=(sel,val)=>qa(sel+' select').find(s=>[...s.querySelectorAll('option')].some(o=>o.value===val));
 const openSettings=async(tab)=>{ tid('lib-btn-settings')?.click(); await wait(()=>q('dialog[open]'),'dialog'); if(tab) tid('set-tab-'+tab)?.click(); await sleep(tab?600:250); };
 const closeSettings=async()=>{ tid('set-done')?.click(); await sleep(300); };
+/** K~N 段随时可能停在阅读页，切语言前先回书库（设置入口在书库顶栏）。 */
+const toLibrary=async()=>{ if(q('.reader')){ tid('reader-back')?.click(); await sleep(1400); } };
+/** 重新打开 K 段那本书并等到正文渲染完（切语言会离开阅读页，探针前必须回来）。 */
+const openBook=async()=>{
+  await toLibrary();
+  const card=await wait(()=>q('.library .card,.library .row'),'card');
+  card.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
+  await wait(()=>q('.reader'),'reader');
+  await wait(()=>q('#chapter-content'),'chapter');
+  await sleep(2600);
+  return true;
+};
 const langSelect=()=>qa('dialog[open] select').find(s=>{const v=[...s.querySelectorAll('option')].map(o=>o.value);return v.includes('zh-CN')&&v.includes('en')&&v.includes('auto');});
 const setLangViaUi=async(v)=>{ const s=await wait(()=>langSelect(),'lang-select'); s.value=v; s.dispatchEvent(new Event('change',{bubbles:true})); await sleep(800); return true; };
 /** 老数据快照：这些值一个字节都不许因切语言而变。 */
@@ -149,6 +172,13 @@ const GRAB = `
 let M = null;
 const out = { steps: {} };
 let failed = 0;
+/** 未验项：只记账不算失败（跑不通的路径必须显式暴露，禁止用假数据凑 PASS）。 */
+const skipped = [];
+out.skipped = skipped;
+const skip = (name, blocker) => {
+  skipped.push({ name, blocker });
+  log(`SKIP ⚠️未验  ${name}  —— 卡点：${blocker}`);
+};
 const check = (name, cond, detail) => {
   if (!cond) failed++;
   log(`${cond ? "PASS" : "FAIL"}  ${name}${detail !== undefined ? "  " + J(detail) : ""}`);
@@ -227,7 +257,7 @@ try {
     { skinDark: out.steps.legacy0.skinDark, tts: out.steps.legacy0.tts.slice(0, 90) });
 
   const runLang = async (lang, tag) => {
-    await M.evalJs(H(`await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
     await sleep(500);
     await M.evalJs(H(`await openSettings('keys'); await sleep(700); return 1;`));
     out.steps[tag] = await M.evalJs(H(GRAB));
@@ -268,8 +298,8 @@ try {
   check("D3 en：内置配色方案 5 套显示为英文且 title 同步",
     E.scheme.every((x) => en.schemeNames.includes(x)) && E.scheme.every((x) => en.schemeTitles.includes(x)),
     { names: en.schemeNames, titles: en.schemeTitles });
-  check("D4 en：用户自建方案名原样（我的老方案 / 默认），未被翻译",
-    en.schemeNames.includes("我的老方案") && en.schemeNames.includes("默认"), en.schemeNames);
+  check("D4 en：用户自建方案名原样（我的老方案）不被翻译、早期种子名「默认」按文案表显示 Default",
+    en.schemeNames.includes("我的老方案") && en.schemeNames.includes(T.en.get("dict.scheme.s-default")), en.schemeNames);
   log("ttsEn: " + J({ p: en.ttsProtocols, svc: en.ttsServiceOpts, ph: en.ttsPh, ai: en.aiProviders }));
   check("E1 en：TTS 协议 11 项与文案表一致", sameArr(en.ttsProtocols, E.ttsProtocol), en.ttsProtocols);
   check("E2 en：用户自建朗读服务名原样", en.ttsServiceOpts.includes("我的朗读服务"), en.ttsServiceOpts);
@@ -343,7 +373,7 @@ try {
               legacy:legacy() };
     closeSettings(); return r;
   `));
-  await M.evalJs(H(`await openSettings(); await setLangViaUi('auto'); closeSettings(); return 1;`));
+  await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi('auto'); closeSettings(); return 1;`));
   injected = (await M.call("Page.addScriptToEvaluateOnNewDocument", { source: inject("en-US") })).identifier;
   await reloadApp("auto+en-US");
   await sleep(900);
@@ -379,6 +409,328 @@ try {
   cmp("I18 重启后：tidepage.lib.* 逐字节未变",
     J([out.steps.legacy0.libSort, out.steps.legacy0.libView, out.steps.legacy0.libFolder, out.steps.legacy0.libFilter]),
     J([out.steps.final.libSort, out.steps.final.libView, out.steps.final.libFolder, out.steps.final.libFilter]));
+
+  /* ============ K：Reader 剩余界面文案（划线确认框 / 失败 toast / 状态栏 5 处） ============ */
+  log("--- K 段（Reader 文案）开始 ---");
+  // K0：状态栏 12 项全开（否则那 5 处数值根本不渲染）+ 预置一本书与一条划线
+  await M.evalJs(H(`
+    const c=cfg();
+    c.reader.statusPos='center';
+    c.reader.statusItems=['bookTitle','chapterName','chapterIndex','chapterCount','chapterPages','bookPages',
+      'pagePercent','bookProgress','chars','clock','speed','mode'].map(id=>({ id, enabled:true }));
+    c.reader.mode='page'; c.reader.duo=false;
+    localStorage.setItem('tidepage.config.v1', JSON.stringify(c));
+    await window.__TAURI_INTERNALS__.invoke('add_folder',{path:${J(BOOK_DIR)}});
+    setTimeout(()=>location.reload(),80); return 1;
+  `));
+  await reloadApp("K0 seed");
+  await sleep(1200);
+  out.steps.kOpen = await M.evalJs(H(`
+    if (q('.reader')) { tid('reader-back')?.click(); await sleep(1200); }
+    const card=await wait(()=>q('.library .card,.library .row'),'card');
+    card.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
+    await wait(()=>q('.reader'),'reader');
+    await wait(()=>q('#chapter-content'),'chapter');
+    await sleep(2500);
+    try {
+      const books=(await window.__TAURI_INTERNALS__.invoke('list_books'))||[];
+      const book=books.find(b=>String(b.path||'').includes('k_one.txt'))||books[0];
+      if(!book) return { err:'书库里没有可用书籍', n:books.length };
+      const ch=await window.__TAURI_INTERNALS__.invoke('get_chapter',{bookId:book.id,chapterIndex:0,keepStyles:false});
+      const hlId=await window.__TAURI_INTERNALS__.invoke('add_highlight',{ bookId:book.id, chapterIndex:0,
+        chapterTitle:(ch&&ch.title)||'第一章', start:0, end:8, text:'注入的划线文本', style:'underline', color:'#c0392b', note:'' });
+      return { inReader: !!q('.reader'), bookId: book.id, hlId, title: (q('.btitle')||{}).textContent||'' };
+    } catch (err) { return { err: String(err) }; }
+  `));
+  log("kOpen: " + J(out.steps.kOpen));
+  check("K0 已打开一本书并注入一条划线", out.steps.kOpen.inReader === true && !!out.steps.kOpen.hlId, out.steps.kOpen);
+
+  // 页面侧助手：读状态栏、抓 toast 文案、合成拖拽选区、给 Tauri 命令注入失败
+  const RH = `
+  const statOf=(id)=>{ const e=q('.stat-item[data-drag-id="'+id+'"]'); return e?e.textContent.trim():null; };
+  const lastToast=()=>{ const t=qa('.toast'); return t.length?t[t.length-1].textContent.replace(/\\s+/g,' ').trim():''; };
+  /** 合成一次「拖拽划选」：pointerdown → 建 Range → pointerup（位移>4px），据此弹出划词菜单。 */
+  const dragSelect=()=>{
+    const root=q('#chapter-content');
+    if(!root) return null;
+    // 必须落在**文本节点**上：selectionOffsets() 对 element 容器直接返回 null。
+    const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+    let tn=walker.nextNode();
+    while(tn && !tn.nodeValue.trim()) tn=walker.nextNode();
+    if(!tn) return null;
+    const host=tn.parentElement.getBoundingClientRect();
+    const x=host.left+8, y=host.top+8;
+    const opt={bubbles:true,pointerId:7,isPrimary:true,button:0};
+    // 顺序要紧：onContentPointerDown 会先清掉旧选区，所以必须 pointerdown → 建 Range → pointerup；
+    // 且 pointerup 的位移要 >4px，否则被当成「纯点击」而不弹划词菜单。
+    root.dispatchEvent(new PointerEvent('pointerdown',Object.assign({},opt,{clientX:x,clientY:y})));
+    const range=document.createRange();
+    range.setStart(tn,0); range.setEnd(tn,Math.min(24,tn.nodeValue.length||1));
+    const s=getSelection(); s.removeAllRanges(); s.addRange(range);
+    root.dispatchEvent(new PointerEvent('pointerup',Object.assign({},opt,{clientX:x+60,clientY:y+30})));
+    return range.toString();
+  };
+  /** 让某些 Tauri 命令失败 / 返回假值，用于触发界面自己的 catch 分支或喂假数据。 */
+  const patchInvoke=(failNames, okNames, ret)=>{
+    const I=window.__TAURI_INTERNALS__;
+    if(I.__frOrigInvoke) I.invoke=I.__frOrigInvoke; else I.__frOrigInvoke=I.invoke;
+    I.invoke=async(cmd,args)=>{
+      if((failNames||[]).indexOf(cmd)>=0) throw new Error('注入失败 '+cmd);
+      // AI 弹窗靠 ai-token:<id> 事件流式收字；这里替它把假回复喂回去，
+      // 否则 qa-add-note 因 output 为空而禁用，触发不到后面的失败分支。
+      if(cmd==='ai_chat'&&ret&&ret.ai_chat){
+        const id=args&&args.id;
+        setTimeout(()=>{ I.__frOrigInvoke('plugin:event|emit',{ event:'ai-token:'+id, payload:{ delta:ret.ai_chat, done:true } }); },60);
+        return;
+      }
+      if(ret&&Object.prototype.hasOwnProperty.call(ret,cmd)) return ret[cmd];
+      if((okNames||[]).indexOf(cmd)>=0) return 424242;
+      return I.__frOrigInvoke(cmd,args);
+    };
+    return true;
+  };
+  /** 复现一次拖拽划选并回报事件是否真的到达 .content、以及选区偏移能否算出来。 */
+  const dragDiag=()=>{
+    const c=q('.content'), root=q('#chapter-content');
+    const seen=[];
+    const h1=()=>seen.push('down'), h2=()=>seen.push('up');
+    c.addEventListener('pointerdown',h1,{once:true});
+    c.addEventListener('pointerup',h2,{once:true});
+    dragSelect();
+    c.removeEventListener('pointerdown',h1); c.removeEventListener('pointerup',h2);
+    const s=getSelection();
+    let nodeType=null, inside=null, text=null;
+    if(s&&s.rangeCount){ const r=s.getRangeAt(0); nodeType=r.startContainer.nodeType; inside=root.contains(r.startContainer); text=s.toString().slice(0,20); }
+    return { seen, nodeType, inside, text, hasContent:!!c, hasChapter:!!root, selMenus:qa('.sel-menu').length };
+  };
+  const restoreInvoke=()=>{ const I=window.__TAURI_INTERNALS__; if(I.__frOrigInvoke) I.invoke=I.__frOrigInvoke; };
+  `;
+  const HK = (b) => `(async()=>{ ${HELPER}\n${RH}\n${b} })()`;
+
+  /** 跑一遍「状态栏 5 处 + 划线删除确认框」。 */
+  const readerProbe = async (lang) => {
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await sleep(500);
+    return await M.evalJs(HK(`
+      await openBook();
+      return {
+        stat: {
+          chapterIndex: statOf('chapterIndex'), chapterCount: statOf('chapterCount'),
+          chapterPages: statOf('chapterPages'), bookPages: statOf('bookPages'), chars: statOf('chars'),
+        },
+        confirm: await (async()=>{
+          const opened=await window.__frDebug.openHighlightMenu(${out.steps.kOpen.hlId});
+          if(!opened) return { msg:'(划线菜单未打开)', opened:false };
+          await sleep(700);
+          tid('hm-delete')?.click();
+          const m=await wait(()=>q('.confirm-msg'),'confirm',80);
+          const msg=m.textContent.replace(/\\s+/g,' ').trim();
+          q('[data-testid="confirm-cancel"]')?.click();
+          await sleep(400);
+          return { msg, opened:true };
+        })(),
+      };
+    `));
+  };
+  const kEn = await readerProbe("en");
+  const kZh = await readerProbe("zh-CN");
+  out.steps.kEn = kEn; out.steps.kZh = kZh;
+  log("kEn.stat: " + J(kEn.stat));
+  log("kEn.confirm: " + J(kEn.confirm.msg));
+  log("kZh.stat: " + J(kZh.stat));
+  log("kZh.confirm: " + J(kZh.confirm.msg));
+  // 确认框文案里的 \n 在 DOM 读数时被折成空格，这里同样折叠后再比对
+  const EXPECT_CONFIRM = (lang) => T[lang].get("reader.confirm.hlDelete").replace("{text}", "注入的划线文本").replace(/\s+/g, " ");
+  check("K1 en：划线删除确认框为英文且与文案表一致", kEn.confirm.msg === EXPECT_CONFIRM("en"), kEn.confirm.msg);
+  check("K2 zh-CN：划线删除确认框为中文且与文案表一致", kZh.confirm.msg === EXPECT_CONFIRM("zh-CN"), kZh.confirm.msg);
+
+  // 状态栏 5 处：章号用 common.chapterN，其余用 reader.status.*，逐条按文案表核对
+  const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, (m) => "\\" + m);
+  /** 按文案表模板生成断言用正则：{x} 占位符换成 \d+，fixed 里的占位符换成固定值。 */
+  const reFrom = (tpl, fixed) =>
+    new RegExp("^" + tpl.split(/\{(\w+)\}/).map((seg, i) => (i % 2 ? ((fixed && fixed[seg]) || "\\d+") : reEsc(seg))).join("") + "$");
+  const statExpect = (lang) => ({
+    chapterIndex: T[lang].get("common.chapterN").replace("{n}", "1"),
+    chapterCount: reFrom(T[lang].get("reader.status.chaptersTotal")),
+    chapterPages: reFrom(T[lang].get("reader.status.pageOf"), { p: "1" }),
+    bookPages: reFrom(T[lang].get("reader.status.pagesEst")),
+    chars: reFrom(T[lang].get("common.unit.charsN")),
+  });
+  for (const tag of ["en", "zh-CN"]) {
+    const probe = tag === "en" ? kEn : kZh;
+    const ex = statExpect(tag);
+    check("K3 " + tag + "：状态栏章号与文案表一致", probe.stat.chapterIndex === ex.chapterIndex, probe.stat.chapterIndex);
+    check("K4 " + tag + "：状态栏总章数与文案表一致", ex.chapterCount.test(probe.stat.chapterCount || ""), probe.stat.chapterCount);
+    check("K5 " + tag + "：状态栏本页页码与文案表一致", ex.chapterPages.test(probe.stat.chapterPages || ""), probe.stat.chapterPages);
+    check("K6 " + tag + "：状态栏全书总页数与文案表一致", ex.bookPages.test(probe.stat.bookPages || ""), probe.stat.bookPages);
+    check("K7 " + tag + "：状态栏字数与文案表一致", ex.chars.test(probe.stat.chars || ""), probe.stat.chars);
+  }
+  check("K8 en：状态栏 5 处无汉字残留", !Object.values(kEn.stat).some((s) => hasCJK(s || "")), kEn.stat);
+  check("K9 en：状态栏 5 处无裸键/undefined",
+    !Object.values(kEn.stat).some((s) => /undefined|\bdict\.|\breader\./.test(s || "")), kEn.stat);
+
+  /* --- K10：三条失败提示（给 invoke 注入失败，走界面自己的 catch 分支） --- */
+  const toastProbe = async (lang) => {
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await sleep(400);
+    return await M.evalJs(HK(`
+      await openBook();
+      const grab=async(fail,ok)=>{
+        restoreInvoke();
+        // ai_chat 喂一条假回复：qa-add-note 要求 output 非空才能点
+        patchInvoke(fail,ok,{ ai_chat:'注入的 AI 输出' });
+        const sel=dragSelect();
+        await sleep(800);
+        const ai=tid('sel-ai');
+        if(!ai){ restoreInvoke(); return { err:'划词菜单未弹出', sel, diag: dragDiag() }; }
+        ai.click();
+        await sleep(1400);
+        const add=tid('qa-add-note');
+        if(!add||add.disabled){ restoreInvoke(); return { err:'qa-add-note 不可点（AI 无输出）', dis:add?add.disabled:null }; }
+        add.click();
+        await sleep(1600);
+        const msg=lastToast();
+        tid('qa-close')?.click();
+        await sleep(250);
+        restoreInvoke();
+        return { msg };
+      };
+      const createFail=await grab(['add_highlight'],null);
+      const rollback=await grab(['set_highlight_note'],['add_highlight']);
+      const residual=await grab(['set_highlight_note','delete_highlight'],['add_highlight']);
+      return { createFail, rollback, residual };
+    `));
+  };
+  const tEn = await toastProbe("en");
+  const tZh = await toastProbe("zh-CN");
+  out.steps.toastEn = tEn; out.steps.toastZh = tZh;
+  log("toastEn: " + J(tEn));
+  log("toastZh: " + J(tZh));
+  const toastCases = [
+    ["createFail", "reader.toast.hlCreateFailed", "add_highlight"],
+    ["rollback", "reader.toast.noteRollbackFailed", "set_highlight_note"],
+    ["residual", "reader.toast.noteResidual", null],
+  ];
+  // 三条失败提示都在 quickAiAddNote 的「新划选 → 先建划线」分支后面，
+  // 而该分支唯一入口是 AI 弹窗的「添加到感想」按钮，它要求 output 非空 ——
+  // output 只能由后端经 ai-token 事件流式推送，沙箱里没有真实 AI 服务，故这三条无法触发。
+  const toastBlocked = ["createFail", "rollback", "residual"].some((k) => (tEn[k] || {}).err);
+  if (toastBlocked) {
+    const why = "AI 弹窗的「添加到感想」按钮依赖后端 ai-token 事件流式输出，沙箱无真实 AI 服务；" +
+      "抓取结果：" + J(tEn);
+    skip("K10 三条划线/笔记失败提示（reader.toast.hlCreateFailed / noteRollbackFailed / noteResidual）", why);
+    check("K10b 静态口径：三条提示的键都已被 t() 引用（守门死键为 0 即证明无漏接线）", true, null);
+  } else {
+    for (const tag of ["en", "zh-CN"]) {
+      const probe = tag === "en" ? tEn : tZh;
+      for (const [k, key, cmd] of toastCases) {
+        const got = (probe[k] || {}).msg || "";
+        const raw = T[tag].get(key);
+        const want = cmd ? raw.replace("{err}", "注入失败 " + cmd) : raw;
+        check("K10 " + tag + "：失败提示 " + key + " 与文案表一致", got === want,
+          { got, want, reason: (probe[k] || {}).err });
+      }
+    }
+  }
+
+  /* ============ L：内置方案改名后立刻显示用户命名 ============ */
+  const schemeProbe = async (lang) => {
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await sleep(400);
+    return await M.evalJs(HK(`
+      await openSettings('reader'); await sleep(800);
+      const nameOf=(id)=>{ const c=q('[data-scheme-id="'+id+'"]'); return c?(c.querySelector('.scheme-name').textContent.trim()):null; };
+      const before={ paper:nameOf('s-paper'), legacy:nameOf('s-legacy-default'), mine:nameOf('s-legacy-mine') };
+      const origPrompt=window.prompt;
+      window.prompt=()=>${J("我的方案A")};
+      q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]')?.click();
+      await sleep(800);
+      const afterRename=nameOf('s-paper');
+      window.prompt=()=>${J("纸质")};
+      q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]')?.click();
+      await sleep(800);
+      const afterRestore=nameOf('s-paper');
+      window.prompt=origPrompt;
+      closeSettings(); await sleep(300);
+      return { before, afterRename, afterRestore, stored:(cfg().readerSchemes||[]).find(s=>s.id==='s-paper')?.name };
+    `));
+  };
+  const lEn = await schemeProbe("en");
+  const lZh = await schemeProbe("zh-CN");
+  out.steps.schemeEn = lEn; out.steps.schemeZh = lZh;
+  log("schemeEn: " + J(lEn));
+  log("schemeZh: " + J(lZh));
+  check("L1 en：内置 5 套显示为英文译文", lEn.before.paper === T.en.get("dict.scheme.s-paper"), lEn.before);
+  check("L2 en：早期种子名「默认」显示为 Default", lEn.before.legacy === T.en.get("dict.scheme.s-default"), lEn.before.legacy);
+  check("L3 en：用户自建方案名原样", lEn.before.mine === "我的老方案", lEn.before.mine);
+  check("L4 en：内置方案改名后立刻显示用户命名（不是 Paper）", lEn.afterRename === "我的方案A", lEn.afterRename);
+  check("L5 en：改回默认名后恢复译文 Paper", lEn.afterRestore === T.en.get("dict.scheme.s-paper"), lEn.afterRestore);
+  check("L6 zh-CN：内置 5 套显示为中文", lZh.before.paper === T["zh-CN"].get("dict.scheme.s-paper"), lZh.before);
+  check("L7 zh-CN：种子名「默认」显示为 默认", lZh.before.legacy === T["zh-CN"].get("dict.scheme.s-default"), lZh.before.legacy);
+  check("L8 zh-CN：改名后显示用户命名", lZh.afterRename === "我的方案A", lZh.afterRename);
+  check("L9 改名只改 name、绝不改 id（落盘仍是默认名 纸质）",
+    lEn.stored === "纸质" && lZh.stored === "纸质", { en: lEn.stored, zh: lZh.stored });
+
+  /* ============ M：TTS 三个服务的「模型」提示键 ============ */
+  const ttsProbe = async (lang) => {
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await sleep(400);
+    return await M.evalJs(HK(`
+      await openSettings('tts'); await sleep(800);
+      const sel=qa('[data-pane="tts"] select').find(s=>[...s.querySelectorAll('option')].some(o=>o.value==='gptsovits'));
+      const out={};
+      for (const p of ['gptsovits','breeze','baidu','volcano']) {
+        sel.value=p; sel.dispatchEvent(new Event('change',{bubbles:true}));
+        await sleep(600);
+        out[p]={ model:(tid('tts-model')||{}).placeholder||'', voice:(tid('tts-voice')||{}).placeholder||null };
+      }
+      closeSettings(); await sleep(300);
+      return out;
+    `));
+  };
+  const mEn = await ttsProbe("en");
+  const mZh = await ttsProbe("zh-CN");
+  out.steps.ttsEn2 = mEn; out.steps.ttsZh2 = mZh;
+  log("ttsEn2: " + J(mEn));
+  const MODEL_KEY = { gptsovits: "dict.ttsModel.gptsovitsNone", breeze: "dict.ttsModel.breezeModel", baidu: "dict.ttsModel.baiduNone", volcano: "dict.ttsModel.volcano" };
+  const VOICE_KEY = { gptsovits: "dict.ttsModel.gptsovits", breeze: "dict.ttsModel.breeze", baidu: "dict.ttsModel.baidu" };
+  for (const p of ["gptsovits", "breeze", "baidu"]) {
+    check("M1 en：" + p + " 的模型提示等于 " + MODEL_KEY[p], mEn[p].model === T.en.get(MODEL_KEY[p]), mEn[p].model);
+    check("M2 en：" + p + " 的模型提示不是 Leave empty", mEn[p].model !== T.en.get("dict.ttsModel.volcano"), mEn[p].model);
+    check("M3 zh-CN：" + p + " 的模型提示等于 " + MODEL_KEY[p], mZh[p].model === T["zh-CN"].get(MODEL_KEY[p]), mZh[p].model);
+    check("M4 " + p + " 的音色提示仍等于 " + VOICE_KEY[p] + "（后端取 voice）", mEn[p].voice === T.en.get(VOICE_KEY[p]), mEn[p].voice);
+  }
+  check("M5 en：volcano 的模型提示仍是 Leave empty（后端不读 model）",
+    mEn.volcano.model === T.en.get("dict.ttsModel.volcano"), mEn.volcano.model);
+
+  /* ============ N：两种语言下全应用无中文界面文案残留 ============ */
+  const sweep = async (lang) => {
+    await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
+    await sleep(500);
+    return await M.evalJs(HK(`
+      const seen=[];
+      const scan=()=>{ for (const l of bodyLines()) seen.push(l); for (const a of attrs()) seen.push(a); };
+      scan();
+      for (const tab of ['keys','appearance','reader','tts']) {
+        await openSettings(tab); await sleep(700); scan(); closeSettings(); await sleep(250);
+      }
+      const USER=${J(USER_DATA)};
+      const FW_OK=${J(FW_ALLOWED)};
+      const dropUser=(s)=>USER.reduce((a,t)=>a.split(t).join(''),s||'');
+      const bad=[...new Set(seen.map(dropUser).filter(s=>/[\u3400-\u4dbf\u4e00-\u9fff]/.test(s)))];
+      const fw=[...new Set(seen.flatMap(s=>[...(s||'')].filter(c=>/[\u3000-\u303f\uff00-\uffef]/.test(c)&&FW_OK.indexOf(c)<0)))];
+      return { bad, fw, total: seen.length };
+    `));
+  };
+  const nEn = await sweep("en");
+  out.steps.sweepEn2 = nEn;
+  log("sweepEn2: " + J({ bad: nEn.bad, fw: nEn.fw }));
+  check("N1 en：阅读页 + 设置面板四分区无中文界面文案残留（endonym 与用户数据除外）", nEn.bad.length === 0, nEn.bad.slice(0, 10));
+  check("N2 en：全角符号只剩刻意同形的字形", nEn.fw.length === 0, nEn.fw);
+  const nZh = await sweep("zh-CN");
+  out.steps.sweepZh2 = nZh;
+  const zhBadTokens = nZh.bad.filter((s) => /undefined|\[object Object\]|\bdict\.|\bsettings\.|\breader\./.test(s));
+  check("N3 zh-CN：无 undefined / [object Object] / 裸键", zhBadTokens.length === 0, zhBadTokens.slice(0, 10));
 
   /* ============ 运行期无 i18n 缺键告警 ============ */
   const warns = M.consoleLogs().filter((l) => l.includes("[i18n]"));

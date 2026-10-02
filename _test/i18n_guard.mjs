@@ -37,6 +37,30 @@ const FILE_WHITELIST = {};
 
 const CJK = /[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/;
 const ALLOW_RE = /\/\/\s*i18n-allow\s*[:：]\s*(.+)$/;
+
+/**
+ * 检查 6：行内 `// i18n-allow:` 的**固定类别前缀集**（检查 6 用）。
+ * 动机：自由格式的豁免理由会让「漏迁的界面文案」伪装成「以后再说」而被放行 ——
+ * 类别集把「这行中文为什么不是界面文案」变成可枚举、可复核的有限集合，新增类别必须显式改这里。
+ * 每条豁免必须以其中之一开头（后接「：」或「:」）。
+ */
+const ALLOW_CATEGORIES = [
+  "持久化值", // 会原样落进 config / localStorage 的值（档名、方案名、种子名）
+  "用户内容", // 用户可编辑的正文（AI 提示词正文、输入框初值）
+  "标识符", // ASCII id 的中文别名 / 地址模板里的一段
+  "正则字面量", // 要匹配中文标题词的正则，翻译即改行为
+  "字体族名", // 必须与字体文件 / 系统字体名逐字一致
+  "算法输入", // 切句标点集合、注入样式表的 CSS 注释等算法/样式输入
+  "图形符号", // 两种语言同形的界面字形（全角加号等）
+  "端点占位符", // 服务地址模板里的中文提示段
+];
+/**
+ * 「以后再说」类措辞：出现即 FAIL，连类别都不看。
+ * 这些词组的含义是「这行其实是界面文案，只是还没接 t()」——那属于漏迁，必须当轮修掉，
+ * 不能靠一句豁免长期挂账（曾出现「历史未迁移／本轮范围外」把 9 条界面文案挂掉的先例）。
+ */
+const ALLOW_DEFER_WORDS = /未迁移|尚未|历史遗留|待迁移|范围外|下轮|本轮不|以后再|先留着|暂不|下阶段|下一阶段/;
+
 const ATTR_NAMES = "title|aria-label|placeholder|alt";
 /** 正则字面量可以出现的前一个实义字符（简化判定：本仓库足够用）。 */
 const REGEX_PREV = new Set("(,=:[!&|?;{}".split(""));
@@ -681,81 +705,124 @@ const TEST_ALLOW_LINES = {
   "i18n_live.mjs:217": "i18n 实机验证脚本自身：中文注释与断言标签",
   "i18n_live.mjs:233": "i18n 实机验证脚本自身：中文注释与断言标签",
   "i18n_live.mjs:377": "i18n 实机验证脚本自身：中文注释与断言标签",
-  "i18n_settings_live.mjs:48": "脚本自身的中文报错信息",
-  "i18n_settings_live.mjs:49": "脚本自身的中文报错信息",
-  "i18n_settings_live.mjs:68": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:69": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:76": "预置的老数据与图形符号（配色方案名/字体族名/音色 id/endonym/全角加号）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:81": "预置的老数据与注入页面的探针脚本自身的中文注释",
-  "i18n_settings_live.mjs:192": "预置的老数据与注入页面的探针脚本自身的中文注释",
-  "i18n_settings_live.mjs:219": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:220": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:222": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:223": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:224": "预置的老数据（配色方案名/字体族名/AI 档名/朗读服务名）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:247": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:248": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:50": "脚本自身的中文报错信息（缺键 / 空值时直接抛，避免拿 undefined 当期望值）",
+  "i18n_settings_live.mjs:51": "脚本自身的中文报错信息（缺键 / 空值时直接抛，避免拿 undefined 当期望值）",
+  "i18n_settings_live.mjs:75": "夹具书籍正文（K 段要打开的那本书，划选与状态栏字数都取自它）",
+  "i18n_settings_live.mjs:79": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:80": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:87": "全角加号：图形符号（与守卫 EN_GLYPH_ALLOWED 同口径），不是可翻译文案",
+  "i18n_settings_live.mjs:92": "注入页面的探针脚本自身的中文注释与假数据（不是界面文案）",
+  "i18n_settings_live.mjs:180": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:222": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:249": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:251": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:250": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
   "i18n_settings_live.mjs:252": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:254": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:257": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:258": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:262": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:263": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:264": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:266": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:267": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:268": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:271": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:272": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:274": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:275": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:276": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:253": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:254": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:277": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:278": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:280": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:279": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:281": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:282": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:284": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:285": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:287": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:289": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:288": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:292": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:293": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:294": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:296": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:297": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:298": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:299": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:301": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:303": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:302": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:304": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:305": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:306": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:307": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:308": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:309": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:310": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:311": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:312": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:313": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:314": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:318": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:315": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:317": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:319": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:320": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:321": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:323": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:324": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:325": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:352": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:327": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:328": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:329": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:331": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:333": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:335": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:336": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:337": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:338": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:339": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:340": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:341": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:342": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:343": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:344": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:348": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:349": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:350": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:351": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:353": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:354": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:362": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:363": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:364": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:365": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:373": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:374": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:375": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:377": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:378": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:379": "i18n 收尾专项脚本自身：断言标签与日志文案",
-  "i18n_settings_live.mjs:386": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:355": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:382": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:383": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:384": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:392": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:393": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:394": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:395": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
+  "i18n_settings_live.mjs:403": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:404": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:405": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:407": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:408": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:409": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:414": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:428": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:446": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:449": "注入页面的探针脚本自身的中文注释与假数据（不是界面文案）",
+  "i18n_settings_live.mjs:514": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:543": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:544": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:545": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:562": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:563": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:564": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:565": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:566": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:568": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:569": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:576": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:619": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:620": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:621": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:622": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:629": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:630": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:640": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:663": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:664": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:665": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:666": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:667": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:668": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:669": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:670": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:671": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:672": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:698": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:699": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:700": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:701": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:703": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:728": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:729": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:733": "i18n 收尾专项脚本自身：断言标签与日志文案",
+  "i18n_settings_live.mjs:738": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "isolation_guard.mjs:28": "隔离守卫自身的中文报错信息",
   "isolation_guard.mjs:33": "隔离守卫自身的中文报错信息",
   "isolation_guard.mjs:37": "隔离守卫自身的中文报错信息",
@@ -894,6 +961,18 @@ const groups = [...exemptGroups].map(([k, n]) => {
   return { file, why, n };
 });
 
+/* ============ 检查 6：行内豁免原因必须属于固定类别集，且不含「以后再说」措辞 ============ */
+
+// 每条豁免取出类别（ALLOW_CATEGORIES 之一 + 全角/半角冒号）。
+const catOf = (why) => ALLOW_CATEGORIES.find((c) => why.startsWith(c + "：") || why.startsWith(c + ":")) || null;
+const badCategory = exemptLines.filter((e) => !catOf(e.why));
+const deferReasons = exemptLines.filter((e) => ALLOW_DEFER_WORDS.test(e.why));
+const byCategory = new Map();
+for (const e of exemptLines) {
+  const c = catOf(e.why) || "（未归类）";
+  byCategory.set(c, (byCategory.get(c) || 0) + 1);
+}
+
 /* ============ 检查 3：zh 表的值必须是中文（否则说明 zh 侧被写成了英文/漏翻） ============ */
 
 /**
@@ -1010,18 +1089,24 @@ if (testStale.length) {
   L("");
   L(`⚠ _test 行级豁免里已查无残留（必须删除，否则视为陈旧豁免）：${testStale.join(", ")}`);
 }
+L("—— 检查 6：行内 i18n-allow 原因必须属于固定类别集 ——");
+L(`豁免 ${exemptLines.length} 行，按类别分布：` + ALLOW_CATEGORIES.map((c) => `${c} ${byCategory.get(c) || 0}`).join(" / "));
+L(`非法类别（未以类别前缀开头，必须为 0）：${badCategory.length}` + (badCategory.length ? " → " + badCategory.slice(0, 8).map((e) => `${e.file}:L${e.line} ${e.why.slice(0, 40)}`).join(" | ") : ""));
+L(`「以后再说」类措辞（未迁移/尚未/历史遗留/待迁移/范围外/下轮/本轮不…，必须为 0）：${deferReasons.length}` + (deferReasons.length ? " → " + deferReasons.slice(0, 8).map((e) => `${e.file}:L${e.line} ${e.why.slice(0, 40)}`).join(" | ") : ""));
 L("=".repeat(78));
 const tablesOutOfSync =
   onlyZh.length + onlyEn.length + dupZh.length + dupEn.length +
   phMismatch.length + cjkInEn.length + emptyVal.length + untranslated.length +
   zhNonCjk.length + zhAllowStale.length + dupLabelKeys.length;
-if (violations.length || testViolations.length || tablesOutOfSync || testStale.length || stale.length || markupLeaks.length || unusedKeys.length || deadAllowStale.length) {
+if (violations.length || testViolations.length || tablesOutOfSync || testStale.length || stale.length || markupLeaks.length || unusedKeys.length || deadAllowStale.length || badCategory.length || deferReasons.length) {
   L(`RESULT: FAIL —— src 侧 ${violations.length} 个文件 + _test 侧 ${testViolations.length} 个文件仍有未迁移的中文` + (tablesOutOfSync ? `；文案表键集合不一致（${tablesOutOfSync} 处）` : "") + (testStale.length || stale.length ? `；陈旧豁免 src ${stale.length} 条 / _test ${testStale.length} 条` : "") +
     (zhNonCjk.length ? `；zh 非中文值 ${zhNonCjk.length} 处` : "") +
     (dupLabelKeys.length ? `；显示名键复用 ${dupLabelKeys.length} 处` : "") +
     (unusedKeys.length ? `；死键（建了没人接线）${unusedKeys.length} 个：${unusedKeys.slice(0, 12).join(", ")}${unusedKeys.length > 12 ? " …" : ""}` : "") +
     (deadAllowStale.length ? `；死键豁免陈旧 ${deadAllowStale.length} 条（该键已有人引用或已不在表里）` : "") +
     (markupLeaks.length ? `；markup 可见文本 ${markupLeaks.length} 行（注释写法被当界面文字渲染）` : "") +
+    (badCategory.length ? `；豁免原因未归入固定类别集 ${badCategory.length} 行` : "") +
+    (deferReasons.length ? `；豁免原因含「以后再说」措辞 ${deferReasons.length} 行（实为漏迁的界面文案）` : "") +
     (zhAllowStale.length ? `；zh 豁免陈旧 ${zhAllowStale.length} 条` : ""));
   process.exit(1);
 }

@@ -4,11 +4,11 @@ export type ZoneKey = "tl" | "tr" | "bl" | "br" | "c";
 export type ZoneAction = BindAction | "none";
 
 export const ZONE_DEFS: { id: ZoneKey; name: string }[] = [
-  { id: "tl", name: "左上区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "tr", name: "右上区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "bl", name: "左下区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "br", name: "右下区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "c", name: "中间小区域" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  { id: "tl", name: "左上区域" }, // i18n-allow:标识符：ZONE_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("zone", id)，中文不上屏。
+  { id: "tr", name: "右上区域" }, // i18n-allow:标识符：ZONE_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("zone", id)，中文不上屏。
+  { id: "bl", name: "左下区域" }, // i18n-allow:标识符：ZONE_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("zone", id)，中文不上屏。
+  { id: "br", name: "右下区域" }, // i18n-allow:标识符：ZONE_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("zone", id)，中文不上屏。
+  { id: "c", name: "中间小区域" }, // i18n-allow:标识符：ZONE_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("zone", id)，中文不上屏。
 ];
 
 export const DEFAULT_ZONES: Record<ZoneKey, ZoneAction> = {
@@ -39,23 +39,23 @@ export type BindAction =
   | "close";
 
 export const BIND_DEFS: { id: BindAction; name: string }[] = [
-  { id: "next", name: "下一页 / 下滚一屏" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "prev", name: "上一页 / 上滚一屏" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "scrollDown", name: "下滚一段" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "scrollUp", name: "上滚一段" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterNext", name: "下一章" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterPrev", name: "上一章" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "toc", name: "打开/关闭目录" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "addBookmark", name: "添加书签" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "bookmarkList", name: "书签列表" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ai", name: "AI 面板" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "bookStats", name: "本书统计" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ttsPlayPause", name: "朗读：播放/暂停" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ttsStop", name: "朗读：停止" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ttsNext", name: "朗读：下一句" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ttsPrev", name: "朗读：上一句" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "settings", name: "设置" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "close", name: "返回书库" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  { id: "next", name: "下一页 / 下滚一屏" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "prev", name: "上一页 / 上滚一屏" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "scrollDown", name: "下滚一段" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "scrollUp", name: "上滚一段" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "chapterNext", name: "下一章" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "chapterPrev", name: "上一章" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "toc", name: "打开/关闭目录" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "addBookmark", name: "添加书签" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "bookmarkList", name: "书签列表" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "ai", name: "AI 面板" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "bookStats", name: "本书统计" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "ttsPlayPause", name: "朗读：播放/暂停" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "ttsStop", name: "朗读：停止" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "ttsNext", name: "朗读：下一句" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "ttsPrev", name: "朗读：上一句" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "settings", name: "设置" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
+  { id: "close", name: "返回书库" }, // i18n-allow:标识符：BIND_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bind", id)，中文不上屏。
 ];
 
 export const DEFAULT_BINDINGS: Record<BindAction, string[]> = {
@@ -126,18 +126,18 @@ export interface StatusItem {
 
 /** 状态项清单（设置页勾选；顶栏顺序即可在阅读界面拖动排序）。 */
 export const STATUS_ITEM_DEFS: { id: StatusItemId; name: string }[] = [
-  { id: "bookTitle", name: "书名" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterName", name: "章节名" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterIndex", name: "当前章号（第X章）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterCount", name: "总章数（共Y章）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chapterPages", name: "本节页数 / 百分比" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "bookPages", name: "全书总页数（估算）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "pagePercent", name: "本节进度" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "bookProgress", name: "全书进度" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "chars", name: "本章字数" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "clock", name: "时间" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "speed", name: "阅读速度（字/分）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "mode", name: "阅读模式" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  { id: "bookTitle", name: "书名" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "chapterName", name: "章节名" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "chapterIndex", name: "当前章号（第X章）" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "chapterCount", name: "总章数（共Y章）" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "chapterPages", name: "本节页数 / 百分比" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "bookPages", name: "全书总页数（估算）" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "pagePercent", name: "本节进度" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "bookProgress", name: "全书进度" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "chars", name: "本章字数" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "clock", name: "时间" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "speed", name: "阅读速度（字/分）" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
+  { id: "mode", name: "阅读模式" }, // i18n-allow:标识符：STATUS_ITEM_DEFS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("statusItem", id)，中文不上屏。
 ];
 
 export const STATUS_ITEM_IDS: Set<string> = new Set(STATUS_ITEM_DEFS.map((d) => d.id));
@@ -147,9 +147,9 @@ export const SCROLL_BOUNCE_PRESETS: Record<
   ScrollBounceLevel,
   { strength: number; threshold: number; label: string }
 > = {
-  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
+  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
+  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
 };
 
 /** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
@@ -260,13 +260,13 @@ export interface ReaderConfig {
 }
 
 export const HIGHLIGHT_STYLES: { id: string; name: string }[] = [
-  { id: "underline", name: "下划线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "wavy", name: "波浪线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "dotted", name: "点线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "double", name: "双下划线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "background", name: "荧光笔" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "strike", name: "删除线" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "box", name: "方框" }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  { id: "underline", name: "下划线" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "wavy", name: "波浪线" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "dotted", name: "点线" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "double", name: "双下划线" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "background", name: "荧光笔" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "strike", name: "删除线" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
+  { id: "box", name: "方框" }, // i18n-allow:标识符：HIGHLIGHT_STYLES 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("hlStyle", id)，中文不上屏。
 ];
 
 /** 划词菜单与划线设置里的预设颜色。 */
@@ -338,11 +338,11 @@ export interface AiProviderMeta {
 
 // 服务商适配表（前端）：下拉/表单字段/占位提示统一由此驱动，新增 provider 只需在此加一行。
 export const AI_PROVIDERS: AiProviderMeta[] = [
-  { id: "openai", label: "OpenAI 兼容 API", baseUrlHint: "https://api.deepseek.com", modelHint: "deepseek-chat", needsKey: true }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
-  { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true }, // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+  { id: "openai", label: "OpenAI 兼容 API", baseUrlHint: "https://api.deepseek.com", modelHint: "deepseek-chat", needsKey: true }, // i18n-allow:标识符：AI_PROVIDERS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("aiProvider", id)，中文不上屏。
+  { id: "ollama", label: "Ollama 本地", baseUrlHint: "http://localhost:11434", modelHint: "llama3", needsKey: false }, // i18n-allow:标识符：AI_PROVIDERS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("aiProvider", id)，中文不上屏。
+  { id: "anthropic", label: "Anthropic（Claude）", baseUrlHint: "https://api.anthropic.com", modelHint: "claude-3-5-sonnet-latest", needsKey: true }, // i18n-allow:标识符：AI_PROVIDERS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("aiProvider", id)，中文不上屏。
   { id: "gemini", label: "Google Gemini", baseUrlHint: "https://generativelanguage.googleapis.com", modelHint: "gemini-1.5-flash", needsKey: true },
-  { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true }, // i18n-allow:baseUrlHint 是服务地址占位模板（<资源名> 是地址里的中文提示段），地址属标识符不翻译
+  { id: "azure-openai", label: "Azure OpenAI", baseUrlHint: "https://<资源名>.openai.azure.com", modelHint: "gpt-4o", needsKey: true, azure: true }, // i18n-allow:端点占位符：Azure 服务地址模板里的 <资源名> 是地址的一段，地址属标识符不翻译。
 ];
 
 export function aiProviderMeta(p: string): AiProviderMeta {
@@ -485,12 +485,12 @@ export function normalizeProfiles(list: any): AiProfile[] {
 /** 生成不与现有端点重名的名称：优先「新端点」，否则「新端点2/3…」。 */
 export function uniqueEndpointName(profiles: AiProfile[]): string {
   const names = new Set(profiles.map((p) => (p.name || "").trim()));
-  if (!names.has("新端点")) return "新端点"; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+  if (!names.has("新端点")) return "新端点"; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
   for (let n = 2; n < 100000; n++) {
-    const cand = `新端点${n}`; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+    const cand = `新端点${n}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
     if (!names.has(cand)) return cand;
   }
-  return `新端点${Date.now()}`; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+  return `新端点${Date.now()}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
 }
 
 /** 干净的新端点：不复制上一个端点的地址与凭证，provider 默认沿用当前类型。 */
@@ -512,27 +512,27 @@ export function newAiProfile(profiles: AiProfile[], provider: AiProvider = "open
 export const DEFAULT_PROMPTS: PromptItem[] = [
   {
     id: 1,
-    name: "剧情总结", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+    name: "剧情总结", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
     key: "F1",
-    text: "请用简洁的中文总结以下小说章节的主要剧情（120字以内），并猜猜接下来的发展：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+    text: "请用简洁的中文总结以下小说章节的主要剧情（120字以内），并猜猜接下来的发展：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
   },
   {
     id: 2,
-    name: "翻译为中文", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+    name: "翻译为中文", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
     key: "F2",
-    text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+    text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
   },
   {
     id: 3,
-    name: "精校润色", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+    name: "精校润色", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
     key: "F3",
-    text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+    text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
   },
   {
     id: 4,
-    name: "人物情节梳理", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+    name: "人物情节梳理", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
     key: "F4",
-    text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+    text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
   },
 ];
 
@@ -649,12 +649,12 @@ export function normalizeTtsService(s: any): TtsService {
 /** 生成不与现有服务重名的名称：优先「新服务」，否则「新服务2/3…」。 */
 export function uniqueTtsServiceName(list: TtsService[]): string {
   const names = new Set(list.map((s) => (s.name || "").trim()));
-  if (!names.has("新服务")) return "新服务"; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+  if (!names.has("新服务")) return "新服务"; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
   for (let n = 2; n < 100000; n++) {
-    const cand = `新服务${n}`; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+    const cand = `新服务${n}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
     if (!names.has(cand)) return cand;
   }
-  return `新服务${Date.now()}`; // i18n-allow:新建实体的默认名：会被持久化进 config，按规则禁止翻译（SettingsModal 显示时空名走本地化兜底）
+  return `新服务${Date.now()}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
 }
 
 /** 干净的新服务档案：不复制上一条的地址与凭证。 */
@@ -732,7 +732,7 @@ export const UI_SKINS: UiSkin[] = [
   // 奶油（保留 · 微调）：暖奶油纸底 + 中性深咖主色，作为「中性暖」一极，与其余彩色皮肤区分。
   {
     id: "cream",
-    name: "奶油", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "奶油", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "light",
     bg: "#FFF1E2", panel: "#FFFFFF", panel2: "#FBEADA",
     fg: "#292320", fg2: "#7A6E64", line: "rgba(41,35,32,0.10)",
@@ -743,7 +743,7 @@ export const UI_SKINS: UiSkin[] = [
   // 赤陶：暖陶土橙（~20°），温润手作气质。
   {
     id: "clay",
-    name: "赤陶", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "赤陶", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "light",
     bg: "#FBF3EC", panel: "#FFFFFF", panel2: "#F3E6DB",
     fg: "#2C2622", fg2: "#756759", line: "rgba(44,38,34,0.10)",
@@ -754,7 +754,7 @@ export const UI_SKINS: UiSkin[] = [
   // 松林：沉静森绿（~155°），清新自然。
   {
     id: "pine",
-    name: "松林", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "松林", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "light",
     bg: "#EFF5F0", panel: "#FFFFFF", panel2: "#E2EDE5",
     fg: "#1F2622", fg2: "#63726A", line: "rgba(31,38,34,0.10)",
@@ -765,7 +765,7 @@ export const UI_SKINS: UiSkin[] = [
   // 湖光：清爽湖蓝（~205°），冷静专注。
   {
     id: "lagoon",
-    name: "湖光", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "湖光", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "light",
     bg: "#EDF3F9", panel: "#FFFFFF", panel2: "#E0E9F3",
     fg: "#1E252E", fg2: "#5E6975", line: "rgba(30,37,46,0.09)",
@@ -776,7 +776,7 @@ export const UI_SKINS: UiSkin[] = [
   // 紫藤：柔雅紫红（~315°），优雅有格调。
   {
     id: "lilac",
-    name: "紫藤", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "紫藤", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "light",
     bg: "#F7F1F6", panel: "#FFFFFF", panel2: "#EEE2EC",
     fg: "#2A2430", fg2: "#726A78", line: "rgba(42,36,48,0.10)",
@@ -788,7 +788,7 @@ export const UI_SKINS: UiSkin[] = [
   // 石墨（保留）：中性冷灰底 + 薄荷青主色（~168°）。
   {
     id: "graphite",
-    name: "石墨", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "石墨", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "dark",
     bg: "#16181D", panel: "#1E2126", panel2: "#252932",
     fg: "#E6E8EC", fg2: "#9AA0A8", line: "rgba(255,255,255,0.10)",
@@ -799,7 +799,7 @@ export const UI_SKINS: UiSkin[] = [
   // 琥珀：暖褐底 + 琥珀金主色（~42°），温暖夜读。
   {
     id: "amber",
-    name: "琥珀", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "琥珀", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "dark",
     bg: "#1A1712", panel: "#221E17", panel2: "#2B261D",
     fg: "#ECE6DA", fg2: "#ADA491", line: "rgba(255,246,230,0.10)",
@@ -810,7 +810,7 @@ export const UI_SKINS: UiSkin[] = [
   // 深海：冷蓝黑底 + 亮蓝主色（~215°），深邃沉浸。
   {
     id: "abyss",
-    name: "深海", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "深海", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "dark",
     bg: "#121620", panel: "#1A1F2B", panel2: "#222839",
     fg: "#E4E8F0", fg2: "#949DB0", line: "rgba(210,224,255,0.10)",
@@ -821,7 +821,7 @@ export const UI_SKINS: UiSkin[] = [
   // 绯夜：暖黑底 + 绯红主色（~353°），醒目而不刺眼。
   {
     id: "crimson",
-    name: "绯夜", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "绯夜", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "dark",
     bg: "#1C1418", panel: "#241A1F", panel2: "#2E2129",
     fg: "#EEE2E6", fg2: "#AE9BA2", line: "rgba(255,230,238,0.10)",
@@ -832,7 +832,7 @@ export const UI_SKINS: UiSkin[] = [
   // 夜行（保留 id · 主色提亮）：紫黑底 + 紫水晶主色（~272°）。
   {
     id: "nocturne",
-    name: "夜行", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+    name: "夜行", // i18n-allow:标识符：UI_SKINS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("skin", id)，中文不上屏。
     mode: "dark",
     bg: "#16121F", panel: "#1E1A2A", panel2: "#262138",
     fg: "#ECE8F5", fg2: "#A29BB4", line: "rgba(228,220,255,0.10)",
@@ -991,8 +991,8 @@ const DEFAULTS: AppConfig = {
     zoneHints: false,
     immersive: false,
     customFonts: [
-      { family: "仓耳云黑-w03", file: "仓耳云黑-w03.ttf" }, // i18n-allow:字体族名，必须与字体文件/系统字体名逐字一致，禁止翻译
-      { family: "方正兰亭圆_gbk", file: "方正兰亭圆_gbk.ttf" }, // i18n-allow:字体族名，必须与字体文件/系统字体名逐字一致，禁止翻译
+      { family: "仓耳云黑-w03", file: "仓耳云黑-w03.ttf" }, // i18n-allow:字体族名：必须与字体文件 / 系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
+      { family: "方正兰亭圆_gbk", file: "方正兰亭圆_gbk.ttf" }, // i18n-allow:字体族名：必须与字体文件 / 系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
       { family: "lxgwneoxiheiscreen", file: "lxgwneoxiheiscreen.ttf" },
       { family: "lxgwwenkai-regular", file: "lxgwwenkai-regular.ttf" },
     ],
@@ -1078,39 +1078,39 @@ p {
   ai: {
     enabled: true,
     autoOnChapter: true,
-    system: "你是一位专业的阅读助手。回答务必简洁准确，使用中文。", // i18n-allow:AI 系统提示词正文（用户内容），规则要求永不翻译
+    system: "你是一位专业的阅读助手。回答务必简洁准确，使用中文。", // i18n-allow:用户内容：AI 系统提示词正文是种子数据（用户可编辑），规则要求永不翻译。
     profiles: structuredClone(DEFAULT_AI_PROFILES),
     active: 0,
     prompts: [
       {
         id: 1,
-        name: "剧情总结", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+        name: "剧情总结", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
         key: "F1",
-        text: "直观说出文本写了什么，不要做阅读理解，不要脑补，不要分段，不要分点，200字内。\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+        text: "直观说出文本写了什么，不要做阅读理解，不要脑补，不要分段，不要分点，200字内。\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
       },
       {
         id: 2,
-        name: "翻译为中文", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+        name: "翻译为中文", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
         key: "F2",
-        text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+        text: "请将以下内容翻译成流畅的中文，直接输出译文：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
       },
       {
         id: 3,
-        name: "精校润色", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+        name: "精校润色", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
         key: "F3",
-        text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+        text: "请校对并润色以下文本：删除广告与乱码字符，修正错别字与标点，保持原意与结构不要扩写或缩写，直接输出处理后的正文，不要任何解释：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
       },
       {
         id: 4,
-        name: "人物情节梳理", // i18n-allow:默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留
+        name: "人物情节梳理", // i18n-allow:用户内容：默认提示词档名（用户可编辑的种子数据），与提示词正文一并保留。
         key: "F4",
-        text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+        text: "请列出本章出场人物（含身份/立场）和本章主要情节点（条目式，简洁）：\n\n{chapter}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
       },
     ],
     display: "reader",
     style: {
       followReader: false,
-      fontFamily: "仓耳云黑-w03", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+      fontFamily: "仓耳云黑-w03", // i18n-allow:字体族名：默认字体族名，必须与字体文件 / 系统字体名逐字一致（否则 CSS font-family 匹配不上）。
       fontSize: 28,
       lineHeight: 1.65,
       paraSpacing: 0,
@@ -1123,7 +1123,7 @@ p {
     },
     failover: true,
     quickPrompt:
-      "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}", // i18n-allow:AI 提示词正文（用户内容），规则要求永不翻译
+      "请解释下列选中的内容，并给出准确的中文翻译/释义（外文译为中文，中文则解释含义与出处语境）。直接输出结果，简洁准确：\n\n{selection}", // i18n-allow:用户内容：AI 提示词正文是种子数据（用户可编辑），规则要求永不翻译。
     groupOrder: [...AI_GROUPS],
   },
   tts: {
@@ -1131,7 +1131,7 @@ p {
     services: [
       {
         id: 1,
-        name: "默认语音服务", // i18n-allow:TTS 服务档名（已持久化进 config.tts.services），禁止翻译
+        name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名会原样落进 config.tts.services，用户可自行改名，界面按用户名字显示。
         provider: "openai",
         baseUrl: "http://127.0.0.1:3900",
         apiKey: "",
@@ -1180,35 +1180,35 @@ function builtinSchemes(): ReaderScheme[] {
   const SERIF = "lxgwwenkai-regular";
   const SANS = '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif';
   return [
-    mk("s-paper", "纸质", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
+    mk("s-paper", "纸质", { // i18n-allow:持久化值：内置配色方案的 name 会落进 config.readerSchemes，是 builtinSchemeNames() 的默认名来源；界面显示走 dict.scheme.<id>，这里的中文不落地上屏。
       theme: "paper", bgColor: "#FDF5E6", fgColor: "#2c2c2c",
       fontFamily: SERIF, latinFont: "Georgia",
       fontSize: 32, lineHeight: 1.75, paraSpacing: 0.6,
       marginH: 320, maxLineChars: 0, marginV: 80,
       indent: "1em", textAlign: "justify",
     }),
-    mk("s-modern", "现代", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
+    mk("s-modern", "现代", { // i18n-allow:持久化值：内置配色方案的 name 会落进 config.readerSchemes，是 builtinSchemeNames() 的默认名来源；界面显示走 dict.scheme.<id>，这里的中文不落地上屏。
       theme: "white", bgColor: "#FAFAF9", fgColor: "#22252A",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.9,
       marginH: 0, maxLineChars: 38, marginV: 72,
       indent: "0em", textAlign: "left",
     }),
-    mk("s-green", "护眼绿", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
+    mk("s-green", "护眼绿", { // i18n-allow:持久化值：内置配色方案的 name 会落进 config.readerSchemes，是 builtinSchemeNames() 的默认名来源；界面显示走 dict.scheme.<id>，这里的中文不落地上屏。
       theme: "green", bgColor: "#c7e6c9", fgColor: "#2d3a2d",
       fontFamily: SERIF, latinFont: "Georgia",
       fontSize: 32, lineHeight: 1.8, paraSpacing: 0.6,
       marginH: 320, maxLineChars: 0, marginV: 80,
       indent: "1em", textAlign: "justify",
     }),
-    mk("s-night", "夜间", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
+    mk("s-night", "夜间", { // i18n-allow:持久化值：内置配色方案的 name 会落进 config.readerSchemes，是 builtinSchemeNames() 的默认名来源；界面显示走 dict.scheme.<id>，这里的中文不落地上屏。
       theme: "dark", bgColor: "#23262b", fgColor: "#b8bcc2",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
       marginH: 0, maxLineChars: 40, marginV: 72,
       indent: "0em", textAlign: "left",
     }),
-    mk("s-ink", "纯黑", { // i18n-allow:内置阅读配色方案名：已持久化进 config.readerSchemes，禁止翻译
+    mk("s-ink", "纯黑", { // i18n-allow:持久化值：内置配色方案的 name 会落进 config.readerSchemes，是 builtinSchemeNames() 的默认名来源；界面显示走 dict.scheme.<id>，这里的中文不落地上屏。
       theme: "night", bgColor: "#0f1115", fgColor: "#8a8f96",
       fontFamily: SANS, latinFont: "Segoe UI",
       fontSize: 30, lineHeight: 1.7, paraSpacing: 0.8,
@@ -1217,6 +1217,21 @@ function builtinSchemes(): ReaderScheme[] {
     }),
   ];
 }
+
+/// 内置方案 id → 默认显示名。**唯一来源就是 builtinSchemes() 本身**，不另抄一份常量，
+/// 否则改了内置方案名这里就会漂移。懒求值：避免模块初始化时就 structuredClone 五份默认配置。
+/// 用途仅限「用户有没有改过内置方案的名字」这一判定；显示文案由界面经 labelOfId("scheme", id) 取。
+let builtinNameMap: Record<string, string> | null = null;
+export function builtinSchemeNames(): Record<string, string> {
+  if (!builtinNameMap) builtinNameMap = Object.fromEntries(builtinSchemes().map((s) => [s.id, s.name]));
+  return builtinNameMap;
+}
+
+/** 早期版本写进方案库的种子名 → 文案表 dict.scheme.* 的键后缀。
+ *  这些名字是我们的文案而非用户命名，故显示时接查表；用户一旦改名即不再命中，回到「原样显示」。 */
+export const SEED_SCHEME_NAME_KEYS: Record<string, string> = {
+  默认: "s-default",
+};
 
 /// 内置方案升级：把「未被用户覆盖过」的内置方案刷新到当前预设（保留用户改过的名字）；
 /// 用户自建方案与已被改过的内置方案原样保留；已退役的内置方案（如 s-wide）从存量中移除。
@@ -1488,7 +1503,7 @@ function migrateAi(savedAi: any): AiConfig {
     const pm = savedAi?.proxyMode === "custom" ? "custom" : "auto";
     profiles = normalizeProfiles([
       {
-        name: "默认", // i18n-allow:结构体显示名：持久化只用 ASCII id，译文统一经 labelOfId(kind,id) 取；此处中文保留（SettingsModal 第三阶段已改走 labelOfId 查表显示）
+        name: "默认", // i18n-allow:持久化值：旧版单端点配置迁移出的 AI 端点档名，会原样落进 config.ai.profiles，用户可自行改名。
         provider: savedAi?.provider ?? "openai",
         baseUrl: savedAi?.baseUrl ?? "",
         apiKey: savedAi?.apiKey ?? "",
@@ -1506,7 +1521,7 @@ function migrateAi(savedAi: any): AiConfig {
   if (savedAi?.promptSummary) prompts[0].text = savedAi.promptSummary;
   if (savedAi?.promptTranslate) prompts[1].text = savedAi.promptTranslate;
   if (savedAi?.action === "custom" && savedAi?.customPrompt) {
-    prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt }); // i18n-allow:旧版 customPrompt 迁移出来的默认提示词名（用户可编辑的种子数据），保留
+    prompts.push({ id: 99, name: "自定义", key: "F9", text: savedAi.customPrompt }); // i18n-allow:用户内容：旧版 customPrompt 迁移出的提示词档名（用户可编辑的种子数据）。
   }
   return {
     enabled: !!savedAi?.enabled,
@@ -1559,7 +1574,7 @@ function migrateTts(savedTts: any): TtsConfig {
     const src = savedTts && typeof savedTts === "object" ? savedTts : {};
     const svc = normalizeTtsService({
       id: 1,
-      name: "默认语音服务", // i18n-allow:TTS 服务档名（已持久化进 config.tts.services），禁止翻译
+      name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名会原样落进 config.tts.services，用户可自行改名，界面按用户名字显示。
       provider:
         typeof src.customProvider === "string" && src.customProvider
           ? src.customProvider
@@ -1595,7 +1610,7 @@ function normalizeSchemes(list: any): ReaderScheme[] {
       let id = typeof s.id === "string" && s.id ? s.id : `s-${Math.random().toString(36).slice(2, 9)}`;
       if (seen.has(id)) id = `s-${Math.random().toString(36).slice(2, 9)}`;
       seen.add(id);
-      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案"; // i18n-allow:方案名兜底：该 name 会被持久化到 config.readerSchemes，禁止翻译
+      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案"; // i18n-allow:持久化值：方案名兜底值会原样落进 config.readerSchemes，用户可自行改名。
       const cfgSrc = s.cfg && typeof s.cfg === "object" ? s.cfg : {};
       const cfg: ReaderConfig = {
         ...structuredClone(DEFAULTS.reader),
@@ -1966,7 +1981,7 @@ export function createReaderScheme(name: string): string {
   const id = `s-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   config.readerSchemes = [
     ...config.readerSchemes,
-    { id, name: name.trim().slice(0, 40) || "未命名方案", cfg: snapshotReader() }, // i18n-allow:方案名兜底：该 name 会被持久化到 config.readerSchemes，禁止翻译
+    { id, name: name.trim().slice(0, 40) || "未命名方案", cfg: snapshotReader() }, // i18n-allow:持久化值：方案名兜底值会原样落进 config.readerSchemes，用户可自行改名。
   ];
   saveConfig();
   return id;

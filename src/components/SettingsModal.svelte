@@ -46,6 +46,8 @@
     applySecrets,
     applyConfigJson,
     runSettingsBackup,
+    builtinSchemeNames,
+    SEED_SCHEME_NAME_KEYS,
   } from "../lib/stores.svelte";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
   import {
@@ -374,15 +376,20 @@
   }
 
   /**
-   * 配色方案（config.readerSchemes）的显示名。方案库里混着两类条目，必须分流：
-   *  - 内置 5 套：stores.svelte.ts 的 builtinSchemes() 里 id 与文案表键后缀**逐字相同**，
-   *    即 s-paper → dict.scheme.s-paper（纸质）、s-modern（现代）、s-green（护眼绿）、
-   *    s-night（夜间）、s-ink（纯黑）；显示走译文，**持久化的 name 一个字都不改**。
-   *  - 用户自建：id 由 createReaderScheme() 现生成（s-<时间戳36进制><随机>），
-   *    字典里必然没有对应键 → 原样显示用户自己起的名字（如「我的老方案」），绝不查表、绝不翻译。
+   * 配色方案（config.readerSchemes）的显示名。**用户数据优先**：只有「名字还是我们给的那个」
+   * 才用译文，用户改过就以用户的名字为准。三条分流：
+   *  - 早期种子名「默认」（stores 的 SEED_SCHEME_NAME_KEYS）：是我们的文案不是用户命名 → 查表；
+   *  - 内置 5 套且 name 仍等于 builtinSchemeNames()[id]：查表。内置 id 与文案表键后缀**逐字相同**
+   *    （s-paper / s-modern / s-green / s-night / s-ink），默认名由 builtinSchemes() 单一来源给出；
+   *  - 其余（用户自建、已改名）：**原样显示用户自己的名字**，绝不查表、绝不翻译。
+   *  全程只读不写：config.readerSchemes[].name 一个字节都不改。
    */
   function schemeLabel(s: ReaderScheme): string {
-    return hasLabelOf("scheme", s.id) ? labelOfId("scheme", s.id) : s.name;
+    const seed = SEED_SCHEME_NAME_KEYS[s.name];
+    if (seed !== undefined && hasLabelOf("scheme", seed)) return labelOfId("scheme", seed);
+    const def = builtinSchemeNames()[s.id];
+    if (def !== undefined && s.name === def && hasLabelOf("scheme", s.id)) return labelOfId("scheme", s.id);
+    return s.name;
   }
 
   function openSchemeSave() {
@@ -466,7 +473,12 @@
   /** 各接口协议的文案提示与默认值（切换协议时用于补空字段）。 */
   interface TtsProviderMeta {
     id: string;
-    /** 界面文案走 t()：labelKey 恒有；model/voiceHint 仅在含中文说明时给 *HintKey，其余是纯取值（模型名、音色 id 等）。 */
+    /** 界面文案走 t()：labelKey 恒有；model/voiceHint 仅在含中文说明时给 *HintKey，其余是纯取值（模型名、音色 id 等）。
+     *  **字段归属按后端实际取值定，别凭字段名下结论**（src-tauri/src/ai.rs）：
+     *  gptsovits 的参考音频路径、baidu 的音色编号、breeze 的音色 id 都取自 `voice`
+     *  （`ref_audio_path = p.voice` / `per = p.voice` / `fetch_breeze_voice_at(root, p.voice)`），
+     *  三者的 `model` 只有 breeze 用来指定模型名、另两个根本不读 → 所以
+     *  voiceHintKey 给「参考音频路径/音色 id/音色编号」，modelHintKey 给各自的实话（无模型名 / 模型名）。 */
     labelKey: MessageKey;
     baseHint: string;
     modelHintKey?: MessageKey;
@@ -487,10 +499,10 @@
     { id: "dashscope", labelKey: "dict.ttsProtocol.dashscope", baseHint: "https://dashscope.aliyuncs.com", modelHint: "qwen3-tts-flash", voiceHint: "Cherry", defaults: { baseUrl: "https://dashscope.aliyuncs.com", model: "qwen3-tts-flash", voice: "Cherry", format: "mp3" }, voiceList: false, hideKeyModel: false },
     { id: "minimax", labelKey: "dict.ttsProtocol.minimax", baseHint: "https://api.minimax.chat", modelHint: "speech-2.6-hd", voiceHint: "male-qn-qingse", defaults: { baseUrl: "https://api.minimax.chat", model: "speech-2.6-hd", voice: "male-qn-qingse", format: "mp3" }, voiceList: false, hideKeyModel: false },
     { id: "fish", labelKey: "dict.ttsProtocol.fish", baseHint: "https://api.fish.audio", modelHint: "s1", voiceHint: "reference_id", defaults: { baseUrl: "https://api.fish.audio", model: "s1", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "gptsovits", labelKey: "dict.ttsProtocol.gptsovits", baseHint: "http://127.0.0.1:9880", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.gptsovits", defaults: { baseUrl: "http://127.0.0.1:9880", model: "", voice: "", format: "wav" }, voiceList: false, hideKeyModel: false },
-    { id: "breeze", labelKey: "dict.ttsProtocol.breeze", baseHint: "http://127.0.0.1:7863", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.breeze", defaults: { baseUrl: "http://127.0.0.1:7863", model: "", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
+    { id: "gptsovits", labelKey: "dict.ttsProtocol.gptsovits", baseHint: "http://127.0.0.1:9880", modelHint: "", modelHintKey: "dict.ttsModel.gptsovitsNone", voiceHint: "", voiceHintKey: "dict.ttsModel.gptsovits", defaults: { baseUrl: "http://127.0.0.1:9880", model: "", voice: "", format: "wav" }, voiceList: false, hideKeyModel: false },
+    { id: "breeze", labelKey: "dict.ttsProtocol.breeze", baseHint: "http://127.0.0.1:7863", modelHint: "", modelHintKey: "dict.ttsModel.breezeModel", voiceHint: "", voiceHintKey: "dict.ttsModel.breeze", defaults: { baseUrl: "http://127.0.0.1:7863", model: "", voice: "", format: "wav" }, voiceList: true, hideKeyModel: false },
     { id: "volcano", labelKey: "dict.ttsProtocol.volcano", baseHint: "https://openspeech.bytedance.com/api/v1/tts", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "zh_female_cancan_mars_bigtts", voiceHintKey: undefined, defaults: { baseUrl: "https://openspeech.bytedance.com/api/v1/tts", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
-    { id: "baidu", labelKey: "dict.ttsProtocol.baidu", baseHint: "https://tsn.baidu.com", modelHint: "", modelHintKey: "dict.ttsModel.volcano", voiceHint: "", voiceHintKey: "dict.ttsModel.baidu", defaults: { baseUrl: "https://tsn.baidu.com", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
+    { id: "baidu", labelKey: "dict.ttsProtocol.baidu", baseHint: "https://tsn.baidu.com", modelHint: "", modelHintKey: "dict.ttsModel.baiduNone", voiceHint: "", voiceHintKey: "dict.ttsModel.baidu", defaults: { baseUrl: "https://tsn.baidu.com", model: "", voice: "", format: "mp3" }, voiceList: false, hideKeyModel: false },
     { id: "edge", labelKey: "dict.ttsProtocol.edge", baseHint: "", modelHint: "", modelHintKey: undefined, voiceHint: "", voiceHintKey: "dict.ttsModel.common", defaults: { baseUrl: "", model: "", voice: "", format: "mp3" }, voiceList: true, hideKeyModel: true },
   ];
 
@@ -730,13 +742,13 @@
       id: "chapterSpecial",
       labelKey: "dict.splitPreset.chapterSpecial",
       pattern:
-        // i18n-allow:分章正则的字面量本身（要匹配的正是中文标题词），翻译它会直接改变匹配行为
+        // i18n-allow:正则字面量：要匹配的正是中文标题词，翻译它会直接改变匹配行为。
         "(?<=[　\\s])(?:(?:内容|文章)?简介|文案|前言|序章|楔子|正文(?!完|结)|终章|后记|番外|第?\\s*[\\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+\\s*(?:卷|章))(?![\\w\\d]).{0,30}$",
     },
-    // i18n-allow:分章正则的字面量本身（要匹配的正是中文标题词），翻译它会直接改变匹配行为
+    // i18n-allow:正则字面量：要匹配的正是中文标题词，翻译它会直接改变匹配行为。
     { id: "chapterN", labelKey: "dict.splitPreset.chapterN", pattern: "第\\s*[0-9〇零一二两三四五六七八九十百千]{1,12}\\s*[章节卷回部篇]" },
     { id: "chapterEn", labelKey: "dict.splitPreset.chapterEn", pattern: "^\\s*Chapter\\s+\\d+.*$" },
-    // i18n-allow:分章正则的字面量本身（含中文顿号/句点），翻译它会直接改变匹配行为
+    // i18n-allow:正则字面量：含中文顿号 / 句点，翻译它会直接改变匹配行为。
     { id: "numbered", labelKey: "dict.splitPreset.numbered", pattern: "^\\s*\\d+[、.．]\\s*\\S.*$" },
     { id: "separator", labelKey: "dict.splitPreset.separator", pattern: "^\\s*[-=*_]{3,}\\s*$" },
   ];
@@ -750,11 +762,11 @@
     "Segoe UI",
     "Georgia",
     "Consolas",
-    "仿宋", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
-    "幼圆", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
-    "隶书", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
-    "思源黑体", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
-    "思源宋体", // i18n-allow:字体族名，必须与系统字体逐字一致，禁止翻译
+    "仿宋", // i18n-allow:字体族名：必须与系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
+    "幼圆", // i18n-allow:字体族名：必须与系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
+    "隶书", // i18n-allow:字体族名：必须与系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
+    "思源黑体", // i18n-allow:字体族名：必须与系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
+    "思源宋体", // i18n-allow:字体族名：必须与系统字体名逐字一致（否则 CSS font-family 匹配不上），禁止翻译。
   ];
 
   let fontList: string[] = $state([]);
@@ -903,7 +915,7 @@
   }
 
   function addPrompt() {
-    config.ai.prompts.push({ id: Date.now(), name: `提示${config.ai.prompts.length + 1}`, text: "{chapter}", key: "" }); // i18n-allow:新建提示词档的种子名，会被持久化进 config.ai.prompts，按规则禁止翻译
+    config.ai.prompts.push({ id: Date.now(), name: `提示${config.ai.prompts.length + 1}`, text: "{chapter}", key: "" }); // i18n-allow:持久化值：新建提示词档的种子名，会原样落进 config.ai.prompts。
     saveConfig();
   }
 
@@ -1015,7 +1027,7 @@
   // 「添加快捷键」芯片在未捕获态显示的图形符号。放脚本常量而非 markup 字面量有两个原因：
   //   1) markup 里的 `//` 不是注释，会被 Svelte 原样渲染成界面文字（历史缺陷）；
   //   2) 豁免说明必须和字面量同处脚本块，守门脚本的行内 `// i18n-allow:` 规则才认得到。
-  const ADD_BIND_GLYPH = "＋"; // i18n-allow:全角加号是图形符号（"添加"芯片），不是可翻译文案
+  const ADD_BIND_GLYPH = "＋"; // i18n-allow:图形符号：全角加号是「添加」芯片的图形，两种语言同形，不是可翻译文案。
 
   let capturing = $state<BindAction | null>(null);
 
@@ -1521,7 +1533,7 @@
       </div>
       <div class="scheme-grid">
         {#each config.readerSchemes as s (s.id)}
-          <div class="scheme-card" class:active={schemeActive(s)}>
+          <div class="scheme-card" class:active={schemeActive(s)} data-scheme-id={s.id}>
             <button class="scheme-preview" data-testid={"scheme-apply-" + s.id} title={t("settings.scheme.applyTip")} style="background:{s.cfg.bgColor || THEMES[s.cfg.theme].bg}; color:{s.cfg.fgColor || THEMES[s.cfg.theme].fg};" onclick={() => applyScheme(s.id, "book")}>
               <span class="sp-line" style="background:currentColor; opacity:.85;"></span>
               <span class="sp-line short" style="background:currentColor; opacity:.55;"></span>
@@ -2024,7 +2036,7 @@
           </div>
           <div class="field">
             <label>{t("settings.tts.model")}</label>
-            <input bind:value={tsvc.model} onchange={saveConfig} placeholder={tsvcMeta.modelHintKey ? t(tsvcMeta.modelHintKey) : tsvcMeta.modelHint} title={t("settings.tts.modelTip")} />
+            <input data-testid="tts-model" bind:value={tsvc.model} onchange={saveConfig} placeholder={tsvcMeta.modelHintKey ? t(tsvcMeta.modelHintKey) : tsvcMeta.modelHint} title={t("settings.tts.modelTip")} />
           </div>
         </div>
       {/if}
@@ -2069,7 +2081,7 @@
                 {/if}
               </select>
             {:else}
-              <input bind:value={tsvc.voice} onchange={saveConfig} placeholder={tsvcMeta.voiceHintKey ? t(tsvcMeta.voiceHintKey) : tsvcMeta.voiceHint} />
+              <input data-testid="tts-voice" bind:value={tsvc.voice} onchange={saveConfig} placeholder={tsvcMeta.voiceHintKey ? t(tsvcMeta.voiceHintKey) : tsvcMeta.voiceHint} />
             {/if}
             {#if tsvcMeta.voiceList}
               <button class="icon" onclick={loadTtsVoices} disabled={ttsVoiceLoading}>{ttsVoiceLoading ? t("settings.tts.loading") : t("settings.tts.loadVoices")}</button>
