@@ -1,3 +1,5 @@
+import { onReducedMotionChange, prefersReducedMotion } from "./reducedMotion";
+
 export interface EdgeEvent {
   edge: -1 | 0 | 1;
   carry: number;
@@ -15,6 +17,8 @@ export class SmoothScroller {
   private apply: (renderPos: number) => void;
   private onStop?: (ratio: number) => void;
   private stopTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 订阅「减少动效」变化的取消函数；destroy() 必须调用它，否则监听会泄漏。 */
+  private stopReducedMotionWatch?: () => void;
 
   /** 60Hz 基准：每 16.667ms 逼近目标的比例 / 回弹衰减比例。 */
   private static readonly BASE_MS = 16.667;
@@ -27,6 +31,22 @@ export class SmoothScroller {
 
   constructor(apply: (renderPos: number) => void) {
     this.apply = apply;
+    // 用户在应用运行中打开「减少动效」时，立刻中止进行中的动量逼近与橡皮筋回弹
+    // （直接落到目标并渲染一帧）。此前只在「下一次」交互时才重新查询 matchMedia，
+    // 已经飞出去的滚动不会被纠正 —— 订阅把这个缺口补上。
+    // 关闭时不做任何特殊处理：下一次 wheelBy/jumpTo 自然恢复惯性与回弹。
+    this.stopReducedMotionWatch = onReducedMotionChange((reduced) => {
+      if (!reduced) return;
+      if (this.raf === 0 && this.over === 0) return; // 本来就静止，无需干预
+      cancelAnimationFrame(this.raf);
+      this.raf = 0;
+      this.current = this.target;
+      this.over = 0;
+      this.pending = 0;
+      this.render();
+      clearTimeout(this.stopTimer);
+      this.stopTimer = setTimeout(() => this.onStop?.(this.ratio()), 200);
+    });
   }
 
   setMax(m: number) {
@@ -65,7 +85,8 @@ export class SmoothScroller {
     this.target = Math.max(0, Math.min(pos, this.max));
     this.over = 0;
     this.pending = 0;
-    if (immediate) {
+    // 「减少动效」下无论调用方传什么都是直接到位（见 wheelBy 里的同款说明）。
+    if (immediate || prefersReducedMotion()) {
       this.current = this.target;
       this.apply(this.current);
     } else {
@@ -113,6 +134,16 @@ export class SmoothScroller {
       }
     } else {
       this.pending = 0;
+    }
+
+    // 「减少动效」：目标位置与越界量照常计算（章节补齐等调用方依赖 edge/carry），
+    // 但跳过惯性逼近与橡皮筋回弹——直接落到目标并渲染一帧。
+    // CSS 的 prefers-reduced-motion 管不到这个 rAF 循环，只能在 JS 里退化。
+    if (prefersReducedMotion()) {
+      this.current = this.target;
+      this.over = 0;
+      this.render();
+      return { edge, carry };
     }
 
     this.ensureLoop();
@@ -176,5 +207,7 @@ export class SmoothScroller {
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     clearTimeout(this.stopTimer);
+    this.stopReducedMotionWatch?.();
+    this.stopReducedMotionWatch = undefined;
   }
 }

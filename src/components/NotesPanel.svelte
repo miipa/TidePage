@@ -7,6 +7,13 @@
   import { toast, ui, requestOpenBook, APP_VERSION } from "../lib/stores.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import {
+    IconLayoutGrid,
+    IconLayoutList,
+    IconRefresh,
+    IconTrash,
+    IconX,
+  } from "@tabler/icons-svelte";
 
   // standalone=true：作为独立面板窗口挂载，隐藏“返回书库”的 ×（改用右上角窗口控件关闭）。
   let { standalone = false }: { standalone?: boolean } = $props();
@@ -158,15 +165,15 @@
       <option value="count">{t("notes.sort.count")}</option>
     </select>
     <div class="spacer"></div>
-    <button class="icon" data-testid="nl-refresh" title={t("common.action.refresh")} aria-label={t("common.action.refresh")} onclick={load}>⟳</button>
-    {#if !standalone}<button class="icon" data-testid="nl-close" title={labelOfId("bind", "close")} aria-label={labelOfId("bind", "close")} onclick={() => (ui.notesOpen = false)}>×</button>{/if}
+    <button class="icon" data-testid="nl-refresh" title={t("common.action.refresh")} aria-label={t("common.action.refresh")} onclick={load}><IconRefresh /></button>
+    {#if !standalone}<button class="icon" data-testid="nl-close" title={labelOfId("bind", "close")} aria-label={labelOfId("bind", "close")} onclick={() => (ui.notesOpen = false)}><IconX /></button>{/if}
   </div>
 
   <div class="nl-body">
     {#if loading}
-      <div class="hint">{t("common.loading")}</div>
+      <div class="empty-state">{t("common.loading")}</div>
     {:else if !shown.length}
-      <div class="hint" data-testid="nl-empty">{query.trim()
+      <div class="empty-state" data-testid="nl-empty">{query.trim()
         ? t("library.empty.noMatch")
         : t("notes.empty")}</div>
     {:else if view === "grid"}
@@ -234,8 +241,8 @@
     <span>{shown.length}{t("notes.statLine", { hl: totalHl, note: totalNotes })}</span>
     <span class="build" title={t("common.app.versionTip")}>TidePage {APP_VERSION}</span>
     <div class="spacer"></div>
-    <button class="icon view-btn" class:active={view === "grid"} data-testid="nl-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
-    <button class="icon view-btn" class:active={view === "list"} data-testid="nl-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
+    <button class="icon view-btn" class:active={view === "grid"} data-testid="nl-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}><IconLayoutGrid /></button>
+    <button class="icon view-btn" class:active={view === "list"} data-testid="nl-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}><IconLayoutList /></button>
   </div>
 
   {#if detail}
@@ -253,13 +260,13 @@
         {#if !detail.deleted}
           <button data-testid="nl-open-book" onclick={() => openBook(detail!)}>{t("notes.openBook")}</button>
         {/if}
-        <button class="icon" data-testid="nl-detail-close" title={t("common.action.close")} onclick={() => (detail = null)}>×</button>
+        <button class="icon" data-testid="nl-detail-close" title={t("common.action.close")} onclick={() => (detail = null)}><IconX /></button>
       </div>
       <div class="drawer-list">
         {#if detailLoading}
-          <div class="hint">{t("common.loading")}</div>
+          <div class="empty-state">{t("common.loading")}</div>
         {:else if !detailNotes.length}
-          <div class="hint">{t("notes.detailEmpty")}</div>
+          <div class="empty-state">{t("notes.detailEmpty")}</div>
         {:else}
           {#each detailNotes as n (n.id)}
             <div class="item">
@@ -272,9 +279,9 @@
               <div class="foot">
                 <span class="ch">{n.chapterTitle || t("common.sectionN", { n: n.chapterIndex + 1 })} · {fmtDate(n.createdAt)}</span>
                 {#if n.note}
-                  <button class="icon" data-testid="nl-del-note" title={t("notes.delNoteTip")} onclick={() => removeNote(n)}>🗑</button>
+                  <button class="icon" data-testid="nl-del-note" title={t("notes.delNoteTip")} onclick={() => removeNote(n)}><IconTrash /></button>
                 {:else}
-                  <button class="icon" data-testid="nl-del-hl" title={t("highlight.deleteTip")} onclick={() => removeHighlight(n)}>🗑</button>
+                  <button class="icon" data-testid="nl-del-hl" title={t("highlight.deleteTip")} onclick={() => removeHighlight(n)}><IconTrash /></button>
                 {/if}
               </div>
             </div>
@@ -289,7 +296,7 @@
   .nl {
     position: fixed;
     inset: 0;
-    z-index: 1090;
+    z-index: var(--z-drawer);
     background: var(--bg);
     color: var(--fg);
     display: flex;
@@ -300,8 +307,8 @@
   .nl-bar {
     display: flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
-    padding: var(--sp-3, 12px) var(--sp-4, 16px);
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-4);
     background: var(--panel);
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
@@ -309,17 +316,17 @@
 
   .nl-title {
     font-weight: 600;
-    font-size: var(--fs-lg, 16px);
+    font-size: var(--fs-lg);
     color: var(--accent);
     letter-spacing: -0.015em;
     user-select: none;
   }
 
   .nl-count {
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     color: var(--accent);
-    background: var(--accent-soft, var(--hover-bg));
-    border-radius: var(--radius-pill, 999px);
+    background: var(--accent-soft);
+    border-radius: var(--radius-pill);
     padding: 1px 8px;
   }
 
@@ -336,15 +343,6 @@
     padding: 16px 20px 32px;
   }
 
-  .hint {
-    text-align: center;
-    padding: 48px 24px;
-    color: var(--fg2);
-    white-space: pre-line;
-    line-height: var(--lh-body, 1.6);
-    font-size: var(--fs-md, 14px);
-  }
-
   /* min(168px,100%) 保证容器比一列还窄时也不越界 —— 任何窗口尺寸都不裁封面。 */
   .nl-grid {
     display: grid;
@@ -354,12 +352,12 @@
   }
 
   .card {
-    padding: var(--sp-2, 8px);
-    border-radius: var(--radius, 12px);
+    padding: var(--sp-2);
+    border-radius: var(--radius-lg);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease),
-      transform var(--dur, 0.2s) var(--ease),
-      box-shadow var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease),
+      transform var(--dur) var(--ease),
+      box-shadow var(--dur) var(--ease);
     min-width: 0;
   }
 
@@ -370,14 +368,14 @@
     box-shadow: var(--shadow-md);
   }
 
-  .card.active { background: var(--accent-soft, var(--hover-bg)); }
+  .card.active { background: var(--accent-soft); }
 
   /* ---------- 封面（与书库 .cover 一致：2:3、8px 圆角、极淡描边） ---------- */
   .cover {
     position: relative;
     width: 100%;
     aspect-ratio: 2 / 3;
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--panel2);
     outline: 1px solid var(--line);
@@ -390,7 +388,7 @@
     height: 100%;
     object-fit: cover;
     display: block;
-    transition: transform var(--dur, 0.2s) var(--ease);
+    transition: transform var(--dur) var(--ease);
   }
 
   .card:hover .cover img { transform: scale(1.03); }
@@ -405,23 +403,23 @@
     gap: 6px;
     padding: 12px;
     text-align: center;
-    background: linear-gradient(160deg, var(--panel2), color-mix(in srgb, var(--panel2) 70%, #000 8%));
+    background: var(--panel2);
   }
-  .cf-t { font-size: 14px; font-weight: 600; line-height: 1.35; color: var(--fg); overflow-wrap: anywhere; }
-  .cf-a { font-size: 12px; color: var(--fg2); }
+  .cf-t { font-size: var(--fs-md); font-weight: 600; line-height: 1.35; color: var(--fg); overflow-wrap: anywhere; }
+  .cf-a { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); }
 
   .tag {
     position: absolute;
-    font-size: var(--fs-2xs, 10px);
+    font-size: var(--fs-2xs);
     line-height: 1;
     padding: 4px 8px;
-    border-radius: var(--radius-sm, 8px);
-    letter-spacing: var(--ls-wide, 0.015em);
+    border-radius: var(--radius-sm);
+    letter-spacing: var(--ls-xs);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
     white-space: nowrap;
   }
   .tag-hl { right: 8px; top: 8px; background: rgba(0, 0, 0, 0.62); color: #fff; }
-  .tag-note { right: 8px; top: 32px; background: color-mix(in srgb, var(--accent) 88%, transparent); color: var(--accent-fg, #fff); }
+  .tag-note { right: 8px; top: 32px; background: color-mix(in srgb, var(--accent) 88%, transparent); color: var(--accent-fg); }
   .tag-del { left: 8px; top: 8px; background: color-mix(in srgb, var(--danger) 86%, transparent); color: #fff; }
 
   /* ---------- 卡片文字块（高度与书库 .meta 对齐：52px） ---------- */
@@ -432,7 +430,7 @@
     overflow: hidden;
   }
   .meta .t {
-    font-size: var(--fs-md, 14px);
+    font-size: var(--fs-md);
     line-height: 20px;
     font-weight: 500;
     color: var(--fg);
@@ -441,7 +439,7 @@
     text-overflow: ellipsis;
   }
   .meta .a {
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     line-height: 18px;
     color: var(--fg2);
     white-space: nowrap;
@@ -458,20 +456,21 @@
     box-sizing: border-box;
     display: flex;
     align-items: center;
-    gap: var(--sp-4, 16px);
-    padding: var(--sp-2, 8px) var(--sp-3, 12px);
-    border-radius: var(--radius-sm, 8px);
+    gap: var(--sp-4);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease);
   }
-  .row:hover, .row:focus-visible { background: var(--hover-row, rgba(0, 0, 0, 0.04)); }
+  .row:hover, .row:focus-visible { background: var(--hover-row); }
 
+  /* 列表行封面：32×48 = 1.5，与 Library 列表行、网格封面、书籍详情同一比例 */
   .row-cover {
-    width: 34px;
+    width: 32px;
     height: 48px;
     flex-shrink: 0;
     object-fit: cover;
-    border-radius: var(--radius-xs, 6px);
+    border-radius: var(--radius-xs);
     outline: 1px solid var(--line);
     outline-offset: -1px;
     box-shadow: var(--shadow-sm);
@@ -490,12 +489,12 @@
   }
 
   .row-meta { flex: 1; min-width: 0; }
-  .row-meta .t { font-size: var(--fs-md, 14px); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .row-meta .a { font-size: var(--fs-xs, 12px); color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-meta .t { font-size: var(--fs-md); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-meta .a { font-size: var(--fs-xs); color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .row-num, .row-date {
     color: var(--fg2);
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
@@ -506,18 +505,18 @@
   .nl-status {
     display: flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
-    padding: var(--sp-2, 8px) var(--sp-4, 16px);
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-4);
     border-top: 1px solid var(--line);
     color: var(--fg2);
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     background: var(--panel);
     flex-shrink: 0;
   }
-  .nl-status .build { font-size: var(--fs-xs, 12px); opacity: 0.55; }
+  .nl-status .build { font-size: var(--fs-xs); opacity: 0.55; }
 
   .view-btn.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     opacity: 1;
   }
@@ -526,16 +525,11 @@
   .drawer-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--scrim);
     backdrop-filter: blur(3px) saturate(1.08);
     -webkit-backdrop-filter: blur(3px) saturate(1.08);
-    z-index: 1090;
-    animation: nd-backdrop-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
-  }
-
-  @keyframes nd-backdrop-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
+    z-index: var(--z-drawer);
+    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
   .drawer {
@@ -544,18 +538,13 @@
     right: 0;
     bottom: 0;
     width: min(460px, 92vw);
-    z-index: 1091;
+    z-index: var(--z-popover);
     background: var(--bg-elev);
     border-left: 1px solid var(--line);
     box-shadow: -6px 0 18px rgba(0, 0, 0, 0.14), -20px 0 52px rgba(0, 0, 0, 0.22);
     display: flex;
     flex-direction: column;
-    animation: nd-drawer-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes nd-drawer-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
+    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
   }
 
   .drawer-head {
@@ -566,21 +555,22 @@
     border-bottom: 1px solid var(--line);
   }
   .dh-main { flex: 1; min-width: 0; }
-  .dh-title { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .dh-sub { font-size: 12px; color: var(--fg2); margin-top: 2px; }
+  .dh-title { font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dh-sub { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); margin-top: 2px; }
 
   .drawer-list { flex: 1; overflow-y: auto; padding: 12px 12px 24px; }
 
   .item {
     border: 1px solid var(--line);
-    border-radius: var(--radius-md, 12px);
+    border-radius: var(--radius-md);
     padding: 12px;
     margin-bottom: 10px;
     background: var(--panel);
   }
 
   .quote {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     color: var(--fg2);
     border-left: 3px solid var(--line-strong);
     padding-left: 8px;
@@ -589,8 +579,8 @@
     overflow-wrap: anywhere;
   }
 
-  .note { font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .note.none { color: var(--fg2); font-size: 13px; }
+  .note { font-size: var(--fs-md); line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .note.none { color: var(--fg2); font-size: var(--fs-sm); letter-spacing: var(--ls-sm); }
 
   .foot {
     display: flex;
@@ -599,5 +589,5 @@
     gap: 8px;
     margin-top: 8px;
   }
-  .ch { font-size: 12px; color: var(--fg2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ch { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>

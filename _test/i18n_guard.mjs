@@ -459,15 +459,15 @@ const allUnused = zhKeys.filter((k) => !usedAll.has(k));
  *   b) 通用词条：同一含义在业务键里已有更具体的写法（如 settings.tts.serviceFallback）；
  *   c) 显示名改由结构体 id 经 labelOfId 取，故不需要独立键（dict.ttsModel.* 里那几条
  *      「服务商给定的取值」，随 hint 原样显示）。
+ * 已移除的条目：tts.serviceDefault / tts.serviceDefaultN / ai.profileDefault / ai.profileDefaultN /
+ *   common.untitledScheme —— 这 5 条原本以「种子名禁止翻译」为由挂在表里；种子名现已改为
+ *   **显示侧查表**（dict.seedEndpoint.* / dict.seedTts.* / dict.seedPrompt.* / dict.scheme.s-untitled，
+ *   见 src/lib/seedNames.svelte.ts 与 SEED_SCHEME_NAME_KEYS），旧键连同文案表里的定义一并删除，
+ *   免得同一句话在表里留两份、且旧理由（禁止翻译）已与实现相反。
  */
 const DEAD_KEY_ALLOWED = {
   "reader.toast.davCompare": "重复键：同一段云端/本地进度文案实际用 reader.confirm.davCompare（Reader.svelte 确认框）",
   "notes.deletedBook": "重复键：划线删除提示实际用 reader.toast.hlDeleted",
-  "tts.serviceDefault": "未被引用：TTS 服务档默认名由 stores 的 uniqueTtsServiceName() 生成并持久化（禁止翻译），显示侧空名兜底用 settings.tts.serviceFallback",
-  "tts.serviceDefaultN": "未被引用：同上（带序号的旧写法）",
-  "ai.profileDefault": "未被引用：AI 端点默认名由 stores 的 uniqueEndpointName() 生成并持久化（禁止翻译）",
-  "ai.profileDefaultN": "未被引用：同上（带序号的旧写法）",
-  "common.untitledScheme": "未被引用：方案名兜底是 stores 里会被持久化的「未命名方案」（禁止翻译）",
   "common.action.save": "未被引用：保存一律用 settings.*.save / reader.* 等更具体的键",
   "common.action.reset": "未被引用：恢复默认一律用 settings.*.reset 等更具体的键",
   "common.action.back": "未被引用：返回一律用各面板自己的 close/back 键",
@@ -710,7 +710,6 @@ const TEST_ALLOW_LINES = {
   "i18n_settings_live.mjs:75": "夹具书籍正文（K 段要打开的那本书，划选与状态栏字数都取自它）",
   "i18n_settings_live.mjs:79": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
   "i18n_settings_live.mjs:80": "预置的老数据与用户自命名（方案名 / 字体族名 / 音色 id / AI 档名 / 朗读服务名 / endonym）—— 断言「不被翻译」的对象",
-  "i18n_settings_live.mjs:87": "全角加号：图形符号（与守卫 EN_GLYPH_ALLOWED 同口径），不是可翻译文案",
   "i18n_settings_live.mjs:92": "注入页面的探针脚本自身的中文注释与假数据（不是界面文案）",
   "i18n_settings_live.mjs:180": "i18n 收尾专项脚本自身：断言标签与日志文案",
   "i18n_settings_live.mjs:222": "i18n 收尾专项脚本自身：断言标签与日志文案",

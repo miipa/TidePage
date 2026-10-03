@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n/index.svelte";
+import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   import type { TocEntry } from "../lib/types";
   import { dragOutHandle } from "../lib/windowSnap";
 
@@ -63,12 +64,12 @@
   });
 </script>
 
-<div class="sidepanel">
+<div class="sidepanel sidepanel--left" style="--sidepanel-w: 320px;">
   <div class="sp-head" data-testid="toc-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
     <span>{t("toc.title")}</span>
     <div class="sp-head-acts">
-      {#if onpopout}<button class="icon" data-testid="toc-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" data-testid="toc-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="toc-popout" title={t("common.panel.popout")} onclick={onpopout}><IconArrowsSplit2 /></button>{/if}
+      {#if onclose}<button class="icon" data-testid="toc-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
   </div>
   <div class="sp-search">
@@ -96,50 +97,22 @@
 </div>
 
 <style>
-  .sidepanel {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 320px;
-    background: color-mix(in srgb, var(--rdr-bg) 94%, black 6%);
-    border-right: 1px solid rgba(128, 128, 128, 0.2);
-    z-index: 40;
-    display: flex;
-    flex-direction: column;
-    box-shadow: 6px 0 18px rgba(0, 0, 0, 0.08), 18px 0 48px rgba(0, 0, 0, 0.14);
-    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes slide-in {
-    from { transform: translateX(-24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .sp-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    font-weight: 600;
-  }
-
-  .sp-head-acts { display: flex; align-items: center; gap: 6px; }
+  /* .sidepanel / .sp-head / .sp-list / .sp-empty 走 app.css 的全局基类；
+     目录面板是唯一的左侧抽屉，故模板上加 .sidepanel--left 并把宽度收窄到 320px。 */
+  .sp-head-acts { display: flex; align-items: center; gap: var(--sp-1); }
   .sp-head-acts .icon { font-weight: 400; }
 
   .sp-search {
-    padding: 0 12px 10px;
+    padding: 0 var(--sp-3) 10px;
   }
 
   .sp-search input {
     width: 100%;
   }
 
+  /* 目录行是虚拟滚动的绝对定位列表，容器不能有横向 padding，故这里覆盖全局基类 */
   .sp-list {
-    flex: 1;
-    overflow-y: auto;
     padding: 0 6px 10px;
-    position: relative;
   }
 
   .sp-inner {
@@ -156,10 +129,11 @@
     text-align: left;
     background: transparent;
     border: none;
-    border-radius: 8px;
-    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    padding: 0 var(--sp-3);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     line-height: 34px;
     white-space: nowrap;
     overflow: hidden;
@@ -168,18 +142,12 @@
   }
 
   .toc-item:hover {
-    background: rgba(128, 128, 128, 0.12);
+    background: color-mix(in srgb, var(--rdr-fg) 8%, transparent);
   }
 
   .toc-item.current {
     color: var(--accent);
     font-weight: 600;
-    background: rgba(128, 128, 128, 0.08);
-  }
-
-  .sp-empty {
-    padding: 24px;
-    text-align: center;
-    opacity: 0.5;
+    background: color-mix(in srgb, var(--rdr-fg) 7%, transparent);
   }
 </style>

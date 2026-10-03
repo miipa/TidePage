@@ -133,12 +133,12 @@ async function main() {
         return { y:Math.round(y), target: target? target.className||target.tagName : 'none', stillOpen: !!q('.iv-backdrop') };`));
       // close via x
       out.closeXhit = await main.evalJs(H(`
-        const b=qa('.iv-btn').find(x=>x.textContent.trim()==='×');
+        const b=q('.iv-stage');
         if(!b) return {found:false};
         const r=b.getBoundingClientRect();
         const el=document.elementFromPoint(r.left+r.width/2, r.top+r.height/2);
         return { found:true, rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}, hit: el? (el===b || b.contains(el)) : false, hitCls: el?el.className:'' };`));
-      out.closeX = await main.evalJs(H(`const b=qa('.iv-btn').find(x=>x.textContent.trim()==='×'); b?.dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(300); return { closed: !q('.iv-backdrop') };`));
+      out.closeX = await main.evalJs(H(`const b=q('.iv-stage'); b?.dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(300); return { closed: !q('.iv-backdrop') };`));
       // reopen viewer then press Esc: should close viewer only, stay in reader (not return to library)
       out.reopen = await main.evalJs(H(`
         const img=q('#chapter-content img'); const r=img.getBoundingClientRect(); const x=r.left+r.width/2,y=r.top+r.height/2;
@@ -208,7 +208,7 @@ async function main() {
         out.hiddenPersist=cfg().reader.topbarHidden;
         cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); await sleep(250);
         out.aiBack=qa('.tb-r .icon').some(b=>b.textContent.trim()==='AI');
-        qa('.tb-panel .icon').find(b=>b.textContent.trim()==='×')?.click(); await sleep(150);
+        q('.tb-panel-head button.icon')?.click(); await sleep(150);
         // --- image menu: 全部关闭 ---
         btnById('images')?.click(); await sleep(250);
         out.imgMenuItems=qa('.tb-panel .tb-menu-item').map(x=>x.textContent.trim());
@@ -235,7 +235,7 @@ async function main() {
         out.blockedListRows=qa('.tb-panel .tb-block-row').length;
         qa('.tb-panel .tb-block-row .tb-menu-item')[0]?.click(); await sleep(300);
         out.blockedAfterUnblock=(bcfg()[bid]?.blockedImages||[]).length;
-        qa('.tb-panel .icon').find(b=>b.textContent.trim()==='×')?.click(); await sleep(150);
+        q('.tb-panel-head button.icon')?.click(); await sleep(150);
         // --- css toggle ---
         const ovr0=q('.reader').classList.contains('ovr');
         btnById('css')?.click(); await sleep(700);

@@ -8,6 +8,7 @@
 import { zhCN } from "./zh-CN";
 import { en } from "./en";
 import type { MessageKey } from "./types";
+import type { AiPiece } from "../types";
 import { config, saveConfig } from "../stores.svelte";
 
 export type { MessageKey } from "./types";
@@ -92,14 +93,24 @@ export function setLocale(v: string) {
   localeSetting.set(normLanguage(v));
 }
 
+/** 把解析出的语言同步到 <html lang>：影响读屏发音、CSS :lang() 选择器与浏览器的断词/断行规则。
+ *  app.html 里写死 lang="en" 只是首帧兜底；这里在语言确定后（含 config.language 被外部改动时）纠正它。 */
+function syncHtmlLang(l: Locale): void {
+  if (typeof document === "undefined") return;
+  if (document.documentElement.lang !== l) document.documentElement.lang = l;
+}
+
 // config.language 可能被三处改动：设置面板下拉、跨窗广播 applyConfigJson、外部导入。
 // 根 effect 统一收敛到 localeState.locale，保证三者的表现完全一致。
 $effect.root(() => {
   $effect(() => {
     const next = resolveLocale(normLanguage(config.language));
     if (next !== localeState.locale) localeState.locale = next;
+    syncHtmlLang(localeState.locale);
   });
 });
+
+if (typeof document !== "undefined") syncHtmlLang(localeState.locale);
 
 /** 日期/数字格式化的 locale：跟随当前语言，禁止在调用点写死 "zh-CN"。 */
 export function dateLocale(): Locale {
@@ -132,7 +143,9 @@ export function t(key: MessageKey, params?: Record<string, string | number>): st
 /** 已知后端错误码 → 本地化文案。
  *  硬约束：这张表**只收 ASCII 错误码/前缀**（Rust 侧那批 `xxx:N` / `SomeErrorName`）。
  *  Rust 返回的中文报错一律原样透传，绝不靠正则改写后端文案；
- *  前端自己抛出的中文错误（stores/tts）也不进这张表 —— 它们在抛出点直接 t() 生成。 */
+ *  前端自己抛出的中文错误（stores/tts）也不进这张表 —— 它们在抛出点直接 t() 生成。
+ *  第二类来源是 AiError.code（`ai.*`）：Rust 侧静态中文已搬进文案表，
+ *  message 只保留动态尾巴（无固定说法时 code 为空串，整条原样透传）。 */
 const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
   // db.rs / library.rs 里的稳定 ASCII 错误码（形如 `xxx:N` / `SomeErrorName`）
   ["order_index_too_large", "err.orderIndexTooLarge"],
@@ -148,21 +161,126 @@ const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
   // 前端 stores 抛出的稳定 ASCII 码（备份入口；见 stores.svelte.ts runSettingsBackup）
   ["backup_running", "err.backupRunning"],
   ["backup_need_creds", "err.backupNeedCreds"],
+  // AiError.code（src-tauri/src/ai.rs）：静态中文已搬进文案表，message 只留动态尾巴。
+  // 一律追加在表尾：这张表按 startsWith 匹配，插在中间可能遮蔽后面的条目。
+  // 译文本身已是完整句子（含 {msg} 时由 errText/aiErrDetail 填入后端动态部分）。
+  ["ai.requestTimeout", "err.aiRequestTimeout"],
+  ["ai.networkFailed", "err.aiNetworkFailed"],
+  ["ai.invalidHeaderValue", "err.aiInvalidHeaderValue"],
+  ["ai.protocolMismatchBody", "err.aiProtocolMismatchBody"],
+  ["ai.protocolMismatchStream", "err.aiProtocolMismatchStream"],
+  ["ai.protocolMismatchEmpty", "err.aiProtocolMismatchEmpty"],
+  ["ai.dashscopeError", "err.aiDashscopeError"],
+  ["ai.audioBase64Decode", "err.aiAudioBase64Decode"],
+  ["ai.responseParse", "err.aiResponseParse"],
+  ["ai.minimaxFailed", "err.aiMinimaxFailed"],
+  ["ai.volcanoError", "err.aiVolcanoError"],
+  ["ai.baiduSynthFailed", "err.aiBaiduSynthFailed"],
+  ["ai.baiduTokenFailed", "err.aiBaiduTokenFailed"],
+  ["ai.edgeBuild", "err.aiEdgeBuild"],
+  ["ai.edgeConnect", "err.aiEdgeConnect"],
+  ["ai.edgeSend", "err.aiEdgeSend"],
+  ["ai.edgeReceive", "err.aiEdgeReceive"],
+  ["ai.noApiAddr", "err.aiNoApiAddr"],
+  ["ai.invalidModelId", "err.aiInvalidModelId"],
+  ["ai.azureNeedDeployment", "err.aiAzureNeedDeployment"],
+  ["ai.azureInvalidDeployment", "err.aiAzureInvalidDeployment"],
+  ["ai.emptyAudio", "err.aiEmptyAudio"],
+  ["ai.dashscopeNeedKey", "err.aiDashscopeNeedKey"],
+  ["ai.audioDownloadFailed", "err.aiAudioDownloadFailed"],
+  ["ai.audioDownloadEmpty", "err.aiAudioDownloadEmpty"],
+  ["ai.dashscopeNoAudio", "err.aiDashscopeNoAudio"],
+  ["ai.noClonedVoice", "err.aiNoClonedVoice"],
+  ["ai.voiceMissingId", "err.aiVoiceMissingId"],
+  ["ai.refAudioReadFailed", "err.aiRefAudioReadFailed"],
+  ["ai.refAudioEmpty", "err.aiRefAudioEmpty"],
+  ["ai.gatewayNoAudio", "err.aiGatewayNoAudio"],
+  ["ai.breezeNoAddr", "err.aiBreezeNoAddr"],
+  ["ai.noServiceAddr", "err.aiNoServiceAddr"],
+  ["ai.azureVoiceNeedDeployment", "err.aiAzureVoiceNeedDeployment"],
+  ["ai.volcanoNeedAppId", "err.aiVolcanoNeedAppId"],
+  ["ai.volcanoNeedToken", "err.aiVolcanoNeedToken"],
+  ["ai.volcanoNoAudio", "err.aiVolcanoNoAudio"],
+  ["ai.baiduNeedKey", "err.aiBaiduNeedKey"],
+  ["ai.baiduNeedSecret", "err.aiBaiduNeedSecret"],
+  ["ai.baiduEmptyAudio", "err.aiBaiduEmptyAudio"],
+  ["ai.edgeNoAudio", "err.aiEdgeNoAudio"],
+  // 代理地址（normalize_proxy_url / proxy_with_bypass，src-tauri/src/ai.rs）
+  ["ai.proxyAddrEmpty", "err.aiProxyAddrEmpty"],
+  ["ai.proxyAddrInvalid", "err.aiProxyAddrInvalid"],
+  // 连接测试的结构化片段（AiPiece）：线路名 / 诊断附注 / 代理来源 / 失败行。
+  // ⚠ 同一张表按 startsWith 匹配，故**长的排前面**：`ai.routeDirect` 是 `ai.routeDirectNoPac`
+  // 与 `ai.routeDirectFallback` 的前缀，插错位置会把它们截断成「直连」。
+  ["ai.routeDirectNoPac", "ai.routeDirectNoPac"],
+  ["ai.routeDirectFallback", "ai.routeDirectFallback"],
+  ["ai.routeCustom", "ai.routeCustom"],
+  ["ai.routeDirect", "ai.routeDirect"],
+  ["ai.routeAuto", "ai.routeAuto"],
+  ["ai.lineFailed", "ai.lineFailed"],
+  ["ai.noteProxyUnavailable", "ai.noteProxyUnavailable"],
+  ["ai.noteDirectClientFailed", "ai.noteDirectClientFailed"],
+  ["ai.noteAutoProxyUnavailable", "ai.noteAutoProxyUnavailable"],
+  ["ai.notePac", "ai.notePac"],
+  ["ai.proxySourceEnv", "ai.proxySourceEnv"],
+  ["ai.proxySourceWindows", "ai.proxySourceWindows"],
+  ["ai.proxySourcePacOnly", "ai.proxySourcePacOnly"],
+  ["ai.proxySourceNone", "ai.proxySourceNone"],
 ];
 
-/** toast(String(e), "error") 的本地化替代：已知错误码给译文，未知原样透传。 */
-export function errText(e: unknown): string {
+/** toast(String(e), "error") 的本地化替代：已知错误码给译文，未知原样透传。
+ *  params 可选：带 `{msg}` 占位符的译文（AiError 的 `ai.*` 码）用它填动态尾巴；
+ *  不传时占位符原样保留，故现有调用点无需改动。 */
+export function errText(e: unknown, params?: Record<string, string | number>): string {
   // 前端 stores 抛出的错误会带稳定 ASCII `code`（见 stores.svelte.ts 备份入口）：
   // 优先按 code 查表，这样不必把中文原文塞进 Error.message。
   const code = (e as { code?: unknown } | null)?.code;
   if (typeof code === "string") {
-    for (const [c, key] of ERR_CODES) if (code === c || code.startsWith(c)) return t(key);
+    for (const [c, key] of ERR_CODES) if (code === c || code.startsWith(c)) return t(key, params);
   }
   const raw = String(e);
   for (const [c, key] of ERR_CODES) {
     if (raw === c || raw.startsWith(c)) return t(key);
   }
   return raw;
+}
+
+/** `AiError.code` / `AiPiece.code` → 文案键。**精确匹配**：`ai.*` 码互不为前缀，
+ *  但 `ai.routeDirect` 是 `ai.routeDirectNoPac` 的前缀，用 startsWith 会把长码截断。 */
+function codeKey(code: string): MessageKey | null {
+  if (!code) return null;
+  for (const [c, key] of ERR_CODES) if (c === code) return key;
+  return null;
+}
+
+/** AiError 的结构化展示（src-tauri/src/ai.rs 序列化出的 `{kind, code, message}`）。
+ *
+ *  规则：**code 命中译文时，译文顶替「kind 标签 + 原始 message」两段** —— 因为码的译文
+ *  本身就是完整描述（例如「连接超时：{msg}」已含 timeout 这个类别），再叠一层 errKind
+ *  会变成「网络错误：网络失败：…」这种重复。
+ * @returns 命中时返回整句译文；未命中（无 code / 码不在表里）返回 null，由调用方沿用
+ *          原来的 `errKindLabel(kind)` + 原始 message，那条路径一个字都不改。 */
+export function aiErrDetail(err: { kind: string; code?: string; message: string }): string | null {
+  const key = codeKey(err.code ?? "");
+  return key ? t(key, { msg: err.message }) : null;
+}
+
+/** 结构化片段（`AiPiece`，src-tauri/src/ai.rs）：连接测试的线路名、诊断附注、失败行都走这里。
+ *
+*  规则与 Rust 侧一致：`code` 命中 → 取译文并把素材按序填进 `{p0}` / `{p1}`…；素材取自
+ *  `params`（本身也是片段，可再嵌套，如「自动代理（环境变量 HTTPS_PROXY）」里的来源），
+ *  没有 `params` 时退化成一个素材 = `param`。`code` 为空或不在表里 → 原样回退 `param`
+ *  （代理地址、上游返回文本这类没有固定说法的内容，后端不会给码）。
+ *  单素材时**同时**提供 `{msg}`：错误码（`err.ai*`）的译文用的是 `{msg}`，与线路/附注的
+ *  `{p0}` 共用这张表，两个占位符都填上，两类码都能命中。 */
+export function aiPieceText(piece: AiPiece | null | undefined): string {
+  if (!piece) return "";
+  const slots = piece.params.length ? piece.params.map(aiPieceText) : piece.param ? [piece.param] : [];
+  const key = codeKey(piece.code);
+  if (!key) return piece.param || slots.join(" ");
+  const params: Record<string, string> = {};
+  if (!piece.params.length && piece.param) params.msg = piece.param;
+  slots.forEach((v, i) => (params[`p${i}`] = v));
+  return t(key, params);
 }
 
 /**

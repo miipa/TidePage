@@ -57,7 +57,7 @@
   });
 </script>
 
-<div class="hl-menu" bind:this={menuEl} style={posStyle}>
+<div class="hl-menu rdr-pop" bind:this={menuEl} style={posStyle}>
   <div class="hm-text" title={highlight.text}>{highlight.text}</div>
   <div class="hm-colors">
     <ColorPalette
@@ -102,29 +102,21 @@
 </div>
 
 <style>
+  /* 底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
   .hl-menu {
     position: fixed;
-    z-index: 980;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 90%, #202020 10%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
-    padding: 8px;
+    z-index: var(--z-popover);
+    padding: var(--sp-2);
     display: flex;
     flex-direction: column;
     gap: 7px;
     max-width: 340px;
-    animation: hm-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes hm-in {
-    from { opacity: 0; transform: translateY(4px) scale(0.96); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .hm-text {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.65;
     max-width: 320px;
     white-space: nowrap;
@@ -135,53 +127,40 @@
   .hm-colors {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--sp-1);
     flex-wrap: wrap;
-  }
-
-  .csw {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 1px solid rgba(128, 128, 128, 0.4);
-    padding: 0;
-    cursor: pointer;
-  }
-
-  .csw.active {
-    outline: 2px solid var(--accent, #4a6b8a);
-    outline-offset: 1px;
   }
 
   .hm-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--sp-2);
   }
 
   .hm-row label {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.6;
   }
 
   .hm-row select {
     flex: 1;
     min-width: 0;
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
 
   .hm-row .danger {
-    color: var(--danger, #c0392b);
-    font-size: 12px;
+    color: var(--danger);
+    font-size: var(--fs-xs);
   }
 
-  .hm-note { display: flex; flex-direction: column; gap: 6px; }
+  .hm-note { display: flex; flex-direction: column; gap: var(--sp-1); }
   .hm-note textarea {
     width: 100%;
     box-sizing: border-box;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     resize: vertical;
     min-height: 60px;
   }
-  .hm-note-acts { display: flex; gap: 6px; justify-content: flex-end; }
+  .hm-note-acts { display: flex; gap: var(--sp-1); justify-content: flex-end; }
 </style>

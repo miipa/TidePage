@@ -1,9 +1,18 @@
 <script lang="ts">
-  import { t } from "../lib/i18n/index.svelte";
+  import { aiErrDetail, t } from "../lib/i18n/index.svelte";
+  import { seedEndpointLabel, seedPromptLabel } from "../lib/seedNames.svelte";
   import { tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
+  import { esc, mdToHtml } from "../lib/md";
   import { dragSort } from "../lib/dragSort";
+  import {
+    IconArrowsSplit2,
+    IconChevronLeft,
+    IconChevronRight,
+    IconSettings,
+    IconX,
+  } from "@tabler/icons-svelte";
   import {
     config,
     saveConfig,
@@ -52,97 +61,6 @@
   );
 
   let ctx = $state({ title: "", html: "" });
-
-  /* ---------- 轻量 markdown → HTML ---------- */
-  function esc(s: string): string {
-    return s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
-  function inlineMd(s: string): string {
-    return s
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, "$1");
-  }
-
-  function mdToHtml(src: string): string {
-    const lines = (src || "").replace(/\r\n/g, "\n").split("\n");
-    const out: string[] = [];
-    let para: string[] = [];
-    let list: string[] | null = null;
-    let code: string[] | null = null;
-    const flushPara = () => {
-      if (para.length) {
-        out.push(`<p>${inlineMd(para.join("<br/>"))}</p>`);
-        para = [];
-      }
-    };
-    const flushList = () => {
-      if (list) {
-        out.push(`<ul>${list.map((li) => `<li>${inlineMd(li)}</li>`).join("")}</ul>`);
-        list = null;
-      }
-    };
-    for (const raw of lines) {
-      const line = raw.trimEnd();
-      if (line.trim().startsWith("```")) {
-        if (code) {
-          out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
-          code = null;
-        } else {
-          flushPara();
-          flushList();
-          code = [];
-        }
-        continue;
-      }
-      if (code) {
-        code.push(raw);
-        continue;
-      }
-      const hm = line.match(/^(#{1,4})\s+(.*)/);
-      if (hm) {
-        flushPara();
-        flushList();
-        out.push(`<h${hm[1].length}>${inlineMd(esc(hm[2]))}</h${hm[1].length}>`);
-        continue;
-      }
-      if (/^\s*([-*•])\s+/.test(line)) {
-        flushPara();
-        if (!list) list = [];
-        list.push(esc(line.replace(/^\s*([-*•])\s+/, "")));
-        continue;
-      }
-      const num = line.match(/^\s*(\d+[.、)])\s+(.*)/);
-      if (num) {
-        flushPara();
-        flushList();
-        out.push(`<p class="li">${esc(num[1] + " " + num[2])}</p>`);
-        continue;
-      }
-      if (line.trim() === "") {
-        flushPara();
-        flushList();
-        continue;
-      }
-      if (/^\s*>/.test(line)) {
-        flushPara();
-        flushList();
-        out.push(`<blockquote>${inlineMd(esc(line.replace(/^\s*>\s?/, "")))}</blockquote>`);
-        continue;
-      }
-      para.push(esc(line));
-    }
-    if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
-    flushPara();
-    flushList();
-    return out.join("\n");
-  }
 
   /* ---------- 章节上下文与请求 ---------- */
   function onChapterAuto(detail: { title: string; html: string }) {
@@ -240,32 +158,23 @@
     }
   }
 
-  // 后端 ai_chat 失败时 reject 结构化对象 {kind,message}；此处兼容字符串/Error 兜底分类。
-  function normalizeAiError(e: unknown): { kind: string; message: string } {
+  // 后端 ai_chat 失败时 reject 结构化对象 {kind,code,message}；此处兼容字符串/Error 兜底分类。
+  function normalizeAiError(e: unknown): { kind: string; code: string; message: string } {
     if (e && typeof e === "object") {
       const o = e as Record<string, unknown>;
-      if ("message" in o || "kind" in o) {
+      if ("message" in o || "kind" in o || "code" in o) {
         return {
           kind: typeof o.kind === "string" ? o.kind : "unknown",
+          code: typeof o.code === "string" ? o.code : "",
           message: typeof o.message === "string" ? o.message : JSON.stringify(e),
         };
       }
     }
+    // 非结构化错误（字符串 / Error / 其它对象）：类别无从得知，一律 unknown。
+    // 早先这里按「超时/网络/协议不匹配/模型ID」等中文词猜类别，但后端静态中文已随
+    // AiError.code 搬进文案表，这些词只会出现在上游原文里，按它猜反而会猜错。
     const s = typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
-    const kind = /超时|timeout/i.test(s)
-      ? "timeout"
-      : /网络|connect|dns|refused|unreachable/i.test(s)
-        ? "network"
-        : /HTTP 5\d\d/.test(s)
-          ? "http_5xx"
-          : /HTTP 4\d\d/.test(s)
-            ? "http_4xx"
-            : /协议不匹配/.test(s)
-              ? "protocol"
-              : /模型ID/.test(s)
-                ? "model_id"
-                : "unknown";
-    return { kind, message: s };
+    return { kind: "unknown", code: "", message: s };
   }
 
   async function run(system: string, userText: string) {
@@ -289,16 +198,16 @@
     const order: number[] = [];
     for (let k = 0; k < profiles.length; k++) order.push((start + k) % profiles.length);
     const maxTries = config.ai.failover ? order.length : 1;
-    const failures: { name: string; kind: string; message: string }[] = [];
+    const failures: { name: string; kind: string; code: string; message: string }[] = [];
 
     for (let a = 0; a < maxTries; a++) {
       const idx = order[a];
       const p = profiles[idx];
       if (!p || !p.baseUrl || !p.model) {
-        failures.push({ name: p?.name || t("ai.endpointDefault", { n: idx + 1 }), kind: "config", message: t("ai.noAddrOrModel") });
+        failures.push({ name: seedEndpointLabel(p?.name ?? "", t("ai.endpointDefault", { n: idx + 1 })), kind: "config", code: "", message: t("ai.noAddrOrModel") });
         continue;
       }
-      const label = p.name || t("ai.endpointDefault", { n: idx + 1 });
+      const label = seedEndpointLabel(p.name, t("ai.endpointDefault", { n: idx + 1 }));
       if (a > 0) {
         const prev = failures[failures.length - 1];
         // 重试前清空上一个端点可能已流式写入的内容，避免拼接错乱
@@ -345,14 +254,21 @@
         active = false;
         un?.();
         const err = normalizeAiError(e);
-        failures.push({ name: label, kind: err.kind, message: err.message });
+        failures.push({ name: label, kind: err.kind, code: err.code, message: err.message });
         if (!config.ai.failover) break;
       }
     }
 
+    // 逐条失败行：code 命中 → 用译文整句顶替（译文本身已含类别描述与动态尾巴，
+    // 再叠一层 errKind 会变成「网络错误：网络失败：…」这种重复）；未命中则沿用旧格式。
     reply.content = failures.length
       ? `${t("ai.allFailedTitle")}\n${failures
-          .map((f) => t("ai.endpointFailedLine", { name: f.name, kind: errKindLabel(f.kind), msg: f.message }))
+          .map((f) => {
+            const coded = aiErrDetail(f);
+            return coded !== null
+              ? t("ai.endpointFailedLineCoded", { name: f.name, err: coded })
+              : t("ai.endpointFailedLine", { name: f.name, kind: errKindLabel(f.kind), msg: f.message });
+          })
           .join("\n")}`
       : t("ai.noEndpointAvailable");
     streaming = false;
@@ -850,13 +766,13 @@ ${readerStyle.extra}
           }
         }}>{t("ai.dock")}</button>
       {:else}
-        <button class="icon" onclick={() => onclose?.()}>×</button>
+        <button class="icon" title={t("ai.closePanel")} aria-label={t("ai.closePanel")} onclick={() => onclose?.()}><IconX /></button>
       {/if}
     </div>
     <div class="ai-actions">
       <select class="ep-sel" data-testid="ai-endpoint" title={t("ai.switchEndpoint")} bind:value={config.ai.active} onchange={saveConfigNow}>
         {#each config.ai.profiles as p, i (p.id)}
-          <option value={i}>{p.name || t("ai.endpointDefault", { n: i + 1 })}</option>
+          <option value={i}>{seedEndpointLabel(p.name, t("ai.endpointDefault", { n: i + 1 }))}</option>
         {/each}
       </select>
       <button class="mini" data-testid="ai-display" title={isReader ? t("ai.displayBubbleTip") : t("ai.displayReaderTip")} onclick={toggleDisplay}>
@@ -866,7 +782,7 @@ ${readerStyle.extra}
       <button class="mini" data-testid="ai-export-epub" title={t("ai.exportEpub")} onclick={() => exportKind("epub")}>EPUB</button>
       <button class="mini" data-testid="ai-clear" title={t("ai.clearTip")} onclick={clearAll}>{t("ai.clear")}</button>
       {#if !standalone}
-        <button class="mini" data-testid="ai-popout" title={t("common.panel.popout")} onclick={popOut}>⧉</button>
+        <button class="mini" data-testid="ai-popout" title={t("common.panel.popout")} onclick={popOut}><IconArrowsSplit2 /></button>
       {/if}
     </div>
   </div>
@@ -877,16 +793,16 @@ ${readerStyle.extra}
   <div class="prompt-bar" use:dragSort={{ onDrop: promptDrop }}>
     {#each config.ai.prompts as p (p.id)}
       <button class="prompt-chip" data-drag-id={p.id} onclick={() => firePrompt(p)} disabled={streaming} title={p.text}>
-        {p.name}<span class="pkey">{p.key}</span>
+        {seedPromptLabel(p.name)}<span class="pkey">{p.key}</span>
       </button>
     {/each}
-    <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title={t("ai.settingsTip")}>⚙</button>
+    <button class="prompt-chip add" onclick={() => (ui.settingsOpen = true)} title={t("ai.settingsTip")}><IconSettings /></button>
     {#if showPager}
       <div class="flex-fill"></div>
       <span class="pg-ind">{aiPages > 1 ? `${aiPage + 1}/${aiPages}` : ""}</span>
       {#if aiPages > 1}
-        <button class="mini" data-testid="ai-prev-page" onclick={() => aiFlip(-1)} title={t("ai.prevPage")}>‹</button>
-        <button class="mini" data-testid="ai-next-page" onclick={() => aiFlip(1)} title={t("ai.nextPage")}>›</button>
+        <button class="mini" data-testid="ai-prev-page" onclick={() => aiFlip(-1)} title={t("ai.prevPage")}><IconChevronLeft /></button>
+        <button class="mini" data-testid="ai-next-page" onclick={() => aiFlip(1)} title={t("ai.nextPage")}><IconChevronRight /></button>
       {/if}
     {/if}
   </div>
@@ -1001,7 +917,8 @@ ${readerStyle.extra}
 <style>
   .ep-sel {
     max-width: 110px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     padding: 3px 6px;
   }
 
@@ -1019,7 +936,8 @@ ${readerStyle.extra}
   .flex-fill { flex: 1; }
 
   .pg-ind {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.65;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -1031,7 +949,8 @@ ${readerStyle.extra}
     align-items: center;
     gap: 12px;
     padding: 5px 16px 8px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.9;
   }
 
@@ -1058,7 +977,7 @@ ${readerStyle.extra}
     right: 0;
     height: 4px;
     background: rgba(128, 128, 128, 0.15);
-    border-radius: 2px;
+    border-radius: var(--radius-pill);
     pointer-events: none;
   }
 
@@ -1075,22 +994,25 @@ ${readerStyle.extra}
   .ai-pg-seg {
     pointer-events: auto;
     background: rgba(128, 128, 128, 0.22);
-    border-radius: 2px;
+    border-radius: var(--radius-pill);
     height: 4px;
   }
 
   .ai-pg-seg.cur { background: rgba(128, 128, 128, 0.42); }
-  .ai-pg-seg:hover { background: var(--accent, #4a6b8a); }
+  .ai-pg-seg {
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .ai-pg-seg:hover { background: var(--accent); }
 
   .ai-prog-fill {
     position: relative;
     height: 4px;
-    background: color-mix(in srgb, var(--accent, #4a6b8a) 55%, transparent);
-    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: var(--radius-pill);
     pointer-events: none;
-    z-index: 1;
+    z-index: var(--z-base);
     max-width: 100%;
-    transition: width 0.18s ease;
+    transition: width var(--dur) var(--ease);
   }
 
   .ai-pg-dot {
@@ -1100,12 +1022,12 @@ ${readerStyle.extra}
     width: 11px;
     height: 11px;
     border-radius: 50%;
-    background: var(--accent, #4a6b8a);
+    background: var(--accent);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 1px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.35);
     opacity: 0;
-    transition: opacity 0.15s;
+    transition: opacity var(--dur-fast) var(--ease);
     pointer-events: none;
-    z-index: 2;
+    z-index: var(--z-raised);
   }
 
   .ai-prog-track:hover .ai-pg-dot,
@@ -1113,9 +1035,10 @@ ${readerStyle.extra}
   .ai-prog-track.dragging { cursor: grab; }
 
   .prompt-chip {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     padding: 3px 9px;
-    border-radius: 20px;
+    border-radius: var(--radius-pill);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1132,7 +1055,8 @@ ${readerStyle.extra}
   }
 
   .pkey {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
     opacity: 0.55;
     font-family: Consolas, monospace;
   }
@@ -1144,21 +1068,25 @@ ${readerStyle.extra}
     bottom: 0;
     width: 6px;
     cursor: ew-resize;
-    z-index: 46;
+    z-index: var(--z-raised);
   }
 
+  /* AI 面板本体：与其它侧面板同一套表面规格（底色/描边/投影走 --rdr-*，
+     宽度由状态注入 --sidepanel-w，方向为右侧故不加 .sidepanel--left）。
+     阅读区内打开时额外叠一层 --ai-* 变量（面板自己的配色方案）。 */
   .ai-panel {
     position: absolute;
     right: 0;
     top: 0;
     bottom: 0;
-    background: color-mix(in srgb, var(--rdr-bg) 92%, black 8%);
-    border-left: 1px solid rgba(128, 128, 128, 0.2);
-    z-index: 45;
+    width: var(--sidepanel-w);
+    background: var(--rdr-surface);
+    border-left: 1px solid var(--rdr-line);
+    z-index: var(--z-drawer);
     display: flex;
     flex-direction: column;
-    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
-    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+    box-shadow: var(--rdr-shadow-panel);
+    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
   }
 
   .ai-panel.standalone {
@@ -1175,25 +1103,20 @@ ${readerStyle.extra}
     color: var(--ai-fg, var(--rdr-fg));
   }
 
-  @keyframes slide-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .ai-head {
+ .ai-head {
     display: flex;
     flex-direction: column;   /* 两行：标题行 + 动作行 */
     align-items: stretch;
-    gap: 6px;
+    gap: var(--sp-1);
     padding: 10px 14px;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+    border-bottom: 1px solid var(--rdr-line);
   }
 
   .ai-head-top {
     display: flex;
     align-items: center;
     justify-content: space-between; /* 标题左、关闭/停靠右 */
-    gap: 8px;
+    gap: var(--sp-2);
   }
 
   /* 独立 AI 窗：顶部第一行既是拖拽区，也要给右上角自绘窗口控制按钮留出空间，
@@ -1204,7 +1127,8 @@ ${readerStyle.extra}
 
   .ai-panel .ai-actions .mini {
     padding: 3px 7px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
   }
 
   .ai-panel.reader .ai-head {
@@ -1213,7 +1137,8 @@ ${readerStyle.extra}
 
   .ai-title {
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1251,7 +1176,8 @@ ${readerStyle.extra}
   }
 
   .mini {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     padding: 3px 10px;
   }
 
@@ -1275,8 +1201,9 @@ ${readerStyle.extra}
   .ai-bubble {
     max-width: 88%;
     padding: 8px 12px;
-    border-radius: 12px;
-    font-size: 13px;
+    border-radius: var(--radius-lg);
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
@@ -1296,7 +1223,8 @@ ${readerStyle.extra}
   .ai-empty {
     text-align: center;
     opacity: 0.5;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     padding: 30px 20px;
     line-height: 1.7;
   }
@@ -1370,7 +1298,7 @@ ${readerStyle.extra}
   .ai-mark :global(pre) {
     background: rgba(128, 128, 128, 0.12);
     padding: 8px 10px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
     white-space: pre-wrap;
     word-break: break-all;
@@ -1380,7 +1308,7 @@ ${readerStyle.extra}
   .ai-mark :global(code) {
     font-family: Consolas, "Courier New", monospace;
     background: rgba(128, 128, 128, 0.12);
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     padding: 0.05em 0.25em;
   }
 

@@ -25,6 +25,7 @@
 import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { prefersReducedMotion } from "./reducedMotion";
 
 const BASE_LABEL = "main";
 const EDGE_SNAP = 10;         // 物理 px：边缘差 ≤ 此值且另一轴真实重叠 → 真正吸附（6–12 取中）
@@ -234,8 +235,22 @@ export function dragOutHandle(node: HTMLElement, onout?: () => void) {
   function feedback(on: boolean) {
     const p = panelEl();
     if (!p) return;
-    if (on) { p.style.outline = "2px dashed var(--accent, #4a6b8a)"; p.style.outlineOffset = "-2px"; p.style.opacity = "0.82"; node.style.cursor = "grabbing"; }
-    else { p.style.outline = ""; p.style.outlineOffset = ""; p.style.opacity = ""; node.style.cursor = ""; }
+    // 「减少动效」下简化视觉反馈：去掉虚线描边与半透明（两者都是「运动/形变」类暗示），
+    // 只保留 cursor 与一个静态的 inset 描边，保证「正在拖出」这件事仍然可感知。
+    // 正确做法不是给这里加动画——拖拽跟随本来就该即时——而是把反馈做减法。
+    if (on) {
+      p.style.outline = prefersReducedMotion() ? "" : "2px dashed var(--accent)";
+      p.style.outlineOffset = prefersReducedMotion() ? "" : "-2px";
+      p.style.opacity = prefersReducedMotion() ? "" : "0.82";
+      p.style.boxShadow = prefersReducedMotion() ? "inset 0 0 0 2px var(--accent)" : "";
+      node.style.cursor = "grabbing";
+    } else {
+      p.style.outline = "";
+      p.style.outlineOffset = "";
+      p.style.opacity = "";
+      p.style.boxShadow = "";
+      node.style.cursor = "";
+    }
   }
 
   function down(e: PointerEvent) {

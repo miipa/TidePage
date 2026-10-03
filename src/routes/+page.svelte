@@ -13,6 +13,7 @@
   import WindowControls from "../components/WindowControls.svelte";
   import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, openPanelWindow } from "../lib/stores.svelte";
   import { t } from "../lib/i18n/index.svelte";
+  import { IconArrowsSplit2, IconCopy, IconX } from "@tabler/icons-svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
@@ -232,7 +233,7 @@
       class="notes-popout-btn"
       title={t("notes.popoutTip")}
       onclick={async () => { const ok = await openPanelWindow("notes", ui.currentBookId || 0, t("library.topbar.notes.label")); if (ok) ui.notesOpen = false; }}
-    >⧉</button>
+    ><IconArrowsSplit2 /></button>
     <NotesPanel />
   {/if}
 
@@ -264,8 +265,8 @@
     <div class="toast-card" class:error={ti.kind === "error"}>
       <div class="toast-msg">{ti.msg}</div>
       <div class="toast-acts">
-        <button class="icon" data-testid="toast-copy" title={t("common.toast.copy")} onclick={() => copyText(ti.msg)}>⧉</button>
-        <button class="icon" data-testid="toast-close" title={t("common.toast.close")} onclick={() => dismissToast(ti.id)}>×</button>
+        <button class="icon" data-testid="toast-copy" title={t("common.toast.copy")} onclick={() => copyText(ti.msg)}><IconCopy /></button>
+        <button class="icon" data-testid="toast-close" title={t("common.toast.close")} onclick={() => dismissToast(ti.id)}><IconX /></button>
       </div>
     </div>
   {/each}
@@ -279,7 +280,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    z-index: 9999;
+    z-index: var(--z-toast);
     max-width: min(560px, 80vw);
   }
 
@@ -290,10 +291,10 @@
     background: var(--panel);
     color: var(--fg);
     border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
+    border-radius: var(--radius-lg);
     padding: 10px 10px 10px 14px;
     box-shadow: var(--shadow-lg), var(--edge-hi);
-    animation: toast-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+    animation: toast-in var(--dur-lift) var(--ease-premium) both;
     max-width: 100%;
     min-width: 0;
     box-sizing: border-box;
@@ -308,7 +309,7 @@
   .toast-msg {
     flex: 1;
     min-width: 0;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     line-height: 1.55;
     white-space: pre-wrap;
     word-break: break-all;
@@ -346,19 +347,18 @@
   .snap-fx {
     position: fixed;
     inset: 0;
-    z-index: 10001;
+    z-index: var(--z-toast);
     pointer-events: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
+    /* 预览态只改 box-shadow（虚线描边用 box-shadow 画，outline 不可过渡）*/
+    transition: box-shadow var(--dur-fast) var(--ease);
   }
   .snap-fx.preview {
-    outline: 2px dashed var(--accent, #4a6b8a);
-    outline-offset: -6px;
-    box-shadow: inset 0 0 0 6px color-mix(in srgb, var(--accent, #4a6b8a) 14%, transparent);
+    /* 预览态：虚线 outline 不可过渡，改用可插值的实心 inset 描边 */
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
   .snap-fx.flash {
-    outline: 3px solid var(--accent, #4a6b8a);
-    outline-offset: -3px;
-    box-shadow: inset 0 0 24px color-mix(in srgb, var(--accent, #4a6b8a) 55%, transparent);
+    box-shadow: inset 0 0 0 3px var(--accent), inset 0 0 24px color-mix(in srgb, var(--accent) 55%, transparent);
     animation: snap-flash-out 1s ease forwards;
   }
   @keyframes snap-flash-out {
@@ -370,10 +370,10 @@
     position: fixed;
     top: 10px;
     right: 56px;
-    z-index: 10000;
+    z-index: var(--z-window);
     width: 30px;
     height: 30px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: rgba(128, 128, 128, 0.18);
     border: none;
     cursor: pointer;
@@ -384,47 +384,39 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(20, 20, 24, 0.35);
+    background: var(--scrim);
     backdrop-filter: blur(3px) saturate(1.08);
     -webkit-backdrop-filter: blur(3px) saturate(1.08);
-    z-index: 990;
-    animation: overlay-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
+    z-index: var(--z-drawer);
+    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
-  @keyframes overlay-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .ai-window-root {
+ .ai-window-root {
     height: 100%;
     background: var(--panel);
     color: var(--fg);
   }
 
+  /* WebDAV 抽屉：遮罩用 --z-drawer、抽屉本体用 --z-overlay —— 刻意压在 --z-modal 之下，
+     这样即使用户先开抽屉再开设置/搜索弹窗，弹窗仍然盖住抽屉（与重构前的 991 < 1000 一致）。 */
   .wd-drawer {
     position: fixed;
     top: 0;
     right: 0;
     bottom: 0;
     width: min(520px, 92vw);
-    z-index: 991;
+    z-index: var(--z-overlay);
     background: var(--panel);
     color: var(--fg);
     border-left: 1px solid var(--line);
-    box-shadow: -10px 0 32px rgba(0, 0, 0, 0.22);
-    animation: wd-in 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
+    box-shadow: var(--shadow-drawer);
+    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
 
-  @keyframes wd-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .ai-window-root :global(.ai-panel) {
+ .ai-window-root :global(.ai-panel) {
     color: var(--fg);
   }
 

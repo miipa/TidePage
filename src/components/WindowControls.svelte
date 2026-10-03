@@ -52,7 +52,7 @@
 
 <div class="win-ctl">
   <button class="wc-btn" data-testid="wc-min" aria-label={t("common.window.minimize")} title={t("common.window.minimize")} onclick={onMinimize}>
-    <IconMinus size={20} stroke={1.75} />
+    <IconMinus size={20} stroke={1.5} />
   </button>
   <button
     class="wc-btn"
@@ -62,26 +62,26 @@
     onclick={onToggleMaximize}
   >
     {#if maximized}
-      <IconSquares size={20} stroke={1.75} />
+      <IconSquares size={20} stroke={1.5} />
     {:else}
-      <IconSquare size={20} stroke={1.75} />
+      <IconSquare size={20} stroke={1.5} />
     {/if}
   </button>
   <button class="wc-btn wc-close" data-testid="wc-close" aria-label={t("common.action.close")} title={t("common.action.close")} onclick={onClose}>
-    <IconX size={20} stroke={1.75} />
+    <IconX size={20} stroke={1.5} />
   </button>
 </div>
 
 <style>
   /* 固定右上角覆盖层：容器高度 = 当前窗口顶栏实际高度（--fr-titlebar-h，由承载顶栏的
      组件测高写入），按钮在容器内垂直居中，使按钮中心线与顶栏图标中心线重合、自动对齐。
-     z-index 高于一切顶栏与弹层（含 notes 面板 1090、设置弹窗 1100），保证任何时候都能操作窗口。 */
+     z-index 取层级表最高的 --z-window，保证任何时候（连设置弹窗打开时）都能操作窗口。 */
   .win-ctl {
     position: fixed;
     top: 0;
     right: 0;
     height: var(--fr-titlebar-h, 44px);
-    z-index: 100000;
+    z-index: var(--z-window);
     display: flex;
     align-items: center;
     gap: 2px;
@@ -96,8 +96,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: var(--ctl-h);
+    height: var(--ctl-h);
     padding: 0;
     border: none;
     border-radius: var(--radius-sm);
@@ -105,7 +105,7 @@
     color: var(--fg);
     opacity: 0.82;
     cursor: pointer;
-    transition: background 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
   }
 
   .wc-btn:hover {

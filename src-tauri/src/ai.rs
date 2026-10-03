@@ -17,35 +17,44 @@ pub struct AiConfig {
     pub api_version: String,
 }
 
-/// 结构化错误：kind 供前端故障转移判定，message 供展示。
+/// 结构化错误：kind 供前端故障转移判定，code 供前端查译文，message 供展示。
 /// 绝不含 apiKey；kind 取值：network / timeout / http_4xx / http_5xx /
 /// protocol / model_id / config / unknown。
+///
+/// code 约定：稳定 ASCII 码（`ai.*`，见 ERR_CODES / 文案表 err.ai* 键）。
+/// **空串 = 无固定说法**，此时 message 是上游原文或纯动态内容，前端原样透传。
+/// 静态中文一律不进 message（message 置空）；带变量的中文包装也已剥离，
+/// 只留动态尾巴，由前端用 code 的译文重新拼装整句。
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct AiError {
     pub kind: String,
+    /// 稳定的 ASCII 错误码，供前端查译文；空串 = 无固定说法（message 原样透传）。
+    pub code: String,
     pub message: String,
 }
 
 impl AiError {
-    pub fn new(kind: &str, message: impl Into<String>) -> Self {
-        Self { kind: kind.to_string(), message: message.into() }
+    pub fn new(kind: &str, code: &str, message: impl Into<String>) -> Self {
+        Self { kind: kind.to_string(), code: code.to_string(), message: message.into() }
     }
-    pub fn network(message: impl Into<String>) -> Self {
-        Self::new("network", message)
+    pub fn network(code: &str, message: impl Into<String>) -> Self {
+        Self::new("network", code, message)
     }
-    pub fn timeout(message: impl Into<String>) -> Self {
-        Self::new("timeout", message)
+    pub fn timeout(code: &str, message: impl Into<String>) -> Self {
+        Self::new("timeout", code, message)
     }
-    pub fn protocol(message: impl Into<String>) -> Self {
-        Self::new("protocol", message)
+    pub fn protocol(code: &str, message: impl Into<String>) -> Self {
+        Self::new("protocol", code, message)
     }
-    pub fn model_id(message: impl Into<String>) -> Self {
-        Self::new("model_id", message)
+    pub fn model_id(code: &str, message: impl Into<String>) -> Self {
+        Self::new("model_id", code, message)
     }
-    pub fn config(message: impl Into<String>) -> Self {
-        Self::new("config", message)
+    pub fn config(code: &str, message: impl Into<String>) -> Self {
+        Self::new("config", code, message)
     }
-    pub fn http(status: u16, message: impl Into<String>) -> Self {
+    /// 上游 HTTP 状态错误：kind 由 status 推导。code 通常留空（正文是上游原文），
+    /// 仅当正文是我们自己的固定说法时才给码。
+    pub fn http(status: u16, code: &str, message: impl Into<String>) -> Self {
         let kind = if (400..500).contains(&status) {
             "http_4xx"
         } else if (500..600).contains(&status) {
@@ -53,7 +62,7 @@ impl AiError {
         } else {
             "unknown"
         };
-        Self::new(kind, message)
+        Self::new(kind, code, message)
     }
 }
 
@@ -77,7 +86,7 @@ fn redact_query(s: &str) -> String {
                 }
                 it.next();
             }
-            out.push_str("?<已隐藏>");
+            out.push_str("?<redacted>");
         } else {
             out.push(c);
         }
@@ -88,9 +97,9 @@ fn redact_query(s: &str) -> String {
 fn classify_req(e: &reqwest::Error) -> AiError {
     let msg = redact_query(&e.to_string());
     if e.is_timeout() {
-        AiError::timeout(format!("请求超时: {msg}"))
+        AiError::timeout("ai.requestTimeout", msg)
     } else {
-        AiError::network(format!("网络失败: {msg}"))
+        AiError::network("ai.networkFailed", msg)
     }
 }
 
@@ -118,10 +127,10 @@ pub fn valid_model_id(s: &str) -> bool {
 
 /* ============================ 代理 ============================ */
 
-fn normalize_proxy_url(raw: &str) -> Result<String, String> {
+fn normalize_proxy_url(raw: &str) -> Result<String, AiError> {
     let mut u = raw.trim().trim_end_matches('/').to_string();
     if u.is_empty() {
-        return Err("代理地址不能为空".into());
+        return Err(AiError::config("ai.proxyAddrEmpty", ""));
     }
     if !u.contains("://") {
         u = format!("http://{u}");
@@ -129,10 +138,10 @@ fn normalize_proxy_url(raw: &str) -> Result<String, String> {
     Ok(u)
 }
 
-fn proxy_with_bypass(u: &str) -> Result<reqwest::Proxy, String> {
+fn proxy_with_bypass(u: &str) -> Result<reqwest::Proxy, AiError> {
     reqwest::Proxy::all(u)
         .map(|p| p.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")))
-        .map_err(|e| format!("代理地址无效: {u} ({e})"))
+        .map_err(|e| AiError::config("ai.proxyAddrInvalid", format!("{u} ({e})")))
 }
 
 /// 解析 `ProxyServer`，兼容 `host:port` 与 `http=host:port;https=host:port` 两种格式。
@@ -200,7 +209,8 @@ pub fn windows_proxy_info() -> WinProxyInfo {
 #[derive(Clone)]
 pub struct ProxyResolution {
     pub url: Option<String>,
-    pub source: String,
+    /// 代理来源：结构化片段（稳定 id + 素材），由前端按当前语言查表拼，不返回中文原文。
+    pub source: AiPiece,
     pub pac: Option<String>,
 }
 
@@ -219,7 +229,7 @@ pub fn resolve_auto_proxy() -> ProxyResolution {
             if !v.is_empty() {
                 return ProxyResolution {
                     url: Some(v.to_string()),
-                    source: format!("环境变量 {k}"),
+                    source: AiPiece::new("ai.proxySourceEnv", k),
                     pac: None,
                 };
             }
@@ -229,14 +239,14 @@ pub fn resolve_auto_proxy() -> ProxyResolution {
     if let Some(addr) = info.manual {
         return ProxyResolution {
             url: Some(addr),
-            source: "Windows 系统代理".into(),
+            source: AiPiece::new("ai.proxySourceWindows", ""),
             pac: info.pac,
         };
     }
     let source = if info.pac.is_some() {
-        "未检测到环境变量，且系统使用 PAC 自动配置脚本（本程序不解析 PAC）".to_string()
+        AiPiece::new("ai.proxySourcePacOnly", "")
     } else {
-        "未检测到环境变量或系统代理".to_string()
+        AiPiece::new("ai.proxySourceNone", "")
     };
     ProxyResolution { url: None, source, pac: info.pac }
 }
@@ -295,7 +305,7 @@ pub fn build_client(
     proxy_mode: &str,
     proxy_url: &str,
     target_url: &str,
-) -> Result<reqwest::Client, String> {
+) -> Result<reqwest::Client, AiError> {
     let accept_invalid = is_local_or_private_url(target_url);
     let key = (proxy_mode.to_string(), proxy_url.to_string(), accept_invalid);
     if let Ok(cache) = client_cache().lock() {
@@ -314,7 +324,7 @@ fn build_client_uncached(
     proxy_mode: &str,
     proxy_url: &str,
     accept_invalid_certs: bool,
-) -> Result<reqwest::Client, String> {
+) -> Result<reqwest::Client, AiError> {
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(20))
@@ -343,7 +353,7 @@ fn build_client_uncached(
             b = b.no_proxy();
         }
     }
-    b.build().map_err(|e| e.to_string())
+    b.build().map_err(|e| AiError::config("", e.to_string()))
 }
 
 /* ============================ 服务商适配 ============================ */
@@ -372,14 +382,15 @@ impl Provider {
             _ => Provider::OpenAi,
         }
     }
-    pub fn label(&self) -> &'static str {
+    /// 稳定 ASCII 标识（与 `dict.aiProvider.*` 的 key 一一对应），界面文案由前端查表拼。
+    pub fn id(&self) -> &'static str {
         match self {
-            Provider::OpenAi => "OpenAI 兼容",
-            Provider::Ollama => "Ollama",
-            Provider::Anthropic => "Anthropic",
-            Provider::Gemini => "Gemini",
-            Provider::Azure => "Azure OpenAI",
-            Provider::DashScope => "通义千问 TTS",
+            Provider::OpenAi => "openai",
+            Provider::Ollama => "ollama",
+            Provider::Anthropic => "anthropic",
+            Provider::Gemini => "gemini",
+            Provider::Azure => "azure-openai",
+            Provider::DashScope => "dashscope",
         }
     }
 }
@@ -615,12 +626,10 @@ fn build_request(
 ) -> Result<Prepared, AiError> {
     let base = strip_trailing_slash(&cfg.base_url);
     if base.is_empty() {
-        return Err(AiError::config("未填写 API 地址"));
+        return Err(AiError::config("ai.noApiAddr", ""));
     }
     if !valid_model_id(&cfg.model) {
-        return Err(AiError::model_id(
-            "模型ID含非法字符（JSON/URL/query/请求头/curl 不能作为模型ID），请求已拦截。",
-        ));
+        return Err(AiError::model_id("ai.invalidModelId", ""));
     }
     // 出站前清洗：摘除客户端/网关/代理拼接的 budget/token 元数据行（含相邻去重）。
     let cleaned: Vec<(String, String)> = sanitize_messages(messages);
@@ -649,10 +658,10 @@ fn build_request(
         }),
         Provider::Azure => {
             if cfg.deployment.trim().is_empty() {
-                return Err(AiError::config("Azure OpenAI 需要填写部署名（deployment）"));
+                return Err(AiError::config("ai.azureNeedDeployment", ""));
             }
             if !valid_model_id(cfg.deployment.trim()) {
-                return Err(AiError::model_id("Azure 部署名含非法字符，请求已拦截。"));
+                return Err(AiError::model_id("ai.azureInvalidDeployment", ""));
             }
             let api_version = if cfg.api_version.trim().is_empty() {
                 "2024-06-01"
@@ -819,6 +828,66 @@ fn error_message_from_body(text: &str) -> String {
 
 /* ============================ 连接测试 ============================ */
 
+/// 连接测试用的**结构化片段**：界面句子一律由前端按当前语言拼，这里只回「稳定 id + 素材」。
+///
+/// - `code`：稳定 ASCII id，与前端文案表一一对应（如 `ai.routeDirect`）；空串表示这段没有固定说法，
+///   前端直接显示 `param` 原文（代理地址、上游返回文本等）。
+/// - `param`：本片段自身的原文素材，同时作为单素材译文的 `{p0}`。
+/// - `params`：该译文的动态素材，按序填进 `{p0}` / `{p1}`…；素材本身也可以是片段（可再嵌套，
+///   如「自动代理（环境变量 HTTPS_PROXY）」里的来源就是一段片段）。
+#[derive(serde::Serialize, Clone)]
+pub struct AiPiece {
+    pub code: String,
+    pub param: String,
+    pub params: Vec<AiPiece>,
+}
+
+impl AiPiece {
+    /// 带 id 与单个素材的片段（译文用 `{p0}` 取素材）；**code 传空串即为原文片段**，前端不翻译。
+    pub fn new(code: &str, param: impl Into<String>) -> Self {
+        Self { code: code.into(), param: param.into(), params: Vec::new() }
+    }
+    /// 带 id 与多个素材的片段（译文用 `{p0}` / `{p1}`… 取素材）。
+    pub fn of(code: &str, params: Vec<AiPiece>) -> Self {
+        Self { code: code.into(), param: String::new(), params }
+    }
+}
+
+/// 把 `AiError` 变成片段：带 code 就由前端查表拼整句，空 code 则回退原文。
+fn err_piece(e: &AiError) -> AiPiece {
+    AiPiece::new(&e.code, mask_creds(&e.message))
+}
+
+/// 语言中立的原文明细（仅供日志与复制，界面不渲染）：片段的 id 与素材原样拼接。
+fn piece_raw(p: &AiPiece) -> String {
+    if p.code.is_empty() {
+        return p.param.clone();
+    }
+    let inner: Vec<String> = p.params.iter().map(piece_raw).filter(|s| !s.is_empty()).collect();
+    let mat = if inner.is_empty() && !p.param.is_empty() { vec![p.param.clone()] } else { inner };
+    if mat.is_empty() {
+        p.code.clone()
+    } else {
+        format!("{} {}", p.code, mat.join(" "))
+    }
+}
+
+/// 连接测试结果：**只回状态与素材，不拼界面文案**（句子一律由前端按当前语言拼）。
+/// status 取值：ok=成功 / config=请求构建失败 / allFailed=全部线路失败。
+/// 失败时不再走 Result 的 Err 通道，避免错误文案与状态混在一个字符串里。
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum AiTestResult {
+    /// route=命中线路（结构化片段）；provider=服务商稳定 id（前端查 `dict.aiProvider.*`）；
+    /// reply=模型回复原文（空串=无回复）；diag=诊断附注（每条一个结构化片段）。
+    Ok { route: AiPiece, provider: String, reply: String, diag: Vec<AiPiece> },
+    /// code=构建失败的原因 id（前端查表得整句）；detail=失败明细原文（空串=该 id 的译文已够用）。
+    Config { code: String, detail: String },
+    /// detail=失败明细原文（已 mask_creds 脱敏，语言中立，仅供日志/复制）；
+    /// lines=逐条失败线路与附注（结构化片段，界面按当前语言渲染）。
+    AllFailed { detail: String, lines: Vec<AiPiece> },
+}
+
 pub async fn test_connection(
     provider: String,
     base_url: String,
@@ -828,7 +897,7 @@ pub async fn test_connection(
     api_version: String,
     proxy_mode: String,
     proxy_url: String,
-) -> Result<String, String> {
+) -> AiTestResult {
     let p = Provider::parse(&provider);
     let cfg = AiConfig {
         provider: provider.clone(),
@@ -838,62 +907,65 @@ pub async fn test_connection(
         deployment,
         api_version,
     };
-    let prepared = build_request(
+    let prepared = match build_request(
         p,
         &cfg,
         "",
         &[("user".to_string(), "回复 OK".to_string())],
         false,
-    )
-    .map_err(|e| format!("✗ 请求配置错误：{}", e.message))?;
+    ) {
+        Ok(v) => v,
+        Err(e) => return AiTestResult::Config { code: e.code, detail: e.message },
+    };
 
     let mode = if proxy_mode.is_empty() { "auto" } else { proxy_mode.as_str() };
     let target = prepared.url.as_str();
-    let mut candidates: Vec<(String, reqwest::Client)> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
+    let mut candidates: Vec<(AiPiece, reqwest::Client)> = Vec::new();
+    let mut notes: Vec<AiPiece> = Vec::new();
 
     match mode {
         "custom" => {
             let shown = mask_creds(&normalize_proxy_url(&proxy_url).unwrap_or_else(|_| proxy_url.clone()));
             match build_client("custom", &proxy_url, target) {
-                Ok(c) => candidates.push((format!("自定义代理 {shown}"), c)),
-                Err(e) => notes.push(format!("自定义代理不可用：{}", mask_creds(&e))),
+                Ok(c) => candidates.push((AiPiece::new("ai.routeCustom", shown), c)),
+                Err(e) => notes.push(AiPiece::of("ai.noteProxyUnavailable", vec![err_piece(&e)])),
             }
         }
         "direct" => match build_client("direct", "", target) {
-            Ok(c) => candidates.push(("直连".into(), c)),
-            Err(e) => notes.push(format!("直连客户端构建失败：{}", mask_creds(&e))),
+            Ok(c) => candidates.push((AiPiece::new("ai.routeDirect", ""), c)),
+            Err(e) => notes.push(AiPiece::of("ai.noteDirectClientFailed", vec![err_piece(&e)])),
         },
         _ => {
             let r = resolve_auto_proxy();
             match &r.url {
                 Some(addr) => match build_client("custom", addr, target) {
-                    Ok(c) => candidates.push((format!("自动代理（{}）", r.source), c)),
-                    Err(e) => notes.push(format!("自动代理（{}）不可用：{}", r.source, mask_creds(&e))),
+                    Ok(c) => candidates.push((AiPiece::of("ai.routeAuto", vec![r.source.clone()]), c)),
+                    Err(e) => notes.push(AiPiece::of(
+                        "ai.noteAutoProxyUnavailable",
+                        vec![r.source.clone(), err_piece(&e)],
+                    )),
                 },
                 None => {
                     notes.push(r.source.clone());
                     if let Ok(c) = build_client("direct", "", target) {
-                        candidates.push(("直连（自动模式未检测到代理）".into(), c));
+                        candidates.push((AiPiece::new("ai.routeDirectNoPac", ""), c));
                     }
                 }
             }
             if let Some(pac) = &r.pac {
-                notes.push(format!(
-                    "检测到系统 PAC 自动配置脚本（{pac}），本程序不解析 PAC，自动模式不会使用该代理"
-                ));
+                notes.push(AiPiece::new("ai.notePac", pac.clone()));
             }
         }
     }
     // 非直连模式再补一条直连回退，便于诊断
     if mode != "direct" {
         if let Ok(c) = build_client("direct", "", target) {
-            candidates.push(("直连（回退）".into(), c));
+            candidates.push((AiPiece::new("ai.routeDirectFallback", ""), c));
         }
     }
 
-    let mut errs: Vec<String> = Vec::new();
-    for (name, http) in &candidates {
+    let mut errs: Vec<(AiPiece, AiError)> = Vec::new();
+    for (route, http) in &candidates {
         let mut req = http.clone().post(&prepared.url).timeout(Duration::from_secs(25)).json(&prepared.body);
         for (k, v) in &prepared.headers {
             if k.eq_ignore_ascii_case("content-type") {
@@ -902,36 +974,35 @@ pub async fn test_connection(
             req = req.header(k.as_str(), v.as_str());
         }
         let outcome = async {
-            let resp = req.send().await.map_err(|e| classify_req(&e).message)?;
+            let resp = req.send().await.map_err(|e| classify_req(&e))?;
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 let brief = error_message_from_body(&text);
-                return Err(format!("HTTP {status}: {brief}"));
+                return Err(AiError::http(status.as_u16(), "", format!("HTTP {status}: {brief}")));
             }
             let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let reply = full_content(p, &parsed).unwrap_or_default();
-            let reply = reply.trim();
-            Ok::<String, String>(if reply.is_empty() {
-                format!("✓ 连接成功（{name}｜{}）", p.label())
-            } else {
-                format!("✓ 连接成功（{name}｜{}），模型回复：{reply}", p.label())
-            })
+            Ok::<String, AiError>(reply.trim().to_string())
         }
         .await;
         match outcome {
-            Ok(msg) => {
-                if notes.is_empty() {
-                    return Ok(msg);
-                }
-                return Ok(format!("{msg}；诊断：{}", notes.join("；")));
+            Ok(reply) => {
+                return AiTestResult::Ok {
+                    route: route.clone(),
+                    provider: p.id().to_string(),
+                    reply,
+                    diag: notes,
+                };
             }
-            Err(e) => errs.push(format!("【{name}】{e}")),
+            Err(e) => errs.push((route.clone(), e)),
         }
     }
-    let mut all: Vec<String> = errs;
-    all.extend(notes);
-    Err(format!("✗ 全部尝试失败 → {}", mask_creds(&all.join(" ； "))))
+    let mut lines: Vec<AiPiece> =
+        errs.iter().map(|(route, e)| AiPiece::of("ai.lineFailed", vec![route.clone(), err_piece(e)])).collect();
+    lines.extend(notes);
+    let detail = lines.iter().map(piece_raw).collect::<Vec<_>>().join(" ");
+    AiTestResult::AllFailed { detail: mask_creds(&detail), lines }
 }
 
 /* ============================ 流式聊天 ============================ */
@@ -976,7 +1047,7 @@ pub async fn stream_chat(
             Ok(hv) => {
                 req = req.header(k.as_str(), hv);
             }
-            Err(_) => return Err(AiError::config(format!("无效的请求头值：{k}"))),
+            Err(_) => return Err(AiError::config("ai.invalidHeaderValue", k)),
         }
     }
 
@@ -991,7 +1062,7 @@ pub async fn stream_chat(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        let err = AiError::http(status, format!("HTTP {status}: {}", error_message_from_body(&text)));
+        let err = AiError::http(status, "", format!("HTTP {status}: {}", error_message_from_body(&text)));
         emit_err(&app, &id, &err);
         return Err(err);
     }
@@ -1015,9 +1086,7 @@ pub async fn stream_chat(
             }
         }
         let brief: String = text.chars().take(300).collect();
-        let err = AiError::protocol(format!(
-            "响应协议不匹配：端点返回非流式响应（Content-Type: {ct}），且未包含可识别的正文字段。响应片段：{brief}"
-        ));
+        let err = AiError::protocol("ai.protocolMismatchBody", format!("{ct} | {brief}"));
         emit_err(&app, &id, &err);
         return Err(err);
     }
@@ -1058,10 +1127,7 @@ pub async fn stream_chat(
             let data = data.trim();
             if data == "[DONE]" {
                 if !got_any {
-                    let err = AiError::protocol(format!(
-                        "响应协议不匹配：流结束前未找到正文字段。响应片段：{}",
-                        buf.chars().take(200).collect::<String>()
-                    ));
+                    let err = AiError::protocol("ai.protocolMismatchStream", buf.chars().take(200).collect::<String>());
                     emit_err(&app, &id, &err);
                     return Err(err);
                 }
@@ -1080,7 +1146,7 @@ pub async fn stream_chat(
     }
 
     if !got_any {
-        let ct2 = if ct.is_empty() { "未知" } else { &ct };
+        let ct2 = if ct.is_empty() { "unknown" } else { &ct };
         let brief: String = buf.chars().take(300).collect();
         let parsed: serde_json::Value = serde_json::from_str(buf.trim()).unwrap_or_default();
         if let Some(content) = full_content(p, &parsed) {
@@ -1089,9 +1155,7 @@ pub async fn stream_chat(
                 return Ok(());
             }
         }
-        let err = AiError::protocol(format!(
-            "响应协议不匹配：流式响应中未找到该协议的正文字段，拒绝空白回复（Content-Type: {ct2}）。响应片段：{brief}"
-        ));
+        let err = AiError::protocol("ai.protocolMismatchEmpty", format!("{ct2} | {brief}"));
         emit_err(&app, &id, &err);
         return Err(err);
     }
@@ -1108,11 +1172,11 @@ async fn post_audio(req: reqwest::RequestBuilder) -> Result<Vec<u8>, AiError> {
     if !status.is_success() {
         let msg = resp.text().await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
     if bytes.is_empty() {
-        return Err(AiError::protocol("语音接口返回空音频"));
+        return Err(AiError::protocol("ai.emptyAudio", ""));
     }
     Ok(bytes.to_vec())
 }
@@ -1150,7 +1214,7 @@ async fn synthesize_dashscope(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if cfg.api_key.trim().is_empty() {
-        return Err(AiError::config("通义千问语音需要填写 DashScope API Key"));
+        return Err(AiError::config("ai.dashscopeNeedKey", ""));
     }
     let model = if cfg.model.trim().is_empty() {
         "qwen3-tts-flash"
@@ -1180,14 +1244,14 @@ async fn synthesize_dashscope(
     if !status.is_success() {
         let msg = resp.text().await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
     // DashScope 可能以 HTTP 200 携带业务错误码返回。
     let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
     if !code.is_empty() {
         let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
-        return Err(AiError::protocol(format!("DashScope 返回错误 {code}：{m}")));
+        return Err(AiError::protocol("ai.dashscopeError", format!("{code} | {m}")));
     }
     let audio = v.get("output").and_then(|o| o.get("audio"));
     // 优先取内联 base64；否则回落到二次下载 url。
@@ -1196,7 +1260,7 @@ async fn synthesize_dashscope(
             use base64::Engine as _;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
-                .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+                .map_err(|e| AiError::protocol("ai.audioBase64Decode", e.to_string()))?;
             if !bytes.is_empty() {
                 return Ok(bytes);
             }
@@ -1206,16 +1270,16 @@ async fn synthesize_dashscope(
         if !audio_url.is_empty() {
             let ar = http.get(audio_url).send().await.map_err(|e| classify_req(&e))?;
             if !ar.status().is_success() {
-                return Err(AiError::http(ar.status().as_u16(), "下载合成音频失败"));
+                return Err(AiError::http(ar.status().as_u16(), "ai.audioDownloadFailed", ""));
             }
             let bytes = ar.bytes().await.map_err(|e| classify_req(&e))?;
             if bytes.is_empty() {
-                return Err(AiError::protocol("下载的合成音频为空"));
+                return Err(AiError::protocol("ai.audioDownloadEmpty", ""));
             }
             return Ok(bytes.to_vec());
         }
     }
-    Err(AiError::protocol("DashScope 响应中未找到音频数据"))
+    Err(AiError::protocol("ai.dashscopeNoAudio", ""))
 }
 
 /* ------------------------ 本地 Breeze-TTS-2 网关 ------------------------ */
@@ -1299,7 +1363,7 @@ pub fn breeze_root_candidates(base: &str) -> Vec<String> {
 /// 否则 192.168.x.x 等局域网地址会被系统代理拦截而连不通。
 /// `base` 为网关地址，用于判定是否放宽 TLS 校验（仅本机/私有网段）。
 pub fn breeze_client(base: &str) -> Result<reqwest::Client, AiError> {
-    build_client("direct", "", base).map_err(AiError::config)
+    build_client("direct", "", base)
 }
 
 /// 音色参考音频缓存：`{base}\x1f{voice_id}` -> (voice_ref_b64, reference_text)。
@@ -1345,7 +1409,7 @@ async fn fetch_breeze_voice_at(
         let status = resp.status();
         let msg = resp.text().await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
     let empty: Vec<serde_json::Value> = Vec::new();
@@ -1368,7 +1432,7 @@ async fn fetch_breeze_voice_at(
             .or_else(|| arr.first())
     };
     let Some(item) = picked else {
-        return Err(AiError::config("该服务未保存音色，请先在服务端创建克隆音色"));
+        return Err(AiError::config("ai.noClonedVoice", ""));
     };
     let id = item
         .get("id")
@@ -1377,7 +1441,7 @@ async fn fetch_breeze_voice_at(
         .trim()
         .to_string();
     if id.is_empty() {
-        return Err(AiError::protocol("音色缺少 id，无法合成"));
+        return Err(AiError::protocol("ai.voiceMissingId", ""));
     }
     let reference_text = item
         .get("reference_text")
@@ -1391,11 +1455,11 @@ async fn fetch_breeze_voice_at(
         .await
         .map_err(|e| classify_req(&e))?;
     if !aref.status().is_success() {
-        return Err(AiError::http(aref.status().as_u16(), "读取音色参考音频失败"));
+        return Err(AiError::http(aref.status().as_u16(), "ai.refAudioReadFailed", ""));
     }
     let bytes = aref.bytes().await.map_err(|e| classify_req(&e))?;
     if bytes.is_empty() {
-        return Err(AiError::protocol("音色参考音频为空"));
+        return Err(AiError::protocol("ai.refAudioEmpty", ""));
     }
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1466,7 +1530,7 @@ async fn synthesize_breeze(
         if !status.is_success() {
             let msg = resp.text().await.unwrap_or_default();
             let brief: String = msg.chars().take(300).collect();
-            last_err = Some(AiError::http(status.as_u16(), brief));
+            last_err = Some(AiError::http(status.as_u16(), "", brief));
             continue;
         }
         let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
@@ -1481,23 +1545,23 @@ async fn synthesize_breeze(
                         use base64::Engine as _;
                         let raw = base64::engine::general_purpose::STANDARD
                             .decode(data)
-                            .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))?;
+                            .map_err(|e| AiError::protocol("ai.audioBase64Decode", e.to_string()))?;
                         if !raw.is_empty() {
                             return Ok(raw);
                         }
                     }
                 }
             }
-            last_err = Some(AiError::protocol("网关返回 JSON 但未包含音频数据"));
+            last_err = Some(AiError::protocol("ai.gatewayNoAudio", ""));
             continue;
         }
         if bytes.is_empty() {
-            last_err = Some(AiError::protocol("语音接口返回空音频"));
+            last_err = Some(AiError::protocol("ai.emptyAudio", ""));
             continue;
         }
         return Ok(bytes.to_vec());
     }
-    Err(last_err.unwrap_or_else(|| AiError::config("未配置 Breeze 网关地址")))
+    Err(last_err.unwrap_or_else(|| AiError::config("ai.breezeNoAddr", "")))
 }
 
 /// 一次在线语音合成的全部参数（按 provider 显式分派到具体协议实现）。
@@ -1566,7 +1630,7 @@ async fn synth_openai(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let url = format!("{}/audio/speech", ensure_v1(base));
     let model = if p.model.trim().is_empty() { "tts-1" } else { p.model.trim() };
@@ -1593,13 +1657,13 @@ async fn synth_azure(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let url = if base.contains("/deployments/") {
         base.to_string()
     } else {
         if p.model.trim().is_empty() {
-            return Err(AiError::config("Azure OpenAI 语音需要填写部署名（模型）"));
+            return Err(AiError::config("ai.azureVoiceNeedDeployment", ""));
         }
         format!("{base}/openai/v1/audio/speech?api-version=preview")
     };
@@ -1626,7 +1690,7 @@ async fn synth_dashscope(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let cfg = AiConfig {
         provider: "dashscope".into(),
@@ -1647,7 +1711,7 @@ async fn synth_minimax(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let model = if p.model.trim().is_empty() { "speech-2.6-hd" } else { p.model.trim() };
     let voice = if p.voice.trim().is_empty() { "male-qn-qingse" } else { p.voice.trim() };
@@ -1668,10 +1732,10 @@ async fn synth_minimax(
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol("ai.responseParse", e.to_string()))?;
     let data = v
         .get("data")
         .and_then(|d| d.get("audio"))
@@ -1682,8 +1746,8 @@ async fn synth_minimax(
             .get("base_resp")
             .and_then(|b| b.get("status_msg"))
             .and_then(|m| m.as_str())
-            .unwrap_or("响应中未找到音频数据");
-        return Err(AiError::protocol(format!("MiniMax 合成失败：{msg}")));
+            .unwrap_or("");
+        return Err(AiError::protocol("ai.minimaxFailed", msg));
     }
     decode_audio_b64_or_hex(data)
 }
@@ -1696,7 +1760,7 @@ async fn synth_fish(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let model = if p.model.trim().is_empty() { "s1" } else { p.model.trim() };
     let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
@@ -1717,7 +1781,7 @@ async fn synth_gptsovits(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let lang = map_gptsovits_lang(p.lang);
     let fmt = if p.format.trim().is_empty() { "wav" } else { p.format.trim() };
@@ -1757,7 +1821,7 @@ async fn synth_breeze_dispatch(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if base.is_empty() {
-        return Err(AiError::config("未填写服务地址"));
+        return Err(AiError::config("ai.noServiceAddr", ""));
     }
     let local = breeze_client(base).unwrap_or_else(|_| http.clone());
     let cfg = AiConfig {
@@ -1779,10 +1843,10 @@ async fn synth_volcano(
 ) -> Result<Vec<u8>, AiError> {
     const URL: &str = VOLCANO_TTS_URL;
     if p.app_id.trim().is_empty() {
-        return Err(AiError::config("火山引擎语音需要填写 AppID"));
+        return Err(AiError::config("ai.volcanoNeedAppId", ""));
     }
     if p.api_key.trim().is_empty() {
-        return Err(AiError::config("火山引擎语音需要填写 Access Token"));
+        return Err(AiError::config("ai.volcanoNeedToken", ""));
     }
     let voice = if p.voice.trim().is_empty() {
         "zh_female_cancan_mars_bigtts"
@@ -1808,18 +1872,18 @@ async fn synth_volcano(
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol("ai.responseParse", e.to_string()))?;
     let code = v.get("code").map(json_i64).unwrap_or(0);
     if code != 3000 {
-        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("合成失败");
-        return Err(AiError::protocol(format!("火山引擎返回错误 {code}：{msg}")));
+        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(AiError::protocol("ai.volcanoError", format!("{code} | {msg}")));
     }
     let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
     if data.is_empty() {
-        return Err(AiError::protocol("火山引擎响应中未找到音频数据"));
+        return Err(AiError::protocol("ai.volcanoNoAudio", ""));
     }
     decode_audio_b64_or_hex(data)
 }
@@ -1831,10 +1895,10 @@ async fn synth_baidu(
     text: &str,
 ) -> Result<Vec<u8>, AiError> {
     if p.api_key.trim().is_empty() {
-        return Err(AiError::config("百度语音需要填写 API Key"));
+        return Err(AiError::config("ai.baiduNeedKey", ""));
     }
     if p.secret_key.trim().is_empty() {
-        return Err(AiError::config("百度语音需要填写 Secret Key"));
+        return Err(AiError::config("ai.baiduNeedSecret", ""));
     }
     let token = baidu_token(http, p.api_key.trim(), p.secret_key.trim()).await?;
     let fmt = if p.format.trim().is_empty() { "mp3" } else { p.format.trim() };
@@ -1871,14 +1935,14 @@ async fn synth_baidu(
     let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
     if ctype.starts_with("audio") {
         if bytes.is_empty() {
-            return Err(AiError::protocol("百度语音返回空音频"));
+            return Err(AiError::protocol("ai.baiduEmptyAudio", ""));
         }
         return Ok(bytes.to_vec());
     }
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     let err_no = v.get("err_no").map(json_i64).unwrap_or(-1);
-    let err_msg = v.get("err_msg").and_then(|x| x.as_str()).unwrap_or("未知错误");
-    Err(AiError::protocol(format!("百度语音合成失败：err_no={err_no} {err_msg}")))
+    let err_msg = v.get("err_msg").and_then(|x| x.as_str()).unwrap_or("");
+    Err(AiError::protocol("ai.baiduSynthFailed", format!("{err_no} | {err_msg}")))
 }
 
 /// 百度语音 token 缓存：`{apiKey}\x1f{secretKey}` -> (token, 过期时间戳秒)。
@@ -1915,10 +1979,10 @@ async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) ->
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
-        return Err(AiError::http(status.as_u16(), brief));
+        return Err(AiError::http(status.as_u16(), "", brief));
     }
     let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| AiError::protocol(format!("响应解析失败：{e}")))?;
+        serde_json::from_str(&txt).map_err(|e| AiError::protocol("ai.responseParse", e.to_string()))?;
     let tok = v
         .get("access_token")
         .and_then(|x| x.as_str())
@@ -1927,8 +1991,8 @@ async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) ->
             let desc = v
                 .get("error_description")
                 .and_then(|x| x.as_str())
-                .unwrap_or("未返回 access_token");
-            AiError::protocol(format!("百度语音获取 token 失败：{desc}"))
+                .unwrap_or("");
+            AiError::protocol("ai.baiduTokenFailed", desc)
         })?
         .to_string();
     let expires = v.get("expires_in").map(json_i64).unwrap_or(2_592_000).max(600) as u64;
@@ -1962,7 +2026,7 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
     );
     let mut request = url
         .into_client_request()
-        .map_err(|e| AiError::protocol(format!("Edge 请求构建失败：{e}")))?;
+        .map_err(|e| AiError::protocol("ai.edgeBuild", e.to_string()))?;
     {
         let headers = request.headers_mut();
         headers.insert(
@@ -1982,12 +2046,12 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
     }
     let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| AiError::network(format!("Edge 连接失败：{e}")))?;
+        .map_err(|e| AiError::network("ai.edgeConnect", e.to_string()))?;
 
     let config_msg = "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}";
     ws.send(Message::text(config_msg))
         .await
-        .map_err(|e| AiError::network(format!("Edge 发送失败：{e}")))?;
+        .map_err(|e| AiError::network("ai.edgeSend", e.to_string()))?;
 
     let request_id = uuid_v4();
     let timestamp = rfc3339_utc();
@@ -2000,7 +2064,7 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
     );
     ws.send(Message::text(ssml_msg))
         .await
-        .map_err(|e| AiError::network(format!("Edge 发送失败：{e}")))?;
+        .map_err(|e| AiError::network("ai.edgeSend", e.to_string()))?;
 
     let mut audio: Vec<u8> = Vec::new();
     loop {
@@ -2023,12 +2087,12 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
             }
             Some(Ok(Message::Close(_))) => break,
             Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(AiError::network(format!("Edge 接收失败：{e}"))),
+            Some(Err(e)) => return Err(AiError::network("ai.edgeReceive", e.to_string())),
             None => break,
         }
     }
     if audio.is_empty() {
-        return Err(AiError::protocol("Edge TTS 未返回音频"));
+        return Err(AiError::protocol("ai.edgeNoAudio", ""));
     }
     Ok(audio)
 }
@@ -2153,7 +2217,7 @@ fn decode_audio_b64_or_hex(s: &str) -> Result<Vec<u8>, AiError> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .decode(t)
-        .map_err(|e| AiError::protocol(format!("音频 Base64 解码失败：{e}")))
+        .map_err(|e| AiError::protocol("ai.audioBase64Decode", e.to_string()))
 }
 
 #[cfg(test)]
@@ -2186,6 +2250,75 @@ mod tests {
         assert_eq!(Provider::parse("dashscope"), Provider::DashScope);
         assert_eq!(Provider::parse("qwen"), Provider::DashScope);
         assert_eq!(Provider::parse("whatever"), Provider::OpenAi);
+    }
+
+    #[test]
+    fn provider_id_is_ascii_dict_key() {
+        // id 必须与前端 dict.aiProvider.* 的 key 逐字一致（labelOfId 按 id 查表）。
+        for p in [
+            Provider::OpenAi,
+            Provider::Ollama,
+            Provider::Anthropic,
+            Provider::Gemini,
+            Provider::Azure,
+            Provider::DashScope,
+        ] {
+            let id = p.id();
+            assert!(id.is_ascii() && !id.is_empty(), "id 必须是 ASCII：{id}");
+            assert!(!id.contains(char::is_whitespace), "id 不得含空白：{id}");
+        }
+        assert_eq!(Provider::parse("dashscope").id(), "dashscope");
+        assert_eq!(Provider::parse("qwen").id(), "dashscope");
+        assert_eq!(Provider::parse("azure-openai").id(), "azure-openai");
+    }
+
+    #[test]
+    fn proxy_addr_errors_carry_codes() {
+        // 两条代理错误必须带稳定 ASCII 码，界面才能按当前语言拼句子。
+        let e = normalize_proxy_url("   ").unwrap_err();
+        assert_eq!(e.code, "ai.proxyAddrEmpty");
+        assert_eq!(e.message, "");
+        assert_eq!(normalize_proxy_url("127.0.0.1:7897").unwrap(), "http://127.0.0.1:7897");
+        // 无效 scheme 由 reqwest 报错，码仍是 ai.proxyAddrInvalid，message 只留动态尾巴。
+        if let Err(e) = proxy_with_bypass("not a proxy") {
+            assert_eq!(e.code, "ai.proxyAddrInvalid");
+            assert!(e.message.contains("not a proxy"), "message 应带上原始地址：{}", e.message);
+        }
+    }
+
+    #[test]
+    fn piece_raw_is_locale_neutral() {
+        // AllFailed.detail 只供日志/复制：必须是语言中立的「id + 素材」，不能出现任何中文字面量。
+        let route = AiPiece::new("ai.routeDirect", "");
+        let line = AiPiece::of("ai.lineFailed", vec![route.clone(), AiPiece::new("", "HTTP 404: nope")]);
+        assert_eq!(piece_raw(&route), "ai.routeDirect");
+        assert_eq!(piece_raw(&line), "ai.lineFailed ai.routeDirect HTTP 404: nope");
+        // 无 code 的片段原样透传（代理地址 / 上游返回文本这类没有固定说法的内容）。
+        assert_eq!(piece_raw(&AiPiece::new("", "http://127.0.0.1:7897")), "http://127.0.0.1:7897");
+        // 自动代理线路把「来源」作为嵌套素材带上，前端递归翻译。
+        let auto = AiPiece::of("ai.routeAuto", vec![AiPiece::new("ai.proxySourceEnv", "HTTPS_PROXY")]);
+        assert_eq!(piece_raw(&auto), "ai.routeAuto ai.proxySourceEnv HTTPS_PROXY");
+    }
+
+    #[test]
+    fn ai_piece_serializes_as_stable_shape() {
+        // 前端按 {code, param, params} 取值，字段名不能改。
+        let p = AiPiece::of("ai.routeCustom", vec![AiPiece::new("", "http://127.0.0.1:7897")]);
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["code"], "ai.routeCustom");
+        assert_eq!(v["param"], "");
+        assert_eq!(v["params"][0]["param"], "http://127.0.0.1:7897");
+        let r = serde_json::to_value(AiTestResult::Ok {
+            route: AiPiece::new("ai.routeDirect", ""),
+            provider: Provider::OpenAi.id().to_string(),
+            reply: "OK".into(),
+            diag: vec![],
+        })
+        .unwrap();
+        assert_eq!(r["status"], "ok");
+        assert_eq!(r["route"]["code"], "ai.routeDirect");
+        assert_eq!(r["provider"], "openai");
+        assert_eq!(r["diag"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -2423,7 +2556,7 @@ mod tests {
         let s = "error sending request for url (https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?key=SECRET)";
         let out = redact_query(s);
         assert!(!out.contains("SECRET"), "查询串中的密钥不应外泄: {out}");
-        assert!(out.contains("?<已隐藏>"));
+        assert!(out.contains("?<redacted>"));
     }
 
     #[test]
@@ -2455,11 +2588,11 @@ mod tests {
 
     #[test]
     fn error_kind_classification() {
-        assert_eq!(AiError::http(401, "x").kind, "http_4xx");
-        assert_eq!(AiError::http(429, "x").kind, "http_4xx");
-        assert_eq!(AiError::http(502, "x").kind, "http_5xx");
-        assert_eq!(AiError::model_id("x").kind, "model_id");
-        assert_eq!(AiError::protocol("x").kind, "protocol");
+        assert_eq!(AiError::http(401, "", "x").kind, "http_4xx");
+        assert_eq!(AiError::http(429, "", "x").kind, "http_4xx");
+        assert_eq!(AiError::http(502, "", "x").kind, "http_5xx");
+        assert_eq!(AiError::model_id("", "x").kind, "model_id");
+        assert_eq!(AiError::protocol("", "x").kind, "protocol");
     }
 }
 

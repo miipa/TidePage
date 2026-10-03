@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { t } from "../lib/i18n/index.svelte";
+  import { dateLocale, t } from "../lib/i18n/index.svelte";
+import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
   import { api } from "../lib/api";
   import { HIGHLIGHT_STYLES, appConfirm, config, saveConfig, toast } from "../lib/stores.svelte";
   import { labelOfId } from "../lib/i18n/index.svelte";
@@ -81,7 +82,7 @@
 
   function when(ts: number): string {
     try {
-      return new Date(ts).toLocaleString();
+      return new Date(ts).toLocaleString(dateLocale());
     } catch {
       return "";
     }
@@ -92,8 +93,8 @@
   <div class="sp-head" data-testid="hlp-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
     <span>{t("highlight.panelTitle")}</span>
     <div style="display:flex; gap:6px; align-items:center;">
-      {#if onpopout}<button class="icon" data-testid="hlp-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" data-testid="hlp-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="hlp-popout" title={t("common.panel.popout")} onclick={onpopout}><IconArrowsSplit2 /></button>{/if}
+      {#if onclose}<button class="icon" data-testid="hlp-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
   </div>
   <div class="sp-search">
@@ -137,7 +138,7 @@
             onpalette={saveConfig}
           />
           <span class="flex1"></span>
-          <button class="icon" data-testid="hlp-del" title={t("highlight.deleteTip")} onclick={() => del(h)}>×</button>
+          <button class="icon" data-testid="hlp-del" title={t("highlight.deleteTip")} onclick={() => del(h)}><IconTrash /></button>
         </div>
       </div>
     {:else}
@@ -149,54 +150,24 @@
 </div>
 
 <style>
-  .sidepanel {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 340px;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 95%, black 5%);
-    border-left: 1px solid rgba(128, 128, 128, 0.2);
-    z-index: 40;
-    display: flex;
-    flex-direction: column;
-    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
-    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes slide-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .sp-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    font-weight: 600;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  }
-
+  /* .sidepanel / .sp-head / .sp-list / .sp-item / .sp-empty 走 app.css 的全局基类。 */
   .sp-search {
-    padding: 8px 12px;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.1);
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--rdr-line);
   }
 
   .sp-search input { width: 100%; box-sizing: border-box; }
 
-  .sp-list { flex: 1; overflow-y: auto; }
-
-  .sp-item { padding: 10px 14px; border-bottom: 1px solid rgba(128, 128, 128, 0.08); }
-
   .hl-top { cursor: pointer; }
 
+  .hl-top .bm-title { transition: text-decoration-color var(--dur-fast) var(--ease); }
   .hl-top:hover .bm-title { text-decoration: underline; }
 
-  .bm-title { font-size: 13px; font-weight: 500; }
+  .bm-title { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); font-weight: 500; }
   .hl-book { font-weight: 400; opacity: 0.65; }
   .bm-excerpt {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     opacity: 0.78;
     margin-top: 3px;
     line-height: 1.55;
@@ -207,18 +178,23 @@
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
-  .hl-note { font-size: 12px; opacity: 0.6; margin-top: 3px; font-style: italic; }
-  .hl-time { font-size: 12px; opacity: 0.45; margin-top: 3px; }
+  .hl-note { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.6; margin-top: 3px; font-style: italic; }
+  .hl-time {
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    opacity: 0.45;
+    margin-top: 3px;
+    font-variant-numeric: tabular-nums;
+  }
 
   .hl-acts {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin-top: 6px;
+    gap: var(--sp-1);
+    margin-top: var(--sp-1);
+    flex-wrap: wrap;
   }
 
-  .hl-acts { flex-wrap: wrap; }
-  .hl-acts select { font-size: 12px; padding: 2px 6px; }
+  .hl-acts select { font-size: var(--fs-xs); padding: 2px var(--sp-1); }
   .flex1 { flex: 1; }
-  .sp-empty { padding: 24px; text-align: center; opacity: 0.5; font-size: 13px; }
 </style>

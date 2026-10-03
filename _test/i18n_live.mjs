@@ -118,8 +118,8 @@ try {
   `));
   log("emptyEn: " + J(out.steps.emptyEn));
   check("A1 en：空态提示为英文", /^Library is empty/.test(out.steps.emptyEn.hint), out.steps.emptyEn.hint);
-  check("A2 en：「添加文件夹」按钮为英文", out.steps.emptyEn.addBtn === "＋ Add folder", out.steps.emptyEn.addBtn);
-  check("A3 en：刷新按钮为英文", out.steps.emptyEn.refresh === "⟳ Refresh", out.steps.emptyEn.refresh);
+  check("A2 en：「添加文件夹」按钮为英文（第二轮起前缀已换成 <IconPlus /> 图标，文本不再含 ＋）", out.steps.emptyEn.addBtn === "Add folder", out.steps.emptyEn.addBtn);
+  check("A3 en：刷新按钮为英文（前缀已换成 <IconRefresh /> 图标；按钮本身按 data-testid 定位）", out.steps.emptyEn.refresh === "Refresh", out.steps.emptyEn.refresh);
   check("A4 en：搜索框 placeholder 为英文", out.steps.emptyEn.searchPh === "Search title / author…", out.steps.emptyEn.searchPh);
 
   await M.evalJs(H(`await openSettings(); await setLangViaUi('zh-CN'); closeSettings(); return 1;`));
@@ -130,8 +130,8 @@ try {
   `));
   log("emptyZh: " + J(out.steps.emptyZh));
   check("A5 zh-CN：空态提示恢复中文", /^书库为空/.test(out.steps.emptyZh.hint), out.steps.emptyZh.hint);
-  check("A6 zh-CN：「添加文件夹」恢复中文", out.steps.emptyZh.addBtn === "＋ 添加文件夹", out.steps.emptyZh.addBtn);
-  check("A7 zh-CN：刷新按钮恢复中文", out.steps.emptyZh.refresh === "⟳ 刷新", out.steps.emptyZh.refresh);
+  check("A6 zh-CN：「添加文件夹」恢复中文（同 A2，无 ＋ 前缀）", out.steps.emptyZh.addBtn === "添加文件夹", out.steps.emptyZh.addBtn);
+  check("A7 zh-CN：刷新按钮恢复中文（同 A3，无 ⟳ 前缀）", out.steps.emptyZh.refresh === "刷新", out.steps.emptyZh.refresh);
   check("A8 zh-CN：搜索框 placeholder 恢复中文", out.steps.emptyZh.searchPh === "搜索书名 / 作者…", out.steps.emptyZh.searchPh);
 
   /* ============ 种子：2 个文件夹 + 3 本书 ============ */
@@ -328,7 +328,7 @@ try {
              statusbar: tid('lib-statusbar-count')?.textContent?.trim() };
   `));
   log("autoEn: " + J(out.steps.autoEn));
-  check("E1 auto + 系统=English → 界面英文", out.steps.autoEn.cfgLang === "auto" && out.steps.autoEn.folderAll === "All" && out.steps.autoEn.refresh === "⟳ Refresh", out.steps.autoEn);
+  check("E1 auto + 系统=English → 界面英文", out.steps.autoEn.cfgLang === "auto" && out.steps.autoEn.folderAll === "All" && out.steps.autoEn.refresh === "Refresh", out.steps.autoEn);
 
   await M.call("Page.removeScriptToEvaluateOnNewDocument", { identifier: injected });
   injected = null;
@@ -341,7 +341,7 @@ try {
              statusbar: tid('lib-statusbar-count')?.textContent?.trim() };
   `));
   log("autoZh: " + J(out.steps.autoZh));
-  check("E2 auto + 系统=简体中文 → 界面中文", out.steps.autoZh.folderAll === "全部" && out.steps.autoZh.refresh === "⟳ 刷新", out.steps.autoZh);
+  check("E2 auto + 系统=简体中文 → 界面中文", out.steps.autoZh.folderAll === "全部" && out.steps.autoZh.refresh === "刷新", out.steps.autoZh);
   await M.call("Page.removeScriptToEvaluateOnNewDocument", { identifier: injected });
   injected = null;
 

@@ -51,15 +51,15 @@
     onclose();
   }}
 ></div>
-<div class="ctx" use:portal bind:this={el} style="left:{pos.left}px; top:{pos.top}px;">
+<div class="ctx-menu" use:portal bind:this={el} style="left:{pos.left}px; top:{pos.top}px;">
   {#each items as it, i (i)}
     {#if it.separator}
       <div class="ctx-sep"></div>
     {:else}
-      <button class:danger={it.danger} disabled={it.disabled} onclick={() => run(it)}>
+      <button class="ctx-item" class:danger={it.danger} disabled={it.disabled} onclick={() => run(it)}>
         {#if it.icon}
           {@const Icon = it.icon}
-          <span class="ci"><Icon size={17} stroke={1.75} /></span>
+          <span class="ci"><Icon size={16} stroke={1.5} /></span>
         {/if}
         {it.label}
       </button>
@@ -68,88 +68,15 @@
 </div>
 
 <style>
-  .ctx-backdrop {
+  /* 菜单本体、菜单项、分隔线、图标框全部走 app.css 的全局 .ctx-menu/.ctx-item/.ctx-sep。
+     本组件特有的是「portal 到 body」这一件事：
+     菜单必须高于 --z-modal，否则右键设置弹窗内的输入框时菜单会被模态盖住。 */
+  .ctx-menu {
     position: fixed;
-    inset: 0;
-    z-index: 2999;
+    z-index: var(--z-portal);
   }
 
-  .ctx {
-    position: fixed;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
-    box-shadow: var(--shadow-lg), var(--edge-hi);
-    padding: 6px;
-    min-width: 168px;
-    z-index: 3000;
-    transform-origin: top left;
-    animation: ctx-in 0.2s var(--ease-premium);
-  }
-
-  @keyframes ctx-in {
-    from {
-      opacity: 0;
-      transform: translateY(-6px) scale(0.96);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
-
-  .ctx button {
-    border: none;
-    background: transparent;
-    text-align: left;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 12px 7px 10px;
-    border-radius: var(--radius-sm, 8px);
-    font-size: var(--fs-sm, 13px);
-    color: var(--fg);
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
-  }
-
-  .ctx .ci {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0.85;
-  }
-
-  .ctx-sep {
-    height: 1px;
-    margin: 5px 8px;
-    background: var(--line);
-  }
-
-  .ctx button:hover:not(:disabled) {
-    background: var(--accent-soft, var(--hover-bg));
-  }
-
-  .ctx button:active {
+  .ctx-item:active {
     transform: none;
-  }
-
-  .ctx button:disabled {
-    opacity: 0.42;
-    cursor: default;
-  }
-
-  .ctx button.danger {
-    color: var(--danger);
-  }
-
-  .ctx button.danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    color: var(--danger);
   }
 </style>

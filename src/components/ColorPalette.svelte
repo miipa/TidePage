@@ -3,6 +3,7 @@
   import { tick } from "svelte";
   import { normalizeColor, parseColor, toHex, toRgbString } from "../lib/color";
   import { portal } from "../lib/portal";
+  import { IconPlus } from "@tabler/icons-svelte";
 
   let {
     colors = $bindable([] as string[]),
@@ -132,10 +133,11 @@
     title={t("palette.add")}
     onclick={addColor}
     oncontextmenu={(e) => e.preventDefault()}
-  >{t("palette.addGlyph")}</button>
+    aria-label={t("palette.add")}
+  ><IconPlus /></button>
 
   {#if editIdx >= 0}
-    <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{popPos.x}px; top:{popPos.y}px;">
+    <div class="cp-pop pop" data-cp-pop use:portal bind:this={popEl} style="left:{popPos.x}px; top:{popPos.y}px;">
       <div class="cp-row">
         <label>HEX</label>
         <input bind:value={hexText} oninput={onHex} placeholder="#rrggbb" spellcheck="false" />
@@ -166,71 +168,70 @@
   .palette {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--sp-1);
     flex-wrap: wrap;
   }
 
   .cp-swatch {
     width: 30px;
     height: 18px;
-    border-radius: 6px;
-    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
     padding: 0;
     cursor: pointer;
     flex-shrink: 0;
-    transition: transform var(--dur, 0.2s) var(--ease-premium, ease), box-shadow var(--dur, 0.2s) var(--ease);
+    transition: transform var(--dur) var(--ease-premium), box-shadow var(--dur) var(--ease);
   }
 
   .cp-swatch:hover { transform: translateY(-1px); }
 
+  /* 同 Library 选中态：outline 不可过渡，改用可插值的 box-shadow */
+  .cp-swatch {
+    transition: transform var(--dur) var(--ease-premium), box-shadow var(--dur) var(--ease);
+  }
+
   .cp-swatch.active {
-    outline: 2px solid var(--accent, #4a6b8a);
-    outline-offset: 1px;
+    box-shadow: 0 0 0 2px var(--accent);
   }
 
   .cp-add {
     width: 30px;
     height: 18px;
-    border-radius: 6px;
-    border: 1px dashed rgba(128, 128, 128, 0.6);
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--line-strong);
     background: transparent;
     color: inherit;
     padding: 0;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     line-height: 1;
-    cursor: pointer;
-    flex-shrink: 0;
   }
 
+  /* 底色 / 描边 / 圆角 / 投影走全局 .pop（外壳浮层，跟随外壳皮肤）。
+     本组件被设置弹窗与阅读区划线/划线面板共用，两种语境下一律跟外壳：
+     它是配置工具而非页面内容，且能保证底色与文字色必然成对同源、不会对比度不足。 */
   .cp-pop {
     position: fixed;
-    z-index: 1100;
+    z-index: var(--z-popover);
     width: 250px;
-    background: var(--rdr-bg, var(--panel, #fff));
-    color: var(--rdr-fg, var(--fg, #222));
-    border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
-    border-radius: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14), 0 20px 44px rgba(0, 0, 0, 0.22);
     padding: 10px;
     user-select: none;
-    animation: cp-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes cp-in {
-    from { opacity: 0; transform: translateY(5px) scale(0.97); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .cp-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 6px;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-1);
   }
 
   .cp-row label {
     width: 34px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.6;
     flex-shrink: 0;
   }
@@ -238,23 +239,23 @@
   .cp-row input {
     flex: 1;
     min-width: 0;
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
 
   .cp-native {
     padding: 0;
-    height: 26px;
+    height: var(--ctl-h-sm);
     cursor: pointer;
   }
 
   .cp-acts {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin-top: 6px;
+    gap: var(--sp-1);
+    margin-top: var(--sp-1);
   }
 
-  .cp-acts .danger { color: var(--danger, #c0392b); font-size: 12px; }
-  .cp-acts .primary { font-size: 12px; padding: 4px 12px; }
+  .cp-acts .danger { color: var(--danger); font-size: var(--fs-xs); }
+  .cp-acts .primary { font-size: var(--fs-xs); padding: var(--sp-1) var(--sp-3); }
   .flex1 { flex: 1; }
 </style>

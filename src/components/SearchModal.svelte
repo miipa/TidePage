@@ -70,7 +70,7 @@
   </div>
 
   {#if searched && !hits.length}
-    <div class="empty">{t("search.empty")}</div>
+    <div class="empty-state">{t("search.empty")}</div>
   {:else}
     <div class="hits">
       {#each hits as h (h.book_id + ":" + h.chapter_index + h.snippet)}
@@ -98,8 +98,9 @@
 
   .hit {
     padding: 8px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
   }
 
   .hit:hover {
@@ -107,7 +108,8 @@
   }
 
   .hb {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     font-weight: 600;
   }
 
@@ -117,23 +119,19 @@
   }
 
   .hs {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     color: var(--fg2);
     margin-top: 2px;
     line-height: 1.5;
   }
 
+  /* 命中片段底色：以 --warning 为色相做浅底，跟随皮肤而非固定黄（与书内搜索一致） */
   .hs :global(mark.mk) {
-    background: #ffe28a;
+    background: color-mix(in srgb, var(--warning) 32%, var(--bg-elev));
     color: inherit;
     padding: 0 2px;
-    border-radius: 2px;
-  }
-
-  .empty {
-    padding: 30px;
-    text-align: center;
-    color: var(--fg2);
+    border-radius: var(--radius-xs);
   }
 
   .close-row {

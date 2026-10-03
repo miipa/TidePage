@@ -2941,8 +2941,7 @@ pub async fn ai_chat(
         &proxy_mode,
         proxy_url.as_deref().unwrap_or(""),
         &cfg.base_url,
-    )
-    .map_err(crate::ai::AiError::config)?;
+    )?;
     crate::ai::stream_chat(app, http, id, cfg, system, messages).await
 }
 
@@ -2956,7 +2955,7 @@ pub async fn ai_test(
     proxy_url: Option<String>,
     deployment: Option<String>,
     api_version: Option<String>,
-) -> Result<String, String> {
+) -> crate::ai::AiTestResult {
     crate::ai::test_connection(
         provider,
         base_url,
@@ -3001,8 +3000,7 @@ pub async fn tts_synth(
     };
     let proxy_mode = proxy_mode.as_deref().unwrap_or("auto");
     let proxy_url = proxy_url.as_deref().unwrap_or("");
-    let http = crate::ai::build_client(proxy_mode, proxy_url, &base_url)
-        .map_err(crate::ai::AiError::config)?;
+    let http = crate::ai::build_client(proxy_mode, proxy_url, &base_url)?;
     let bytes = crate::ai::synthesize_tts(http, proxy_mode, proxy_url, &params, &text).await?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -3065,7 +3063,7 @@ async fn list_openai_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInf
         format!("{root}/v1/audio/voices"),
         format!("{root}/v1/voices"),
     ];
-    let client = crate::ai::build_client("auto", "", base).map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", base).map_err(|e| e.message)?;
     let mut last_err = String::from("未找到音色接口");
     for url in candidates {
         let mut req = client.get(&url);
@@ -3143,7 +3141,7 @@ async fn list_openai_voices(base: &str, api_key: &str) -> Result<Vec<TtsVoiceInf
 /// Edge TTS 官方音色清单（无需密钥）：取 ShortName 作 id/name、Locale 作语言。
 async fn list_edge_voices() -> Result<Vec<TtsVoiceInfo>, String> {
     const URL: &str = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-    let client = crate::ai::build_client("auto", "", URL).map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", URL).map_err(|e| e.message)?;
     let resp = client.get(URL).send().await.map_err(|e| format!("请求失败：{e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -3279,7 +3277,7 @@ pub async fn tts_ensure_fixed_voice(
     if base.is_empty() {
         return Err("未填写服务地址".into());
     }
-    let client = crate::ai::build_client("auto", "", base).map_err(|e| e)?;
+    let client = crate::ai::build_client("auto", "", base).map_err(|e| e.message)?;
     let key = api_key.trim().to_string();
     let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
         if key.is_empty() {

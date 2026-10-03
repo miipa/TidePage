@@ -25,7 +25,7 @@
 <div class="modal-body">
   <h3>{t("stats.recent", { n: 14 })}</h3>
   {#if !stats.length}
-    <div class="empty">{t("stats.empty")}</div>
+    <div class="empty-state">{t("stats.empty")}</div>
   {:else}
     <div class="total">{t("stats.totalPrefix")}{fmt(total)}</div>
     <div class="bars">
@@ -44,7 +44,8 @@
 
 <style>
   .total {
-    font-size: 14px;
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
     font-weight: 600;
     margin-bottom: 14px;
     color: var(--accent);
@@ -72,18 +73,13 @@
     width: 100%;
     max-width: 36px;
     background: linear-gradient(to top, var(--accent), color-mix(in srgb, var(--accent) 55%, white));
-    border-radius: 4px 4px 0 0;
+    border-radius: var(--radius-xs) var(--radius-xs) 0 0;
     min-height: 3px;
   }
 
   .lbl {
-    font-size: 10px;
-    color: var(--fg2);
-  }
-
-  .empty {
-    padding: 40px;
-    text-align: center;
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
     color: var(--fg2);
   }
 

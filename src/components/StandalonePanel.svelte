@@ -131,20 +131,23 @@
 <style>
   .panel-window-root {
     height: 100vh;
-    background: var(--rdr-bg, #f5f1e8);
-    color: var(--rdr-fg, #3b3630);
+    /* 独立面板窗整窗都是阅读内容（目录 / 书签 / 划线 / 统计 / 笔记），
+       底色跟阅读主题而非外壳皮肤。--rdr-bg/-fg 由 stores.svelte.ts 的
+       applyReaderSurfaceVars() 写到 <html>（独立窗没有 .reader 可继承）。 */
+    background: var(--rdr-bg);
+    color: var(--rdr-fg);
     position: relative;
     overflow: hidden;
   }
 
-  /* 无边框窗口顶部标题栏拖拽区：z-index 高于面板内容(40)、低于窗口控制按钮(100000) */
+  /* 无边框窗口顶部标题栏拖拽区：z-index 高于面板内容(--z-drawer)、低于窗口控制按钮(--z-window) */
   .win-titlebar {
     position: fixed;
     top: 0;
     left: 0;
     right: 0;
     height: 40px;
-    z-index: 50;
+    z-index: var(--z-sticky);
     user-select: none;
     -webkit-user-select: none;
   }
@@ -165,30 +168,23 @@
     top: 40px;
   }
 
-  .sidepanel {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    background: var(--rdr-bg, #f5f1e8);
-  }
-
-  .sp-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    font-weight: 600;
-  }
-
-  .sp-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
-
-  .sp-item { border-radius: 8px; }
+  /* .sidepanel / .sp-head / .sp-list / .sp-item / .sp-empty 走 app.css 的全局基类。
+     独立窗内没有阅读区（.reader 不存在，--rdr-* 未定义），由 :root 的兜底退回外壳面板色。 */
   .bm-item { display: flex; align-items: center; }
-  .bm-main { flex: 1; padding: 8px 12px; cursor: pointer; }
-  .bm-main:hover { background: rgba(128, 128, 128, 0.12); border-radius: 8px; }
-  .bm-title { font-size: 13px; }
-  .bm-excerpt { font-size: 12px; opacity: 0.6; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sp-empty { padding: 24px; text-align: center; opacity: 0.5; }
+  .bm-main { flex: 1; min-width: 0; cursor: pointer; }
+  .bm-main {
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .bm-main:hover { background: var(--hover-row); border-radius: var(--radius-sm); }
+  .bm-title { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); }
+  .bm-excerpt {
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    opacity: 0.6;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .pw-empty { padding: 40px; text-align: center; opacity: 0.6; }
 </style>

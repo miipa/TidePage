@@ -49,7 +49,7 @@
   });
 </script>
 
-<div class="sel-menu" bind:this={menuEl} style={posStyle} oncontextmenu={(e) => e.preventDefault()}>
+<div class="sel-menu rdr-pop" bind:this={menuEl} style={posStyle} oncontextmenu={(e) => e.preventDefault()}>
   <div class="hl-row" title={t("selection.styleTip")}>
     {#each HIGHLIGHT_STYLES as s (s.id)}
       <button class="sw sw-{s.id}" data-testid={"sel-style-" + s.id} title={labelOfId("hlStyle", s.id)} onclick={() => onhighlight(s.id, activeColor)}>
@@ -76,38 +76,29 @@
 </div>
 
 <style>
+  /* 底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
   .sel-menu {
     position: fixed;
-    z-index: 980;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 88%, #202020 12%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.28);
-    border-radius: 12px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
-    padding: 8px;
+    z-index: var(--z-popover);
+    padding: var(--sp-2);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--sp-2);
     min-width: 208px;
     user-select: none;
-    animation: sel-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes sel-in {
-    from { opacity: 0; transform: translateY(4px) scale(0.96); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   /* 组间细分隔线，层次更清晰 */
   .sel-sep {
     height: 1px;
     margin: 1px 2px;
-    background: rgba(128, 128, 128, 0.2);
+    background: color-mix(in srgb, var(--rdr-fg) 16%, transparent);
   }
 
   .hl-row {
     display: flex;
-    gap: 6px;
+    gap: var(--sp-1);
     align-items: center;
   }
 
@@ -117,25 +108,25 @@
     padding: 0;
     display: grid;
     place-items: center;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     background: transparent;
-    border: 1px solid rgba(128, 128, 128, 0.25);
+    border: 1px solid var(--rdr-line);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), transform var(--dur, 0.2s) var(--ease-premium, ease);
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), transform var(--dur) var(--ease-premium);
   }
 
   .sw:hover {
-    background: rgba(128, 128, 128, 0.16);
-    border-color: rgba(128, 128, 128, 0.4);
+    background: color-mix(in srgb, var(--rdr-fg) 10%, transparent);
+    border-color: color-mix(in srgb, var(--rdr-fg) 34%, transparent);
   }
 
   .sw:active { transform: scale(0.92); }
 
   .sw-line {
     display: block;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     line-height: 1.15;
-    color: var(--hl-color, var(--accent, #c0392b));
+    color: var(--hl-color);
   }
 
   .sw-underline .sw-line { text-decoration: underline 2px currentColor; text-underline-offset: 2px; }
@@ -143,8 +134,8 @@
   .sw-dotted .sw-line { text-decoration: underline dotted 2px currentColor; text-underline-offset: 2px; }
   .sw-double .sw-line { text-decoration: underline double 2px currentColor; text-underline-offset: 2px; }
   .sw-strike .sw-line { text-decoration: line-through 2px currentColor; }
-  .sw-box .sw-line { box-shadow: 0 0 0 1.5px currentColor; border-radius: 3px; }
-  .sw-background .sw-line { background: color-mix(in srgb, currentColor 42%, transparent); border-radius: 3px; }
+  .sw-box .sw-line { box-shadow: 0 0 0 1.5px currentColor; border-radius: var(--radius-xs); }
+  .sw-background .sw-line { background: color-mix(in srgb, currentColor 42%, transparent); border-radius: var(--radius-xs); }
 
   .color-row {
     display: flex;
@@ -152,65 +143,51 @@
     gap: 5px;
   }
 
-  .csw {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    border: 1px solid rgba(128, 128, 128, 0.4);
-    padding: 0;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-
-  .csw.active {
-    outline: 2px solid var(--accent, #4a6b8a);
-    outline-offset: 1px;
-  }
-
   .act-row {
     display: flex;
-    gap: 6px;
+    gap: var(--sp-1);
   }
 
   .act-row button {
     flex: 1;
-    font-size: 12px;
-    padding: 5px 8px;
-    border-radius: 8px;
-    border: 1px solid rgba(128, 128, 128, 0.28);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    padding: 5px var(--sp-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--rdr-line);
     background: transparent;
     color: inherit;
     white-space: nowrap;
-    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease), transform var(--dur, 0.2s) var(--ease-premium, ease);
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), transform var(--dur) var(--ease-premium);
   }
 
   .act-row button:hover {
-    background: rgba(128, 128, 128, 0.14);
-    border-color: rgba(128, 128, 128, 0.42);
+    background: color-mix(in srgb, var(--rdr-fg) 10%, transparent);
+    border-color: color-mix(in srgb, var(--rdr-fg) 34%, transparent);
   }
 
   .act-row button:active { transform: scale(0.96); }
 
   /* 主操作「划线」用主色实底，AI 用主色描边，强调层次 */
   .act-row .hl-main {
-    background: var(--accent, #4a6b8a);
+    background: var(--accent);
     border-color: transparent;
-    color: #fff;
+    color: var(--accent-fg);
     font-weight: 600;
   }
 
   .act-row .hl-main:hover {
-    background: color-mix(in srgb, var(--accent, #4a6b8a) 88%, #000);
+    background: var(--accent-hover);
     border-color: transparent;
   }
 
   .act-row .ai {
-    color: var(--accent, #4a6b8a);
-    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 42%, transparent);
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
   }
 
   .act-row .ai:hover {
-    background: color-mix(in srgb, var(--accent, #4a6b8a) 14%, transparent);
-    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   }
 </style>

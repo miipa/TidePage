@@ -84,7 +84,7 @@ const stripUser = (s) => USER_DATA.reduce((a, t) => a.split(t).join(""), s || ""
 const HAN = "[\\u3400-\\u4dbf\\u4e00-\\u9fff]";
 /** 全角标点/图形符号区：en 下只允许出现刻意保持同形的界面字形。 */
 const FW = "[\\u3000-\\u303f\\uff00-\\uffef]";
-const FW_ALLOWED = ["＋"]; // 与守卫 EN_GLYPH_ALLOWED 同口径：全角加号是图形符号，不是文案
+const FW_ALLOWED = []; // 图标化之后 en 下不再有任何全角字形（原先的 ＋ 已换成 <IconPlus />）
 const hasCJK = (s) => new RegExp(HAN).test(s);
 const fwChars = (s) => [...new Set([...(s || "")].filter((c) => new RegExp(FW).test(c)))];
 const badFw = (s) => fwChars(s).filter((c) => !FW_ALLOWED.includes(c));
@@ -100,8 +100,8 @@ const pane=(id)=>q('[data-pane="'+id+'"]');
 const paneText=(id)=>((pane(id)||{}).innerText||'');
 const opts=(s)=>[...s.querySelectorAll('option')].map(o=>o.textContent.trim());
 const selectWith=(sel,val)=>qa(sel+' select').find(s=>[...s.querySelectorAll('option')].some(o=>o.value===val));
-const openSettings=async(tab)=>{ tid('lib-btn-settings')?.click(); await wait(()=>q('dialog[open]'),'dialog'); if(tab) tid('set-tab-'+tab)?.click(); await sleep(tab?600:250); };
-const closeSettings=async()=>{ tid('set-done')?.click(); await sleep(300); };
+const openSettings=async(tab)=>{ if(q('dialog[open]')){ tid('set-done')?.click(); await wait(()=>!q('dialog[open]'),'closed'); } tid('lib-btn-settings')?.click(); await wait(()=>q('dialog[open]'),'dialog'); if(tab){ (await wait(()=>tid('set-tab-'+tab),'tab-'+tab)).click(); await sleep(tab?900:400); } };
+const closeSettings=async()=>{ tid('set-done')?.click(); await wait(()=>!q('dialog[open]'),'closed'); await sleep(250); };
 /** K~N 段随时可能停在阅读页，切语言前先回书库（设置入口在书库顶栏）。 */
 const toLibrary=async()=>{ if(q('.reader')){ tid('reader-back')?.click(); await sleep(1400); } };
 /** 重新打开 K 段那本书并等到正文渲染完（切语言会离开阅读页，探针前必须回来）。 */
@@ -149,8 +149,8 @@ const GRAB = `
     zoneOpts: zoneOpts[0]||[],
     zoneSelects: zoneSel.length,
     zoneOptsUniform: zoneOpts.every(a=>JSON.stringify(a)===JSON.stringify(zoneOpts[0]||[])),
-    addChip: (q('[data-pane="keys"] .key-add')||{}).textContent?.trim(),
-    addChipTitles: qa('[data-pane="keys"] .key-add').map(e=>e.getAttribute('title')),
+    addChip: window.__addIdle,
+    addChipCap: ((q('[data-pane="keys"] .key-add')||{}).textContent||'').trim(),
     keysText: paneText('keys'),
     skinNames: qa('[data-pane="appearance"] .sk-name').map(e=>e.textContent.trim()),
     skinTitles: qa('[data-pane="appearance"] .skin-card').map(e=>e.getAttribute('title')),
@@ -259,7 +259,7 @@ try {
   const runLang = async (lang, tag) => {
     await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
     await sleep(500);
-    await M.evalJs(H(`await openSettings('keys'); await sleep(700); return 1;`));
+    await M.evalJs(H(`await openSettings('keys'); await sleep(700); window.__addIdle=(()=>{const b=q('[data-pane="keys"] .key-add'); if(!b) return null; return {icon:/<svg[\\s\\S]*<\\/svg>/.test(b.innerHTML), text:b.textContent.trim()};})(); (await wait(()=>q('[data-pane="keys"] .key-add'),'key-add')).click(); await sleep(500); return 1;`));
     out.steps[tag] = await M.evalJs(H(GRAB));
     await M.evalJs(H(`closeSettings(); return 1;`));
     return out.steps[tag];
@@ -311,7 +311,7 @@ try {
   check("G2 en：所有 title/aria-label 无中文界面文案残留", enLeft.attrs.length === 0, enLeft.attrs);
   check("G3 en：全角符号只剩刻意同形的字形（＋），无全角标点残留",
     enFw.pane.length === 0 && enFw.body.length === 0, enFw);
-  check("H1 en：「＋」按钮文本就是 ＋ 本身", en.addChip === "＋", en.addChip);
+  check("H1 en：「＋」按钮已图标化（内含 <svg>、无字形文本），捕获态有本地化文案且与中文不同", en.addChip && en.addChip.icon === true && en.addChip.text === "" && en.addChipCap === TABLES.en.get("settings.keys.capture") && en.addChipCap !== TABLES["zh-CN"].get("settings.keys.capture"), { idle: en.addChip, cap: en.addChipCap });
   check("H2 en：按键分区不含 i18n-allow / // 字样",
     !en.keysText.includes("i18n-allow") && !en.keysText.includes("//"), null);
   check("H3 en：整页 innerText 不含 i18n-allow 字样", !en.body.some((l) => l.includes("i18n-allow")),
@@ -340,7 +340,7 @@ try {
     zh.schemeNames.includes("我的老方案") && zh.schemeNames.includes("默认"), zh.schemeNames);
   check("E4 zh-CN：TTS 协议 11 项与文案表一致", sameArr(zh.ttsProtocols, Z.ttsProtocol), zh.ttsProtocols);
   check("F2 zh-CN：AI 服务商 5 项与文案表一致", sameArr(zh.aiProviders, Z.aiProvider), zh.aiProviders);
-  check("H5 zh-CN：「＋」按钮文本就是 ＋ 本身", zh.addChip === "＋", zh.addChip);
+  check("H5 zh-CN：「＋」按钮已图标化（内含 <svg>、无字形文本），捕获态文案等于文案表", zh.addChip && zh.addChip.icon === true && zh.addChip.text === "" && zh.addChipCap === TABLES["zh-CN"].get("settings.keys.capture"), { idle: zh.addChip, cap: zh.addChipCap });
   check("H6 zh-CN：整页 innerText 不含 i18n-allow 字样", !zh.body.some((l) => l.includes("i18n-allow")),
     zh.body.filter((l) => l.includes("i18n-allow")).slice(0, 5));
 
@@ -636,22 +636,22 @@ try {
   /* ============ L：内置方案改名后立刻显示用户命名 ============ */
   const schemeProbe = async (lang) => {
     await M.evalJs(H(`await toLibrary(); await openSettings(); await setLangViaUi(${J(lang)}); closeSettings(); return 1;`));
-    await sleep(400);
+    await sleep(500);
     return await M.evalJs(HK(`
-      await openSettings('reader'); await sleep(800);
+      await openSettings('reader'); await wait(()=>q('[data-pane="reader"] [data-scheme-id]'),'scheme-card');
       const nameOf=(id)=>{ const c=q('[data-scheme-id="'+id+'"]'); return c?(c.querySelector('.scheme-name').textContent.trim()):null; };
       const before={ paper:nameOf('s-paper'), legacy:nameOf('s-legacy-default'), mine:nameOf('s-legacy-mine') };
       const origPrompt=window.prompt;
       window.prompt=()=>${J("我的方案A")};
-      q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]')?.click();
+      (await wait(()=>q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]'),'rename')).click();
       await sleep(800);
       const afterRename=nameOf('s-paper');
       window.prompt=()=>${J("纸质")};
-      q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]')?.click();
+      (await wait(()=>q('[data-scheme-id="s-paper"] [data-testid="scheme-rename"]'),'rename')).click();
       await sleep(800);
       const afterRestore=nameOf('s-paper');
       window.prompt=origPrompt;
-      closeSettings(); await sleep(300);
+      closeSettings(); await sleep(800); // > saveConfig 的 300ms 去抖，否则读 localStorage 会读到旧值
       return { before, afterRename, afterRestore, stored:(cfg().readerSchemes||[]).find(s=>s.id==='s-paper')?.name };
     `));
   };

@@ -5,12 +5,14 @@
   import { toast } from "../lib/stores.svelte";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import type { BookSearchHit } from "../lib/types";
+  import { IconArrowLeft, IconSearch, IconX } from "@tabler/icons-svelte";
 
   let {
     bookId,
     initialQuery = "",
     anchor,
     canBack = false,
+    surfaceVars = "",
     onpick,
     onback,
     onclose,
@@ -19,6 +21,12 @@
     initialQuery?: string;
     anchor: PopupAnchor;
     canBack?: boolean;
+    /** 阅读区表面令牌（--rdr-bg/-fg 及其派生量），由 Reader 的 readerSurfaceVars() 提供。
+     *  本浮层 portal 到 body，脱离 .reader 子树，拿不到 Reader 写在根节点上的内联值，
+     *  故必须自带一份——否则书内搜索会渲染成外壳皮肤的颜色（深色外壳 + 纸色书页时
+     *  会出现深色小窗压在浅色书页上）。由调用方提供而非自行推导，是为了带上
+     *  「仅本书方案」覆盖，且与它所浮着的书页严格同源。 */
+    surfaceVars?: string;
     onpick: (chapterIndex: number, query: string) => void;
     onback: () => void;
     onclose: () => void;
@@ -130,14 +138,14 @@
   }
 </script>
 
-<div class="sb-pop" use:portal bind:this={popEl} style={posStyle}>
+<div class="sb-pop rdr-pop" use:portal bind:this={popEl} style="{surfaceVars};{posStyle}">
   <div class="sb-head" data-testid="bsp-head" onpointerdown={startDrag} title={t("search.popup.moveTip")}>
-    <span class="sb-drag">{t("search.popup.title")}</span>
+    <span class="sb-drag"><IconSearch />{t("search.popup.title")}</span>
     <div class="sb-head-acts">
       {#if canBack}
-        <button class="mini" data-testid="bsp-back" onclick={onback} title={t("search.popup.backTip")}>{t("search.popup.back")}</button>
+        <button class="mini" data-testid="bsp-back" onclick={onback} title={t("search.popup.backTip")}><IconArrowLeft />{t("search.popup.back")}</button>
       {/if}
-      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}>×</button>
+      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}><IconX /></button>
     </div>
   </div>
   <div class="sb-row">
@@ -168,58 +176,68 @@
 </div>
 
 <style>
+  /* 底色 / 描边 / 圆角 / 投影走全局 .rdr-pop。
+     本浮层 portal 到 body、拿不到 .reader 上的 --rdr-*，由 app.css :root 的
+     阅读区变量兜底退回外壳面板色（与取色框同一策略）。 */
   .sb-pop {
     position: fixed;
-    z-index: 980;
+    z-index: var(--z-popover);
     width: min(440px, 88vw);
     max-height: min(60vh, 520px);
     display: flex;
     flex-direction: column;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 94%, #202020 6%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 12px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 24px 52px rgba(0, 0, 0, 0.26);
     overflow: hidden;
+    animation: fr-pop-in var(--dur) var(--ease-premium) both;
   }
 
   .sb-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 12px;
-    font-size: 13px;
+    padding: var(--sp-2) var(--sp-3);
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     font-weight: 600;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+    border-bottom: 1px solid var(--line);
     cursor: move;
     user-select: none;
     touch-action: none;
   }
 
-  .sb-drag { cursor: move; }
+  .sb-drag {
+    cursor: move;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+
 
   .sb-head-acts {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--sp-1);
   }
 
   .sb-head .x {
-    padding: 1px 8px;
-    border-radius: 6px;
+    padding: 1px var(--sp-2);
+    border-radius: var(--radius-sm);
   }
 
   .sb-head .mini {
-    font-size: 12px;
-    padding: 2px 8px;
-    border-radius: 6px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    padding: 2px var(--sp-2);
+    border-radius: var(--radius-sm);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
   }
 
   .sb-row {
     display: flex;
-    gap: 6px;
-    padding: 8px 12px;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.12);
+    gap: var(--sp-1);
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--line-soft);
   }
 
   .sb-row input { flex: 1; min-width: 0; }
@@ -227,39 +245,46 @@
   .sb-list {
     overflow-y: auto;
     flex: 1;
-    padding: 4px;
+    padding: var(--sp-1);
   }
 
   .sb-hit {
     padding: 7px 9px;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
-  .sb-hit:hover { background: rgba(128, 128, 128, 0.14); }
-  .sb-hit.active { background: color-mix(in srgb, var(--accent, #4a6b8a) 22%, transparent); }
+  .sb-hit {
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .sb-hit:hover { background: var(--hover-row); }
+  .sb-hit.active { background: var(--accent-soft); }
 
-  .sb-ch { font-size: 13px; font-weight: 600; }
+  .sb-ch { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); font-weight: 600; }
 
   .sb-sn {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.8;
     line-height: 1.55;
     margin-top: 2px;
     word-break: break-word;
   }
 
+  /* 命中片段底色：以 --warning 为色相做浅底，跟随皮肤而非固定黄 */
   .sb-sn :global(mark.mk) {
-    background: #ffe28a;
+    background: color-mix(in srgb, var(--warning) 32%, var(--bg-elev));
     color: inherit;
     padding: 0 2px;
-    border-radius: 2px;
+    border-radius: var(--radius-xs);
   }
 
   .sb-empty {
-    padding: 22px;
+    padding: 48px var(--sp-4);
     text-align: center;
-    font-size: 13px;
-    opacity: 0.55;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    color: var(--fg2);
+    line-height: 1.8;
   }
 </style>

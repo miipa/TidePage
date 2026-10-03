@@ -21,7 +21,9 @@ const out = {};
 const M = await connectTarget(9444, (t) => t.type === "page" && !t.url.includes("ai=1"));
 await M.evalJs(H(`
   const I=window.__TAURI_INTERNALS__.invoke;
-  for (let i=0;i<80 && !document.querySelector('.library');i++){ const b=[...document.querySelectorAll('.topbar button')].find(x=>x.textContent.includes('←')); if(b)b.click(); else break; await sleep(150); }
+  // Back-to-library: the topbar back button is an <IconArrowLeft /> icon now (no arrow glyph in textContent), so locate it by data-testid. Missing button or never reaching the library = explicit throw, never a silent break.
+  for (let i=0;i<80 && !document.querySelector('.library');i++){ const b=document.querySelector('[data-testid="reader-back"]'); if(!b) throw new Error('no reader-back'); b.click(); await sleep(150); }
+  if(!document.querySelector('.library')) throw new Error('never reached library');
   try { await I("remove_folder",{path:${JSON.stringify(root)}}); } catch(e){}
   await I("add_folder",{path:${JSON.stringify(root)}});
   let a=null,b=null;

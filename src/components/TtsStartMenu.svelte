@@ -38,48 +38,40 @@
   });
 </script>
 
-<div class="ts-menu" bind:this={menuEl} style={posStyle}>
+<div class="ts-menu rdr-pop" bind:this={menuEl} style={posStyle}>
   <div class="ts-title">{t("tts.start.ask")}</div>
   <button class="ts-btn" data-testid="ts-page" onclick={onpage}>{t("tts.start.page")}</button>
   <button class="ts-btn" data-testid="ts-chapter" onclick={onchapter}>{t("tts.start.chapter")}</button>
 </div>
 
 <style>
+  /* 底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
   .ts-menu {
     position: fixed;
-    z-index: 985;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 92%, #202020 8%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
-    padding: 8px;
+    z-index: var(--z-popover);
+    padding: var(--sp-2);
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: var(--sp-1);
     min-width: 150px;
-    animation: ts-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes ts-in {
-    from { opacity: 0; transform: translateY(5px) scale(0.97); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .ts-title {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.65;
-    padding: 2px 4px 4px;
+    padding: 2px var(--sp-1) var(--sp-1);
   }
 
   .ts-btn {
     text-align: left;
-    font-size: 13px;
-    padding: 8px 12px;
-    border-radius: 7px;
+    font-size: var(--fs-sm);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-sm);
   }
 
   .ts-btn:hover {
-    background: rgba(128, 128, 128, 0.16);
+    background: color-mix(in srgb, var(--rdr-fg) 10%, transparent);
   }
 </style>

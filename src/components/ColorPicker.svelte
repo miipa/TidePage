@@ -118,7 +118,7 @@
 </button>
 
 {#if open}
-  <div class="cp-pop" data-cp-pop use:portal bind:this={popEl} style="left:{pos.x}px; top:{pos.y}px;">
+    <div class="cp-pop pop" data-cp-pop use:portal bind:this={popEl} style="left:{pos.x}px; top:{pos.y}px;">
     <div class="cp-title">{titleText}</div>
     <div class="cp-grid">
       {#each presets as p (p)}
@@ -132,7 +132,16 @@
         ></button>
       {/each}
       {#if allowEmpty}
-        <button type="button" class="cp-swatch cp-clear" class:active={!value} title={emptyText} onclick={() => apply("")}>∅</button>
+        <!-- 「无颜色」不再叠加 ∅ 字形：45° 斜纹底（.cp-none）本身就是正确信号，
+             再加一个字形只会把它变成第二个含义不同的标记。按钮保留 title/aria-label。 -->
+        <button
+          type="button"
+          class="cp-swatch cp-clear"
+          class:active={!value}
+          title={emptyText}
+          aria-label={emptyText}
+          onclick={() => apply("")}
+        ></button>
       {/if}
     </div>
 
@@ -161,26 +170,28 @@
   .cp-trigger {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 3px 8px;
+    gap: var(--sp-1);
+    padding: 3px var(--sp-2);
     border: 1px solid var(--line);
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     background: var(--panel);
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     max-width: 100%;
   }
 
   .cp-dot {
     width: 14px;
     height: 14px;
-    border-radius: 4px;
-    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: var(--radius-xs);
+    border: 1px solid var(--line-strong);
     flex-shrink: 0;
   }
 
+  /* 「无颜色」斜纹：唯一保留的 linear-gradient 用途（语义标记，非装饰） */
   .cp-none {
     background:
-      linear-gradient(45deg, transparent 45%, var(--danger, #c0392b) 45%, var(--danger, #c0392b) 55%, transparent 55%),
+      linear-gradient(45deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%),
       var(--panel2);
   }
 
@@ -192,29 +203,23 @@
     opacity: 0.8;
   }
 
+  /* 底色 / 描边 / 圆角 / 投影走全局 .pop（外壳浮层，跟随外壳皮肤）。
+     本组件被设置弹窗与阅读区划线菜单共用，两种语境下一律跟外壳：
+     它是配置工具而非页面内容，且能保证底色与文字色必然成对同源、不会对比度不足。 */
   .cp-pop {
     position: fixed;
-    z-index: 1100;
+    z-index: var(--z-popover);
     width: 250px;
-    background: var(--panel);
-    color: var(--fg);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14), 0 20px 44px rgba(0, 0, 0, 0.22);
     padding: 10px;
-    animation: cp-in 0.18s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes cp-in {
-    from { opacity: 0; transform: translateY(5px) scale(0.97); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .cp-title {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-weight: 600;
     opacity: 0.75;
-    margin-bottom: 8px;
+    margin-bottom: var(--sp-2);
   }
 
   .cp-grid {
@@ -227,33 +232,40 @@
   .cp-swatch {
     width: 20px;
     height: 20px;
-    border-radius: 5px;
-    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
     cursor: pointer;
     padding: 0;
   }
 
+  /* 同 ColorPalette：outline 不可过渡，改用可插值的 box-shadow */
+  .cp-swatch {
+    transition: box-shadow var(--dur) var(--ease);
+  }
+
   .cp-swatch.active {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
+    box-shadow: 0 0 0 2px var(--accent);
   }
 
   .cp-clear {
     background: var(--panel2);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     line-height: 1;
+    display: grid;
+    place-items: center;
   }
 
   .cp-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 6px;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-1);
   }
 
   .cp-row label {
     width: 34px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.6;
     flex-shrink: 0;
   }
@@ -261,18 +273,19 @@
   .cp-row input {
     flex: 1;
     min-width: 0;
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
 
   .cp-native {
     padding: 0;
-    height: 26px;
+    height: var(--ctl-h-sm);
     cursor: pointer;
   }
 
   .cp-tip {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.5;
-    margin-top: 4px;
+    margin-top: var(--sp-1);
   }
 </style>

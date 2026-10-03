@@ -23,6 +23,11 @@
     IconArrowBackUp,
     IconTrash,
     IconArrowsSort,
+    IconCheck,
+    IconLayoutGrid,
+    IconLayoutList,
+    IconPlus,
+    IconX,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
   import ProgressRing from "./ProgressRing.svelte";
@@ -1665,7 +1670,7 @@
       <div class="spacer" data-tauri-drag-region></div>
     {:else}
     <span class="logo">TidePage</span>
-    <button class="primary" data-testid="lib-btn-add-folder" onclick={addFolder}>{t("library.toolbar.addFolder")}</button>
+    <button class="primary" data-testid="lib-btn-add-folder" onclick={addFolder}><IconPlus />{t("library.toolbar.addFolder")}</button>
     <div class="refresh-wrap">
       <button
         onpointerdown={refreshDown}
@@ -1676,7 +1681,7 @@
         disabled={refreshing}
         data-testid="lib-btn-refresh"
         title={t("library.toolbar.refreshTip")}
-      >{refreshing ? t("library.toolbar.refreshing") : t("library.toolbar.refresh")}</button>
+      ><IconRefresh />{refreshing ? t("library.toolbar.refreshing") : t("library.toolbar.refresh")}</button>
       {#if refreshMenu}
         <div class="refresh-menu" role="menu">
           <button class="rm-item" data-testid="lib-btn-rescan" onclick={() => { refreshMenu = false; refreshAll(); }}>{t("library.toolbar.rescan")}</button>
@@ -1693,7 +1698,7 @@
       <option value="size">{t("library.sort.size")}</option>
     </select>
     <button class="icon" data-testid="lib-btn-reverse" data-tip={t("library.toolbar.reverseTip")} aria-label={t("library.toolbar.reverseTip")} onclick={toggleReverse}>
-      <IconArrowsSort size={20} stroke={1.75} />
+      <IconArrowsSort size={20} stroke={1.5} />
     </button>
     <div class="filter-wrap">
       <button
@@ -1705,7 +1710,7 @@
       >{t("library.toolbar.category")}{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
       {#if hasFilter}
         <button class="filter-chip" data-testid="lib-filter-chip" title={t("library.toolbar.clearFilterTip")} onclick={clearFilter}>
-          {t("library.toolbar.filtered")} <span class="fx">×</span>
+          {t("library.toolbar.filtered")} <span class="fx"><IconX /></span>
         </button>
       {/if}
     </div>
@@ -1721,7 +1726,7 @@
           data-tip={b.title}
           onclick={b.run}
         >
-          <Icon size={20} stroke={1.75} />
+          <Icon size={20} stroke={1.5} />
         </button>
       {/each}
     </div>
@@ -1777,8 +1782,8 @@
           onclick={() => selectFolder(f)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFolder(f); } }}
         >
-          📁 {f}
-          <button class="x" onclick={(e) => { e.stopPropagation(); removeFolder(f); }}>×</button>
+          <IconFolder /> {f}
+          <button class="x" title={t("library.folder.removeTip")} aria-label={t("library.folder.removeTip")} onclick={(e) => { e.stopPropagation(); removeFolder(f); }}><IconX /></button>
         </span>
       {/each}
       {#if foldersFailed}<span class="fp-empty" data-testid="lib-folders-failed">{t("library.folders.failed")}</span>{/if}
@@ -1799,9 +1804,9 @@
     onpointerleave={onGridPointerLeave}
   >
     {#if loading && total === 0}
-      <div class="hint" data-testid="lib-hint-loading">{t("library.empty.loading")}</div>
+      <div class="empty-state" data-testid="lib-hint-loading">{t("library.empty.loading")}</div>
     {:else if total === 0}
-      <div class="hint" data-testid="lib-hint-empty">
+      <div class="empty-state" data-testid="lib-hint-empty">
         {query.trim() ? t("library.empty.noMatch") : t("library.empty.blank")}
       </div>
     {:else if view === "grid"}
@@ -1838,7 +1843,7 @@
                       {/key}
                       <span class="fmt">{b.format.toUpperCase()}</span>
                       {#if selectMode}
-                        <span class="sel-badge" class:on={sel} aria-hidden="true">{sel ? "✓" : ""}</span>
+                        <span class="sel-badge" class:on={sel} aria-hidden="true">{#if sel}<IconCheck />{/if}</span>
                       {/if}
                       {#if ri.show && config.library.showCoverProgress}
                         <ProgressRing pct={ri.pct} full={ri.full} />
@@ -1879,7 +1884,7 @@
               oncontextmenu={(e) => openCtx(e, b)}
             >
               {#if selectMode}
-                <span class="sel-badge row-badge" class:on={sel} aria-hidden="true">{sel ? "✓" : ""}</span>
+                <span class="sel-badge row-badge" class:on={sel} aria-hidden="true">{#if sel}<IconCheck />{/if}</span>
               {/if}
               <div class="row-cover-wrap">
                 {#key cu}
@@ -1932,33 +1937,33 @@
       </div>
     {/if}
     <div class="spacer"></div>
-    <button class="icon view-btn" class:active={view === "grid"} data-testid="lib-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}>▦</button>
-    <button class="icon view-btn" class:active={view === "list"} data-testid="lib-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}>≡</button>
+    <button class="icon view-btn" class:active={view === "grid"} data-testid="lib-view-grid" title={t("common.view.grid")} aria-pressed={view === "grid"} onclick={() => setView("grid")}><IconLayoutGrid /></button>
+    <button class="icon view-btn" class:active={view === "list"} data-testid="lib-view-list" title={t("common.view.list")} aria-pressed={view === "list"} onclick={() => setView("list")}><IconLayoutList /></button>
   </div>
 
   <div class="sel-box" class:on={boxActive} bind:this={boxEl}></div>
 
   {#if ctxMenu}
     <div class="ctx-backdrop" onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
-      <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
-        <button data-testid="lib-ctx-open" onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={17} stroke={1.75} /></span>{t("library.ctx.open")}</button>
-        <button data-testid="lib-ctx-detail" onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={17} stroke={1.75} /></span>{t("library.ctx.detail")}</button>
+      <div class="ctx ctx-menu" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
+        <button class="ctx-item" data-testid="lib-ctx-open" onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={16} stroke={1.5} /></span>{t("library.ctx.open")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-detail" onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={16} stroke={1.5} /></span>{t("library.ctx.detail")}</button>
         {#if ctxMenu.book.format === "txt"}
-          <button data-testid="lib-ctx-convert" onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={17} stroke={1.75} /></span>{t("library.ctx.convert")}</button>
+          <button class="ctx-item" data-testid="lib-ctx-convert" onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={16} stroke={1.5} /></span>{t("library.ctx.convert")}</button>
         {/if}
         <div class="ctx-sep"></div>
-        <button data-testid="lib-ctx-cover" onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={17} stroke={1.75} /></span>{t("library.ctx.setCover")}</button>
-        <button data-testid="lib-ctx-reextract" onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={17} stroke={1.75} /></span>{t("library.ctx.reextract")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-cover" onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={16} stroke={1.5} /></span>{t("library.ctx.setCover")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-reextract" onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={16} stroke={1.5} /></span>{t("library.ctx.reextract")}</button>
         {#if effectiveState(ctxMenu.book) !== "read"}
-          <button data-testid="lib-ctx-mark-read" onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={17} stroke={1.75} /></span>{t("library.ctx.markRead")}</button>
+          <button class="ctx-item" data-testid="lib-ctx-mark-read" onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={16} stroke={1.5} /></span>{t("library.ctx.markRead")}</button>
         {/if}
         {#if effectiveState(ctxMenu.book) !== "unread"}
-          <button data-testid="lib-ctx-mark-unread" onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={17} stroke={1.75} /></span>{t("library.ctx.markUnread")}</button>
+          <button class="ctx-item" data-testid="lib-ctx-mark-unread" onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={16} stroke={1.5} /></span>{t("library.ctx.markUnread")}</button>
         {/if}
-        <button data-testid="lib-ctx-reveal" onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={17} stroke={1.75} /></span>{t("library.ctx.reveal")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-reveal" onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={16} stroke={1.5} /></span>{t("library.ctx.reveal")}</button>
         <div class="ctx-sep"></div>
-        <button class="danger" data-testid="lib-ctx-remove" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={17} stroke={1.75} /></span>{t("library.ctx.removeOnly")}</button>
-        <button class="danger" data-testid="lib-ctx-delete-file" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>{t("library.ctx.deleteFile")}</button>
+        <button class="ctx-item danger" data-testid="lib-ctx-remove" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={16} stroke={1.5} /></span>{t("library.ctx.removeOnly")}</button>
+        <button class="ctx-item danger" data-testid="lib-ctx-delete-file" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={16} stroke={1.5} /></span>{t("library.ctx.deleteFile")}</button>
       </div>
     </div>
   {/if}
@@ -1989,8 +1994,8 @@
   .toolbar {
     display: flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
-    padding: var(--sp-3, 12px) var(--sp-4, 16px);
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-4);
     /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
     padding-right: 112px;
     background: var(--panel);
@@ -1998,14 +2003,14 @@
     box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02), 0 6px 16px -12px rgba(23, 25, 30, 0.35);
     flex-shrink: 0;
     position: relative;
-    z-index: 5;
+    z-index: var(--z-raised);
   }
 
   .logo {
     font-weight: 700;
-    font-size: var(--fs-lg, 16px);
+    font-size: var(--fs-lg);
     color: var(--accent);
-    margin-right: var(--sp-3, 12px);
+    margin-right: var(--sp-3);
     letter-spacing: -0.02em;
     user-select: none;
   }
@@ -2020,11 +2025,11 @@
   .filter-wrap {
     display: inline-flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
+    gap: var(--sp-2);
   }
 
   .cat-btn.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
@@ -2033,12 +2038,12 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-    border-radius: var(--radius-pill, 999px);
+    border-radius: var(--radius-pill);
     padding: 4px 10px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     cursor: pointer;
   }
   .filter-chip .fx {
@@ -2051,25 +2056,25 @@
   .filter-panel {
     display: flex;
     flex-direction: column;
-    gap: var(--sp-3, 12px);
-    padding: var(--sp-3, 12px) var(--sp-4, 16px);
+    gap: var(--sp-3);
+    padding: var(--sp-3) var(--sp-4);
     background: var(--panel);
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
-    animation: ctx-in 0.12s cubic-bezier(0, 0, 0.2, 1);
+    animation: fr-menu-in var(--dur-fast) var(--ease-in) both;
   }
 
   .fp-group {
     display: flex;
     align-items: flex-start;
-    gap: var(--sp-3, 12px);
+    gap: var(--sp-3);
   }
 
   .fp-label {
     flex-shrink: 0;
     width: 56px;
     padding-top: 5px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     color: var(--fg2);
     user-select: none;
   }
@@ -2077,24 +2082,24 @@
   .fp-tags {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--sp-2, 8px);
+    gap: var(--sp-2);
   }
 
-  .fp-empty { color: var(--fg2); font-size: var(--fs-xs, 12px); padding-top: 5px; }
+  .fp-empty { color: var(--fg2); font-size: var(--fs-xs); padding-top: 5px; }
 
   .fp-tags .tag {
     border: 1px solid var(--line);
     background: var(--panel2);
     color: var(--fg2);
-    border-radius: var(--radius-pill, 999px);
+    border-radius: var(--radius-pill);
     padding: 4px 12px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease), border-color var(--dur) var(--ease);
   }
   .fp-tags .tag:hover { background: var(--hover-bg); color: var(--fg); }
   .fp-tags .tag.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
@@ -2104,9 +2109,9 @@
     border: none;
     background: transparent;
     color: var(--fg2);
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     padding: 4px 8px;
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
   .fp-clear:hover { background: var(--hover-bg); color: var(--fg); }
@@ -2114,20 +2119,20 @@
   /* ---------- 文件夹胶囊 ---------- */
   .folders {
     display: flex;
-    gap: var(--sp-2, 8px);
-    padding: var(--sp-3, 12px) var(--sp-4, 16px) 0;
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-4) 0;
     flex-wrap: wrap;
   }
 
   .folder-chip {
     display: inline-flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
+    gap: var(--sp-2);
     background: var(--panel2);
     border: 1px solid var(--line);
-    border-radius: var(--radius-pill, 999px);
+    border-radius: var(--radius-pill);
     padding: 4px 8px 4px 12px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     font-family: inherit;
     color: var(--fg2);
     max-width: 420px;
@@ -2135,15 +2140,15 @@
     white-space: nowrap;
     text-overflow: ellipsis;
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease),
-      border-color var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+      border-color var(--dur) var(--ease);
   }
 
   .folder-chip:hover { background: var(--hover-bg); color: var(--fg); }
 
   /* 选中态：仿分类标签 .fp-tags .tag.active。 */
   .folder-chip.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
@@ -2154,12 +2159,12 @@
     padding: 0 4px;
     cursor: pointer;
     color: var(--fg2);
-    border-radius: var(--radius-sm, 8px);
-    transition: background var(--dur, 0.2s) var(--ease);
+    border-radius: var(--radius-sm);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
   }
 
   .folder-chip .x:hover {
-    background: var(--hover-bg, rgba(0, 0, 0, 0.06));
+    background: var(--hover-bg);
     color: var(--fg);
   }
 
@@ -2202,12 +2207,12 @@
     width: 100%;
     box-sizing: border-box;
     cursor: pointer;
-    border-radius: var(--radius, 12px);
-    padding: var(--sp-2, 8px);
+    border-radius: var(--radius-lg);
+    padding: var(--sp-2);
     /* 悬停抬升：柔和抬起 + 分层扩散阴影；用 премиум落位曲线模拟质量感（skill: haptic depth） */
-    transition: background var(--dur-lift, 0.34s) var(--ease-premium),
-      transform var(--dur-lift, 0.34s) var(--ease-premium),
-      box-shadow var(--dur-lift, 0.34s) var(--ease-premium);
+    transition: background var(--dur-lift) var(--ease-premium),
+      transform var(--dur-lift) var(--ease-premium),
+      box-shadow var(--dur-lift) var(--ease-premium);
   }
 
   .card:hover {
@@ -2218,7 +2223,7 @@
 
   .card:active {
     transform: translateY(-1px) scale(0.99);
-    transition-duration: var(--dur-fast, 0.12s);
+    transition-duration: var(--dur-fast);
   }
 
   /* 未加载完成的占位槽：只占位保持列对齐，不响应交互、无悬停效果 */
@@ -2236,13 +2241,13 @@
   .cover {
     position: relative;
     width: 100%;
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--panel2);
     outline: 1px solid var(--line);
     outline-offset: -1px;
     box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.14);
-    transition: box-shadow var(--dur-lift, 0.34s) var(--ease-premium);
+    transition: box-shadow var(--dur-lift) var(--ease-premium);
   }
 
   .card:hover .cover {
@@ -2254,7 +2259,7 @@
     height: 100%;
     object-fit: cover;
     display: block;
-    transition: transform var(--dur-lift, 0.34s) var(--ease-premium);
+    transition: transform var(--dur-lift) var(--ease-premium);
   }
 
   .card:hover .cover img {
@@ -2270,12 +2275,12 @@
     top: 8px;
     background: rgba(0, 0, 0, 0.55);
     color: #fff;
-    font-size: var(--fs-2xs, 10px);
+    font-size: var(--fs-2xs);
     font-weight: 500;
     line-height: 1;
     padding: 4px 8px;
-    border-radius: var(--radius-sm, 8px);
-    letter-spacing: var(--ls-wide, 0.015em);
+    border-radius: var(--radius-sm);
+    letter-spacing: var(--ls-xs);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
   }
 
@@ -2289,7 +2294,7 @@
   }
 
   .meta .t {
-    font-size: var(--fs-md, 14px);
+    font-size: var(--fs-md);
     line-height: 20px;
     font-weight: 500;
     color: var(--fg);
@@ -2299,7 +2304,7 @@
   }
 
   .meta .a {
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     line-height: 18px;
     color: var(--fg2);
     white-space: nowrap;
@@ -2323,71 +2328,68 @@
     box-sizing: border-box;
     display: flex;
     align-items: center;
-    gap: var(--sp-4, 16px);
-    padding: var(--sp-2, 8px) var(--sp-3, 12px);
-    border-radius: var(--radius-sm, 8px);
+    gap: var(--sp-4);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease);
+    /* box-shadow 追加在末尾，用于 .row.selected 的选中环渐显。
+       时长/曲线跟随本行原有的 --dur / --ease，不跟 .card 的 --dur-lift：
+       列表行的交互反馈本来就比卡片轻。 */
+    transition: background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
   }
 
-  .row:hover { background: var(--hover-row, rgba(0, 0, 0, 0.04)); }
+  .row:hover { background: var(--hover-row); }
 
+  /* 列表行封面：32×48 = 1.5，与网格封面、书籍详情（aspect-ratio 2/3）同一比例。
+     高度必须保持 48px —— .row 高 64px、上下 padding 各 8px，内容盒正好 48px，
+     动它会与虚拟滚动的 ROW_H=66 失配（行内几何不得变动）。 */
   .row-cover {
-    width: 34px;
+    width: 32px;
     height: 48px;
     object-fit: cover;
-    border-radius: var(--radius-xs, 6px);
+    border-radius: var(--radius-xs);
     outline: 1px solid var(--line);
     outline-offset: -1px;
     box-shadow: var(--shadow-sm);
   }
 
-  /* 列表行封面容器：为进度环提供定位上下文（不改变 34×48 布局尺寸）。 */
+  /* 列表行封面容器：为进度环提供定位上下文（不改变 32×48 布局尺寸）。 */
   .row-cover-wrap {
     position: relative;
     flex-shrink: 0;
-    width: 34px;
+    width: 32px;
     height: 48px;
     display: block;
   }
 
   .row-meta { flex: 1; min-width: 0; }
-  .row-meta .t { font-size: var(--fs-md, 14px); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .row-meta .a { font-size: var(--fs-xs, 12px); color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .row-size, .row-date { color: var(--fg2); font-size: var(--fs-xs, 12px); width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
+  .row-meta .t { font-size: var(--fs-md); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-meta .a { font-size: var(--fs-xs); color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-size, .row-date { color: var(--fg2); font-size: var(--fs-xs); width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
 
   /* ---------- 空状态 ---------- */
-  .hint {
-    text-align: center;
-    padding: 48px 24px;
-    color: var(--fg2);
-    white-space: pre-line;
-    line-height: var(--lh-body, 1.6);
-    font-size: var(--fs-md, 14px);
-  }
-
   /* ---------- 状态栏 ---------- */
   .statusbar {
     display: flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
-    padding: var(--sp-2, 8px) var(--sp-4, 16px);
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-4);
     border-top: 1px solid var(--line);
     color: var(--fg2);
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     background: var(--panel);
     flex-shrink: 0;
   }
 
   .statusbar .build {
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     opacity: 0.55;
   }
 
   .lib-tb-group {
     display: flex;
     align-items: center;
-    gap: var(--sp-1, 4px);
+    gap: var(--sp-1);
     position: relative;
   }
 
@@ -2405,7 +2407,7 @@
 
   /* 当前视图高亮：让用户知道自己在哪个视图（skill: active nav indication） */
   .view-btn.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     opacity: 1;
   }
@@ -2418,16 +2420,16 @@
     position: absolute;
     top: calc(100% + 6px);
     left: 0;
-    z-index: 120;
+    z-index: var(--z-popover);
     display: flex;
     flex-direction: column;
     min-width: 200px;
     padding: 4px;
     background: var(--bg-elev);
     border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
-    animation: ctx-in 0.12s cubic-bezier(0, 0, 0.2, 1);
+    animation: fr-menu-in var(--dur-fast) var(--ease-in) both;
   }
 
   .refresh-menu .rm-item {
@@ -2436,38 +2438,29 @@
     box-shadow: none;
     text-align: left;
     padding: 8px 12px;
-    border-radius: var(--radius-sm, 8px);
-    font-size: var(--fs-sm, 13px);
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-sm);
     color: var(--fg);
   }
 
   .refresh-menu .rm-item:hover:not(:disabled) { background: var(--hover-bg); border-color: transparent; }
 
-  .rm-backdrop { position: fixed; inset: 0; z-index: 119; }
+  .rm-backdrop { position: fixed; inset: 0; z-index: var(--z-drawer); }
 
   .scan-progress {
     display: flex;
     align-items: center;
-    gap: var(--sp-2, 8px);
+    gap: var(--sp-2);
     min-width: 180px;
   }
 
-  .meta-progress .meta-fill { background: var(--accent); opacity: 0.7; }
-
-  .scan-bar {
+  /* 进度条在状态栏里横向撑满（轨道的粗细/圆角/配色由 app.css 的全局进度条给） */
+  .scan-progress .scan-bar {
     flex: 1;
-    height: 4px;
-    border-radius: var(--radius-pill, 999px);
-    background: color-mix(in srgb, var(--fg2) 22%, transparent);
-    overflow: hidden;
   }
 
-  .scan-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: var(--radius-pill, 999px);
-    transition: width var(--dur, 0.2s) linear;
-  }
+  /* 此处只留本组件特有的不确定态与元信息进度弱化 */
+  .meta-progress .meta-fill { background: var(--accent); opacity: 0.7; }
 
   /* 不确定进度（total<=0，如添加目录阶段）：来回滑动动画条。
      keyframes 定义在全局 app.css（Svelte 会重命名组件内 keyframes，导致 app.css 的
@@ -2485,75 +2478,20 @@
   }
 
   /* ---------- 右键菜单 ---------- */
-  .ctx-backdrop {
+  /* .ctx-backdrop / .ctx-menu / .ctx-item / .ctx-sep 全部走 app.css 的全局规格。
+     本组件特有的是「fixed + 视口坐标定位 + 菜单是遮罩的子节点」这一件事。
+     保留 .ctx 这个类名是因为自动化脚本用它作为「菜单已出现」的等待信号。 */
+  .ctx-menu {
     position: fixed;
-    inset: 0;
-    z-index: 100;
+    z-index: var(--z-popover);
   }
-
-  .ctx {
-    position: fixed;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
-    box-shadow: var(--shadow-lg), var(--edge-hi-soft);
-    padding: 6px;
-    min-width: 208px;
-    z-index: 101;
-    transform-origin: top left;
-    animation: ctx-in 0.2s var(--ease-premium);
-  }
-
-  @keyframes ctx-in {
-    from { opacity: 0; transform: translateY(-6px) scale(0.96); }
-    to { opacity: 1; transform: none; }
-  }
-
-  .ctx button {
-    border: none;
-    background: transparent;
-    text-align: left;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 12px 7px 10px;
-    border-radius: var(--radius-sm, 8px);
-    font-size: var(--fs-sm, 13px);
-    color: var(--fg);
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
-  }
-
-  /* 图标统一列宽（Tabler 线性图标，与顶栏同款），文字左边缘对齐，观感整齐 */
-  .ctx .ci {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0.85;
-  }
-
-  /* 分组分隔线：把「打开/信息」「封面/状态」「删除」三组轻轻分开 */
-  .ctx-sep {
-    height: 1px;
-    margin: 5px 8px;
-    background: var(--line);
-  }
-
-  .ctx button:hover { background: var(--accent-soft, var(--hover-bg)); }
-  .ctx button:active { transform: none; }
-  .ctx button.danger { color: var(--danger); }
-  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
 
   /* ---------- 多选（长按 / 右键拉框） ---------- */
+  /* 选中态描边用 box-shadow 而不是 outline：outline-color 在多数引擎里不插值，
+     transition 无效。inset box-shadow 画在边框内侧，视觉与 outline-offset:-2px 等价且可过渡。 */
   .card.selected,
   .row.selected {
-    outline: 2px solid var(--accent);
-    outline-offset: -2px;
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
 
   .card.selected .cover {
@@ -2564,21 +2502,22 @@
     position: absolute;
     left: 6px;
     top: 6px;
-    width: 20px;
-    height: 20px;
+    width: var(--ctl-h-xs);
+    height: var(--ctl-h-xs);
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: var(--radius-pill, 999px);
-    font-size: 12px;
+    border-radius: var(--radius-pill);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-weight: 700;
     line-height: 1;
     color: #fff;
     background: color-mix(in srgb, var(--panel) 82%, transparent);
     border: 1.5px solid color-mix(in srgb, var(--fg2) 50%, transparent);
     box-shadow: var(--shadow-sm);
-    z-index: 3;
+    z-index: var(--z-raised);
     pointer-events: none;
   }
 
@@ -2587,16 +2526,18 @@
     border-color: var(--accent);
   }
 
+
   .row-badge {
     left: 6px;
     top: 6px;
-    width: 16px;
-    height: 16px;
-    font-size: 11px;
+    width: var(--ctl-h-xs);
+    height: var(--ctl-h-xs);
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
   }
 
   .sel-count {
-    font-size: var(--fs-sm, 13px);
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--fg);
     white-space: nowrap;
@@ -2604,7 +2545,7 @@
   }
 
   .sel-note {
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     color: var(--fg2);
     white-space: nowrap;
   }
@@ -2626,12 +2567,15 @@
     left: 0;
     width: 0;
     height: 0;
-    z-index: 200;
+    z-index: var(--z-drawer);
     pointer-events: none;
     border: 1px solid var(--accent);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
-    border-radius: var(--radius-xs, 6px);
+    border-radius: var(--radius-xs);
     opacity: 0;
+    /* 只有 opacity 补过渡：marquee 的 transform 每帧由 rAF 改写，
+       加 transform 过渡会和拖拽手感打架（每帧都在追一个滞后的目标值）。 */
+    transition: opacity var(--dur-fast) var(--ease);
     will-change: transform;
   }
 

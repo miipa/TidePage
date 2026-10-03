@@ -106,3 +106,24 @@ export interface BookmarkRow {
   excerpt: string;
   created_at: number;
 }
+
+/** 连接测试用的结构化片段（`ai.rs` 的 `AiPiece`）：**稳定 id + 动态素材**，界面句子一律前端拼。
+ *
+ *  - `code`：稳定 ASCII id，与文案表一一对应（如 `ai.routeDirect`）；空串表示这段没有固定
+ *    说法（代理地址、上游返回文本等），直接显示 `param` 原文。
+ *  - `param`：本片段自身的原文素材，同时作为单素材译文的 `{p0}`。
+ *  - `params`：该译文的动态素材，按序填进 `{p0}` / `{p1}`…；素材本身也可以是片段（可嵌套）。
+ *  翻译用 `aiPieceText()`（src/lib/i18n/index.svelte.ts）。 */
+export interface AiPiece {
+  code: string;
+  param: string;
+  params: AiPiece[];
+}
+
+/** ai_test 的返回：**只有状态与素材，没有拼好的句子**（界面文案一律前端按当前语言拼）。
+ *  ok 走结构化 `route` / `diag`；config 带 `code` 以便查表；allFailed 的 `lines` 逐条结构化，
+ *  `detail` 只是语言中立的原文明细（供日志/复制，界面不渲染）。 */
+export type AiTestResult =
+  | { status: "ok"; route: AiPiece; provider: string; reply: string; diag: AiPiece[] }
+  | { status: "config"; code: string; detail: string }
+  | { status: "allFailed"; detail: string; lines: AiPiece[] };

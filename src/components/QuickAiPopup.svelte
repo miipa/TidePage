@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { t } from "../lib/i18n/index.svelte";
+  import { aiErrDetail, t } from "../lib/i18n/index.svelte";
+  import { seedEndpointLabel } from "../lib/seedNames.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { config, copyText, saveConfigNow, toast } from "../lib/stores.svelte";
   import { api } from "../lib/api";
   import { esc, mdToHtml } from "../lib/md";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
+  import { IconRefresh, IconX } from "@tabler/icons-svelte";
 
   let {
     text,
@@ -77,18 +79,19 @@
     }
   }
 
-  function normErr(e: unknown): { kind: string; message: string } {
+  function normErr(e: unknown): { kind: string; code: string; message: string } {
     if (e && typeof e === "object") {
       const o = e as Record<string, unknown>;
-      if ("message" in o || "kind" in o) {
+      if ("message" in o || "kind" in o || "code" in o) {
         return {
           kind: typeof o.kind === "string" ? o.kind : "unknown",
+          code: typeof o.code === "string" ? o.code : "",
           message: typeof o.message === "string" ? o.message : JSON.stringify(e),
         };
       }
     }
     const s = typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
-    return { kind: "unknown", message: s };
+    return { kind: "unknown", code: "", message: s };
   }
 
   function renderPrompt(): string {
@@ -121,7 +124,7 @@
       const idx = order[a];
       const p = profiles[idx];
       if (!p || !p.baseUrl || !p.model) {
-        failures.push(t("ai.failureNoAddr", { name: p?.name || t("ai.endpointPlain"), msg: t("ai.noAddrOrModel") }));
+        failures.push(t("ai.failureNoAddr", { name: seedEndpointLabel(p?.name ?? "", t("ai.endpointPlain")), msg: t("ai.noAddrOrModel") }));
         continue;
       }
       if (a > 0) output = "";
@@ -165,7 +168,12 @@
         un?.();
         activeUn = null;
         const err = normErr(e);
-        failures.push(t("ai.errLine", { name: p.name || t("ai.endpointPlain"), kind: errLabel(err.kind), msg: err.message }));
+        const name = seedEndpointLabel(p.name, t("ai.endpointPlain"));
+        // code 命中 → 译文本身就是完整句子（含 {msg}），不再叠 errLabel，避免重复
+        const coded = aiErrDetail(err);
+        failures.push(coded !== null
+          ? t("ai.errLineCoded", { name, err: coded })
+          : t("ai.errLine", { name, kind: errLabel(err.kind), msg: err.message }));
         if (!config.ai.failover) break;
       }
     }
@@ -213,12 +221,12 @@
   });
 </script>
 
-<div class="qa-pop" bind:this={popEl} style={posStyle}>
+<div class="qa-pop rdr-pop" bind:this={popEl} style={posStyle}>
   <div class="qa-head">
     <span data-testid="qa-title">{t("quickAi.title")}</span>
     <div class="qa-acts">
       {#if !busy && output}
-        <button class="mini" data-testid="qa-retry" title={t("quickAi.regenerate")} onclick={retry}>↻</button>
+        <button class="mini" data-testid="qa-retry" title={t("quickAi.regenerate")} onclick={retry}><IconRefresh /></button>
         <button class="mini" data-testid="qa-copy" title={t("quickAi.copyResult")} onclick={() => copyText(output)}>{t("common.action.copy")}</button>
       {/if}
       <button
@@ -230,7 +238,7 @@
       >
         {added ? t("common.toast.added") : t("quickAi.addToNote")}
       </button>
-      <button class="mini" data-testid="qa-close" title={t("common.action.close")} onclick={onclose}>×</button>
+      <button class="mini" data-testid="qa-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>
     </div>
   </div>
   <div class="qa-body" bind:this={bodyEl}>
@@ -243,49 +251,43 @@
 </div>
 
 <style>
+  /* 底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
   .qa-pop {
     position: fixed;
-    z-index: 980;
+    z-index: var(--z-popover);
     width: min(420px, 88vw);
     max-height: min(58vh, 480px);
     display: flex;
     flex-direction: column;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 94%, #202020 6%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 12px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 24px 52px rgba(0, 0, 0, 0.26);
     overflow: hidden;
-    animation: qa-in 0.2s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes qa-in {
-    from { opacity: 0; transform: translateY(6px) scale(0.97); }
-    to { opacity: 1; transform: none; }
+    animation: fr-pop-in var(--dur) var(--ease-premium) both;
   }
 
   .qa-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 7px 12px;
-    font-size: 13px;
+    padding: 7px var(--sp-3);
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     font-weight: 600;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+    border-bottom: 1px solid var(--rdr-line);
   }
 
-  .qa-acts { display: flex; gap: 4px; }
+  .qa-acts { display: flex; gap: var(--sp-1); }
 
   .mini {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     padding: 2px 7px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
   .qa-body {
     overflow-y: auto;
     padding: 10px 13px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     line-height: 1.7;
   }
 
@@ -296,17 +298,18 @@
   }
   .qa-mark :global(ul), .qa-mark :global(ol) { padding-left: 1.5em; }
   .qa-mark :global(pre) {
-    background: rgba(128, 128, 128, 0.14);
-    padding: 8px 10px;
-    border-radius: 6px;
+    background: color-mix(in srgb, var(--rdr-fg) 10%, transparent);
+    padding: var(--sp-2) 10px;
+    border-radius: var(--radius-sm);
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .qa-mark.err { opacity: 0.85; font-size: 13px; }
+  .qa-mark.err { opacity: 0.85; font-size: var(--fs-sm); }
 
   .qa-loading {
     opacity: 0.55;
-    font-size: 13px;
-    padding: 6px 0;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    padding: var(--sp-1) 0;
   }
 </style>

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { coverTheme, defaultCoverBust, secretsReady } from "./stores.svelte";
-import type { BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, OpenResult, Progress, SearchHit, TocEntry } from "./types";
+import type { AiTestResult, BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, OpenResult, Progress, SearchHit, TocEntry } from "./types";
 
 /** 依赖凭据的封装统一先等凭据回填完成再 invoke，避免启动瞬间用到空密钥。
  *  仅延后 invoke；调用方传入的参数保持不变（命令签名不变）。 */
@@ -192,7 +192,7 @@ export const api = {
     provider: string; baseUrl: string; apiKey: string; model: string;
     deployment?: string; apiVersion?: string;
     proxyMode: string; proxyUrl: string;
-  }) => invoke<string>("ai_test", args)),
+  }) => invoke<AiTestResult>("ai_test", args)),
   ttsSynth: needsSecrets((args: {
     provider: string; baseUrl: string; apiKey: string;
     secretKey?: string; appId?: string; cluster?: string;

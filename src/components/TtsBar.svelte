@@ -11,6 +11,16 @@
     ttsStop,
   } from "../lib/tts.svelte";
   import type { FlatSegment, OnlineVoice } from "../lib/tts.svelte";
+  import {
+    IconClock,
+    IconPlayerPause,
+    IconPlayerPlay,
+    IconPlayerSkipBack,
+    IconPlayerSkipForward,
+    IconPlayerStop,
+    IconRefresh,
+    IconSettings,
+  } from "@tabler/icons-svelte";
 
   let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
 
@@ -79,13 +89,13 @@
   );
 </script>
 
-<div class="tts-bar" class:expanded>
-  <button class="tb-btn" data-testid="tts-prev" title={t("tts.prevSentence")} onclick={ttsPrev}>⏮</button>
+<div class="tts-bar rdr-pop" class:expanded>
+  <button class="tb-btn" data-testid="tts-prev" title={t("tts.prevSentence")} onclick={ttsPrev}><IconPlayerSkipBack /></button>
   <button class="tb-btn primary" data-testid="tts-pause" title={ttsState.paused ? t("tts.resume") : t("tts.pause")} onclick={ttsPauseResume}>
-    {ttsState.paused ? "▶" : "⏸"}
+    {#if ttsState.paused}<IconPlayerPlay />{:else}<IconPlayerPause />{/if}
   </button>
-  <button class="tb-btn" data-testid="tts-next" title={t("tts.nextSentence")} onclick={ttsNext}>⏭</button>
-  <button class="tb-btn stop" data-testid="tts-stop" title={t("tts.stop")} onclick={ttsStop}>⏹</button>
+  <button class="tb-btn" data-testid="tts-next" title={t("tts.nextSentence")} onclick={ttsNext}><IconPlayerSkipForward /></button>
+  <button class="tb-btn stop" data-testid="tts-stop" title={t("tts.stop")} onclick={ttsStop}><IconPlayerStop /></button>
 
   <div class="tb-info" title={current?.text || ""}>
     <span class="tb-count">
@@ -98,10 +108,10 @@
   </div>
 
   {#if sleepLeft > 0}
-    <span class="tb-sleep" title={t("tts.timerRemain")}>⏰ {fmtLeft(sleepLeft)}</span>
+    <span class="tb-sleep" title={t("tts.timerRemain")}><IconClock /> {fmtLeft(sleepLeft)}</span>
   {/if}
 
-  <button class="tb-btn" data-testid="tts-settings" title={t("tts.settings")} onclick={() => (expanded = !expanded)}>⚙</button>
+  <button class="tb-btn" data-testid="tts-settings" title={t("tts.settings")} onclick={() => (expanded = !expanded)}><IconSettings /></button>
 
   {#if expanded}
     <div class="tb-panel">
@@ -131,7 +141,7 @@
             title={t("tts.loadVoices")}
             onclick={() => refreshOnlineVoices()}
             disabled={ttsState.onlineVoiceLoading}
-          >{ttsState.onlineVoiceLoading ? "…" : "↻"}</button>
+          >{#if ttsState.onlineVoiceLoading}…{:else}<IconRefresh />{/if}</button>
         {:else}
           <select bind:value={config.tts.voice} onchange={saveConfig}>
             <option value="">{t("tts.auto")}</option>
@@ -178,64 +188,71 @@
 </div>
 
 <style>
+  /* 底色 / 描边 / 投影走全局 .rdr-pop（跟随阅读主题）；
+     圆角保留药丸形——这是一条「芯片条」而非卡片，故用 --radius-pill。 */
   .tts-bar {
     position: fixed;
     left: 50%;
     bottom: 46px;
     transform: translateX(-50%);
-    z-index: 70;
+    z-index: var(--z-sticky);
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
+    gap: var(--sp-1);
+    padding: var(--sp-1) 10px;
     max-width: min(760px, 92vw);
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 90%, #202020 10%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 22px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 48px rgba(0, 0, 0, 0.26);
+    border-radius: var(--radius-pill);
     flex-wrap: wrap;
+    /* 固定药丸：用 opacity + translateY 的轻量入场，不带 blur（会与条内正在更新的文本抢合成层） */
+    animation: fr-rise-in var(--dur) var(--ease-premium) both;
   }
 
   .tb-btn {
     border: none;
     background: transparent;
     color: inherit;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     line-height: 1;
-    padding: 6px 8px;
+    padding: var(--sp-1) var(--sp-2);
     border-radius: 50%;
     cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
 
-  .tb-btn:hover { background: rgba(128, 128, 128, 0.18); }
+  .tb-btn:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
 
   .tb-btn.primary {
-    background: var(--accent, #4a6b8a);
-    color: #fff;
-    font-size: 14px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: var(--fs-md);
   }
 
-  .tb-btn.stop { color: var(--danger, #c0392b); }
+  .tb-btn.primary:hover { background: var(--accent-hover); }
+
+  .tb-btn.stop { color: var(--danger); }
 
   .tb-info {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--sp-2);
     min-width: 120px;
     max-width: 340px;
     overflow: hidden;
   }
 
   .tb-count {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.65;
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
   }
 
   .tb-text {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -243,14 +260,18 @@
   }
 
   .tb-sleep {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.75;
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
   }
-
   .tb-buffering {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.7;
     flex-shrink: 0;
     animation: tb-pulse 1s ease-in-out infinite;
@@ -265,33 +286,34 @@
     border: none;
     background: transparent;
     color: inherit;
-    font-size: 13px;
-    padding: 3px 6px;
-    border-radius: 6px;
+    font-size: var(--fs-sm);
+    padding: 3px var(--sp-1);
+    border-radius: var(--radius-pill);
     cursor: pointer;
     flex-shrink: 0;
   }
 
-  .tb-mini:hover { background: rgba(128, 128, 128, 0.18); }
+  .tb-mini:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
 
   .tb-panel {
     flex-basis: 100%;
-    border-top: 1px solid rgba(128, 128, 128, 0.2);
-    margin-top: 6px;
-    padding-top: 8px;
+    border-top: 1px solid var(--rdr-line);
+    margin-top: var(--sp-1);
+    padding-top: var(--sp-2);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--sp-2);
+    animation: fr-fade-in var(--dur-fast) var(--ease-in) both;
   }
 
   .tb-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--sp-2);
   }
 
-  .tb-row label { font-size: 12px; opacity: 0.7; width: 36px; }
-  .tb-row select { flex: 1; min-width: 0; font-size: 12px; }
+  .tb-row label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; width: 36px; }
+  .tb-row select { flex: 1; min-width: 0; font-size: var(--fs-xs); }
 
   .tb-grid {
     display: grid;
@@ -300,14 +322,15 @@
     align-items: center;
   }
 
-  .tb-grid label { font-size: 12px; opacity: 0.7; white-space: nowrap; }
+  .tb-grid label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; white-space: nowrap; }
   .tb-grid input[type="range"] { width: 100%; }
-  .tb-grid select { font-size: 12px; }
+  .tb-grid select { font-size: var(--fs-xs); }
 
   .tb-checks {
     display: flex;
-    gap: 16px;
+    gap: var(--sp-4);
     flex-wrap: wrap;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
   }
 </style>

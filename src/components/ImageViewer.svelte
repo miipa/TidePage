@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { BookImage } from "../lib/types";
   import { t } from "../lib/i18n/index.svelte";
+import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
 
   let {
     images = [],
@@ -81,7 +82,7 @@
     </span>
   </div>
 
-  <button class="iv-nav left" data-testid="iv-prev" title={t("common.imgViewer.prev")} onclick={prev} disabled={total <= 1}>‹</button>
+  <button class="iv-nav left" data-testid="iv-prev" title={t("common.imgViewer.prev")} onclick={prev} disabled={total <= 1}><IconChevronLeft /></button>
 
   <div class="iv-stage" onclick={(e) => { if (e.target === e.currentTarget) onclose(); }}>
     {#if current}
@@ -97,30 +98,26 @@
     {/if}
   </div>
 
-  <button class="iv-nav right" data-testid="iv-next" title={t("common.imgViewer.next")} onclick={next} disabled={total <= 1}>›</button>
+  <button class="iv-nav right" data-testid="iv-next" title={t("common.imgViewer.next")} onclick={next} disabled={total <= 1}><IconChevronRight /></button>
 
   <div class="iv-hint">{t("common.imgViewer.hint")}</div>
 </div>
 
 <style>
+  /* 灯箱：刻意不用 --scrim，保留近黑的深遮罩（看图时背景必须彻底退场） */
   .iv-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 2000;
+    z-index: var(--z-modal);
     background: rgba(0, 0, 0, 0.86);
     display: flex;
     align-items: center;
     justify-content: center;
     outline: none;
-    animation: iv-in 0.22s cubic-bezier(0, 0, 0.2, 1) both;
+    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
-  @keyframes iv-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .iv-stage {
+ .iv-stage {
     position: absolute;
     inset: 0;
     display: flex;
@@ -137,7 +134,7 @@
     object-fit: contain;
     cursor: zoom-in;
     user-select: none;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4), 0 24px 70px rgba(0, 0, 0, 0.5);
   }
 
@@ -159,11 +156,12 @@
     padding: 0 16px;
     color: #eee;
     background: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), transparent);
-    z-index: 2;
+    z-index: var(--z-raised);
   }
 
   .iv-meta {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     opacity: 0.9;
     white-space: nowrap;
     overflow: hidden;
@@ -175,15 +173,16 @@
     position: absolute;
     top: 50%;
     transform: translateY(-50%);
-    z-index: 2;
+    z-index: var(--z-raised);
     width: 46px;
     height: 76px;
     border: none;
     background: rgba(255, 255, 255, 0.1);
     color: #fff;
-    font-size: 30px;
-    line-height: 1;
-    border-radius: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
     cursor: pointer;
   }
 
@@ -202,10 +201,11 @@
     right: 0;
     text-align: center;
     color: rgba(255, 255, 255, 0.55);
-    font-size: 12px;
-    z-index: 2;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    z-index: var(--z-raised);
     pointer-events: none;
   }
 
-  .iv-empty { color: rgba(255, 255, 255, 0.6); font-size: 14px; }
+  .iv-empty { color: rgba(255, 255, 255, 0.6); font-size: var(--fs-md); }
 </style>

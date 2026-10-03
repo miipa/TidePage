@@ -36,6 +36,7 @@
   import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
+import { prefersReducedMotion } from "../lib/reducedMotion";
   import { preloadReaderFonts } from "../lib/fontfaces";
   import {
     charRangeToRange,
@@ -64,6 +65,7 @@
     IconAdjustmentsHorizontal,
     IconArrowLeft,
     IconArrowsExchange,
+    IconArrowsSplit2,
     IconBook2,
     IconBookmarkPlus,
     IconBookmarks,
@@ -81,6 +83,12 @@
     IconPlayerStop,
     IconSettings,
     IconSparkles,
+    IconTextDecrease,
+    IconTextIncrease,
+    IconTrash,
+    IconX,
+    IconZoomIn,
+    IconZoomOut,
   } from "@tabler/icons-svelte";
   import AiPanel from "./AiPanel.svelte";
   import TocPanel from "./TocPanel.svelte";
@@ -1567,11 +1575,7 @@
     });
   }
 
-  function reducedMotion(): boolean {
-    return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
-  }
-
-  /** 页面偏移统一由 transform 表达（GPU 合成）；animate=true 时仅用户主动翻页才启用过渡。 */
+/** 页面偏移统一走 transform 合成（GPU 合成层），animate=true 时不会带动页面滚动 */
   let lastPageX = Number.NaN;
   function applyPage(animate = false) {
     if (!pageWrap) return;
@@ -1579,7 +1583,7 @@
     const x = stepPx > 0 ? -Math.round(page * stepPx) : 0;
     if (!animate && x === lastPageX) return; // 位置未变：跳过，避免无谓的强制同步布局
     lastPageX = x;
-    if (animate && config.reader.anim && !reducedMotion()) {
+    if (animate && config.reader.anim && !prefersReducedMotion()) {
       pageWrap.style.transform = `translate3d(${x}px,0,0)`;
       return;
     }
@@ -1722,7 +1726,7 @@
     if (!el) return;
     const tx = mangaRtl() ? -(mangaMaxX - mangaPosX) : -mangaPosX;
     const ty = -mangaPosY;
-    if (smooth && !reducedMotion()) {
+    if (smooth && !prefersReducedMotion()) {
       el.style.transition = "transform 180ms ease";
       el.style.transform = `translate3d(${Math.round(tx)}px, ${Math.round(ty)}px, 0)`;
       return;
@@ -2942,16 +2946,41 @@
     return base ? `${latin}, ${base}` : latin;
   }
 
-  function readerVars(): string {
-    // 有效阅读配色：优先本书单独套用的方案，其次全局。主题预设取有效主题。
+  /** 当前书的有效阅读底色 / 字色（本书方案 > 全局 config.reader > 主题预设；漫画模式可用独立底色）。 */
+  function readerColors(): { bg: string; fg: string } {
     const t = THEMES[effTheme()];
     // 漫画模式可独立设置背景色（空则跟随普通主题/自定义背景）。
     const mangaBg = isMangaMode() && config.reader.manga.bgColor ? config.reader.manga.bgColor : "";
-    const bg = mangaBg || effBgColor() || t.bg;
-    const fg = effFgColor() || t.fg;
+    return { bg: mangaBg || effBgColor() || t.bg, fg: effFgColor() || t.fg };
+  }
+
+  /**
+   * 阅读区「表面令牌」子集：--rdr-bg/-fg 及其派生量（surface / line / radius / shadow）。
+   * 单独抽出来是因为书内搜索浮层要 portal 到 body —— 一旦脱离 .reader 子树就拿不到
+   * readerVars() 写在根节点上的内联值，只能由它在自身根元素上补一份。
+   * 这里复用同一份 readerColors()，故浮层与它所浮着的书页永远同源（含「仅本书方案」覆盖）。
+   */
+  function readerSurfaceVars(): string {
+    const { bg, fg } = readerColors();
     return [
       `--rdr-bg:${bg}`,
       `--rdr-fg:${fg}`,
+      // 浮层配方：底色由阅读底/字做一次固定的轻微提亮/压暗（亮色主题变深、暗色主题变亮，
+      // 方向自动正确），描边由阅读字色派生低 alpha 发丝边。见 app.css 的 .rdr-pop。
+      `--rdr-surface:color-mix(in srgb, var(--rdr-bg) 94%, var(--rdr-fg))`,
+      `--rdr-line:color-mix(in srgb, var(--rdr-fg) 22%, transparent)`,
+      `--rdr-radius:var(--radius-md)`,
+      `--rdr-shadow-pop:var(--shadow-md)`,
+      `--rdr-shadow-panel:var(--shadow-drawer)`,
+    ].join(";");
+  }
+
+  function readerVars(): string {
+    // 有效阅读配色：优先本书单独套用的方案，其次全局。主题预设取有效主题。
+    const t = THEMES[effTheme()];
+    const { bg, fg } = readerColors();
+    return [
+      ...readerSurfaceVars().split(";"),
       `--rdr-font:${fontStack(effFontFamily(), effLatinFont())}`,
       `--rdr-fs:${effFontSize()}px`,
       `--rdr-lh:${effLineHeight()}`,
@@ -2968,7 +2997,6 @@
       `--hl-color:${config.reader.highlightColor || "#c0392b"}`,
       `--rdr-top:${config.reader.topbarColor || "color-mix(in srgb, " + bg + " 90%, black 10%)"}`,
       `--rdr-stat:${config.reader.statusColor || t.fg}`,
-      `--rdr-stat-align:${config.reader.statusPos === "none" ? "center" : config.reader.statusPos}`,
     ].join(";");
   }
 
@@ -4111,7 +4139,7 @@ ${effCssExtra() || ""}
         data-tip={standalone ? t("reader.closeEsc") : t("reader.backEsc")}
         onclick={goBack}
       >
-        <IconArrowLeft size={20} stroke={1.75} />
+        <IconArrowLeft size={20} stroke={1.5} />
       </button>
       <div class="btitle" data-tauri-drag-region>{book?.book.title ?? ""}</div>
     </div>
@@ -4149,15 +4177,15 @@ ${effCssExtra() || ""}
           onpointercancel={tbPointerUp}
           onclick={() => tbClick(b)}
         >
-          <Icon size={20} stroke={1.75} />
+          <Icon size={20} stroke={1.5} />
         </button>
       {/each}
     </div>
   </div>
 
   {#if tbManagerOpen}
-    <div class="tb-panel tb-manager" role="dialog" aria-label={t("reader.toolbar.manager")}>
-      <div class="tb-panel-head"><span>{t("reader.manager.title")}</span><button class="icon" data-testid="tb-manager-close" title={t("common.action.close")} onclick={() => (tbManagerOpen = false)}>×</button></div>
+    <div class="tb-panel tb-manager rdr-pop" role="dialog" aria-label={t("reader.toolbar.manager")}>
+      <div class="tb-panel-head"><span>{t("reader.manager.title")}</span><button class="icon" data-testid="tb-manager-close" title={t("common.action.close")} onclick={() => (tbManagerOpen = false)}><IconX /></button></div>
       <div class="tb-panel-body">
         <div class="tb-chip-grid">
           {#each config.reader.topbarOrder as id (id)}
@@ -4182,8 +4210,8 @@ ${effCssExtra() || ""}
   {/if}
 
   {#if imgMenuOpen}
-    <div class="tb-panel" role="menu" aria-label={t("reader.toolbar.images")}>
-      <div class="tb-panel-head"><span>{t("reader.menu.imagesTitle")}</span><button class="icon" data-testid="tb-img-close" title={t("common.action.close")} onclick={() => (imgMenuOpen = false)}>×</button></div>
+    <div class="tb-panel rdr-pop" role="menu" aria-label={t("reader.toolbar.images")}>
+      <div class="tb-panel-head"><span>{t("reader.menu.imagesTitle")}</span><button class="icon" data-testid="tb-img-close" title={t("common.action.close")} onclick={() => (imgMenuOpen = false)}><IconX /></button></div>
       <div class="tb-panel-body">
         <button class="tb-menu-item" data-testid="tb-img-all" onclick={toggleAllImages}>{effShowImages() ? t("reader.menu.allImagesOff") : t("reader.menu.allImagesOn")}</button>
         <button class="tb-menu-item" data-testid="tb-img-block" onclick={startBlockPick}>{t("reader.menu.blockSelected")}</button>
@@ -4194,8 +4222,8 @@ ${effCssExtra() || ""}
 
   {#if wdMenuOpen}
     <!-- 关闭依赖窗口捕获阶段的外点监听（见下方 $effect），不再使用全屏遮罩元素。 -->
-    <div class="tb-panel wd-menu" bind:this={wdMenuEl} role="menu" aria-label={t("reader.toolbar.webdav")} style="top:{wdMenuPos.top}px; right:{wdMenuPos.right}px">
-      <div class="tb-panel-head"><span>{t("reader.menu.davTitle")}</span><button class="icon" data-testid="tb-dav-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (wdMenuOpen = false)}>×</button></div>
+    <div class="tb-panel wd-menu rdr-pop" bind:this={wdMenuEl} role="menu" aria-label={t("reader.toolbar.webdav")} style="top:{wdMenuPos.top}px; right:{wdMenuPos.right}px">
+      <div class="tb-panel-head"><span>{t("reader.menu.davTitle")}</span><button class="icon" data-testid="tb-dav-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (wdMenuOpen = false)}><IconX /></button></div>
       <div class="tb-panel-body">
         <button class="tb-menu-item" data-testid="tb-dav-upload" onclick={uploadBook} disabled={!book}>{t("reader.menu.davUploadBook")}</button>
       </div>
@@ -4203,8 +4231,8 @@ ${effCssExtra() || ""}
   {/if}
 
   {#if blockedListOpen}
-    <div class="tb-panel" role="dialog" aria-label={t("reader.menu.blockedTitle")}>
-      <div class="tb-panel-head"><span>{t("reader.menu.blockedTitle")}</span><button class="icon" data-testid="tb-blocked-close" title={t("common.action.close")} onclick={() => (blockedListOpen = false)}>×</button></div>
+    <div class="tb-panel rdr-pop" role="dialog" aria-label={t("reader.menu.blockedTitle")}>
+      <div class="tb-panel-head"><span>{t("reader.menu.blockedTitle")}</span><button class="icon" data-testid="tb-blocked-close" title={t("common.action.close")} onclick={() => (blockedListOpen = false)}><IconX /></button></div>
       <div class="tb-panel-body">
         {#if blockedImages().length === 0}
           <div class="tb-panel-empty">{t("reader.menu.blockedEmpty")}</div>
@@ -4221,8 +4249,8 @@ ${effCssExtra() || ""}
   {/if}
 
   {#if mangaGuideOpen}
-    <div class="tb-panel manga-guide" role="dialog" aria-label={t("reader.manga.sizeLabel")}>
-      <div class="tb-panel-head"><span>{t("reader.manga.guideTitle")}</span><button class="icon" data-testid="tb-manga-close" title={t("common.action.close")} onclick={closeMangaGuide}>×</button></div>
+    <div class="tb-panel manga-guide rdr-pop" role="dialog" aria-label={t("reader.manga.sizeLabel")}>
+      <div class="tb-panel-head"><span>{t("reader.manga.guideTitle")}</span><button class="icon" data-testid="tb-manga-close" title={t("common.action.close")} onclick={closeMangaGuide}><IconX /></button></div>
       <div class="tb-panel-body">
         <p class="tb-panel-hint">{t("reader.manga.guideHint")}</p>
         <div class="manga-slider">
@@ -4248,7 +4276,7 @@ ${effCssExtra() || ""}
 
   <div class="body" bind:this={bodyEl}>
     {#if openError}
-      <div class="empty error-box">
+      <div class="empty-state error-box">
         <div>
           <p data-testid="reader-open-failed">{t("reader.open.failed")}</p>
           <p class="err-detail">{openError}</p>
@@ -4256,7 +4284,7 @@ ${effCssExtra() || ""}
         </div>
       </div>
     {:else if !book}
-      <div class="empty" data-testid="reader-opening">{t("reader.open.opening")}</div>
+      <div class="empty-state" data-testid="reader-opening">{t("reader.open.opening")}</div>
     {:else}
       <div class="stage">
         <div
@@ -4397,7 +4425,7 @@ ${effCssExtra() || ""}
 
     {#if bookmarksOpen}
       <div class="sidepanel">
-        <div class="sp-head" data-testid="bm-head" use:dragOutHandle={() => popOutPanel("bookmarks")} title={t("common.panel.popoutTip")}><span>{t("reader.bookmarks.title")}</span><div style="display:flex; gap:6px; align-items:center;"><button class="icon" data-testid="bm-popout" title={t("common.panel.popout")} onclick={() => popOutPanel("bookmarks")}>⧉</button><button class="icon" data-testid="bm-close" title={t("common.action.close")} onclick={() => (rightPanel = null)}>×</button></div></div>
+        <div class="sp-head" data-testid="bm-head" use:dragOutHandle={() => popOutPanel("bookmarks")} title={t("common.panel.popoutTip")}><span>{t("reader.bookmarks.title")}</span><div style="display:flex; gap:6px; align-items:center;"><button class="icon" data-testid="bm-popout" title={t("common.panel.popout")} onclick={() => popOutPanel("bookmarks")}><IconArrowsSplit2 /></button><button class="icon" data-testid="bm-close" title={t("common.action.close")} onclick={() => (rightPanel = null)}><IconX /></button></div></div>
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
@@ -4405,7 +4433,7 @@ ${effCssExtra() || ""}
                 <div class="bm-title">{bm.title || t("common.untitled")}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
-              <button class="icon bm-del" data-testid="bm-del" title={t("reader.bookmarks.deleteTip")} onclick={() => deleteBookmark(bm.id)}>×</button>
+              <button class="icon bm-del" data-testid="bm-del" title={t("reader.bookmarks.deleteTip")} onclick={() => deleteBookmark(bm.id)}><IconTrash /></button>
             </div>
           {:else}
             <div class="sp-empty" data-testid="bm-empty">{t("reader.bookmarks.empty")}</div>
@@ -4489,12 +4517,12 @@ ${effCssExtra() || ""}
     {#if book && !openError}
       <div class="font-ctl" class:show={fontCtlShow}>
         <div class="ctl-row">
-          <button class="icon" data-testid="font-dec" title={t("reader.font.decrease")} use:repeatAction={() => bumpFont(-1)}>{t("reader.font.decGlyph")}</button>
-          <button class="icon" data-testid="font-inc" title={t("reader.font.increase")} use:repeatAction={() => bumpFont(1)}>{t("reader.font.incGlyph")}</button>
+          <button class="icon" data-testid="font-dec" title={t("reader.font.decrease")} use:repeatAction={() => bumpFont(-1)}><IconTextDecrease /></button>
+          <button class="icon" data-testid="font-inc" title={t("reader.font.increase")} use:repeatAction={() => bumpFont(1)}><IconTextIncrease /></button>
         </div>
         <div class="ctl-row">
-          <button class="icon" data-testid="img-dec" title={t("reader.img.decrease")} use:repeatAction={() => bumpImgScale(-0.1)}>{t("reader.img.decGlyph")}</button>
-          <button class="icon" data-testid="img-inc" title={t("reader.img.increase")} use:repeatAction={() => bumpImgScale(0.1)}>{t("reader.img.incGlyph")}</button>
+          <button class="icon" data-testid="img-dec" title={t("reader.img.decrease")} use:repeatAction={() => bumpImgScale(-0.1)}><IconZoomOut /></button>
+          <button class="icon" data-testid="img-inc" title={t("reader.img.increase")} use:repeatAction={() => bumpImgScale(0.1)}><IconZoomIn /></button>
           <button class="icon" class:on={effFitWidth()} data-testid="img-fit-w" title={t("reader.img.fitWidth")} onclick={toggleFitWidth}>{t("reader.img.fitWidthShort")}</button>
           <button class="icon" class:on={effFitHeight()} data-testid="img-fit-h" title={t("reader.img.fitHeight")} onclick={toggleFitHeight}>{t("reader.img.fitHeightShort")}</button>
         </div>
@@ -4503,7 +4531,7 @@ ${effCssExtra() || ""}
 
   </div>
 
-  <!-- 图库放在 .body 之外：.body 有 z-index 形成层叠上下文，放里面会被顶栏(z-index:30)盖住，
+  <!-- 图库放在 .body 之外：.body 有 z-index 形成层叠上下文，放里面会被顶栏(--z-raised)盖住，
        导致右上角 × 点不到（用户以为没有关闭按钮）。放在 .reader 下才能盖住顶栏。 -->
   {#if viewerIndex !== null && book}
     <ImageViewer
@@ -4516,7 +4544,7 @@ ${effCssExtra() || ""}
 
   <!-- H2：悬停划线的感想浮层（仅 note 非空时） -->
   {#if hoverNote}
-    <div class="fr-note-tip" style="left:{Math.round(hoverNote.x)}px; top:{Math.round(hoverNote.y)}px;">
+    <div class="fr-note-tip rdr-pop" style="left:{Math.round(hoverNote.x)}px; top:{Math.round(hoverNote.y)}px;">
       <div class="fr-note-tip-quote">{hoverNote.text.length > 40 ? hoverNote.text.slice(0, 40) + "…" : hoverNote.text}</div>
       <div class="fr-note-tip-body">{hoverNote.note}</div>
     </div>
@@ -4530,6 +4558,7 @@ ${effCssExtra() || ""}
       initialQuery={searchPopup.query}
       anchor={searchPopup.anchor}
       canBack={searchNavStack.length > 0 || !!searchOrigin}
+      surfaceVars={readerSurfaceVars()}
       onpick={jumpToChapterText}
       onback={searchGoBack}
       onclose={() => { searchPopup = null; searchNavStack = []; searchOrigin = null; }}
@@ -4543,8 +4572,8 @@ ${effCssExtra() || ""}
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--rdr-bg, #f5f1e8);
-    color: var(--rdr-fg, #3b3630);
+    background: var(--rdr-bg);
+    color: var(--rdr-fg);
     position: relative;
   }
 
@@ -4555,7 +4584,7 @@ ${effCssExtra() || ""}
     background-position: center;
     background-repeat: no-repeat;
     pointer-events: none;
-    z-index: 0;
+    z-index: var(--z-base);
   }
 
   /* 任务 8：进入全屏时的大字号、居中淡入浮层提示（transition:fade 负责淡入/淡出） */
@@ -4564,15 +4593,15 @@ ${effCssExtra() || ""}
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    z-index: 9999;
+    z-index: var(--z-toast);
     padding: 22px 40px;
     font-size: 30px;
     font-weight: 600;
     letter-spacing: 0.08em;
     color: #fff;
     background: rgba(0, 0, 0, 0.62);
-    border-radius: 14px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
     pointer-events: none;
     white-space: nowrap;
   }
@@ -4580,16 +4609,16 @@ ${effCssExtra() || ""}
   .topbar {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 7px 12px;
+    gap: var(--sp-1);
+    padding: 7px var(--sp-3);
     /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
     padding-right: 112px;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 90%, black 10%);
-    z-index: 30;
+    background: color-mix(in srgb, var(--rdr-bg) 90%, black 10%);
+    z-index: var(--z-raised);
     position: relative;
     user-select: none;
     /* 顶栏下方 1px 用顶栏背景色补齐：快速滚动时滚动层与顶栏交界处不会露出背景形成亮线/接缝 */
-    box-shadow: 0 1px 0 0 var(--rdr-top, #ece7dd);
+    box-shadow: 0 1px 0 0 var(--rdr-top);
     /* 让顶栏成为独立稳定合成层，避免滚动中边框/交界被单独合成产生一帧闪烁 */
     transform: translateZ(0);
     transition: opacity var(--dur) var(--ease);
@@ -4614,12 +4643,13 @@ ${effCssExtra() || ""}
     right: 0;
     bottom: 0;
     height: 1px;
-    background: rgba(128, 128, 128, 0.15);
+    background: var(--rdr-line);
     pointer-events: none;
   }
 
   .btitle {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     opacity: 0.7;
     white-space: nowrap;
     overflow: hidden;
@@ -4653,16 +4683,20 @@ ${effCssExtra() || ""}
   }
 
   .stat-item {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     opacity: 0.85;
     white-space: nowrap;
     cursor: grab;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
     padding: 0 2px;
   }
 
+  .stat-item {
+    transition: background var(--dur-fast) var(--ease);
+  }
   .stat-item:hover {
-    background: rgba(128, 128, 128, 0.16);
+    background: color-mix(in srgb, var(--rdr-fg) 8%, transparent);
   }
 
   .stat-item.dragging {
@@ -4670,7 +4704,8 @@ ${effCssExtra() || ""}
   }
 
   .stat-sep {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     opacity: 0.45;
     margin: 0 6px;
   }
@@ -4690,7 +4725,8 @@ ${effCssExtra() || ""}
     border-radius: var(--radius-sm);
   }
 
-  /* 顶栏按钮管理 / 本书图片 / 已屏蔽列表 / 漫画引导 弹出面板 */
+  /* 顶栏按钮管理 / 本书图片 / 已屏蔽列表 / 漫画引导 弹出面板。
+     底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题）。 */
   .tb-panel {
     position: absolute;
     top: 52px;
@@ -4698,15 +4734,10 @@ ${effCssExtra() || ""}
     width: 290px;
     max-height: 70vh;
     overflow: auto;
-    z-index: 60;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 96%, black 4%);
-    color: var(--rdr-fg, #333);
-    border: 1px solid rgba(128, 128, 128, 0.25);
-    border-radius: var(--radius-md);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.1), 0 20px 48px rgba(0, 0, 0, 0.18);
-    padding: 8px;
+    z-index: var(--z-popover);
+    padding: var(--sp-2);
     transform-origin: top right;
-    animation: tb-panel-in 0.22s cubic-bezier(0.32, 0.72, 0, 1) both;
+    animation: tb-panel-in var(--dur-page) var(--ease-premium) both;
   }
 
   @keyframes tb-panel-in {
@@ -4726,8 +4757,9 @@ ${effCssExtra() || ""}
     align-items: center;
     justify-content: space-between;
     font-weight: 600;
-    font-size: 13px;
-    padding: 4px 6px 8px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    padding: var(--sp-1) var(--sp-1) var(--sp-2);
   }
 
   .tb-panel-body { display: flex; flex-direction: column; gap: 2px; }
@@ -4738,27 +4770,29 @@ ${effCssExtra() || ""}
     display: flex;
     flex-wrap: wrap;
     gap: 7px;
-    padding: 2px 2px 4px;
+    padding: 2px 2px var(--sp-1);
   }
+  /* 芯片是药丸角色，用 --radius-pill（该值禁止用在普通按钮与卡片上） */
   .tb-chip {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--sp-1);
     padding: 5px 11px 5px 9px;
-    border-radius: var(--radius-pill, 999px);
-    border: 1px solid rgba(128, 128, 128, 0.28);
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--rdr-line);
     background: transparent;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     line-height: 1;
     cursor: pointer;
     user-select: none;
-    transition: background var(--dur, 0.2s) var(--ease), border-color var(--dur, 0.2s) var(--ease), opacity var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), opacity var(--dur) var(--ease);
   }
-  .tb-chip:hover { background: rgba(128, 128, 128, 0.12); }
+  .tb-chip:hover { background: color-mix(in srgb, var(--rdr-fg) 9%, transparent); }
   .tb-chip.on {
-    background: color-mix(in srgb, var(--accent, #4a6b8a) 16%, transparent);
-    border-color: color-mix(in srgb, var(--accent, #4a6b8a) 42%, transparent);
-    color: var(--accent, #4a6b8a);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+    color: var(--accent);
   }
   .tb-chip.fixed { cursor: default; opacity: 0.75; }
   .tb-chip.na { opacity: 0.42; }
@@ -4771,30 +4805,31 @@ ${effCssExtra() || ""}
     border: none;
     color: inherit;
     padding: 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
   }
 
-  .tb-menu-item:hover { background: rgba(128, 128, 128, 0.14); }
+  .tb-menu-item:hover { background: color-mix(in srgb, var(--rdr-fg) 9%, transparent); }
 
-  .tb-panel-hint { font-size: 12px; opacity: 0.6; margin: 8px 6px 2px; line-height: 1.5; }
-  .tb-panel-empty { font-size: 13px; opacity: 0.5; padding: 10px 8px; }
+  .tb-panel-hint { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.6; margin: 8px 6px 2px; line-height: 1.5; }
+  .tb-panel-empty { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); opacity: 0.5; padding: 10px 8px; }
   .tb-block-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
   .tb-block-thumb {
     width: 44px;
     height: 44px;
     object-fit: cover;
-    border-radius: 4px;
-    background: rgba(128, 128, 128, 0.15);
+    border-radius: var(--radius-xs);
+    background: color-mix(in srgb, var(--rdr-fg) 12%, transparent);
   }
 
-  .manga-slider { display: flex; align-items: center; gap: 8px; padding: 6px; font-size: 12px; }
+  .manga-slider { display: flex; align-items: center; gap: 8px; padding: 6px; font-size: var(--fs-xs); letter-spacing: var(--ls-xs); }
   .manga-slider input[type="range"] { flex: 1; }
   .manga-val { min-width: 38px; text-align: right; opacity: 0.75; }
   .manga-actions { display: flex; gap: 8px; padding: 6px; }
 
-  .font-ctl .icon.on { color: var(--accent, #4a6b8a); font-weight: 700; }
+  .font-ctl .icon.on { color: var(--accent); font-weight: 700; }
 
   .body {
     flex: 1;
@@ -4803,7 +4838,9 @@ ${effCssExtra() || ""}
     display: flex;
     flex-direction: column;
     min-height: 0;
-    z-index: 1;
+    /* 正文层压过背景图层：.body 形成层叠上下文（--z-raised），
+       内部 .content / 侧面板都靠它与背景图分层。 */
+    z-index: var(--z-raised);
   }
 
   .stage {
@@ -4830,8 +4867,10 @@ ${effCssExtra() || ""}
     -webkit-user-select: text;
   }
 
+  /* 阅读区选区底色跟随「阅读主题」的 --rdr-sel（5 套主题 + 自由配色各自一份），
+     与外壳区域的 ::selection（app.css，走 --accent）刻意不同。 */
   .content :global(::selection) {
-    background: var(--rdr-sel, #e8e0cd);
+    background: var(--rdr-sel);
   }
 
   /* 单本「全部关闭图片」：隐藏正文里的图片/SVG 图 */
@@ -4846,12 +4885,12 @@ ${effCssExtra() || ""}
     bottom: 46px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    z-index: 25;
+    gap: var(--sp-1);
+    z-index: var(--z-sticky);
     opacity: 0;
     pointer-events: none;
     transform: translateY(4px);
-    transition: opacity 0.18s, transform 0.18s;
+    transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
   }
 
   .font-ctl .ctl-row {
@@ -4881,8 +4920,9 @@ ${effCssExtra() || ""}
     position: absolute;
     top: 0;
     bottom: 0;
-    left: var(--rdr-mh, 56px);
-    right: var(--rdr-mh, 56px);
+    /* fallback 同上：取真实默认值 320px，避免首帧先按 56px 排一版 */
+    left: var(--rdr-mh, 320px);
+    right: var(--rdr-mh, 320px);
     overflow: hidden;
   }
 
@@ -4910,7 +4950,9 @@ ${effCssExtra() || ""}
   .col-scroll {
     /* 正常文档流：高度=正文高度，作为 .scroll-area 的可滚动内容，由浏览器按需分块绘制。
        不再 position:absolute + will-change:transform 把整章提升为超长合成层（撕裂/空白的根因）。 */
-    padding: var(--rdr-mv, 48px) var(--rdr-mh, 56px);
+    /* fallback 取 config.reader 的真实默认值（marginV 80 / marginH 320），
+       与 readerVars() 写入的值一致 —— 否则首帧会先按 48/56 排一版再跳到 80/320，肉眼可见地闪一下。 */
+    padding: var(--rdr-mv, 80px) var(--rdr-mh, 320px);
     box-sizing: border-box;
   }
 
@@ -4922,8 +4964,9 @@ ${effCssExtra() || ""}
     overflow: hidden;
     cursor: grab;
     touch-action: none;
-    background: var(--rdr-bg, #f5f1e8);
-    padding: var(--rdr-mv, 0) 0;
+    background: var(--rdr-bg);
+    /* 漫画模式的边距默认 8px（config.reader.manga.marginV/H） */
+    padding: var(--rdr-mv, 8px) 0;
     box-sizing: border-box;
   }
 
@@ -4994,7 +5037,7 @@ ${effCssExtra() || ""}
   /* 漫画瀑布流（纵向连续窗口）：固定视口层承载左右边距，内容块纵向顺排，原生竖向滚动。
      canvas 占满宽度 + 每个 .manga-block 内部水平居中（漫画窗口里无 #chapter-content 包裹层）。 */
   .manga-flow-viewport {
-    padding: 0 var(--rdr-mh, 0);
+    padding: 0 var(--rdr-mh, 8px);
     box-sizing: border-box;
     overflow-y: auto !important;
     overflow-x: hidden !important;
@@ -5051,7 +5094,7 @@ ${effCssExtra() || ""}
   }
 
   .tb-btn.on {
-    color: var(--accent, #4a6b8a);
+    color: var(--accent);
     font-weight: 700;
   }
 
@@ -5124,7 +5167,7 @@ ${effCssExtra() || ""}
 
   #chapter-content :global(td),
   #chapter-content :global(th) {
-    border: 1px solid rgba(128, 128, 128, 0.3);
+    border: 1px solid var(--rdr-line);
     padding: 4px 8px;
   }
 
@@ -5136,15 +5179,15 @@ ${effCssExtra() || ""}
   }
 
   #chapter-content :global(mark.fr-tts) {
-    background: color-mix(in srgb, var(--accent, #4a6b8a) 32%, transparent);
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
     color: inherit;
-    border-radius: 3px;
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #4a6b8a) 45%, transparent);
+    border-radius: var(--radius-xs);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
   }
 
   #chapter-content :global(mark.fr-hl-underline) {
     text-decoration-line: underline;
-    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 2px;
   }
@@ -5152,7 +5195,7 @@ ${effCssExtra() || ""}
   #chapter-content :global(mark.fr-hl-wavy) {
     text-decoration-line: underline;
     text-decoration-style: wavy;
-    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 3px;
   }
@@ -5160,7 +5203,7 @@ ${effCssExtra() || ""}
   #chapter-content :global(mark.fr-hl-dotted) {
     text-decoration-line: underline;
     text-decoration-style: dotted;
-    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 2px;
   }
@@ -5168,20 +5211,20 @@ ${effCssExtra() || ""}
   #chapter-content :global(mark.fr-hl-double) {
     text-decoration-line: underline;
     text-decoration-style: double;
-    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 2px;
   }
 
   #chapter-content :global(mark.fr-hl-strike) {
     text-decoration-line: line-through;
-    text-decoration-color: var(--hl-color, #c0392b);
+    text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
   }
 
   #chapter-content :global(mark.fr-hl-background) {
-    background: color-mix(in srgb, var(--hl-color, #c0392b) 38%, transparent);
-    border-radius: 3px;
+    background: color-mix(in srgb, var(--hl-color) 38%, transparent);
+    border-radius: var(--radius-xs);
   }
 
   /* H2：有感想(note)的划线加一个小圆点标记，提示可悬停查看 */
@@ -5195,29 +5238,27 @@ ${effCssExtra() || ""}
     height: 3px;
     margin-left: 2px;
     border-radius: 50%;
-    background: var(--hl-color, #c0392b);
+    background: var(--hl-color);
     vertical-align: super;
   }
 
-  /* H2 感想浮层 */
+  /* H2 感想浮层：底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
   .fr-note-tip {
     position: fixed;
-    z-index: 990;
+    z-index: var(--z-popover);
     transform: translate(-50%, calc(-100% - 8px));
     max-width: 320px;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 92%, #202020 8%);
-    color: var(--rdr-fg, #2c2c2c);
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16), 0 20px 44px rgba(0, 0, 0, 0.24);
-    padding: 8px 10px;
+    padding: var(--sp-2) 10px;
     pointer-events: none;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
   }
   .fr-note-tip-quote {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.6;
-    margin-bottom: 4px;
+    margin-bottom: var(--sp-1);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5225,24 +5266,26 @@ ${effCssExtra() || ""}
   .fr-note-tip-body { line-height: 1.6; white-space: pre-wrap; }
 
   #chapter-content :global(mark.fr-hl-box) {
-    box-shadow: 0 0 0 1.5px var(--hl-color, #c0392b);
-    border-radius: 3px;
+    box-shadow: 0 0 0 1.5px var(--hl-color);
+    border-radius: var(--radius-xs);
   }
 
+  /* 拖拽选区提示框（选区高亮的可视边框） */
   .zone-hints {
     position: absolute;
     inset: 0;
-    z-index: 22;
+    z-index: var(--z-raised);
     pointer-events: none;
   }
 
   .zh {
     position: absolute;
-    font-size: 12px;
-    color: rgba(127, 127, 127, 0.65);
-    background: rgba(127, 127, 127, 0.10);
-    border: 1px dashed rgba(127, 127, 127, 0.4);
-    border-radius: 6px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    color: color-mix(in srgb, var(--rdr-fg) 65%, transparent);
+    background: color-mix(in srgb, var(--rdr-fg) 10%, transparent);
+    border: 1px dashed color-mix(in srgb, var(--rdr-fg) 40%, transparent);
+    border-radius: var(--radius-sm);
   }
 
   .zh-tl { left: 2%; top: 2%; height: 46%; width: 46%; display: grid; place-items: center; }
@@ -5260,7 +5303,9 @@ ${effCssExtra() || ""}
     background: rgba(127, 127, 127, 0.14);
   }
 
-  /* 可视宽约 5px，但用 13px 透明命中区（左右各 4px padding），thumb 居中便于拖动。 */
+  /* 可视宽约 5px，但用 13px 透明命中区（左右各 4px padding），thumb 居中便于拖动。
+     颜色复用全局滚动条 token（--scrollbar-thumb / --scrollbar-thumb-hover），
+     使它与其余滚动面观感一致；命中区更宽是拖拽功能所需，刻意与全局不同。 */
   .scrollbar {
     position: absolute;
     right: 1px;
@@ -5269,11 +5314,18 @@ ${effCssExtra() || ""}
     width: 13px;
     padding: 0 4px;
     box-sizing: border-box;
-    z-index: 20;
+    z-index: var(--z-sticky);
     cursor: pointer;
     touch-action: none;
   }
 
+  /* 命中区固定 5px，hover 加粗靠 scale 的 X 轴 —— width 是触发重排的属性，在滚动条上尤其危险
+     （每帧都在算滚动几何）。
+     用独立的 scale 属性而不是 transform：JS 在 pointermove 里每帧写 thumb.style.transform，
+     同属性会互相覆盖；scale 与 transform 是两个独立属性、按规范叠加，两者可以共存。
+     只给 X 轴值（1.6 1）：.thumb 高度是模板内联的 height:8%，两轴缩放会让它从中心向上下
+     额外扩出 0.3 倍高度，探出轨道 top，且缩放发生在滚动位置计算之后，hover 期间 thumb 的
+     视觉中心会与它代表的滚动位置错位，拖拽时手感对不上。 */
   .thumb {
     position: absolute;
     top: 0;
@@ -5281,26 +5333,28 @@ ${effCssExtra() || ""}
     right: 0;
     width: 5px;
     margin: 0 auto;
-    background: rgba(128, 128, 128, 0.35);
-    border-radius: 3px;
+    background: var(--scrollbar-thumb);
+    border-radius: var(--radius-pill);
+    transform-origin: center center;
     will-change: transform;
-    transition: background 0.12s ease, width 0.12s ease;
+    transition: background var(--dur-fast) var(--ease), scale var(--dur-fast) var(--ease);
   }
 
   .scrollbar:hover .thumb,
   .scrollbar.dragging .thumb {
-    width: 8px;
-    background: rgba(128, 128, 128, 0.6);
+    scale: 1.6 1;
+    background: var(--scrollbar-thumb-hover);
   }
 
-  /* 加载骨架：用与正文同形的灰条替代「加载中…」药丸，减少版面跳动。 */
+  /* 加载骨架：用与正文同形的灰条替代「加载中…」药丸，减少版面跳动。
+     这是保留 linear-gradient 的合理用途之一（骨架屏微光扫过）。 */
   .loading {
     position: absolute;
     top: 12%;
     left: 50%;
     transform: translateX(-50%);
     width: min(680px, 78%);
-    z-index: 20;
+    z-index: var(--z-sticky);
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -5310,14 +5364,19 @@ ${effCssExtra() || ""}
   .sk {
     display: block;
     height: 1em;
-    border-radius: 4px;
-    background: rgba(128, 128, 128, 0.14);
-    background-image: linear-gradient(90deg, transparent, rgba(128, 128, 128, 0.2), transparent);
+    border-radius: var(--radius-xs);
+    background: color-mix(in srgb, var(--rdr-fg) 12%, transparent);
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--rdr-fg) 20%, transparent),
+      transparent
+    );
     background-size: 200% 100%;
     animation: sk-shimmer 1.2s ease-in-out infinite;
   }
 
-  .sk-title { height: 1.4em; width: 46%; margin: 0 auto 8px; }
+  .sk-title { height: 1.4em; width: 46%; margin: 0 auto var(--sp-2); }
   .sk-short { width: 68%; }
 
   @keyframes sk-shimmer {
@@ -5329,15 +5388,17 @@ ${effCssExtra() || ""}
     display: flex;
     align-items: center;
     gap: 14px;
-    padding: 6px 18px;
-    font-size: 12px;
+    padding: var(--sp-1) 18px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.8;
     position: relative;
-    z-index: 5;
+    z-index: var(--z-base);
     user-select: none;
     transition: opacity var(--dur) var(--ease);
   }
 
+  /* 可拖拽的进度刷：16px 是命中区高度（好点按），真正的轨道厚度取全局 --bar-h */
   .progress-track {
     flex: 1;
     height: 16px;
@@ -5353,8 +5414,9 @@ ${effCssExtra() || ""}
     position: absolute;
     left: 0;
     right: 0;
-    height: 4px;
-    background: rgba(128, 128, 128, 0.15);
+    height: var(--bar-h);
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--rdr-fg) 14%, transparent);
     pointer-events: none;
   }
 
@@ -5364,12 +5426,12 @@ ${effCssExtra() || ""}
     left: 0;
     top: 50%;
     width: 100%;
-    height: 4px;
-    margin-top: -2px;
-    background: var(--accent, #4a6b8a);
-    border-radius: 2px;
+    height: var(--bar-h);
+    margin-top: calc(var(--bar-h) / -2);
+    background: var(--accent);
+    border-radius: var(--radius-pill);
     transform-origin: left center;
-    z-index: 1;
+    z-index: var(--z-base);
     pointer-events: none;
     transition: transform var(--dur) var(--ease);
   }
@@ -5381,13 +5443,13 @@ ${effCssExtra() || ""}
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--accent, #4a6b8a);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 1px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+    background: var(--accent);
+    box-shadow: var(--shadow-sm);
     transform: translate(-50%, -50%);
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.15s, left var(--dur) var(--ease);
-    z-index: 2;
+    transition: opacity var(--dur-fast) var(--ease), left var(--dur) var(--ease);
+    z-index: var(--z-raised);
   }
 
   .progress-track:hover .progress-knob,
@@ -5405,7 +5467,7 @@ ${effCssExtra() || ""}
   }
 
   .progress-track.dragging .progress-knob {
-    transition: opacity 0.15s;
+    transition: opacity var(--dur-fast) var(--ease);
   }
 
   .finfo {
@@ -5428,19 +5490,20 @@ ${effCssExtra() || ""}
   }
   .finfo-l { text-align: left; }
   .finfo-r { text-align: right; }
+  /* 页码 / 进度百分比 / 字数都是数字：等宽对齐，翻页时不会左右抖动 */
+  .fitem, .fsep, .finfo { font-variant-numeric: tabular-nums; }
   .fitem { opacity: 0.85; }
   .fsep { opacity: 0.45; margin: 0 4px; }
 
-  .empty {
+  /* 空状态走全局 .empty-state；这里只补「撑满剩余高度并垂直居中」这一条布局 */
+  .empty-state {
     flex: 1;
     display: grid;
     place-items: center;
-    opacity: 0.5;
   }
 
   .error-box {
     opacity: 1;
-    text-align: center;
   }
 
   .error-box p {
@@ -5449,7 +5512,8 @@ ${effCssExtra() || ""}
   }
 
   .err-detail {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-weight: 400;
     opacity: 0.7;
     max-width: 480px;
@@ -5457,51 +5521,21 @@ ${effCssExtra() || ""}
     margin-bottom: 16px;
   }
 
-  .sidepanel {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 320px;
-    background: color-mix(in srgb, var(--rdr-bg, #f5f1e8) 94%, black 6%);
-    border-left: 1px solid rgba(128, 128, 128, 0.2);
-    z-index: 40;
-    display: flex;
-    flex-direction: column;
-    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
-    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes slide-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .sp-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    font-weight: 600;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  }
-
-  .sp-list { flex: 1; overflow-y: auto; }
-
-  .sp-item {
-    padding: 10px 16px;
-    cursor: pointer;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.08);
-  }
-
-  .sp-item:hover { background: rgba(128, 128, 128, 0.1); }
-
-  .bm-item { display: flex; align-items: flex-start; gap: 8px; }
+  /* .sidepanel / .sp-head / .sp-list / .sp-item / .sp-empty 走 app.css 的全局基类
+     （宽度由 --sidepanel-w 决定，底色/描边跟随阅读主题）。此处只留本面板特有部分。 */
+  .bm-item { display: flex; align-items: flex-start; gap: var(--sp-2); }
   .bm-main { flex: 1; min-width: 0; cursor: pointer; }
-  .bm-del { opacity: 0; flex-shrink: 0; transition: opacity 0.15s; }
+  .bm-del { opacity: 0; flex-shrink: 0; transition: opacity var(--dur-fast) var(--ease); }
   .bm-item:hover .bm-del { opacity: 1; }
 
-  .bm-title { font-size: 13px; font-weight: 500; }
-  .bm-excerpt { font-size: 12px; opacity: 0.6; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sp-empty { padding: 24px; text-align: center; opacity: 0.5; }
+  .bm-title { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); font-weight: 500; }
+  .bm-excerpt {
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    opacity: 0.6;
+    margin-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 </style>

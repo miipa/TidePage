@@ -64,15 +64,28 @@
   } from "@tabler/icons-svelte";
   import ColorPicker from "./ColorPicker.svelte";
   import { dragSort } from "../lib/dragSort";
+  import { seedEndpointLabel, seedPromptLabel, seedTtsLabel } from "../lib/seedNames.svelte";
   import { slide } from "svelte/transition";
   // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
-  import { dateLocale, errText, hasLabelOf, labelOfId, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
+  import { dateLocale, aiErrDetail, aiPieceText, errText, hasLabelOf, labelOfId, locale, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
+  import {
+    IconCaretRight,
+    IconCheck,
+    IconChevronLeft,
+    IconChevronRight,
+    IconCopy,
+IconPlus,
+    IconRefresh,
+    IconStarFilled,
+    IconTrash,
+    IconX,
+  } from "@tabler/icons-svelte";
   import type { MessageKey } from "../lib/i18n/types";
-  import { onMount, tick, untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { OnlineVoice } from "../lib/tts.svelte";
-  import type { TocEntry } from "../lib/types";
+  import type { AiTestResult, TocEntry } from "../lib/types";
 
   type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
   // 默认不硬编码分区：initialTab 不传时用「排序后的第一项」，以区分调用方显式指定与未指定。
@@ -138,8 +151,16 @@
     searchIndex = hits;
   }
 
-  // 组件每次打开都重挂载，onMount 重建索引，正好覆盖 AI 分类默认展开的状态。
-  onMount(buildSearchIndex);
+  // 索引里存的是建索引那一刻的 DOM 文案快照，故语言切换后必须重建，否则 searchResults
+  // 一直按旧语言文本过滤（左侧 tab 过滤走实时 t()，不受影响）。locale() 是响应式唯一来源，
+  // 依赖它即无需自造查询源；navQuery 保留不动，让结果在新文本上重新过滤。
+  $effect(() => {
+    locale();
+    void (async () => {
+      await tick();
+      buildSearchIndex();
+    })();
+  });
 
   /** 搜索结果：仅取匹配的具体设置项（上限 80 条）。 */
   const searchResults = $derived.by(() => {
@@ -202,6 +223,8 @@
   }
   let webdavTesting = $state(false);
   let webdavStatus = $state("");
+/** dav 探测结果：显式状态位，不靠嗅探文案前缀的字形（字形已从 i18n 文案里剥离）。 */
+let davState = $state<"" | "ok" | "bad">("");
   let regexText = $state(config.regex || "");
   let rebuildingFts = $state(false);
   let dataDir = $state("");
@@ -821,6 +844,8 @@
 
   let aiTesting = $state(false);
   let aiTestResult = $state("");
+/** AI 端点测试结果：同上，显式状态位而非嗅探文案前缀。 */
+let aiTestState = $state<"" | "ok" | "bad">("");
   let capPromptIdx = $state<number | null>(null);
 
   // 字体平滑：单个复选框（勾选=灰度抗锯齿；取消=系统 ClearType 子像素）。
@@ -886,7 +911,7 @@
     config.ai.profiles.push(created);
     config.ai.active = config.ai.profiles.length - 1;
     saveConfigNow();
-    toast(t("settings.ai.endpointCreated", { name: created.name }));
+    toast(t("settings.ai.endpointCreated", { name: seedEndpointLabel(created.name) }));
   }
 
   function delProfile() {
@@ -915,7 +940,7 @@
   }
 
   function addPrompt() {
-    config.ai.prompts.push({ id: Date.now(), name: `提示${config.ai.prompts.length + 1}`, text: "{chapter}", key: "" }); // i18n-allow:持久化值：新建提示词档的种子名，会原样落进 config.ai.prompts。
+    config.ai.prompts.push({ id: Date.now(), name: t("settings.ai.promptSeed", { n: config.ai.prompts.length + 1 }), text: "{chapter}", key: "" });
     saveConfig();
   }
 
@@ -947,6 +972,29 @@
     return () => document.removeEventListener("keydown", h, true);
   });
 
+  /** 后端只给状态与**结构化素材**（`AiPiece`：稳定 id + 动态素材），句子在这里按当前语言拼：
+   *  线路名 / 服务商 / 诊断附注 / 失败明细都经 `aiPieceText`、`labelOfId` 查当前语言文案，
+   *  后端不再回传任何中文字面量（`detail` 只是语言中立的原文明细，界面不渲染）。 */
+  function aiTestText(r: AiTestResult): string {
+    if (r.status === "config") {
+      const inner = aiErrDetail({ kind: "", code: r.code, message: r.detail }) ?? r.detail;
+      return inner ? t("settings.ai.testCfgFail", { detail: inner }) : t("settings.ai.testCfgFailBare");
+    }
+    if (r.status === "allFailed") {
+      const lines = (r.lines ?? []).map(aiPieceText).filter(Boolean);
+      return t("settings.ai.testAllFail", { detail: lines.join("  ") || r.detail });
+    }
+    const route = aiPieceText(r.route);
+    const provider = labelOfId("aiProvider", r.provider);
+    const main = r.reply
+      ? t("settings.ai.testOkReply", { route, provider, reply: r.reply })
+      : t("settings.ai.testOk", { route, provider });
+    const notes = (r.diag ?? []).map(aiPieceText).filter(Boolean);
+    return notes.length
+      ? t("settings.ai.testDiag", { main, diag: notes.join(t("settings.ai.testDiagSep")) })
+      : main;
+  }
+
   async function testAi() {
     aiTesting = true;
     aiTestResult = t("settings.ai.testingHint");
@@ -962,9 +1010,11 @@
         proxyMode: p.proxyMode,
         proxyUrl: p.proxyUrl,
       });
-      aiTestResult = r;
+      aiTestResult = aiTestText(r);
+      aiTestState = r.status === "ok" ? "ok" : "bad";
     } catch (e) {
-      aiTestResult = `✗ ${e}`;
+      aiTestResult = errText(e);
+      aiTestState = "bad";
     } finally {
       aiTesting = false;
     }
@@ -1027,7 +1077,6 @@
   // 「添加快捷键」芯片在未捕获态显示的图形符号。放脚本常量而非 markup 字面量有两个原因：
   //   1) markup 里的 `//` 不是注释，会被 Svelte 原样渲染成界面文字（历史缺陷）；
   //   2) 豁免说明必须和字面量同处脚本块，守门脚本的行内 `// i18n-allow:` 规则才认得到。
-  const ADD_BIND_GLYPH = "＋"; // i18n-allow:图形符号：全角加号是「添加」芯片的图形，两种语言同形，不是可翻译文案。
 
   let capturing = $state<BindAction | null>(null);
 
@@ -1078,9 +1127,11 @@
     try {
       const ok = await api.webdavTest(config.webdav.base, config.webdav.user, config.webdav.pass);
       webdavStatus = ok ? t("settings.dav.testOk") : t("settings.dav.testFail");
+      davState = ok ? "ok" : "bad";
       if (!ok) toast(t("settings.dav.testFailed"), "error");
     } catch (e) {
-      webdavStatus = `✗ ${e}`;
+      webdavStatus = errText(e);
+      davState = "bad";
     } finally {
       webdavTesting = false;
     }
@@ -1116,7 +1167,7 @@
     const base = it.name.replace(/^config-/, "").replace(/\.json$/, "");
     const m = base.match(/^(.*)-(\d{8}-\d{6})$/);
     const device = m ? m[1] : base;
-    const at = it.mtime ? new Date(it.mtime * 1000).toLocaleString() : m ? m[2] : "";
+    const at = it.mtime ? new Date(it.mtime * 1000).toLocaleString(dateLocale()) : m ? m[2] : "";
     return `${device} · ${at}`;
   }
 
@@ -1293,10 +1344,10 @@
   <header class="set-head">
     <div class="set-title">
       <span class="set-title-main">{t("settings.title")}</span>
-      <span class="set-crumb">›</span>
+      <span class="set-crumb"><IconChevronRight /></span>
       <span class="set-crumb-now">{tabLabel}</span>
     </div>
-    <button class="icon set-close" title={t("settings.close")} onclick={() => (ui.settingsOpen = false)}>×</button>
+    <button class="icon set-close" title={t("settings.close")} onclick={() => (ui.settingsOpen = false)}><IconX /></button>
   </header>
 
   <div class="set-main">
@@ -1305,7 +1356,7 @@
       <div class="set-search">
         <input placeholder={t("settings.nav.searchPlaceholder")} bind:value={navQuery} aria-label={t("settings.nav.searchAria")} onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
         {#if navQuery}
-          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}>×</button>
+          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}><IconX /></button>
         {/if}
       </div>
       <div class="set-nav-list" use:dragSort={{ onDrop: navDrop, axis: "y" }}>
@@ -1318,7 +1369,7 @@
             class:active={tab === it.id}
             onclick={() => { tab = it.id; if (it.id === "tts") refreshVoices(); }}
           >
-            <span class="set-nav-glyph"><Icon size={16} stroke={1.75} /></span>
+            <span class="set-nav-glyph"><Icon size={16} stroke={1.5} /></span>
             <span class="set-nav-label">{t(it.labelKey)}</span>
           </button>
         {/each}
@@ -1370,7 +1421,7 @@
               <span class="sk-bar short" style="background:{skin.fg2};"></span>
             </span>
             <span class="sk-name">{labelOfId("skin", skin.id)}</span>
-            {#if config.uiSkinLight === skin.id}<span class="sk-check">✓</span>{/if}
+            {#if config.uiSkinLight === skin.id}<span class="sk-check"><IconCheck /></span>{/if}
           </button>
         {/each}
       </div>
@@ -1393,7 +1444,7 @@
               <span class="sk-bar short" style="background:{skin.fg2};"></span>
             </span>
             <span class="sk-name">{labelOfId("skin", skin.id)}</span>
-            {#if config.uiSkinDark === skin.id}<span class="sk-check">✓</span>{/if}
+            {#if config.uiSkinDark === skin.id}<span class="sk-check"><IconCheck /></span>{/if}
           </button>
         {/each}
       </div>
@@ -1492,7 +1543,7 @@
     </div>
 
     <details class="adv">
-      <summary>{t("settings.statusItems.title")}</summary>
+      <summary><IconCaretRight class="fold" />{t("settings.statusItems.title")}</summary>
       <div class="field">
       <div class="stat-grid">
         <div class="stat-head">{t("settings.statusItems.item")}</div>
@@ -1507,15 +1558,15 @@
           <div class="stat-cell">
             <input type="checkbox" checked={footerHas("left", d.id)} onchange={() => toggleFooter("left", d.id)} />
             {#if footerHas("left", d.id)}
-              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("left", d.id, -1)}>‹</button>
-              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("left", d.id, 1)}>›</button>
+              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("left", d.id, -1)}><IconChevronLeft /></button>
+              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("left", d.id, 1)}><IconChevronRight /></button>
             {/if}
           </div>
           <div class="stat-cell">
             <input type="checkbox" checked={footerHas("right", d.id)} onchange={() => toggleFooter("right", d.id)} />
             {#if footerHas("right", d.id)}
-              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("right", d.id, -1)}>‹</button>
-              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("right", d.id, 1)}>›</button>
+              <button type="button" class="stat-mv" title={t("settings.moveLeft")} onclick={() => moveFooter("right", d.id, -1)}><IconChevronLeft /></button>
+              <button type="button" class="stat-mv" title={t("settings.moveRight")} onclick={() => moveFooter("right", d.id, 1)}><IconChevronRight /></button>
             {/if}
           </div>
         {/each}
@@ -1545,7 +1596,7 @@
               <button class="icon" data-testid="scheme-global" title={t("settings.scheme.globalTitle")} onclick={() => applyScheme(s.id, "global")}>{t("settings.scheme.global")}</button>
               <button class="icon" data-testid="scheme-book" title={t("settings.scheme.bookTitle")} onclick={() => applyScheme(s.id, "book")}>{t("settings.scheme.book")}</button>
               <button class="icon" data-testid="scheme-rename" title={t("settings.scheme.rename")} onclick={() => renameScheme(s)}>{t("settings.scheme.renameShort")}</button>
-              <button class="icon" data-testid="scheme-delete" title={t("settings.scheme.delete")} onclick={() => delScheme(s)}>×</button>
+              <button class="icon" data-testid="scheme-delete" title={t("settings.scheme.delete")} onclick={() => delScheme(s)}><IconTrash /></button>
             </div>
           </div>
         {/each}
@@ -1577,7 +1628,7 @@
           </div>
           <div class="ss-new">
             <input placeholder={t("settings.scheme.newPlaceholder")} bind:value={schemeNameInput} />
-            <button class="primary" onclick={openSchemeNew}>{t("settings.scheme.newBtn")}</button>
+            <button class="primary" onclick={openSchemeNew}><IconPlus />{t("settings.scheme.newBtn")}</button>
           </div>
         </div>
       </div>
@@ -1646,7 +1697,7 @@
           onchange={saveConfig}
         />
         <button onclick={installFont}>{t("settings.font.install")}</button>
-        <button onclick={() => refreshFontNames()} title={t("settings.font.reloadNamesTip")}>{t("settings.font.reloadNames")}</button>
+        <button onclick={() => refreshFontNames()} title={t("settings.font.reloadNamesTip")}><IconRefresh />{t("settings.font.reloadNames")}</button>
       </div>
       <div class="font-list">
         {#if customFontOptions.length}
@@ -1658,12 +1709,12 @@
                 class:active={config.reader.fontFamily === f.family}
                 style="font-family:'{f.family}'"
                 onclick={() => { config.reader.fontFamily = f.family; saveConfig(); }}
-              >★ {f.family}</button>
+              ><IconStarFilled /> {f.family}</button>
               <button
                 class="font-del"
                 title={t("settings.font.deleteTitle")}
                 onclick={(e) => { e.stopPropagation(); deleteCustomFont(f.family, f.file); }}
-              >×</button>
+              ><IconTrash /></button>
             </span>
           {/each}
         {/if}
@@ -1690,7 +1741,7 @@
           onchange={saveConfig}
         />
         {#if config.reader.latinFont}
-          <button class="icon" title={t("settings.font.clear")} onclick={() => { config.reader.latinFont = ""; saveConfig(); }}>×</button>
+          <button class="icon" title={t("settings.font.clear")} onclick={() => { config.reader.latinFont = ""; saveConfig(); }}><IconX /></button>
         {/if}
       </div>
       <datalist id="latin-font-options">
@@ -1950,10 +2001,10 @@
           <span class="bind-name">{labelOfId("bind", def.id)}</span>
           <div class="bind-keys">
             {#each config.reader.bindings[def.id] as k (k)}
-              <button class="key-chip" title={t("settings.keys.chipDelete")} onclick={() => removeBind(def.id, k)}>{k} ×</button>
+              <button class="key-chip" title={t("settings.keys.chipDelete")} onclick={() => removeBind(def.id, k)}>{k}<IconX /></button>
             {/each}
             <button class="key-add" class:cap={capturing === def.id} onclick={() => (capturing = capturing === def.id ? null : def.id)}>
-              {capturing === def.id ? t("settings.keys.capture") : ADD_BIND_GLYPH}
+              {#if capturing === def.id}{t("settings.keys.capture")}{:else}<IconPlus />{/if}
             </button>
           </div>
         </div>
@@ -2001,11 +2052,11 @@
         <div class="row-inline">
           <select bind:value={config.tts.activeService} onchange={saveConfig}>
             {#each config.tts.services as s, i (s.id)}
-              <option value={i}>{s.name || t("settings.tts.serviceFallback", { n: i + 1 })}</option>
+              <option value={i}>{seedTtsLabel(s.name, t("settings.tts.serviceFallback", { n: i + 1 }))}</option>
             {/each}
           </select>
-          <button class="icon" title={t("settings.tts.addTitle")} onclick={addTtsService}>{t("settings.tts.add")}</button>
-          <button class="icon" title={t("settings.tts.delTitle")} onclick={delTtsService}>{t("settings.tts.del")}</button>
+          <button class="icon" title={t("settings.tts.addTitle")} onclick={addTtsService}><IconPlus />{t("settings.tts.add")}</button>
+          <button class="icon" title={t("settings.tts.delTitle")} onclick={delTtsService}><IconTrash />{t("settings.tts.del")}</button>
         </div>
       </div>
 
@@ -2021,7 +2072,7 @@
       <div class="grid2">
         <div class="field">
           <label>{t("settings.tts.name")}</label>
-          <input bind:value={tsvc.name} onchange={saveConfig} placeholder={t("settings.tts.namePlaceholder")} />
+          <input value={seedTtsLabel(tsvc.name)} oninput={(e) => (tsvc.name = e.currentTarget.value)} onchange={saveConfig} placeholder={t("settings.tts.namePlaceholder")} />
         </div>
         <div class="field">
           <label>{t("settings.tts.baseUrl")}</label>
@@ -2190,7 +2241,7 @@
 
     <div class="row-inline" style="margin: 6px 0 16px">
       <button onclick={testWebdav} disabled={webdavTesting}>{t("settings.dav.test")}</button>
-      {#if webdavStatus}<span class="status">{webdavStatus}</span>{/if}
+      {#if webdavStatus}<span class="status" class:ok={davState === "ok"} class:bad={davState === "bad"}>{webdavStatus}</span>{/if}
     </div>
 
     <p class="sec-title" style="margin-top:18px">{t("settings.dav.backupTitle")}</p>
@@ -2238,7 +2289,7 @@
       {#each aiGroups as g (g.id)}
         <section class="ai-group" data-drag-id={g.id}>
           <div class="ai-group-head" class:open={aiOpen[g.id]} onclick={() => (aiOpen[g.id] = !aiOpen[g.id])}>
-            {g.title}
+            <IconCaretRight class="fold" />{t(g.title)}
           </div>
           {#if aiOpen[g.id]}
             <!-- 分类体阻止 pointerdown 冒泡：拖滑块 / 文本框选字不会误触发整组排序。 -->
@@ -2249,11 +2300,11 @@
                   <div class="row-inline">
                     <select bind:value={config.ai.active} onchange={saveConfigNow}>
                       {#each config.ai.profiles as p, i (p.id)}
-                        <option value={i}>{p.name || t("settings.ai.endpointFallback", { n: i + 1 })}</option>
+                        <option value={i}>{seedEndpointLabel(p.name, t("settings.ai.endpointFallback", { n: i + 1 }))}</option>
                       {/each}
                     </select>
-                    <button class="icon" title={t("settings.ai.addEndpointTitle")} onclick={addProfile}>{t("settings.ai.add")}</button>
-                    <button class="icon" title={t("settings.ai.delEndpointTitle")} onclick={delProfile}>{t("settings.ai.del")}</button>
+                    <button class="icon" title={t("settings.ai.addEndpointTitle")} onclick={addProfile}><IconPlus />{t("settings.ai.add")}</button>
+                    <button class="icon" title={t("settings.ai.delEndpointTitle")} onclick={delProfile}><IconTrash />{t("settings.ai.del")}</button>
                   </div>
                   <p class="tip">{t("settings.ai.endpointTip")}</p>
                 </div>
@@ -2261,7 +2312,7 @@
                 <div class="grid2">
                   <div class="field">
                     <label>{t("settings.ai.endpointName")}</label>
-                    <input bind:value={ap.name} onchange={saveConfig} />
+                    <input value={seedEndpointLabel(ap.name)} oninput={(e) => (ap.name = e.currentTarget.value)} onchange={saveConfig} />
                   </div>
                   <div class="field">
                     <label for="ai-provider-sel">{t("settings.ai.provider")}</label>
@@ -2334,7 +2385,7 @@
                   <div class="flex1"></div>
                 </div>
                 {#if aiTestResult}
-                  <div class="ai-test-result" class:ok={aiTestResult.startsWith("✓")} class:bad={aiTestResult.startsWith("✗")}>{aiTestResult}</div>
+                  <div class="ai-test-result" class:ok={aiTestState === "ok"} class:bad={aiTestState === "bad"}>{aiTestResult}</div>
                 {/if}
 
                 <p class="tip">{t("settings.ai.endpointOrderTip")}</p>
@@ -2442,7 +2493,7 @@
                   {#each config.ai.prompts as p, i (p.id)}
                     <div class="prompt-edit">
                       <div class="row-inline" style="margin-bottom:4px">
-                        <input class="pname" placeholder={t("settings.ai.promptName")} bind:value={p.name} onchange={saveConfig} />
+                        <input class="pname" placeholder={t("settings.ai.promptName")} value={seedPromptLabel(p.name)} oninput={(e) => (p.name = e.currentTarget.value)} onchange={saveConfig} />
                         <button class="key-chip-inline" class:cap={capPromptIdx === i} title={t("settings.ai.bindKey")}
                           onclick={() => (capPromptIdx = capPromptIdx === i ? null : i)}>
                           {p.key || t("settings.ai.bindKey")}{capPromptIdx === i ? "…" : ""}
@@ -2450,12 +2501,12 @@
                         {#if capPromptIdx === i}
                           <button class="icon" onclick={() => (capPromptIdx = null)}>{t("settings.ai.cancel")}</button>
                         {/if}
-                        <button class="icon" title={t("settings.ai.delPromptTitle")} onclick={() => delPrompt(i)}>×</button>
+                        <button class="icon" title={t("settings.ai.delPromptTitle")} onclick={() => delPrompt(i)}><IconTrash /></button>
                       </div>
                       <textarea rows="3" bind:value={p.text} oninput={saveConfig}></textarea>
                     </div>
                   {/each}
-                  <button onclick={addPrompt} style="margin-top:6px">{t("settings.ai.addPrompt")}</button>
+                  <button onclick={addPrompt} style="margin-top:6px"><IconPlus />{t("settings.ai.addPrompt")}</button>
                 </div>
 
                 <p class="tip">{t("settings.ai.promptTip")}</p>
@@ -2507,7 +2558,7 @@
         <div class="st-row">
           <span class="st-label">{t("settings.storage.dataDir")}</span>
           <span class="st-val path" title={storage.data_dir}>{storage.data_dir}</span>
-          <button class="icon" title={t("settings.storage.copyPath")} onclick={copyDataDir}>⧉</button>
+          <button class="icon" title={t("settings.storage.copyPath")} onclick={copyDataDir}><IconCopy /></button>
         </div>
         <div class="st-row">
           <span class="st-label">{t("settings.storage.total")}</span>
@@ -2602,12 +2653,12 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    font-size: var(--fs-lg, 16px);
+    font-size: var(--fs-lg);
   }
 
-  .set-title-main { font-weight: 600; letter-spacing: var(--ls-tight, -0.015em); }
-  .set-crumb { color: var(--fg2); font-weight: 400; }
-  .set-crumb-now { color: var(--fg2); font-size: var(--fs-sm, 13px); }
+  .set-title-main { font-weight: 600; letter-spacing: var(--ls-tight); }
+  .set-crumb { color: var(--fg2); font-weight: 400; display: inline-flex; align-items: center; }
+  .set-crumb-now { color: var(--fg2); font-size: var(--fs-sm); }
 
   .set-close { font-size: 18px; line-height: 1; }
 
@@ -2631,7 +2682,7 @@
   .set-search input {
     width: 100%;
     min-height: 30px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     padding-right: 26px;
     box-sizing: border-box;
   }
@@ -2650,7 +2701,8 @@
     color: var(--fg2);
     cursor: pointer;
     border-radius: 50%;
-    font-size: 14px;
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
     line-height: 1;
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
   }
@@ -2659,8 +2711,10 @@
     color: var(--fg);
   }
 
+
   .set-nav-group {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
     font-weight: 600;
     letter-spacing: 0.04em;
     color: var(--fg2);
@@ -2679,21 +2733,21 @@
     background: transparent;
     color: var(--fg2);
     padding: 8px 10px;
-    border-radius: var(--radius-sm, 8px);
-    font-size: var(--fs-sm, 13px);
+    border-radius: var(--radius-sm);
+    font-size: var(--fs-sm);
     min-height: 34px;
     box-shadow: none;
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
   }
 
   .set-nav-item:hover:not(:disabled) {
-    background: var(--hover-bg, rgba(0, 0, 0, 0.05));
+    background: var(--hover-bg);
     color: var(--fg);
     border-color: transparent;
   }
 
   .set-nav-item.active {
-    background: var(--accent-soft, var(--hover-bg));
+    background: var(--accent-soft);
     color: var(--accent);
     font-weight: 600;
   }
@@ -2707,8 +2761,9 @@
     flex-shrink: 0;
   }
 
+
   .set-nav-label { flex: 1; }
-  .set-nav-empty { padding: 16px 10px; color: var(--fg2); font-size: var(--fs-xs, 12px); }
+  .set-nav-empty { padding: 16px 10px; color: var(--fg2); font-size: var(--fs-xs); }
 
   /* 搜索命中的「具体设置」结果列表 */
   .set-nav-results {
@@ -2727,22 +2782,22 @@
     background: transparent;
     color: var(--fg);
     padding: 6px 10px;
-    border-radius: 8px;
-    font-size: var(--fs-xs, 12px);
+    border-radius: var(--radius-md);
+    font-size: var(--fs-xs);
     cursor: pointer;
-    transition: background var(--dur, 0.2s) var(--ease), color var(--dur, 0.2s) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
   }
   .set-result:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   .set-result-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .set-result-tab { flex-shrink: 0; color: var(--fg2); font-size: 11px; opacity: 0.8; }
+  .set-result-tab { flex-shrink: 0; color: var(--fg2); font-size: var(--fs-2xs); letter-spacing: var(--ls-2xs); opacity: 0.8; }
 
   /* 定位高亮：类名由 JS 运行时添加，必须用 :global，否则会被 Svelte 当作未用选择器删除。
      box-shadow 用于画强调色光环（.field 未设 box-shadow，不冲突）；
      transition 用 !important 覆盖 .field 自带的 transition，使光环淡入淡出。 */
   :global(.fr-locate) {
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 65%, transparent) !important;
-    transition: box-shadow 0.35s var(--ease) !important;
+    transition: box-shadow var(--dur) var(--ease) !important;
   }
 
   /* 右侧内容 */
@@ -2767,28 +2822,6 @@
     padding: 12px 20px;
     border-top: 1px solid var(--line);
     flex-shrink: 0;
-  }
-
-  .tabs {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 16px;
-    border-bottom: 1px solid var(--line);
-    padding-bottom: 0;
-  }
-
-  .tabs button {
-    border: none;
-    background: transparent;
-    padding: 8px 18px;
-    border-radius: 8px 8px 0 0;
-    border-bottom: 2px solid transparent;
-  }
-
-  .tabs button.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
-    font-weight: 600;
   }
 
   .grid2 {
@@ -2829,25 +2862,25 @@
   details.adv {
     margin: 4px 0 12px;
     border: 1px solid var(--line);
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     background: var(--panel2);
   }
   details.adv > summary {
     cursor: pointer;
     padding: 8px 12px;
-    font-size: var(--fs-sm, 13px);
+    font-size: var(--fs-sm);
     color: var(--fg2);
     list-style: none;
     user-select: none;
+    /* 图标 + 文字横向对齐（图标本身的尺寸与旋转在 app.css 的全局规则里） */
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
   details.adv > summary::-webkit-details-marker { display: none; }
-  details.adv > summary::before {
-    content: "▸";
-    display: inline-block;
-    margin-right: 6px;
-    transition: transform var(--dur, 0.2s) var(--ease);
+  details.adv > summary {
+    transition: color var(--dur-fast) var(--ease);
   }
-  details.adv[open] > summary::before { transform: rotate(90deg); }
   details.adv > summary:hover { color: var(--fg); }
   details.adv > .field { padding: 0 12px 10px; margin-bottom: 0; }
 
@@ -2859,23 +2892,23 @@
   }
   .ai-group {
     border: 1px solid var(--line);
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     background: var(--panel2);
   }
   .ai-group-head {
     cursor: pointer;
     padding: 8px 12px;
-    font-size: var(--fs-sm, 13px);
+    font-size: var(--fs-sm);
     color: var(--fg2);
     user-select: none;
+    /* 同上：图标 + 文字横向对齐 */
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
-  .ai-group-head::before {
-    content: "▸";
-    display: inline-block;
-    margin-right: 6px;
-    transition: transform var(--dur, 0.2s) var(--ease);
+  .ai-group-head {
+    transition: color var(--dur-fast) var(--ease);
   }
-  .ai-group-head.open::before { transform: rotate(90deg); }
   .ai-group-head:hover { color: var(--fg); }
   .ai-group-body {
     display: flex;
@@ -2892,12 +2925,14 @@
     margin: 6px 0;
   }
   .stat-head {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     font-weight: 500;
   }
   .stat-name {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
   }
   .stat-cell {
     display: flex;
@@ -2906,14 +2941,15 @@
   }
   .stat-mv {
     padding: 0 5px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     line-height: 1.4;
   }
 
   /* ---- 存储空间卡片 ---- */
   .storage-card {
     border: 1px solid var(--line);
-    border-radius: var(--radius-md, 12px);
+    border-radius: var(--radius-md);
     background: var(--bg-elev);
     overflow: hidden;
   }
@@ -2924,14 +2960,14 @@
     gap: 12px;
     padding: 9px 14px;
     border-bottom: 1px solid var(--line);
-    font-size: var(--fs-sm, 13px);
+    font-size: var(--fs-sm);
   }
 
   .st-row:last-of-type { border-bottom: none; }
   .st-label { color: var(--fg2); width: 88px; flex-shrink: 0; }
   .st-val { color: var(--fg); }
   .st-val.strong { font-weight: 600; }
-  .st-val.path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg2); font-size: var(--fs-xs, 12px); }
+  .st-val.path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg2); font-size: var(--fs-xs); }
 
   .st-actions {
     display: flex;
@@ -2942,7 +2978,7 @@
     background: var(--panel2);
   }
 
-  .st-cache { flex: 1; color: var(--fg2); font-size: var(--fs-xs, 12px); }
+  .st-cache { flex: 1; color: var(--fg2); font-size: var(--fs-xs); }
 
   /* ---- 默认封面底图控件 ---- */
   .cover-ctl {
@@ -2955,7 +2991,7 @@
     height: 144px;
     flex-shrink: 0;
     object-fit: cover;
-    border-radius: var(--radius-sm, 8px);
+    border-radius: var(--radius-sm);
     border: 1px solid var(--line);
     background: var(--panel2);
   }
@@ -3000,7 +3036,7 @@
     top: 8px;
     bottom: 8px;
     width: 26px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
   .sk-accent {
@@ -3009,7 +3045,7 @@
     top: 8px;
     width: 20px;
     height: 8px;
-    border-radius: 4px;
+    border-radius: var(--radius-xs);
   }
 
   .sk-bar {
@@ -3018,7 +3054,7 @@
     top: 24px;
     width: 52px;
     height: 6px;
-    border-radius: 3px;
+    border-radius: var(--radius-xs);
     opacity: 0.75;
   }
 
@@ -3077,6 +3113,9 @@
     gap: 5px;
   }
 
+  .scheme-card {
+    transition: border-color var(--dur-fast) var(--ease);
+  }
   .scheme-card.active {
     border-color: var(--accent);
   }
@@ -3095,7 +3134,7 @@
   .sp-line {
     display: block;
     height: 5px;
-    border-radius: 3px;
+    border-radius: var(--radius-xs);
     margin-bottom: 5px;
   }
 
@@ -3107,7 +3146,7 @@
     display: block;
     width: 22px;
     height: 10px;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     margin-top: 2px;
   }
 
@@ -3127,7 +3166,7 @@
     gap: 8px;
     flex-wrap: wrap;
     margin-top: 6px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     color: var(--fg2);
   }
   .link-btn {
@@ -3136,9 +3175,9 @@
     color: var(--accent);
     min-height: auto;
     padding: 2px 4px;
-    font-size: var(--fs-xs, 12px);
+    font-size: var(--fs-xs);
     font-weight: 600;
-    border-radius: var(--radius-xs, 6px);
+    border-radius: var(--radius-xs);
     cursor: pointer;
   }
   .link-btn:hover:not(:disabled) {
@@ -3155,7 +3194,8 @@
   .scheme-menu button {
     min-height: 22px;
     padding: 1px 6px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
   }
 
   button.save-target {
@@ -3173,8 +3213,8 @@
   .scheme-save-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 1100;
-    background: rgba(0, 0, 0, 0.4);
+    z-index: var(--z-overlay);
+    background: var(--scrim);
     display: grid;
     place-items: center;
   }
@@ -3189,6 +3229,7 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     padding: var(--sp-4);
+    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .ss-head {
@@ -3225,9 +3266,10 @@
   .flex1 { flex: 1; }
 
   .ai-test-result {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     padding: 8px 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: var(--panel2);
     word-break: break-all;
     line-height: 1.6;
@@ -3238,7 +3280,7 @@
 
   .prompt-edit {
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 8px;
     margin-bottom: 8px;
   }
@@ -3254,7 +3296,8 @@
   }
 
   .key-chip-inline {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-family: Consolas, monospace;
     padding: 4px 10px;
     white-space: nowrap;
@@ -3266,18 +3309,11 @@
     animation: pulse 1s infinite;
   }
 
-  .picker {
-    padding: 2px;
-    width: 42px;
-    height: 34px;
-    cursor: pointer;
-  }
-
   .bg-thumb {
     width: 72px;
     height: 46px;
     object-fit: cover;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--line);
   }
 
@@ -3291,15 +3327,16 @@
     max-height: 130px;
     overflow-y: auto;
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 8px;
     margin-top: 8px;
   }
 
   .font-opt {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     padding: 3px 10px;
-    border-radius: 14px;
+    border-radius: var(--radius-lg);
   }
 
   .font-opt.active {
@@ -3310,7 +3347,8 @@
 
   .font-group-title {
     flex-basis: 100%;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-weight: 700;
     color: var(--fg2);
     letter-spacing: 0.04em;
@@ -3331,7 +3369,8 @@
     padding: 0;
     line-height: 1;
     border-radius: 50%;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     display: grid;
     place-items: center;
     background: var(--panel);
@@ -3355,24 +3394,31 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     cursor: pointer;
   }
 
   .cssbox {
     font-family: Consolas, monospace;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     resize: vertical;
   }
 
   .status {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     align-self: center;
   }
 
   .status.ok {
-    color: #2e7d43;
+    color: var(--success);
     font-weight: 600;
+  }
+
+  .status.bad {
+    color: var(--danger);
   }
 
   .presets {
@@ -3382,7 +3428,8 @@
   }
 
   .presets button {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     padding: 4px 10px;
   }
 
@@ -3393,7 +3440,7 @@
 
   .toc-preview {
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     max-height: 200px;
     overflow-y: auto;
     padding: 6px 0;
@@ -3402,7 +3449,8 @@
 
   .tp-row {
     padding: 3px 14px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3414,7 +3462,8 @@
 
   .sub-h {
     margin: 14px 0 4px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
   }
 
   .zone-grid {
@@ -3429,18 +3478,20 @@
     flex-direction: column;
     gap: 4px;
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 8px 10px;
   }
 
   .zone-label {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
   }
 
   .zone-cell select {
     width: 100%;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
   }
 
   .bind-list {
@@ -3450,7 +3501,7 @@
     flex-direction: column;
     gap: 2px;
     border: 1px solid var(--line);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     padding: 6px;
   }
 
@@ -3459,15 +3510,19 @@
     align-items: center;
     gap: 12px;
     padding: 5px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
+  .bind-row {
+    transition: background var(--dur-fast) var(--ease);
+  }
   .bind-row:hover { background: var(--panel2); }
 
   .bind-name {
     width: 150px;
     flex-shrink: 0;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
   }
 
   .bind-keys {
@@ -3480,9 +3535,10 @@
   .key-chip {
     background: var(--panel2);
     border: 1px solid var(--line);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 2px 8px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     font-family: Consolas, monospace;
   }
 
@@ -3494,7 +3550,8 @@
   .key-add {
     border-style: dashed;
     padding: 2px 10px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     min-width: 34px;
   }
 
@@ -3509,12 +3566,6 @@
     50% { opacity: 0.55; }
   }
 
-  .tip {
-    font-size: 12px;
-    color: var(--fg2);
-    line-height: 1.7;
-  }
-
   .close-row {
     display: flex;
     justify-content: flex-end;
@@ -3524,68 +3575,22 @@
   }
 
   .ver {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     opacity: 0.7;
     margin-right: auto;
   }
 
-  .sec-title {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--accent);
-    letter-spacing: 0.06em;
-    margin: 0 0 10px;
-    text-transform: uppercase;
-  }
-
   .sec-val {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     color: var(--fg);
     word-break: break-all;
     line-height: 1.5;
   }
 
-  .tabs {
-    gap: 2px;
-  }
 
-  .tabs button {
-    position: relative;
-    border: none;
-    font-size: 13px;
-    color: var(--fg2);
-    padding: 8px 14px 10px;
-    transition: color 0.18s;
-  }
-
-  .tabs button:hover {
-    color: var(--fg);
-    background: transparent;
-  }
-
-  .tabs button.active {
-    color: var(--accent);
-    font-weight: 600;
-  }
-
-  .tabs button.active::after {
-    content: "";
-    position: absolute;
-    left: 14px;
-    right: 14px;
-    bottom: 2px;
-    height: 2px;
-    border-radius: 1px;
-    background: var(--accent);
-    transform-origin: left center;
-    animation: tab-in 0.3s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes tab-in {
-    from { transform: scaleX(0); opacity: 0; }
-    to { transform: scaleX(1); opacity: 1; }
-  }
 
   .checks input[type="checkbox"],
   input[type="checkbox"] {
@@ -3600,18 +3605,8 @@
     cursor: pointer;
   }
 
-  .field {
-    background: color-mix(in srgb, var(--panel) 60%, transparent);
-    border-radius: 10px;
-    padding: 9px 12px;
-    border: 1px solid transparent;
-    transition: border-color 0.18s, background 0.18s;
-  }
-
-  .field:focus-within {
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-    background: var(--panel);
-  }
+  /* .field（字段容器）与 .sec-title（分组小标题）已收敛到 app.css 的全局一份，
+     不在此处重复定义 —— 原先这里那份总会覆盖全局那份，是「同一个类两套外观」的根源。 */
 
   /* 窄窗口（如弹出的 AI 独立窗内打开设置）：
      侧栏改为顶部横向导航条，内容占满整宽，杜绝横向滚动条并优化排版。

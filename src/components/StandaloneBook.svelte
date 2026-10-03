@@ -22,6 +22,6 @@
 <style>
   .sb-root {
     height: 100vh;
-    background: var(--rdr-bg, #f5f1e8);
+    background: var(--rdr-bg);
   }
 </style>

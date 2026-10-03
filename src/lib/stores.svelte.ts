@@ -1,4 +1,4 @@
-export type ReadMode = "page" | "scroll";
+﻿export type ReadMode = "page" | "scroll";
 export type ThemeKey = "paper" | "white" | "green" | "dark" | "night";
 export type ZoneKey = "tl" | "tr" | "bl" | "br" | "c";
 export type ZoneAction = BindAction | "none";
@@ -308,7 +308,7 @@ export interface WebdavConfig {
   backup: WebdavBackupConfig;
 }
 
-export type AiProvider = "openai" | "ollama" | "anthropic" | "gemini" | "azure-openai";
+export type AiProvider = "openai" | "ollama" | "anthropic" | "gemini" | "azure-openai" | "dashscope";
 
 export interface AiProfile {
   /** 稳定唯一 id（用于渲染 key 与端点识别；旧配置迁移时补齐） */
@@ -446,6 +446,9 @@ function sanitizeProvider(v: any): AiProvider {
   if (s === "ollama") return "ollama";
   if (s === "anthropic" || s === "claude") return "anthropic";
   if (s === "gemini" || s === "google") return "gemini";
+  // dashscope（通义千问）只出现在配置文件里（下拉列表不提供该选项），但后端 Provider::parse
+  // 认这个 id 且走 OpenAI 兼容协议；这里必须放行，否则读一次配置就被改写成 openai（数据丢失）。
+  if (s === "dashscope" || s === "qwen") return "dashscope";
   if (s === "azure-openai" || s === "azure" || s === "azure_openai") return "azure-openai";
   return "openai";
 }
@@ -485,12 +488,12 @@ export function normalizeProfiles(list: any): AiProfile[] {
 /** 生成不与现有端点重名的名称：优先「新端点」，否则「新端点2/3…」。 */
 export function uniqueEndpointName(profiles: AiProfile[]): string {
   const names = new Set(profiles.map((p) => (p.name || "").trim()));
-  if (!names.has("新端点")) return "新端点"; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+  if (!names.has("新端点")) return "新端点"; // i18n-allow:持久化值：落盘值恒为中文 —— uniqueEndpointName() 的去重判断（names.has / 新端点{n} 递增）依赖它，存量配置里也已是中文；显示侧经 seedEndpointLabel() 查 dict.seedEndpoint.* ，不写回 config。
   for (let n = 2; n < 100000; n++) {
-    const cand = `新端点${n}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+    const cand = `新端点${n}`; // i18n-allow:持久化值：落盘值恒为中文 —— uniqueEndpointName() 的去重判断（names.has / 新端点{n} 递增）依赖它，存量配置里也已是中文；显示侧经 seedEndpointLabel() 查 dict.seedEndpoint.numbered ，不写回 config。
     if (!names.has(cand)) return cand;
   }
-  return `新端点${Date.now()}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+  return `新端点${Date.now()}`; // i18n-allow:持久化值：10 万个序号都用尽后的兜底，运行期唯一值，故不进静态表；显示侧由 seedEndpointLabel() 的「新端点+数字」正则按 dict.seedEndpoint.numbered 拼，不写回 config。
 }
 
 /** 干净的新端点：不复制上一个端点的地址与凭证，provider 默认沿用当前类型。 */
@@ -649,12 +652,12 @@ export function normalizeTtsService(s: any): TtsService {
 /** 生成不与现有服务重名的名称：优先「新服务」，否则「新服务2/3…」。 */
 export function uniqueTtsServiceName(list: TtsService[]): string {
   const names = new Set(list.map((s) => (s.name || "").trim()));
-  if (!names.has("新服务")) return "新服务"; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+  if (!names.has("新服务")) return "新服务"; // i18n-allow:持久化值：落盘值恒为中文 —— uniqueTtsServiceName() 的去重判断（names.has / 新服务{n} 递增）依赖它，存量配置里也已是中文；显示侧经 seedTtsLabel() 查 dict.seedTts.* ，不写回 config。
   for (let n = 2; n < 100000; n++) {
-    const cand = `新服务${n}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+    const cand = `新服务${n}`; // i18n-allow:持久化值：落盘值恒为中文 —— uniqueTtsServiceName() 的去重判断依赖它；显示侧经 seedTtsLabel() 查 dict.seedTts.numbered ，不写回 config。
     if (!names.has(cand)) return cand;
   }
-  return `新服务${Date.now()}`; // i18n-allow:持久化值：新建 AI 端点 / TTS 服务的默认名，会原样落进 config（用户可自行改名）；界面显示时空名走本地化兜底。
+  return `新服务${Date.now()}`; // i18n-allow:持久化值：10 万个序号都用尽后的兜底，运行期唯一值，故不进静态表；显示侧由 seedTtsLabel() 的「新服务+数字」正则按 dict.seedTts.numbered 拼，不写回 config。
 }
 
 /** 干净的新服务档案：不复制上一条的地址与凭证。 */
@@ -710,10 +713,8 @@ export interface UiSkin {
   success: string;
   warning: string;
   danger: string;
-  /** 卡片圆角（部分皮肤走硬朗/柔和两种气质）。 */
+  /** 卡片圆角（部分皮肤走硬朗/柔和两种气质）。运行时映射到 --radius-lg。 */
   radiusCard: string;
-  /** 卡片阴影：柔 or 细线（部分皮肤几乎不用阴影）。 */
-  shadow: string;
 }
 
 /**
@@ -738,7 +739,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#292320", fg2: "#7A6E64", line: "rgba(41,35,32,0.10)",
     accent: "#3A2A20", accentFg: "#FFF1E2",
     success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
-    radiusCard: "16px", shadow: "0 1px 2px rgba(41,35,32,0.06), 0 1px 2px rgba(41,35,32,0.04)",
+    radiusCard: "16px"
   },
   // 赤陶：暖陶土橙（~20°），温润手作气质。
   {
@@ -749,7 +750,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#2C2622", fg2: "#756759", line: "rgba(44,38,34,0.10)",
     accent: "#A9482A", accentFg: "#FFF7F2",
     success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(44,38,34,0.06), 0 6px 20px rgba(44,38,34,0.06)",
+    radiusCard: "12px"
   },
   // 松林：沉静森绿（~155°），清新自然。
   {
@@ -760,7 +761,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#1F2622", fg2: "#63726A", line: "rgba(31,38,34,0.10)",
     accent: "#1E7A55", accentFg: "#F3FBF6",
     success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(31,38,34,0.05), 0 6px 20px rgba(31,38,34,0.06)",
+    radiusCard: "12px"
   },
   // 湖光：清爽湖蓝（~205°），冷静专注。
   {
@@ -771,7 +772,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#1E252E", fg2: "#5E6975", line: "rgba(30,37,46,0.09)",
     accent: "#2E6CB0", accentFg: "#F2F7FC",
     success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(30,37,46,0.05), 0 6px 20px rgba(30,37,46,0.06)",
+    radiusCard: "12px"
   },
   // 紫藤：柔雅紫红（~315°），优雅有格调。
   {
@@ -782,7 +783,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#2A2430", fg2: "#726A78", line: "rgba(42,36,48,0.10)",
     accent: "#9C3A80", accentFg: "#FBF3F8",
     success: "#2E7D5B", warning: "#B5791C", danger: "#B23A3A",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(42,36,48,0.05), 0 6px 20px rgba(42,36,48,0.06)",
+    radiusCard: "12px"
   },
   // ===================== 深色 5 套 =====================
   // 石墨（保留）：中性冷灰底 + 薄荷青主色（~168°）。
@@ -794,7 +795,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#E6E8EC", fg2: "#9AA0A8", line: "rgba(255,255,255,0.10)",
     accent: "#4FAE95", accentFg: "#0F1115",
     success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.35)",
+    radiusCard: "12px"
   },
   // 琥珀：暖褐底 + 琥珀金主色（~42°），温暖夜读。
   {
@@ -805,7 +806,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#ECE6DA", fg2: "#ADA491", line: "rgba(255,246,230,0.10)",
     accent: "#D6A845", accentFg: "#201A0C",
     success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.35)",
+    radiusCard: "12px"
   },
   // 深海：冷蓝黑底 + 亮蓝主色（~215°），深邃沉浸。
   {
@@ -816,7 +817,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#E4E8F0", fg2: "#949DB0", line: "rgba(210,224,255,0.10)",
     accent: "#5B93E6", accentFg: "#0A1020",
     success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
+    radiusCard: "12px"
   },
   // 绯夜：暖黑底 + 绯红主色（~353°），醒目而不刺眼。
   {
@@ -827,7 +828,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#EEE2E6", fg2: "#AE9BA2", line: "rgba(255,230,238,0.10)",
     accent: "#E77080", accentFg: "#2A0E12",
     success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
+    radiusCard: "12px"
   },
   // 夜行（保留 id · 主色提亮）：紫黑底 + 紫水晶主色（~272°）。
   {
@@ -838,7 +839,7 @@ export const UI_SKINS: UiSkin[] = [
     fg: "#ECE8F5", fg2: "#A29BB4", line: "rgba(228,220,255,0.10)",
     accent: "#A98BE0", accentFg: "#17102A",
     success: "#4FB985", warning: "#D6A73C", danger: "#E5695F",
-    radiusCard: "12px", shadow: "0 1px 2px rgba(0,0,0,0.4)",
+    radiusCard: "12px"
   },
 ];
 
@@ -1131,7 +1132,7 @@ p {
     services: [
       {
         id: 1,
-        name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名会原样落进 config.tts.services，用户可自行改名，界面按用户名字显示。
+        name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名原样落进 config.tts.services（用户可自行改名）；种子名显示侧经 seedTtsLabel() 查 dict.seedTts.default 。
         provider: "openai",
         baseUrl: "http://127.0.0.1:3900",
         apiKey: "",
@@ -1231,6 +1232,7 @@ export function builtinSchemeNames(): Record<string, string> {
  *  这些名字是我们的文案而非用户命名，故显示时接查表；用户一旦改名即不再命中，回到「原样显示」。 */
 export const SEED_SCHEME_NAME_KEYS: Record<string, string> = {
   默认: "s-default",
+  未命名方案: "s-untitled",
 };
 
 /// 内置方案升级：把「未被用户覆盖过」的内置方案刷新到当前预设（保留用户改过的名字）；
@@ -1503,7 +1505,7 @@ function migrateAi(savedAi: any): AiConfig {
     const pm = savedAi?.proxyMode === "custom" ? "custom" : "auto";
     profiles = normalizeProfiles([
       {
-        name: "默认", // i18n-allow:持久化值：旧版单端点配置迁移出的 AI 端点档名，会原样落进 config.ai.profiles，用户可自行改名。
+        name: "默认", // i18n-allow:持久化值：旧版单端点配置迁移出的 AI 端点档名，原样落进 config.ai.profiles（用户可自行改名）；显示侧经 seedEndpointLabel() 查 dict.seedEndpoint.legacy 。
         provider: savedAi?.provider ?? "openai",
         baseUrl: savedAi?.baseUrl ?? "",
         apiKey: savedAi?.apiKey ?? "",
@@ -1574,7 +1576,7 @@ function migrateTts(savedTts: any): TtsConfig {
     const src = savedTts && typeof savedTts === "object" ? savedTts : {};
     const svc = normalizeTtsService({
       id: 1,
-      name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名会原样落进 config.tts.services，用户可自行改名，界面按用户名字显示。
+      name: "默认语音服务", // i18n-allow:持久化值：TTS 服务档名原样落进 config.tts.services（用户可自行改名）；种子名显示侧经 seedTtsLabel() 查 dict.seedTts.default 。
       provider:
         typeof src.customProvider === "string" && src.customProvider
           ? src.customProvider
@@ -1610,7 +1612,7 @@ function normalizeSchemes(list: any): ReaderScheme[] {
       let id = typeof s.id === "string" && s.id ? s.id : `s-${Math.random().toString(36).slice(2, 9)}`;
       if (seen.has(id)) id = `s-${Math.random().toString(36).slice(2, 9)}`;
       seen.add(id);
-      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案"; // i18n-allow:持久化值：方案名兜底值会原样落进 config.readerSchemes，用户可自行改名。
+      const name = typeof s.name === "string" && s.name.trim() ? s.name.trim().slice(0, 40) : "未命名方案"; // i18n-allow:持久化值：方案名兜底值原样落进 config.readerSchemes（用户可自行改名）；种子名显示侧由 schemeLabel() 经 SEED_SCHEME_NAME_KEYS 查 dict.scheme.s-untitled 。
       const cfgSrc = s.cfg && typeof s.cfg === "object" ? s.cfg : {};
       const cfg: ReaderConfig = {
         ...structuredClone(DEFAULTS.reader),
@@ -1920,16 +1922,21 @@ export function applyUiTheme(): void {
   root.style.setProperty("--success", s.success);
   root.style.setProperty("--warning", s.warning);
   root.style.setProperty("--danger", s.danger);
-  root.style.setProperty("--radius-card", s.radiusCard);
-  root.style.setProperty("--shadow-card", s.shadow);
-  // 分层柔和阴影（近影 + 远影双层），并按皮肤前景色「着色」而非纯黑：更融于背景、不显脏。
-  // 深色皮肤整体加深（乘 1.0），浅色减淡（乘 0.55），与外壳既有观感一致。
+  // 皮肤圆角：直接落到 --radius-lg（弹窗 / 卡片 / 皮肤卡共用这一档），
+  // 让每套皮肤的圆角气质真正生效，而不是写一个没人读的 --radius-card。
+  root.style.setProperty("--radius-lg", s.radiusCard);
+  // 分层柔和阴影（Vercel 的「堆叠式」配方：近距细影 + 远距扩散影），并按皮肤前景色
+  // 「着色」而非纯黑：更融于背景、不显脏。深色皮肤整体加深（乘 1.0），浅色减淡（乘 0.55）。
   const tint = s.fg;
   const a = (v: number) => Math.round(mode === "dark" ? v : v * 0.55);
   const mix = (pct: number) => `color-mix(in srgb, ${tint} ${pct}%, transparent)`;
-  root.style.setProperty("--shadow-sm", `0 1px 1.5px ${mix(a(8))}, 0 1px 2px ${mix(a(10))}`);
-  root.style.setProperty("--shadow-md", `0 2px 6px ${mix(a(10))}, 0 10px 26px ${mix(a(16))}`);
-  root.style.setProperty("--shadow-lg", `0 4px 14px ${mix(a(16))}, 0 28px 64px ${mix(a(30))}`);
+  root.style.setProperty("--shadow-sm", `0 1px 2px ${mix(a(6))}, 0 1px 1px ${mix(a(4))}`);
+  root.style.setProperty("--shadow-md", `0 2px 2px ${mix(a(5))}, 0 8px 8px -4px ${mix(a(7))}`);
+  root.style.setProperty("--shadow-drawer", `0 2px 2px ${mix(a(5))}, 0 16px 32px -8px ${mix(a(11))}`);
+  root.style.setProperty(
+    "--shadow-lg",
+    `0 1px 1px ${mix(a(4))}, 0 8px 16px -4px ${mix(a(7))}, 0 24px 32px -8px ${mix(a(9))}`,
+  );
 
   // 默认封面配色随主题更新（供 coverUrl 拼进默认封面 URL；仅影响无内嵌封面书）。
   const ct = computeCoverTheme(s);
@@ -1937,6 +1944,31 @@ export function applyUiTheme(): void {
   coverTheme.g2 = ct.g2;
   coverTheme.g3 = ct.g3;
   coverTheme.tc = ct.tc;
+}
+
+/**
+ * 把**全局**阅读配色写进 <html> 的 --rdr-bg / --rdr-fg（阅读区表面变量的根）。
+ *
+ * 为什么需要：阅读区表面变量（--rdr-surface/-line/-shadow-*）在 app.css 里由
+ * --rdr-bg/--rdr-fg 派生。正常阅读时它们写在 .reader 上（见 Reader.svelte 的
+ * readerVars()，含「仅本书方案」覆盖），但有两类地方拿不到 .reader：
+ *   ① 独立阅读窗 / 独立面板窗（StandaloneBook / StandalonePanel）——整窗就是阅读内容；
+ *   ② portal 到 body 的阅读区浮层（书内搜索）——脱离 .reader 子树。
+ * 这两处都需要一个「阅读主题」而不是「外壳皮肤」的值，否则会出现深色外壳 + 纸色书页
+ * 时浮层渲染成深色小窗的割裂感。
+ *
+ * 取值与 +page.svelte 的 aiRootStyle（独立 AI 窗）同源同法：本书方案拿不到（那属于
+ * Reader 的职责，它会用更精确的值覆盖这里的全局值），故这里只取全局 config.reader。
+ * 派生量（--rdr-surface 等）刻意不在这里写：留在 app.css 由这两个基色推导，改一处即可。
+ */
+function applyReaderSurfaceVars(): void {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  const t = THEMES[config.reader.theme];
+  const bg = config.reader.bgColor || t.bg;
+  const fg = config.reader.fgColor || t.fg;
+  root.style.setProperty("--rdr-bg", bg);
+  root.style.setProperty("--rdr-fg", fg);
 }
 
 // 界面主题响应式生效：uiTheme / 皮肤变化即更新；system 时监听系统切换。
@@ -1949,12 +1981,22 @@ if (typeof window !== "undefined") {
       applyUiTheme();
     });
   });
+  // 阅读配色变化即更新全局 --rdr-bg/-fg（供无 .reader 的阅读窗与 portal 浮层）。
+  $effect.root(() => {
+    $effect(() => {
+      void config.reader.theme;
+      void config.reader.bgColor;
+      void config.reader.fgColor;
+      applyReaderSurfaceVars();
+    });
+  });
   try {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       if (config.uiTheme === "system") applyUiTheme();
     });
   } catch { /* ignore */ }
   applyUiTheme();
+  applyReaderSurfaceVars();
 }
 
 /** 返回一份 reader 默认配置（深拷贝，供设置页回退字体/恢复默认使用）。 */

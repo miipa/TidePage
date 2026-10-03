@@ -1,5 +1,6 @@
 <script lang="ts">
   import { errText, t } from "../lib/i18n/index.svelte";
+import { IconRestore, IconX } from "@tabler/icons-svelte";
   import { untrack } from "svelte";
   import { api } from "../lib/api";
   import { config, convertState, saveConfig, toast } from "../lib/stores.svelte";
@@ -104,7 +105,7 @@
 <div class="modal-body conv">
   <div class="conv-head">
     <h3>{t("convert.title")}</h3>
-    <button class="icon" data-testid="conv-close" title={t("common.action.close")} onclick={close}>×</button>
+    <button class="icon" data-testid="conv-close" title={t("common.action.close")} onclick={close}><IconX /></button>
   </div>
   {#if book}
     <p class="src">{t("convert.sourceFile")} {book.title} · {book.format.toUpperCase()}</p>
@@ -138,10 +139,10 @@
             disabled={!config.reader.conv?.coverPath}
             data-testid="conv-last-cover"
             title={t("convert.reuseCoverTip")}
-          >{t("convert.lastCover")}</button>
+          ><IconRestore />{t("convert.lastCover")}</button>
           {#if coverPath}
             <span class="covername" title={coverPath}>{coverPath.split(/[\\/]/).pop()}</span>
-            <button class="icon" data-testid="conv-clear-cover" title={t("common.action.clear")} onclick={() => (coverPath = "")}>×</button>
+            <button class="icon" data-testid="conv-clear-cover" title={t("common.action.clear")} onclick={() => (coverPath = "")}><IconX /></button>
           {/if}
         </div>
         <p class="tip">{t("convert.coverAutoRemember")}</p>
@@ -175,14 +176,16 @@
   }
 
   .lbl {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
   }
 
   .pill {
     padding: 4px 14px;
-    border-radius: 16px;
-    font-size: 12px;
+    border-radius: var(--radius-xl);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
   }
 
   .pill.active {
@@ -192,21 +195,16 @@
   }
 
   .src {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     margin: 0 0 12px;
     word-break: break-all;
   }
 
-  .tip {
-    font-size: 12px;
-    color: var(--fg2);
-    line-height: 1.7;
-    margin: 4px 0 0;
-  }
-
   .covername {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     white-space: nowrap;
     overflow: hidden;
@@ -216,7 +214,8 @@
 
   textarea {
     font-family: Consolas, monospace;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     resize: vertical;
   }
 

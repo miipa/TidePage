@@ -2,6 +2,7 @@
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api, coverUrl } from "../lib/api";
+import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   import { appConfirm, copyText, toast } from "../lib/stores.svelte";
   import type { BookRow, BookSession } from "../lib/types";
 
@@ -134,7 +135,7 @@
   <div class="bd-panel" role="dialog" aria-label={t("bookDetail.title")}>
     <div class="bd-head">
       <span>{t("bookDetail.title")}</span>
-      <button class="icon" data-testid="bd-close" title={t("common.action.close")} onclick={onclose}>×</button>
+      <button class="icon" data-testid="bd-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>
     </div>
 
     <div class="bd-body">
@@ -151,14 +152,14 @@
           <label>{t("bookDetail.field.title")}</label>
           <div class="bd-row">
             <input data-testid="bd-title" bind:value={title} />
-            <button class="icon" data-testid="bd-copy-title" title={t("bookDetail.copyTitle")} onclick={() => copyText(title).then(() => toast(t("common.toast.copied")))}>⧉</button>
+            <button class="icon" data-testid="bd-copy-title" title={t("bookDetail.copyTitle")} onclick={() => copyText(title).then(() => toast(t("common.toast.copied")))}><IconCopy /></button>
           </div>
         </div>
         <div class="bd-field">
           <label>{t("bookDetail.field.author")}</label>
           <div class="bd-row">
             <input data-testid="bd-author" bind:value={author} placeholder={t("common.unknown")} />
-            <button class="icon" data-testid="bd-copy-author" title={t("bookDetail.copyAuthor")} onclick={() => copyText(author).then(() => toast(t("common.toast.copied")))}>⧉</button>
+            <button class="icon" data-testid="bd-copy-author" title={t("bookDetail.copyAuthor")} onclick={() => copyText(author).then(() => toast(t("common.toast.copied")))}><IconCopy /></button>
           </div>
         </div>
 
@@ -177,8 +178,8 @@
           <label>{t("bookDetail.field.path")}</label>
           <div class="bd-row">
             <input class="path" data-testid="bd-path" value={book.path} readonly />
-            <button class="icon" data-testid="bd-copy-path" title={t("bookDetail.copyPath")} onclick={() => copyText(book.path).then(() => toast(t("bookDetail.pathCopied")))}>⧉</button>
-            <button class="icon" data-testid="bd-reveal" title={t("bookDetail.reveal")} onclick={() => api.revealInExplorer(book.path)}>📂</button>
+            <button class="icon" data-testid="bd-copy-path" title={t("bookDetail.copyPath")} onclick={() => copyText(book.path).then(() => toast(t("bookDetail.pathCopied")))}><IconCopy /></button>
+            <button class="icon" data-testid="bd-reveal" title={t("bookDetail.reveal")} onclick={() => api.revealInExplorer(book.path)}><IconFolderOpen /></button>
           </div>
         </div>
 
@@ -220,19 +221,14 @@
   .bd-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(20, 20, 24, 0.42);
+    background: var(--scrim-strong);
     backdrop-filter: blur(3px) saturate(1.08);
     -webkit-backdrop-filter: blur(3px) saturate(1.08);
-    z-index: 1200;
+    z-index: var(--z-modal);
     display: grid;
     place-items: center;
     padding: 24px;
-    animation: bd-overlay-in 0.24s cubic-bezier(0, 0, 0.2, 1) both;
-  }
-
-  @keyframes bd-overlay-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
+    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
   .bd-panel {
@@ -241,17 +237,12 @@
     background: var(--panel);
     color: var(--fg);
     border: 1px solid var(--line);
-    border-radius: 14px;
-    box-shadow: var(--shadow-lg), var(--edge-hi-soft);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg), var(--edge-hi);
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    animation: bd-panel-in 0.32s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes bd-panel-in {
-    from { opacity: 0; transform: translateY(10px) scale(0.97); filter: blur(6px); }
-    to { opacity: 1; transform: none; filter: blur(0); }
+    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .bd-head {
@@ -276,7 +267,7 @@
     width: 100%;
     aspect-ratio: 2 / 3;
     object-fit: cover;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.14);
     background: var(--panel2);
   }
@@ -287,7 +278,7 @@
     margin-top: 10px;
   }
 
-  .bd-cover-acts button { flex: 1; font-size: 12px; padding: 5px 0; }
+  .bd-cover-acts button { flex: 1; font-size: var(--fs-xs); letter-spacing: var(--ls-xs); padding: 5px 0; }
 
   .bd-right { flex: 1; min-width: 0; }
 
@@ -295,14 +286,15 @@
 
   .bd-field label {
     display: block;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     margin-bottom: 4px;
   }
 
   .bd-row { display: flex; gap: 6px; align-items: center; }
   .bd-row input { flex: 1; min-width: 0; }
-  .bd-row input.path { font-size: 12px; color: var(--fg2); }
+  .bd-row input.path { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); }
 
   .bd-grid {
     display: grid;
@@ -311,13 +303,14 @@
     margin: 12px 0;
   }
 
-  .bd-kv { display: flex; justify-content: space-between; font-size: 13px; }
+  .bd-kv { display: flex; justify-content: space-between; font-size: var(--fs-sm); letter-spacing: var(--ls-sm); }
   .bd-kv span { color: var(--fg2); }
   .bd-kv b { font-weight: 500; }
 
   .bd-sec {
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     margin: 14px 0 8px;
     padding-bottom: 4px;
     border-bottom: 1px solid var(--line);
@@ -332,26 +325,27 @@
 
   .bd-s {
     background: var(--panel2);
-    border-radius: 9px;
+    border-radius: var(--radius-md);
     padding: 8px 6px;
     text-align: center;
   }
 
-  .bd-s b { display: block; font-size: 14px; color: var(--accent); }
-  .bd-s span { font-size: 12px; color: var(--fg2); }
+  .bd-s b { display: block; font-size: var(--fs-md); color: var(--accent); }
+  .bd-s span { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); }
 
   .bd-sessions { max-height: 190px; overflow-y: auto; }
 
   .bd-srow {
     display: flex;
     gap: 12px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     padding: 5px 2px;
     border-bottom: 1px solid var(--line);
   }
 
   .bd-day { width: 92px; color: var(--fg2); }
-  .bd-empty { padding: 18px; text-align: center; color: var(--fg2); font-size: 13px; }
+  .bd-empty { padding: 18px; text-align: center; color: var(--fg2); font-size: var(--fs-sm); letter-spacing: var(--ls-sm); }
 
   .bd-foot {
     display: flex;

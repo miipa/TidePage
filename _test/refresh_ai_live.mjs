@@ -42,7 +42,9 @@ await M.evalJs(H(`
 `));
 await sleep(4500);
 await M.evalJs(H(`
-  for (let i=0;i<80 && !document.querySelector('.library');i++){ const b=[...document.querySelectorAll('.topbar button')].find(x=>x.textContent.includes('←')); if(b)b.click(); else break; await sleep(150); }
+  // Same as refresh_live.mjs: back button is an icon, locate it by data-testid; explicit throw instead of silent break.
+  for (let i=0;i<80 && !document.querySelector('.library');i++){ const b=document.querySelector('[data-testid="reader-back"]'); if(!b) throw new Error('no reader-back'); b.click(); await sleep(150); }
+  if(!document.querySelector('.library')) throw new Error('never reached library');
   return { apiKey: cfgRead().ai.profiles[0].apiKey, baseUrl: cfgRead().ai.profiles[0].baseUrl };
 `)).then((v) => (out.configAtRefresh = v));
 

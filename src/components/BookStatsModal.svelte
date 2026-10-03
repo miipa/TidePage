@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n/index.svelte";
+import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { dragOutHandle } from "../lib/windowSnap";
@@ -90,17 +91,17 @@
   <div class="sp-head" data-testid="bsm-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
     <span>{t("bookStats.title")}</span>
     <div style="display:flex; gap:6px; align-items:center;">
-      {#if onpopout}<button class="icon" data-testid="bsm-popout" title={t("common.panel.popout")} onclick={onpopout}>⧉</button>{/if}
-      {#if onclose}<button class="icon" data-testid="bsm-close" title={t("common.action.close")} onclick={onclose}>×</button>{/if}
+      {#if onpopout}<button class="icon" data-testid="bsm-popout" title={t("common.panel.popout")} onclick={onpopout}><IconArrowsSplit2 /></button>{/if}
+      {#if onclose}<button class="icon" data-testid="bsm-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
   </div>
   <div class="stats-body">
     {#if !loaded}
-      <div class="empty">{t("common.loading")}</div>
+      <div class="empty-state">{t("common.loading")}</div>
     {:else}
       <div class="book-title">{bookTitle}</div>
       {#if !wc}
-        <div class="empty">{t("bookStats.calculating")}</div>
+        <div class="empty-state">{t("bookStats.calculating")}</div>
       {:else}
       <div class="summary">
         <div class="sum-item">
@@ -130,7 +131,7 @@
       </div>
 
       {#if !sessions.length}
-        <div class="empty">{t("bookStats.empty")}</div>
+        <div class="empty-state">{t("bookStats.empty")}</div>
       {:else}
       {#each groups as g (g.day)}
         <div class="day-block">
@@ -155,43 +156,16 @@
 </div>
 
 <style>
-  .sidepanel {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 340px;
-    background: color-mix(in srgb, var(--rdr-bg) 94%, black 6%);
-    border-left: 1px solid rgba(128, 128, 128, 0.2);
-    z-index: 40;
-    display: flex;
-    flex-direction: column;
-    box-shadow: -6px 0 18px rgba(0, 0, 0, 0.08), -18px 0 48px rgba(0, 0, 0, 0.14);
-    animation: slide-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
-  }
-
-  @keyframes slide-in {
-    from { transform: translateX(24px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  .sp-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    font-weight: 600;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  }
-
+  /* .sidepanel / .sp-head 走 app.css 的全局基类。 */
   .stats-body {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 16px;
+    padding: var(--sp-3) var(--sp-4);
   }
 
   .book-title {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     font-weight: 600;
     opacity: 0.8;
     margin-bottom: 10px;
@@ -202,26 +176,29 @@
 
   .summary {
     display: flex;
-    gap: 8px;
+    gap: var(--sp-2);
     margin-bottom: 14px;
   }
 
   .sum-item {
     flex: 1;
-    background: rgba(128, 128, 128, 0.1);
-    border-radius: 10px;
-    padding: 10px 6px;
+    background: color-mix(in srgb, var(--rdr-fg) 7%, transparent);
+    border-radius: var(--radius-md);
+    padding: 10px var(--sp-1);
     text-align: center;
   }
 
+  /* 统计数值：等宽对齐，避免刷新时数字左右跳动 */
   .sum-item .v {
-    font-size: 16px;
+    font-size: var(--fs-lg);
     font-weight: 700;
     color: var(--accent);
+    font-variant-numeric: tabular-nums;
   }
 
   .sum-item .k {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.65;
     margin-top: 3px;
   }
@@ -230,40 +207,40 @@
     margin-bottom: 14px;
   }
 
+  /* 虚线只用于「按日期分组的组标题」这一种用途 */
   .day-head {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    padding: 4px 0;
-    border-bottom: 1px dashed rgba(128, 128, 128, 0.25);
+    padding: var(--sp-1) 0;
+    border-bottom: 1px dashed var(--rdr-line);
   }
 
   .day {
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
     font-weight: 600;
+    font-variant-numeric: tabular-nums;
   }
 
   .day-sum {
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     opacity: 0.6;
+    font-variant-numeric: tabular-nums;
   }
 
   .s-row {
     display: flex;
     gap: 10px;
     padding: 5px 2px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    font-variant-numeric: tabular-nums;
   }
 
   .s-time { width: 44px; opacity: 0.7; }
   .s-len { width: 56px; }
   .s-chars { flex: 1; }
   .s-speed { opacity: 0.7; }
-
-  .empty {
-    padding: 30px 10px;
-    text-align: center;
-    opacity: 0.55;
-    line-height: 1.8;
-  }
 </style>

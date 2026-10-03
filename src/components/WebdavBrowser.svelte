@@ -2,7 +2,22 @@
   import { dateLocale, t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { IconClipboard, IconCopy, IconCut, IconTrash } from "@tabler/icons-svelte";
+  import {
+  IconClipboard,
+  IconCopy,
+  IconCut,
+  IconFileText,
+  IconFolder,
+  IconFolderUp,
+  IconHome,
+  IconLoader2,
+  IconPlugConnected,
+  IconRefresh,
+  IconSortAscending,
+  IconSortDescending,
+  IconTrash,
+  IconX,
+} from "@tabler/icons-svelte";
   import { api } from "../lib/api";
   import { config, saveConfig, toast, ui } from "../lib/stores.svelte";
 
@@ -296,21 +311,21 @@
 <div class="wd-browse" bind:this={browseEl}>
   <div class="wd-head">
     <span class="wd-title">{t("library.topbar.webdav.label")}</span>
-    <button class="icon" data-testid="wd-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (ui.webdavOpen = false)}>×</button>
+    <button class="icon" data-testid="wd-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (ui.webdavOpen = false)}><IconX /></button>
   </div>
 
   {#if !configReady}
-    <div class="wd-empty-cfg">
-      <div class="wd-empty-ico">🔌</div>
+    <div class="wd-empty-cfg wd-state">
+      <div class="wd-empty-ico"><IconPlugConnected /></div>
       <p class="wd-empty-t">{t("webdav.notConfigured")}</p>
       <p class="wd-empty-d">{t("webdav.notConfiguredHint")}</p>
     </div>
   {:else}
     <!-- 工具行：导航 + 当前路径 + 排序控件（窄抽屉下自动换行，路径省略号不撑破） -->
     <div class="wd-tools">
-      <button class="wd-btn" data-testid="wd-root" onclick={() => load("")} disabled={!path} title={t("webdav.rootDir")} aria-label={t("webdav.rootDir")}>⌂</button>
-      <button class="wd-btn" data-testid="wd-up" onclick={up} disabled={!hasUp} title={t("webdav.parentDir")} aria-label={t("webdav.parentDir")}>↑</button>
-      <button class="wd-btn" data-testid="wd-refresh" onclick={() => load()} title={t("webdav.refreshDir")} aria-label={t("common.action.refresh")}>⟳</button>
+      <button class="wd-btn" data-testid="wd-root" onclick={() => load("")} disabled={!path} title={t("webdav.rootDir")} aria-label={t("webdav.rootDir")}><IconHome /></button>
+      <button class="wd-btn" data-testid="wd-up" onclick={up} disabled={!hasUp} title={t("webdav.parentDir")} aria-label={t("webdav.parentDir")}><IconFolderUp /></button>
+      <button class="wd-btn" data-testid="wd-refresh" onclick={() => load()} title={t("webdav.refreshDir")} aria-label={t("common.action.refresh")}><IconRefresh /></button>
       {#if clipboard}
         <button class="wd-btn" data-testid="wd-paste" onclick={paste} title={t("webdav.pasteHereTip", { name: clipboard.name })} aria-label={t("webdav.pasteHereAria")}>{t("common.action.paste")}</button>
       {/if}
@@ -327,7 +342,7 @@
         data-testid="wd-sortdir"
         title={sortDir === "asc" ? t("webdav.ascTip") : t("webdav.descTip")}
         aria-label={t("webdav.toggleOrderAria")}
-      >{sortDir === "asc" ? "↑" : "↓"}</button>
+      >{#if sortDir === "asc"}<IconSortAscending />{:else}<IconSortDescending />{/if}</button>
       <label class="wd-check" title={t("webdav.dirsFirstTip")}>
         <input type="checkbox" bind:checked={foldersFirst} /> {t("webdav.foldersFirst")}
       </label>
@@ -341,7 +356,7 @@
 
     <div class="wd-list" oncontextmenu={onListCtx} role="presentation">
       {#if loading || (!attempted && !error)}
-        <div class="wd-state"><span class="wd-spin">⟳</span> {t("common.loading")}</div>
+        <div class="wd-state"><span class="wd-spin"><IconLoader2 /></span> {t("common.loading")}</div>
       {:else if error}
         <div class="wd-state wd-state-error">
           <div class="wd-err-msg">{t("webdav.listFailed")}{error}</div>
@@ -353,12 +368,12 @@
         {#each sortedEntries as e (path + "/" + e.name + String(e.size))}
           {#if e.is_dir}
             <button class="wd-row wd-dir" onclick={() => openEntry(e)} oncontextmenu={(ev) => openCtx(ev, e)}>
-              <span class="wd-ico">📁</span>
+              <span class="wd-ico"><IconFolder /></span>
               <span class="wd-name" title={e.name}>{e.name}</span>
             </button>
           {:else}
             <div class="wd-row" oncontextmenu={(ev) => openCtx(ev, e)} role="presentation">
-              <span class="wd-ico">📄</span>
+              <span class="wd-ico"><IconFileText /></span>
               <span class="wd-name" title={e.name}>{e.name}</span>
               <span class="wd-meta">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span>
               <button class="wd-dl-btn" onclick={() => download(e)} disabled={activeDownloads >= 3}>
@@ -389,14 +404,14 @@
   {/if}
 
   {#if ctxMenu}
-    <div class="ctx" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
+    <div class="ctx ctx-menu" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;">
       {#if ctxMenu.entry}
-        <button data-testid="wd-ctx-copy" onclick={() => setClip("copy", ctxMenu!.entry!)}><span class="ci"><IconCopy size={17} stroke={1.75} /></span>{t("common.action.copy")}</button>
-        <button data-testid="wd-ctx-move" onclick={() => setClip("move", ctxMenu!.entry!)}><span class="ci"><IconCut size={17} stroke={1.75} /></span>{t("webdav.move")}</button>
+        <button class="ctx-item" data-testid="wd-ctx-copy" onclick={() => setClip("copy", ctxMenu!.entry!)}><span class="ci"><IconCopy size={16} stroke={1.5} /></span>{t("common.action.copy")}</button>
+        <button class="ctx-item" data-testid="wd-ctx-move" onclick={() => setClip("move", ctxMenu!.entry!)}><span class="ci"><IconCut size={16} stroke={1.5} /></span>{t("webdav.move")}</button>
         <div class="ctx-sep"></div>
-        <button class="danger" data-testid="wd-ctx-del" onclick={() => { confirmDel = ctxMenu!.entry!; ctxMenu = null; }}><span class="ci"><IconTrash size={17} stroke={1.75} /></span>{t("common.action.delete")}</button>
+        <button class="ctx-item danger" data-testid="wd-ctx-del" onclick={() => { confirmDel = ctxMenu!.entry!; ctxMenu = null; }}><span class="ci"><IconTrash size={16} stroke={1.5} /></span>{t("common.action.delete")}</button>
       {:else}
-        <button data-testid="wd-ctx-paste" onclick={paste} disabled={!clipboard}><span class="ci"><IconClipboard size={17} stroke={1.75} /></span>{t("webdav.pasteHere")}</button>
+        <button class="ctx-item" data-testid="wd-ctx-paste" onclick={paste} disabled={!clipboard}><span class="ci"><IconClipboard size={16} stroke={1.5} /></span>{t("webdav.pasteHere")}</button>
       {/if}
     </div>
   {/if}
@@ -438,38 +453,39 @@
 
   .wd-title {
     font-weight: 600;
-    font-size: 16px;
+    font-size: var(--fs-lg);
+    letter-spacing: var(--ls-md);
   }
 
-  /* ---- 未配置空状态 ---- */
+  /* ---- 未配置空状态 ----
+     保留自己的结构（🔌 插图 + 标题 + 描述），但外层用全局 .wd-state 的排版规格，
+     字号/行高不再各写一份。插图沿用 emoji（换 Tabler 图标属下一轮图标统一的工作）。 */
   .wd-empty-cfg {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
     gap: 10px;
     text-align: center;
-    padding: 0 24px;
   }
 
   .wd-empty-ico {
-    font-size: 34px;
+    line-height: 1;
     opacity: 0.7;
   }
 
+
   .wd-empty-t {
     margin: 0;
-    font-size: 15px;
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
     font-weight: 600;
+    color: var(--fg);
   }
 
   .wd-empty-d {
     margin: 0;
-    font-size: 13px;
-    line-height: 1.7;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    line-height: 1.8;
     color: var(--fg2);
-    max-width: 320px;
+    max-width: 42ch;
   }
 
   /* ---- 工具行 ---- */
@@ -488,7 +504,8 @@
 
   .wd-path {
     font-family: Consolas, monospace;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -500,10 +517,11 @@
 
   .wd-btn {
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     line-height: 1.4;
     border: 1px solid var(--line);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--panel2);
     color: var(--fg);
     cursor: pointer;
@@ -520,9 +538,10 @@
 
   .wd-sel {
     padding: 4px 8px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     border: 1px solid var(--line);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--panel2);
     color: var(--fg);
     cursor: pointer;
@@ -532,7 +551,8 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     white-space: nowrap;
     cursor: pointer;
@@ -548,7 +568,8 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     margin-bottom: 10px;
   }
 
@@ -572,19 +593,25 @@
     min-height: 0;
     overflow-y: auto;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 4px;
+    border-radius: var(--radius-md);
+    padding: var(--sp-1);
   }
 
+  /* 列表行规格对齐 .sp-item：行间分隔统一走 border-bottom + 发丝边，hover 走 --hover-row */
   .wd-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--sp-2);
     width: 100%;
     box-sizing: border-box;
-    padding: 7px 8px;
-    border-radius: 6px;
+    padding: 7px var(--sp-2);
+    border-radius: var(--radius-sm);
+    border-bottom: 1px solid var(--line-soft);
     text-align: left;
+  }
+
+  .wd-list .wd-row:last-child {
+    border-bottom: none;
   }
 
   /* 目录行为 <button>：清除按钮默认样式，保留可点击观感 */
@@ -596,21 +623,20 @@
     cursor: pointer;
   }
 
-  .wd-row + .wd-row {
-    border-top: 1px solid rgba(128, 128, 128, 0.12);
+  button.wd-row:hover {
+    background: var(--hover-row);
   }
-
-  .wd-row:hover {
-    background: var(--panel2);
+  /* 父按钮的 transition 不会级联到子元素，所以这条自己声明 */
+  .wd-name {
+    transition: color var(--dur-fast) var(--ease);
   }
-
   .wd-dir:hover .wd-name {
     color: var(--accent);
   }
 
   .wd-ico {
     flex: 0 0 auto;
-    font-size: 14px;
+    font-size: var(--fs-xs);
   }
 
   .wd-name {
@@ -621,19 +647,24 @@
     white-space: nowrap;
   }
 
+  /* 文件大小 / 修改时间：等宽对齐 */
   .wd-meta {
     flex: 0 0 auto;
     opacity: 0.5;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
   .wd-dl-btn {
     flex: 0 0 auto;
     padding: 3px 10px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    min-height: var(--ctl-h-sm);
     border: 1px solid var(--line);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--panel2);
     color: var(--fg);
     cursor: pointer;
@@ -656,11 +687,13 @@
     justify-content: center;
     gap: 10px;
     min-height: 120px;
-    padding: 20px;
-    font-size: 13px;
-    color: var(--fg2);
+    padding: 48px var(--sp-4);
     text-align: center;
+    color: var(--fg2);
   }
+
+  /* 带 🔌 插图 + 标题 + 描述的空状态（.wd-empty-cfg）保留自己的结构，
+     排版规格（字号/字距/行高）与本区块一致，不再另写一份。 */
 
   .wd-state-error .wd-err-msg {
     color: var(--danger);
@@ -672,38 +705,38 @@
     padding: 5px 18px;
   }
 
+  /* 加载中：旋转的 IconLoader2。用全局 fr-spin（取代原先组件内的 wd-rotate），
+     这样「循环动画」在本项目只有一处定义。 */
   .wd-spin {
-    display: inline-block;
-    animation: wd-rotate 1s linear infinite;
+    display: inline-flex;
+    animation: fr-spin 1s linear infinite;
   }
 
-  @keyframes wd-rotate {
-    to { transform: rotate(360deg); }
-  }
 
   /* ---- 下载进度 ---- */
   .wd-dlbox {
     margin-top: 10px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--sp-2);
     max-height: 40%;
     overflow-y: auto;
   }
 
   .wd-dl {
     border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 8px 10px;
+    border-radius: var(--radius-md);
+    padding: var(--sp-2) 10px;
     background: var(--panel2);
   }
 
   .wd-dl-top {
     display: flex;
     justify-content: space-between;
-    gap: 8px;
-    font-size: 12px;
-    margin-bottom: 6px;
+    gap: var(--sp-2);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    margin-bottom: var(--sp-1);
   }
 
   .wd-dl-name {
@@ -712,150 +745,71 @@
     white-space: nowrap;
   }
 
-  .wd-dl-state.ok { color: #2e8b57; font-weight: 600; }
+  .wd-dl-state { font-variant-numeric: tabular-nums; }
+  .wd-dl-state.ok { color: var(--success); font-weight: 600; }
   .wd-dl-state.bad { color: var(--danger); font-weight: 600; }
 
-  .wd-bar {
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(128, 128, 128, 0.18);
-    overflow: hidden;
-  }
-
-  .wd-bar-fill {
-    height: 100%;
-    border-radius: 3px;
-    background: linear-gradient(90deg, var(--accent), #3fae7a);
-    background-size: 200% 100%;
-    transition: width 0.25s ease;
-    animation: wd-slide 1.6s linear infinite;
-  }
-
-  .wd-bar-fill.fin {
-    background: #2e8b57;
-    animation: none;
-  }
-
-  .wd-bar-fill.fail {
-    background: var(--danger);
-    animation: none;
-  }
+  /* .wd-bar / .wd-bar-fill 的轨道与填充规格走 app.css 的全局进度条
+     （填充色 / 成功态 / 失败态也在那里），此处不再重写。 */
 
   .wd-dl-err {
-    margin-top: 6px;
-    font-size: 12px;
+    margin-top: var(--sp-1);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--danger);
     word-break: break-all;
     max-height: 44px;
     overflow-y: auto;
   }
 
-  @keyframes wd-slide {
-    from { background-position: 200% 0; }
-    to { background-position: -200% 0; }
-  }
-
-  /* ---------- 右键菜单（观感照 Library 的 .ctx） ---------- */
-  .ctx {
-    position: absolute;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
-    box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.28));
-    padding: 6px;
-    min-width: 168px;
-    z-index: 30;
-    transform-origin: top left;
-    animation: wd-ctx-in 0.18s ease;
-  }
-
-  @keyframes wd-ctx-in {
-    from { opacity: 0; transform: translateY(-6px) scale(0.96); }
-    to { opacity: 1; transform: none; }
-  }
-
-  .ctx button {
-    border: none;
-    background: transparent;
-    text-align: left;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 12px 7px 10px;
-    border-radius: var(--radius-sm, 8px);
-    font-size: var(--fs-sm, 13px);
-    color: var(--fg);
-    cursor: pointer;
-  }
-
-  .ctx .ci {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0.85;
-  }
-
-  .ctx-sep {
-    height: 1px;
-    margin: 5px 8px;
-    background: var(--line);
-  }
-
-  .ctx button:hover { background: var(--accent-soft, var(--hover-bg)); }
-  .ctx button:disabled { opacity: 0.42; cursor: default; }
-  .ctx button.danger { color: var(--danger); }
-  .ctx button.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
-
   /* ---------- 面板内删除确认（仅覆盖 webdav 面板区域） ---------- */
   .wd-confirm-wrap {
     position: absolute;
     inset: 0;
-    z-index: 20;
+    z-index: var(--z-overlay);
     display: grid;
     place-items: center;
-    padding: 16px;
+    padding: var(--sp-4);
   }
 
-  /* 遮罩做成 <button> 以关闭且不引入 a11y 告警；用 !important 压过全局 button:hover 背景 */
+  /* 遮罩做成 <button> 以关闭且不引入 a11y 告警；用 !important 压过全局 button:hover 背景。
+     删除确认需要更强聚焦，故走 --scrim-strong（常规模态/抽屉用 --scrim）。 */
   .wd-confirm-mask {
     position: absolute;
     inset: 0;
     margin: 0;
     padding: 0;
     border: none;
-    background: rgba(0, 0, 0, 0.35) !important;
+    background: var(--scrim-strong) !important;
     cursor: default;
   }
 
   .wd-confirm {
     position: relative;
-    z-index: 1;
+    z-index: var(--z-base);
     box-sizing: border-box;
     width: min(320px, 100%);
     background: var(--panel);
     color: var(--fg);
     border: 1px solid var(--line);
-    border-radius: var(--radius, 12px);
-    box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.28));
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
     padding: 18px;
+    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .wd-confirm-t {
     margin: 0 0 8px;
-    font-size: 14px;
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
     font-weight: 600;
     word-break: break-all;
   }
 
   .wd-confirm-s {
     margin: 0 0 4px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
     color: var(--fg2);
     line-height: 1.6;
   }

@@ -1,6 +1,6 @@
 import { activeTtsService, config, saveConfig, toast } from "./stores.svelte";
 import { api } from "./api";
-import { t } from "./i18n/index.svelte";
+import { aiErrDetail, t } from "./i18n/index.svelte";
 
 export interface FlatSegment {
   /** 用于朗读的文本（已去首尾空白） */
@@ -478,10 +478,20 @@ async function retryAudio(text: string, g: number): Promise<string | null> {
 }
 
 function failOnline(err: unknown) {
+  // tts_synth / tts_voices 回来的也是 AiError（{kind, code, message}）：
+  // code 命中译文时整句用译文（已含类别描述），否则沿用原来的 kind + 原始 message。
+  const o = (err && typeof err === "object" ? err : {}) as { kind?: unknown; code?: unknown; message?: unknown };
+  const coded = aiErrDetail({
+    kind: typeof o.kind === "string" ? o.kind : "unknown",
+    code: typeof o.code === "string" ? o.code : "",
+    message: typeof o.message === "string" ? o.message : String(err),
+  });
   const msg =
-    err && typeof err === "object" && "message" in err
-      ? String((err as { message: unknown }).message)
-      : String(err);
+    coded !== null
+      ? coded
+      : err && typeof err === "object" && "message" in err
+        ? String((err as { message: unknown }).message)
+        : String(err);
   if (!onlineWarned) {
     onlineWarned = true;
     toast(t("tts.onlineFailed", { msg }), "error");
