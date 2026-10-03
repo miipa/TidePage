@@ -91,6 +91,30 @@ fn sniff_mime(b: &[u8]) -> &'static str {
     }
 }
 
+/// `tidepage://` 各资源前缀的 HTTP 缓存策略（`None` = 不设，走启发式缓存）。
+///
+/// - `epubimg/`、`res/`、`covers/`、`book-cover/`、`cover-default/`：URL 由内容本身决定
+///   （book_id + zip 内路径 / 提取文件名 / 封面文件名，封面端点还带 `v=cover_ver`、`db=`），
+///   换图必换 URL，故可长期 immutable。漫画窗口重建 `.manga-block` 时能直接命中缓存，
+///   不必反复重新解压 zip 条目、重新下载与重新解码同一张几百 KB 的图。
+/// - `bg/`：阅读器背景图 URL 不含任何版本分量（用户换背景不换 URL），只能给短缓存。
+/// - 其余（`fonts/` 等）不设：字体/未知资源保持原行为。
+fn cache_control_for(path: &str) -> Option<&'static str> {
+    const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+    if path.starts_with("epubimg/")
+        || path.starts_with("res/")
+        || path.starts_with("covers/")
+        || path.starts_with("book-cover/")
+        || path.starts_with("cover-default/")
+    {
+        return Some(IMMUTABLE);
+    }
+    if path.starts_with("bg/") {
+        return Some("public, max-age=60");
+    }
+    None
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -434,6 +458,14 @@ pub fn run() {
             if path.starts_with("fonts/") {
                 builder = builder.header("Access-Control-Allow-Origin", "*");
             }
+            // 图片类 URL 由内容本身决定，可长期缓存：epubimg/<book_id>/<b64url(zip内路径)> 与
+            // res/<book_id>/<提取文件名> 只在书内图片被替换（重新导入该书）时才变；covers/ 与
+            // book-cover/<id>?v=<coverVer>、cover-default/<id>?…&db=<n> 的 URL 自带版本参数。
+            // 目的：被重建的 .manga-block 直接命中内存/磁盘缓存，避免同一张几百 KB 的图反复
+            // 重新解压 zip 条目、重新下载与重新解码。
+            if let Some(cc) = cache_control_for(path) {
+                builder = builder.header("Cache-Control", cc);
+            }
             builder.body(bytes).unwrap()
         })
         .invoke_handler(tauri::generate_handler![
@@ -541,4 +573,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_paths_are_immutably_cached() {
+        for p in [
+            "epubimg/42/aW1nLzAucG5n",
+            "res/42/r00001.jpg",
+            "covers/a.png",
+            "book-cover/42",
+            "cover-default/42",
+        ] {
+            assert_eq!(
+                cache_control_for(p),
+                Some("public, max-age=31536000, immutable"),
+                "{p} 应长期缓存"
+            );
+        }
+        // 背景图 URL 无版本分量，只能短缓存
+        assert_eq!(cache_control_for("bg/a.png"), Some("public, max-age=60"));
+        // 字体等保持原行为
+        assert_eq!(cache_control_for("fonts/a.ttf"), None);
+        assert_eq!(cache_control_for("other"), None);
+    }
 }
