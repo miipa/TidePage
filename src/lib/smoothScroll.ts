@@ -52,6 +52,15 @@ export class SmoothScroller {
     this.pending = 0;
   }
 
+  /**
+   * 丢弃当前越界量（窗口补齐后的续章调用方用它避免回弹一帧）。
+   * 目标落点不变，只把累加器与回弹位移清零——既消除视觉回弹，又保留真实滚动位置。
+   */
+  consumeEdge() {
+    this.over = 0;
+    this.pending = 0;
+  }
+
   jumpTo(pos: number, immediate = true) {
     this.target = Math.max(0, Math.min(pos, this.max));
     this.over = 0;
