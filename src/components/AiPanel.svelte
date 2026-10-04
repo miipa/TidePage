@@ -5,6 +5,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
   import { esc, mdToHtml } from "../lib/md";
+import { fontStack } from "../lib/fontfaces";
   import { dragSort } from "../lib/dragSort";
   import {
     IconArrowsSplit2,
@@ -394,17 +395,9 @@
     };
   });
 
-  function fontStack(raw: string, latinFirst?: string): string {
-    const norm = (list: string[]) => list
-      .map((x) => x.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean)
-      .map((x) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(x) ? x : `"${x}"`))
-      .join(", ");
-    const base = norm((raw || "").split(","));
-    const latin = norm([latinFirst || ""]);
-    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
-    return base ? `${latin}, ${base}` : latin;
-  }
+  /* fontStack 已移到 src/lib/fontfaces.ts 与 Reader 共用一份：原先这里是与 Reader 逐字相同的
+     副本（同为零回退、改一处漏一处），两份同名同实现的函数正是本轮要根治的问题。
+     --ai-font 的消费点不变：正常路径零视觉变化，只在字体缺失 / 加载失败时才有差别。 */
 
   const readerVars = $derived(
     `--ai-font:${fontStack(readerStyle.font, readerStyle.latin)};--ai-fs:${readerStyle.size}px;--ai-lh:${readerStyle.lh};` +

@@ -38,7 +38,7 @@
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
 import { prefersReducedMotion } from "../lib/reducedMotion";
-  import { preloadReaderFonts } from "../lib/fontfaces";
+  import { preloadReaderFonts, fontStack } from "../lib/fontfaces";
   import {
     charRangeToRange,
     clearTtsMark,
@@ -2935,18 +2935,6 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     };
   });
 
-  function fontStack(raw: string, latinFirst?: string): string {
-    const norm = (list: string[]) => list
-      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean)
-      .map((s) => (/^[A-Za-z][A-Za-z0-9-]*$/.test(s) ? s : `"${s}"`))
-      .join(", ");
-    const base = norm((raw || "").split(","));
-    const latin = norm([latinFirst || ""]);
-    if (!latin) return base || '"Microsoft YaHei", "Segoe UI", sans-serif';
-    return base ? `${latin}, ${base}` : latin;
-  }
-
   /** 当前书的有效阅读底色 / 字色（本书方案 > 全局 config.reader > 主题预设；漫画模式可用独立底色）。 */
   function readerColors(): { bg: string; fg: string } {
     const t = THEMES[effTheme()];
@@ -3063,9 +3051,35 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // （固定视口层承载边距 + 内容变形层平移/滚动），不再依赖会随 transform 移动的 #chapter-content padding。
     const hideTextRule = isMangaMode() && r.manga.hideText // i18n-allow:算法输入：下面模板里带中文的是注入样式表的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
       ? `
-/* 漫画模式「仅图片」：隐藏不含图片的文本块 */
-.reader.manga #chapter-content :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
-`
+/* 漫画模式「仅图片」：隐藏纯文字块。
+     ⚠️ 作用域必须是漫画的画布容器，不能写 #chapter-content —— 漫画横向（.manga-h-canvas）
+     与瀑布流（.manga-flow-canvas）两种布局的模板里都没有 #chapter-content 这层包裹
+     （本文件 .manga-flow-canvas 的样式注释里也写明了这一点），旧选择器因此永远匹配不到
+     任何元素：这个开关按下去一直没反应。现在按容器作用域写，两种布局都命中。
+
+     为什么【只隐藏文字标签、不隐藏 div】：隐藏目标是「一段文字」，不是「一个容器」。
+     早期版本把 div 也列进 :is()，看着更彻底，实则制造了一个能把整页吃掉的失效模式 ——
+     用 background-image 做图的漫画（老一些的中文扫描组常见写法）里，页面容器是 div 且
+     子树里没有任何 img/svg/video 标签，于是整页被隐藏 → 空白页。而本规则此前的状态是
+     「死开关、任何书都安全地什么都不发生」，直接套用宽选择器等于把「功能不生效」的风险
+     换成「部分书白页」—— 后者严重得多。
+     去掉 div 之后：一个用背景图做页的容器不再是隐藏目标，整页永远不会被隐藏（白页风险
+     归零），而它内部的 <span>/<p> 文字仍会被隐藏 —— 这正是「仅显示图片」该做的事。
+
+     ⚠️ 这里有一个**有意的取舍**：译注若被包在第二层 <div> 里（div 不再是目标），那层
+     容器里的文字会**留下来**。我们选择「多留一点文字」而不是「整页空白」—— 前者只是
+     功能不够彻底，后者是内容丢失。
+
+     :has() 仍然全深度匹配，所以「任何一棵含媒体的子树」天然豁免，不会连带隐藏含图的
+     分支；含 picture 的结构（<picture><source><img>）也被视为有媒体。
+     整章无图时那个 .manga-block div 不再被隐藏，会留下一个空块 —— 这是有意的：空块
+     保留了章与章之间的间距感（早期版本会把它藏掉、让相邻两章贴在一起）。
+
+     .reader 模板上那个 class:hide-text 目前仍无 CSS 消费者：本规则已按容器作用域表达，
+     它是冗余的，保留只为可读性（历史上它是这个开关的落点标记）。 */
+  /* 漫画模式「仅图片」：隐藏纯文字块 */
+  .reader.manga :is(.manga-h-canvas, .manga-flow-canvas) :is(p,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video,picture)) { display: none !important; }
+  `
       : "";
     // i18n-allow:算法输入：注入样式表里的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
     return `
