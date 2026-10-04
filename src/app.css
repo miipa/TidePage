@@ -30,7 +30,16 @@
   --sp-4: 16px;
 
   /* ---- 圆角阶梯（互不相同，按尺寸分角色；50% 另用于进度环/头像）----
-     xs 极小装饰块 / sm 控件 / md 卡片下拉 / lg 弹窗 / xl 大面板 / pill 仅芯片与药丸 */
+     xs 极小装饰块 / sm 控件 / md 卡片下拉 / lg 弹窗 / xl 大面板 / pill 仅芯片与药丸
+
+     ⚠️⚠️ --radius-pill 的适用边界（写死，别再铺开）：
+     只给【标签、徽章、分段控件的段、芯片】—— 即「标注一个事物是什么」的小容器。
+     动作按钮（主/次/危险）走 --radius-sm(6px)，输入框 --radius-sm，卡片 --radius-lg。
+     依据：药丸是「胶囊形容器」的语义。给动作按钮用会让一排同级按钮失去形状层级，
+     读起来像标签而不是能按的东西（minimalist-ui 明确禁 large container / card /
+     primary button 用 rounded-full；Linear 里 pill 也只出现在 pricing-tab 与
+     status-badge 两处）。唯一该保留药丸的「容器」是轨道上的一段：分段控件与
+     设置左侧导航项。 */
   --radius-xs: 4px;
   --radius-sm: 6px;
   --radius-md: 8px;
@@ -73,6 +82,10 @@
   --icon-sm: 16px; /* 按钮内 / 导航项图标 */
   --icon-md: 20px; /* 工具栏主图标、关闭类按钮 */
 --icon-lg: 28px; /* 大号目标：图片浏览灯箱的前后翻页箭头（容器 46×76）*/
+  /* 空状态插图：刻意单开一档，不并入上面的控件阶梯。空状态自带 48px 以上的大留白，
+     把 14px 的内联图标放大到那一档会缩成「一个点」，20px 仍偏小；
+     而且它是插图不是控件，混进控件阶梯会破坏「图标尺寸随容器走」的直觉。 */
+  --icon-empty: 30px;
   --icon-stroke: 1.5; /* 全应用唯一样条描边值（见下方 .tabler-icon）*/
 
   /* ---- 滚动条 ---- */
@@ -133,8 +146,40 @@
   --rdr-surface: color-mix(in srgb, var(--rdr-bg) 94%, var(--rdr-fg));
   --rdr-line: color-mix(in srgb, var(--rdr-fg) 22%, transparent);
   --rdr-radius: var(--radius-md);
-  --rdr-shadow-pop: var(--shadow-md);
-  --rdr-shadow-panel: var(--shadow-drawer);
+  /* 阅读区投影一律由 --rdr-fg 派生，与外壳皮肤无关（--shadow-* 由 applyUiTheme()
+     按皮肤前景色重算，别名过去就等于「换皮肤时这本书的浮层投影跟着变」）。
+     下面的配方与 Reader.svelte 的 readerSurfaceVars() 逐字相同，改一处必须改两处。
+     派生方向自动正确：阅读字色在浅色主题是深字（向下的暗影）、深色主题是浅字（微光）。 */
+  --rdr-shadow-pop: 0 2px 2px color-mix(in srgb, var(--rdr-fg) 8%, transparent),
+    0 8px 8px -4px color-mix(in srgb, var(--rdr-fg) 12%, transparent);
+  --rdr-shadow-panel: 0 2px 2px color-mix(in srgb, var(--rdr-fg) 8%, transparent),
+    0 16px 32px -8px color-mix(in srgb, var(--rdr-fg) 14%, transparent);
+  --rdr-shadow-sm: 0 1px 2px color-mix(in srgb, var(--rdr-fg) 26%, transparent);
+  /* 阅读区的「强调 / 次要色 / 悬停 / 按下」也在这里派生，与上面同一份推导。
+     纪律：阅读区一律不引用外壳令牌（--accent/--fg2/--hover-bg…），否则换 UI 皮肤会
+     改动正在读的这本书的观感。推导只能走 --rdr-bg / --rdr-fg，故阅读区的强调色是
+     「阅读字色压向底色」得到的中性深（浅色主题）/ 中性亮（深色主题）。
+
+     ⚠️⚠️ 别去 stores.svelte.ts 的 UI_SKINS 里找「每套阅读主题配好的 accent/accentFg」
+     （#3A2A20 / #1E7A55 / #5B93E6…）—— 那一对是【外壳皮肤】的，10 套壳与阅读正文配色
+     在那份表的注释里就写明「完全解耦」。THEMES（阅读主题）只有 { bg, fg, sel } 三个字段，
+     没有 accent。所以阅读区的强调色目前只能是阅读字色的派生值；
+     若要让每套阅读主题有自己的品牌色，第一步是给 THEMES 增字段（改数据，需单独立项）。
+
+     --rdr-fg2-pct 的唯一来源：stores.svelte.ts 的 RDR_FG2_PCT，由
+     applyReaderSurfaceVars() 写到 <html>、由 Reader 的 readerSurfaceVars() 写到 .reader；
+     上面那行只是首帧兜底（纸色档）。三处比例必须一致，改一处要改三处。 */
+  --rdr-accent: color-mix(in srgb, var(--rdr-fg) 82%, var(--rdr-bg));
+  --rdr-accent-hover: color-mix(in srgb, var(--rdr-accent) 86%, var(--rdr-fg));
+  --rdr-accent-fg: color-mix(in srgb, var(--rdr-fg) 12%, var(--rdr-bg));
+  /* 次要文字：混合比逐主题不同（只有护眼绿需要 78%，其余 72%），
+     故比例本身是一个 token —— 写者见下方「唯一来源」注释。首帧兜底取纸色档。
+     ⚠️ 这是【文字】色（喂 .reader .empty-state / .sp-empty 的 13px 空状态文案），
+        按 WCAG 文字线 4.5:1 判，不是按图形线 3:1 —— 上一轮把它当图形放过，是错的。 */
+  --rdr-fg2-pct: 72%; /* 首帧兜底 = 纸色档；JS 起来后被阅读主题的档位覆盖 */
+  --rdr-fg2: color-mix(in srgb, var(--rdr-fg) var(--rdr-fg2-pct), transparent);
+  --rdr-hover: color-mix(in srgb, var(--rdr-fg) 8%, transparent);
+  --rdr-active: color-mix(in srgb, var(--rdr-fg) 14%, transparent);
 
   /* 中文优先：微软雅黑承担中文字形，Segoe UI 仅兜底拉丁/符号，
      避免中英混排时中英字形风格割裂。 */
@@ -415,6 +460,16 @@ button.icon .tabler-icon {
   height: var(--icon-md);
 }
 
+/* 带文字的主按钮 / 次级动作按钮里的图标：按钮内那一档。
+   裸 <button>（没挂 .icon）不受上一条归一化管，Tabler 默认 24px 会顶破 --ctl-h 的行高，
+   在 30px 高的按钮里显得比文字重一倍以上。 */
+button.primary .tabler-icon,
+button.danger .tabler-icon,
+.toolbar .refresh-wrap > button .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
 /* 图标描边：全应用唯一值。Tabler 把 stroke 作为 svg 的表现属性下发，
    而 CSS 规则优先级高于表现属性，故这一条即可统一全应用（含后续新增图标）；
    模板里也按同一值传 stroke={1.5}，保持 DOM 与样式一致。
@@ -467,7 +522,225 @@ input[type="range"] {
   cursor: pointer;
 }
 
-/* 分段控件（如 浅色/深色/系统） */
+/* ===================== accent 的边界（先立规矩，再逐处对照） =====================
+   **大面积底色的选中态用中性，小面积强调才用 accent。**
+
+   · 中性选中 = --bg-elev 底 + --fg 字 + --line-strong 描边（+ 字重 600）。
+     依据 Linear 的 pricing-tab-selected：surface-2 底 + ink 字，中性。
+   · accent 只留给小面积：主按钮、焦点圈、当前导航项、多选选中环（inset 0 0 0 2px）、
+     选项卡的选中描边（皮肤卡/配色方案卡/字体卡）、进度与激活指示、计数徽章、
+     以及「筛选生效中」这类信号徽章（.filter-chip，等同 Linear 的 status-badge）。
+   理由：accent 是稀缺资源（Linear：used scarcely, never decoratively）。
+   一片大面积 accent 底色会让「选中了」和「这是主操作」混成一件事，反而丢层级。
+
+   ⚠️ 下面这组 token 是「中性选中」的唯一来源，改选中色只改这里一处。 */
+
+/* ===================== 选中态配方的取值（唯一来源） =====================
+   抽成变量而不是在下面两条规则里各写一遍字面值：基础组与 hover 兜底组必须永远同步。
+   取值全部中性（--bg-elev / --fg / --line-strong），因此深浅两套外壳主题自动跟随，
+   且不再随皮肤的主色变绿/变蓝 —— 「选中了」不该由品牌色决定。 */
+:root {
+  --sel-bg: var(--bg-elev);
+  --sel-fg: var(--fg);
+  --sel-line: var(--line-strong);
+}
+
+/* ===================== 选中态配方（胶囊 / 芯片 / 分段控件 / 标签） =====================
+   这一组配方原本在四个地方各写一遍「accent-soft 底 + accent 字 + accent 描边」，
+   取值一模一样却分散在 app.css 与 Library.svelte 的组件样式里，改一处就会漏另一处。
+   照 --z-* 表的做法收敛到这里，给它一个明确位置：形状仍由各容器自己决定
+   （胶囊 --radius-pill / 工具栏按钮 --radius-sm / 分段控件无边框），
+   这里只统一「被选中」这件事的观感 —— 而这观感是【中性】的（见上一节的 accent 边界）。
+   ⚠️ 分段控件原先的选中段是「--bg-elev 抬起的白实体 + --shadow-sm」；统一到本组后
+      观感回到那副样子（白实体 + 深字），顺带守住一条纪律：静态表面不该有投影。
+
+   ⚠️⚠️ 下面紧跟着的 hover 兜底组、以及本组每一条选择器上的 body 前缀，都是这条配方
+   成立的前提，删不得任何一样。
+   为什么配方放 app.css 而不是留在组件里：它要同时管 .folder-chip / .fp-tags .tag
+   / .cat-btn / .fr-seg 四处，留在组件里就还是四份副本。
+   代价是它不带 Svelte 作用域类，而级联有两面会把它拆掉，两面都得靠 body 锚点兜：
+
+   ① 同特异性输给它 —— app.css 由 <link> 先加载、组件样式由 JS chunk 后注入，
+      同特异性时【组件赢】。只要组件里存在同名基态规则，而本组是裸 .xxx.active，
+      就会平手判负 → 选中态完全不显（不是「弱一点」，是完全没有）：
+        .folder-chip.svelte-x                    (0,2,0) 声明 background/color/border
+          ← 本组原为 .folder-chip.active        (0,2,0)  平手，输 ❌
+        .fp-tags.svelte-x .tag:where(.svelte-x) (0,3,0) 声明 background/color/border
+          ← 本组原为 .fp-tags .tag.active      (0,3,0)  平手，输 ❌
+        .fr-seg button                          (0,2,1) 声明 background/color（同在本文件，但更靠后）
+          ← 本组原为 .fr-seg button.active      (0,2,1)  平手，输 ❌
+      补上 body 前缀后三者变成 (0,3,1)/(0,4,1)/(0,3,1)，class 列全部压过。
+
+   ② hover 压过 active —— 组件的 :hover 多带一枚作用域类：
+        .folder-chip.svelte-x:hover                     (0,3,0)
+        .fp-tags.svelte-x .tag:where(.svelte-x):hover    (0,4,0)
+        button:hover:not(:disabled) 全局按钮基线           (0,2,1)
+        button.icon:hover:not(:disabled) 图标按钮基线      (0,3,1)
+      基础态补了 body 也只是追平，还得再由下面那组 body …:hover 兜底。
+
+   级联是【按属性】判的：组件基态没声明某个属性时，那条属性不受影响，
+   不要把「特异性高」误读成「所有属性都被压」。
+
+   ⚠️⚠️ 为什么选中态要带 --edge-hi 内环 + font-weight（这条是深色主题下的生死线）：
+   中性选中底是 --bg-elev，而胶囊/标签的未选中底是 --panel2。浅色主题里
+   bg-elev(#ffffff) 比 panel2(#f2f1ec) 亮，「选中=更亮」天然成立；
+   但深色主题里三档表面是 bg(#16181d) < bg-elev(#1e2126) < panel2(#252932) ——
+   选中底比周围【更暗】，语义直接颠倒（实测：胶囊选中 #1e2126 vs 未选中 #252932）。
+   .fr-seg 同理（轨道 panel2 最亮、选中段 bg-elev 更暗）。
+   分段控件原来靠「bg-elev + --shadow-sm, --edge-hi」里的那道内环把暗表面勾出来，
+   上一轮统一配方时把阴影去掉了，内环也跟着一起没了 —— 于是深色下选中态不可见。
+   现在补回：
+     · 内环 --edge-hi（inset，不投影。它表达的是表面自己的边缘，不是「离开文档流」，
+       所以不违反上面「静态表面不加投影」那条纪律；dialog 早就在用同一道内环）；
+     · 字重 600 —— 12px 的小胶囊光靠底色+内环仍偏弱，字重在两套主题下都一眼可辨。
+   这两条只加在【本组】；下面的 .filter-chip 是 accent 徽章，不加内环。 */
+body .folder-chip.active,
+body .cat-btn.active,
+body .fp-tags .tag.active,
+body .fr-seg button.active {
+  background: var(--sel-bg);
+  color: var(--sel-fg);
+  border-color: var(--sel-line);
+  box-shadow: var(--edge-hi);
+  font-weight: 600;
+}
+
+/* 选中态必须压过 hover：否则鼠标一停上去，「已选中」就变成「没选中」。
+   写法说明：统一用 body 锚点把特异性抬到各 :hover 之上（body 是类型选择器，
+   落在第三列，正好用来压过「同 class 数、但组件那条还多带一枚作用域类」的对手）：
+     body .folder-chip.active:hover              (0,3,1) > 组件 .folder-chip.svelte-x:hover            (0,3,0)
+     body .fp-tags .tag.active:hover             (0,4,1) > 组件 .fp-tags.svelte-x .tag:…:hover       (0,4,0)
+     body .fr-seg button.active:hover:not(:disabled)
+                                                (0,4,2) > 本文件 .fr-seg button:hover:not(:disabled) (0,3,1)
+     body .cat-btn.active:hover                  (0,3,1) > 本文件 button:hover:not(:disabled)        (0,2,1)
+   分段控件那条多带一个 :not(:disabled) 不是凑数：hover 规则本身就写了它，
+   少了这一项就变成 (0,3,2) vs (0,3,2) 的平手，而 app.css 先加载、平手必输。
+   前两条与本组基础态同特异性（(0,3,1) / (0,4,1)），靠「本组在源码里更靠后」取胜 ——
+   两者声明的是同一组变量，即使顺序将来变了也不会有可见差异。
+
+   ⚠️ 加新成员 / 新建选中态时的检查清单（三次回归都出自漏掉其中一条）：
+     逐个成员算，别只看一个就算完 —— 每加一个都要对着下面三张表各查一遍：
+     (a) 同名基态规则在哪？它 (几,几,几)？本组加 body 后是 (几,几,几)？
+         平手即负（app.css 先加载），必须 class 列严格大于。
+     (b) 有没有 :hover 覆盖？全局 button:hover:not(:disabled) 是 (0,2,1)，
+         button.icon:hover:not(:disabled) 是 (0,3,1) —— 两个都是「class 列两项 + 类型列一项」，
+         裸 .xxx.active (0,2,0) 必输。组件的 :hover 还多带一枚作用域类。
+     (c) 那几个属性组件基态到底声明了没有？级联按属性判，没声明的属性不受影响，
+         别把「特异性高」误读成「所有属性都被压」。
+     结论：放 app.css 的选中态必须带 body 前缀，且成员越多越要逐个验算。
+   ⚠️ 本组也必须重复基础态的那两条（内环 + 字重）：hover 时下面这些规则会重新声明
+     background/color，而 .fr-seg button:hover:not(:disabled) 与本组基础态同为 (0,3,1)、
+     却在文件里更靠后（会把基础态的 box-shadow 顶掉）。所以这里要再写一遍。 */
+body .folder-chip.active:hover,
+body .fp-tags .tag.active:hover,
+body .fr-seg button.active:hover:not(:disabled),
+body .cat-btn.active:hover {
+  background: var(--sel-bg);
+  color: var(--sel-fg);
+  border-color: var(--sel-line);
+  box-shadow: var(--edge-hi);
+  font-weight: 600;
+}
+
+/* 分段控件的选中段：从轨道里「抬起」，靠投影而不是色差来分离。
+   ⚠️ 这看似违反「静态表面不加投影」，但那条纪律的例外正在这里 —— 轨道上的选中段是一个
+   物理上抬起的段，不是贴着轨道的静态面。.fr-seg 本来就有这道 --shadow-sm，早前一轮被当作
+   「静态表面的投影」误删了，现在补回；另有先例是书库 .card:hover 的抬升投影。
+   为什么这一族必须有它：本项目的中性色板只有三级表面（--bg < --bg-elev = --panel < --panel2），
+   没有第四级可用来表达「从轨道里抬起」。于是轨道（--panel2）与选中段（--bg-elev）只差约
+   1.1:1，识别信号几乎全压在 600 字重上；给它一段抬起的投影，是把「层级」还回来而不是把颜色加重。
+   ⚠️ 刻意不把 .fr-seg button.active 从上面那组里移出去：移了就退回 (0,2,1)，
+   会被本文件更靠后的 .fr-seg button:hover:not(:disabled) (0,3,1) 压掉，选中段一悬停就掉色。
+   这里只覆盖 box-shadow 一个属性（级联按属性判），另外三项仍由组提供；两条特异性
+   (0,3,1) / (0,4,2) 与组内同名声明同值，只能靠源码顺序取胜。
+   ⚠️ 位置纪律：这条必须同时落在【基础组】与【hover 兜底组】之后。若只放在基础组之后、
+   hover 组之前，鼠标停上选中段时 hover 组会把它顶掉（两者特异性都是 (0,4,2)，而 hover 组
+   在源码里更靠后）—— 抬起效果一悬停就消失，正是本条要避免的。 */
+body .fr-seg button.active,
+body .fr-seg button.active:hover:not(:disabled) {
+  box-shadow: var(--shadow-sm), var(--edge-hi);
+}
+
+/* ---- .filter-chip：本组唯一的 accent 成员（信号徽章，不是「选中项」）----
+   它没有「已选中 / 未选中」两态：芯片出现在 DOM 里就等于「筛选生效中」，
+   属于 Linear 的 status-badge 一类，所以按 accent 边界那一节的结论保留 accent，
+   不跟上面那组一起中性化。之所以连 :hover 一起写：
+   组件里 .filter-chip:hover 是 (0,3,0)，而本组基础态带 body 是 (0,3,1) ——
+   只写基础态的话 hover 会被基础态压掉（app.css 先加载、同列 class 时后者赢）。 */
+body .filter-chip,
+body .filter-chip:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* ===================== 输入框内的清除键（fr-clear） ===================== */
+/* 五处共用：书库顶栏搜索框、设置弹窗左侧导航的搜索框、目录面板（TocPanel）、划线与书签
+   面板（HighlightsPanel）、笔记面板（NotesPanel）。五处都是「输入框 + 右侧一颗 ×」，
+   规格必须一致，所以配方只写在这里；各自的容器负责提供定位参照与右侧留白。
+   容器契约（缺了 × 就会贴到文字上）：
+     · 定位参照：包裹层 position: relative；
+     · 右侧留白：输入框 padding-right: 26px —— = 键宽 20 + 键的 inset 4 + 余量 2，
+       不是栅格值，是从上面三个尺寸算出来的；改键宽时这几处要一起改。
+   降噪用 opacity: .55 而非 0：0 会让元素不可见却仍然接收指针事件，读者既看不到也猜不到
+   这里能点；.55 保留可见性与命中区，只是把对比压低。三处 ×（fr-clear / .folder-chip .x /
+   .sb-head .x / .wd-close）统一用这一档。 */
+.fr-clear {
+  position: absolute;
+  right: var(--sp-1);
+  top: 50%;
+  translate: 0 -50%;
+  width: var(--ctl-h-xs);
+  height: var(--ctl-h-xs);
+  /* 全局 button 带 min-height: var(--ctl-h)(30px)，不重置的话这颗「20px 的圆」
+     实际命中区会是 20×30 —— 视觉上被 flex 居中掩盖了，但命中区与视觉不一致。 */
+  min-height: var(--ctl-h-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--fg2);
+  /* 正方形 + 50% = 正圆，与图标框尺寸无关，改键宽也不会变形 */
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    opacity var(--dur) var(--ease);
+}
+
+.fr-clear:hover,
+.fr-clear:focus-visible {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg);
+  opacity: 1;
+}
+
+.fr-clear .tabler-icon {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+/* 阅读侧面板里那颗 × 的配色覆盖：.fr-clear 的 hover 底/字色用的是外壳 --accent 与
+   --fg，那是壳色 —— 直接复用到目录面板 / 划线面板，在夜间阅读主题下会闪出一层壳色绿。
+   故在阅读语境里（.reader 与 .sidepanel 两档）换成阅读主题派生的量，形状 / 尺寸 /
+   opacity / 图标档位全部沿用上面的公共配方，一项都不重复定义。
+   笔记面板那颗不在 .reader 内：它的根是 .nl、整体走外壳层，保持壳色是对的。
+   ⚠️ 另一档 .sidepanel 不能省：目录 / 划线面板在【独立面板窗】里挂在 .sidepanel 根下，
+   那个窗口没有 .reader（整窗就是阅读内容，底色走 --rdr-bg）。只写 .reader 的话，独立窗里那颗 ×
+   的 hover 就会露出壳色绿。.sidepanel 是「跟随阅读主题的侧面板」这一族共用的全局类（目录 / 划线 /
+   书签 / 统计 / AI），而笔记面板的根是 .nl，不在其中，故不会误伤。
+   特异性 (0,3,0) 严格大于上面那条 (0,2,0)，不需要 body 锚点。 */
+.reader .fr-clear:hover,
+.reader .fr-clear:focus-visible,
+.sidepanel .fr-clear:hover,
+.sidepanel .fr-clear:focus-visible {
+  background: color-mix(in srgb, var(--rdr-fg) 8%, transparent);
+  color: var(--rdr-fg);
+}
+
+/* 分段控件（浅色/深色/系统） */
 .fr-seg {
   display: inline-flex;
   padding: 2px;
@@ -501,11 +774,12 @@ input[type="range"] {
   transform: none;
 }
 
+/* 选中态的底色/字色/描边/内环/字重都走上面的「中性选中配方」一组（body 锚点，(0,3,1)/(0,4,2)，
+   稳压上面两条 .fr-seg 规则）。此处保留这条同值声明只是为了让本块自解释：
+   分段控件的选中段是 600 字重 —— 单独删掉它对结果毫无影响，但下一个改这里的人
+   会以为字重归本块所有。 */
 .fr-seg button.active {
-  background: var(--bg-elev);
-  color: var(--fg);
   font-weight: 600;
-  box-shadow: var(--shadow-sm), var(--edge-hi);
 }
 
 /* ===================== 滚动条 ===================== */
@@ -658,15 +932,37 @@ p,
   margin: 0 0 var(--sp-2);
 }
 
-/* 空状态（无数据 / 无搜索结果 / 无划线）：全局一份，组件不要另写。
-   现有空状态都是单行文案，故不提供可选标题行 —— 真需要时分两行写，别加一个没人用的类。 */
-.empty-state {
+/* 空状态（无数据 / 无搜索结果 / 无划线）：全局一份配方，组件不要另写。
+   ⚠️ 这里有【两个类名】而不是一个：.empty-state（外壳弹窗：SearchModal / StatsModal /
+   BookStatsModal / Library / NotesPanel）与 .sp-empty（阅读侧面板：目录 / 划线 / 书签 /
+   统计 / 独立面板窗）。它们是同一份视觉配方的两个入口 —— 面板基类 .sidepanel 一套、
+   弹窗一套，各自历史上长出了自己的类名。保留两个名字是为了不改任何模板（本轮冻结
+   Reader.svelte，而它内部就有两处 .sp-empty）；代价必须自己扛住：两条规则必须同步，
+   所以它们写在一起、用一条选择器组，而不是散在文件两处各写一遍。
+   （阅读界面里还有 BookSearchPopup 自己的 .sb-empty，那是第三套，不在此列。）
+
+   现有空状态都是单行文案，故不提供可选标题行 —— 真需要时分两行写，别加一个没人用的类。
+   ⚠️ 这里的 --fg2 是【外壳】次要色，而这两个类有两批使用者：外壳那批与阅读区那批
+   （Reader 的开屏与报错、目录/书签面板的空状态）。不能把 --fg2 直接换成 --rdr-fg2 ——
+   那会把外壳那几处的文字改成阅读底色派生的灰（深色外壳下会糊在面板上）。
+   故保留 --fg2，另在下面按 .reader 前缀补一条阅读区覆盖。 */
+.empty-state,
+.sp-empty {
   padding: 48px var(--sp-4);
   text-align: center;
   font-size: var(--fs-sm);
   letter-spacing: var(--ls-sm);
   color: var(--fg2);
   line-height: 1.8;
+}
+
+/* 阅读区里的同款空状态改用阅读主题的次要色（--rdr-fg2，由阅读底色/字色派生）。
+   放在全局而不是 Reader.svelte：这两个类是全局基类，而空状态可能出现在 Reader 之外的
+   子组件里（目录面板、划线面板…），scoped 规则匹配不到那些子组件内部的元素。
+   特异性 (0,3,0) 严格大于上面那条 (0,2,0)，不需要 body 锚点。 */
+.reader .empty-state,
+.reader .sp-empty {
+  color: var(--rdr-fg2);
 }
 
 /* ===================== 进度条（全局一套规格） ===================== */
@@ -816,14 +1112,8 @@ p,
   background: color-mix(in srgb, var(--rdr-fg) 7%, transparent);
 }
 
-.sp-empty {
-  padding: 48px var(--sp-4);
-  text-align: center;
-  font-size: var(--fs-sm);
-  letter-spacing: var(--ls-sm);
-  color: var(--fg2);
-  line-height: 1.8;
-}
+/* .sp-empty 的空状态配方与上面的 .empty-state 合并在同一条选择器组里（见那里的注释：
+   两个类名是同一份配方在「外壳弹窗 / 阅读侧面板」两类容器上的两个入口，必须同步）。 */
 
 /* ===================== 上下文菜单（全局一份规格） ===================== */
 /* 三处实现共用：ContextMenu（portal 到 body）、Library、WebdavBrowser（面板内绝对定位）。 */
@@ -963,16 +1253,32 @@ p,
 .cp-add .tabler-icon,
 .cp-clear .tabler-icon,
 .key-add .tabler-icon,
+.key-chip .tabler-icon,
 .font-del .tabler-icon,
 .sel-badge .tabler-icon,
 .set-search-clear .tabler-icon,
+.set-crumb .tabler-icon,
 .prompt-chip .tabler-icon,
 .tb-sleep .tabler-icon,
 .wd-ico .tabler-icon,
-.wd-btn .tabler-icon,
-.wd-empty-ico .tabler-icon {
+.wd-btn .tabler-icon {
   width: var(--icon-xs);
   height: var(--icon-xs);
+}
+
+/* 容器比 --ctl-h 小一档的行内图标：字体选项前的星标、皮肤卡选中勾。
+   （.stat-mv 的方向微调按钮已在上面那一档里。） */
+.font-opt .tabler-icon,
+.sk-check .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* 空状态插图：书库空、WebDAV 未配置等「大留白 + 一枚图标」的场景，单独一档。 */
+.wd-empty-ico .tabler-icon,
+.lib-empty-ico .tabler-icon {
+  width: var(--icon-empty);
+  height: var(--icon-empty);
 }
 
 /* 图片浏览灯箱的前后翻页箭头（容器 46×76）：大号目标 */

@@ -145,7 +145,7 @@
       {#if canBack}
         <button class="mini" data-testid="bsp-back" onclick={onback} title={t("search.popup.backTip")}><IconArrowLeft />{t("search.popup.back")}</button>
       {/if}
-      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}><IconX /></button>
+      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}><IconX size={14} stroke={1.5} /></button>
     </div>
   </div>
   <div class="sb-row">
@@ -212,15 +212,53 @@
   }
 
 
+  /* 头高必须恒定，两种情况都得一样：
+     _test/batch1_live.mjs 与 _test/e_portal.mjs 取 .sb-head 的 getBoundingClientRect()
+     换算拖拽起点坐标（y+16 / y+14），头一缩这两个坐标就偏。
+     下面的 .x 从 30px 缩到 20px 之后，「有返回键」（.mini 仍是 30px）与「没返回键」
+     两种情况的头高会差 10px；这里给动作区补一个 --ctl-h 下限把差值抹平，
+     头高与改前逐像素一致。 */
   .sb-head-acts {
     display: flex;
     align-items: center;
     gap: var(--sp-1);
+    min-height: var(--ctl-h);
   }
 
+  /* 关闭键：与书库文件夹胶囊里的 X 同一套规格（--icon-xs 14px 图标 + --ctl-h-xs 20px
+     容器 + 圆角容器 + 常驻可见、靠 opacity .55 降噪）。改之前它没走 button.icon 归一化：
+     IconX 没传 size 走 Tabler 默认 24px，又继承了全局 button 的 min-height: var(--ctl-h)，
+     于是 47px 高的头部右侧挂着一个 30px 高、24px 宽的 X ——「块很大但线很细」。
+
+     刻意不用 opacity: 0 + pointer-events: none（曾用过，见 git 历史）：本弹层的整个头部
+     就是拖拽把手，X 一旦不接收指针，事件就落到 .sb-head 上、命中 startDrag 开头的
+     closest("button") 守卫的相反分支 → 启动拖拽 → 弹层位移，也就是「点 × 结果弹层跳一下」。
+     可见性不能靠 pointer-events 开关来换。常驻 + .55 降噪同时满足可见、可点、不抢眼。 */
   .sb-head .x {
-    padding: 1px var(--sp-2);
-    border-radius: var(--radius-sm);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--ctl-h-xs);
+    min-height: var(--ctl-h-xs);
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--fg2);
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    opacity: 0.55;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+      opacity var(--dur) var(--ease);
+  }
+
+  .sb-head:hover .x,
+  .sb-head .x:focus-visible {
+    opacity: 1;
+  }
+
+  .sb-head .x:hover {
+    background: var(--hover-bg);
+    color: var(--fg);
   }
 
   .sb-head .mini {

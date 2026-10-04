@@ -28,6 +28,8 @@
     IconLayoutList,
     IconPlus,
     IconX,
+    IconBooks,
+    IconSearchOff,
   } from "@tabler/icons-svelte";
   import BookDetailModal from "./BookDetailModal.svelte";
   import ProgressRing from "./ProgressRing.svelte";
@@ -1689,7 +1691,23 @@
         <div class="rm-backdrop" onclick={() => (refreshMenu = false)}></div>
       {/if}
     </div>
-    <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={queryInput} />
+    <!-- 搜索框 + 清除键：外壳只提供定位参照与固定总宽（见 .search-wrap 的注释）。
+         × 的规格走 app.css 的公共类 .fr-clear，与设置弹窗搜索框那颗完全同一份配方。
+         只在有输入时渲染：空搜索框上常驻一颗灰按钮既没有可清的东西又是纯噪声。
+         onclick 只把绑定值置空 —— queryInput 的 250ms 防抖与 reload() 照常经它生效，
+         本轮不碰任何查询逻辑。data-testid 必须留在 input 自身（测试读它的 placeholder）。 -->
+    <span class="search-wrap">
+      <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={queryInput} />
+      {#if queryInput}
+        <button
+          class="fr-clear"
+          data-testid="lib-search-clear"
+          title={t("common.action.clear")}
+          aria-label={t("library.toolbar.clearSearchAria")}
+          onclick={() => (queryInput = "")}
+        ><IconX size={14} stroke={1.5} /></button>
+      {/if}
+    </span>
     <select data-testid="lib-sort" bind:value={sortKey} onchange={onSortChange}>
       <option value="lastread">{t("library.sort.lastread")}</option>
       <option value="added">{t("library.sort.added")}</option>
@@ -1710,7 +1728,7 @@
       >{t("library.toolbar.category")}{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
       {#if hasFilter}
         <button class="filter-chip" data-testid="lib-filter-chip" title={t("library.toolbar.clearFilterTip")} onclick={clearFilter}>
-          {t("library.toolbar.filtered")} <span class="fx"><IconX /></span>
+          {t("library.toolbar.filtered")} <span class="fx"><IconX size={14} stroke={1.5} /></span>
         </button>
       {/if}
     </div>
@@ -1782,8 +1800,14 @@
           onclick={() => selectFolder(f)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFolder(f); } }}
         >
-          <IconFolder /> {f}
-          <button class="x" title={t("library.folder.removeTip")} aria-label={t("library.folder.removeTip")} onclick={(e) => { e.stopPropagation(); removeFolder(f); }}><IconX /></button>
+          <IconFolder size={16} stroke={1.5} /> {f}
+          <button
+            class="x"
+            title={t("library.folder.removeTip")}
+            aria-label={t("library.folder.removeTip")}
+            onclick={(e) => { e.stopPropagation(); removeFolder(f); }}
+            onkeydown={(e) => { e.stopPropagation(); }}
+          ><IconX size={14} stroke={1.5} /></button>
         </span>
       {/each}
       {#if foldersFailed}<span class="fp-empty" data-testid="lib-folders-failed">{t("library.folders.failed")}</span>{/if}
@@ -1792,7 +1816,6 @@
 
   <div
     class="grid"
-    class:list-view={view === "list"}
     class:boxing={boxActive}
     bind:this={gridEl}
     onscroll={onScroll}
@@ -1806,8 +1829,12 @@
     {#if loading && total === 0}
       <div class="empty-state" data-testid="lib-hint-loading">{t("library.empty.loading")}</div>
     {:else if total === 0}
-      <div class="empty-state" data-testid="lib-hint-empty">
-        {query.trim() ? t("library.empty.noMatch") : t("library.empty.blank")}
+      <div class="lib-empty" data-testid="lib-hint-empty">
+        <span class="lib-empty-ico">
+          {#if query.trim()}<IconSearchOff stroke={1.5} />{:else}<IconBooks stroke={1.5} />{/if}
+        </span>
+        <p class="lib-empty-t">{query.trim() ? t("library.empty.noMatch") : t("library.empty.blankTitle")}</p>
+        {#if !query.trim()}<p class="lib-empty-d">{t("library.empty.blankHint")}</p>{/if}
       </div>
     {:else if view === "grid"}
       <div class="grid-inner" style="height:{gridRows * cellH}px;">
@@ -2019,6 +2046,25 @@
     width: 220px;
   }
 
+  /* 搜索框外壳：给 .fr-clear 提供 position: relative 的定位参照。
+     总宽必须在这里显式给成 220px（与包壳前的裸 input 同宽）：包一层之后外壳成了
+     .toolbar 那行 flex 里的 item，宽度一旦由内容决定，右侧那排图标按钮与
+     自绘窗口控制按钮就会整体横向移位。内部的 input 再占满外壳，两者相加仍是一个 220px。
+     padding-right 是 .fr-clear 的容器契约（= 键宽 20 + inset 4 + 余量 2），
+     少了它长文本会滑到 × 底下；配方与这个数值都在 app.css 的 .fr-clear 处。 */
+  .search-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 220px;
+    flex-shrink: 0;
+  }
+
+  .search-wrap .search {
+    width: 100%;
+    padding-right: 26px;
+  }
+
   .spacer { flex: 1; }
 
   /* ---------- 分类筛选 ---------- */
@@ -2028,18 +2074,11 @@
     gap: var(--sp-2);
   }
 
-  .cat-btn.active {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  }
-
+  /* 「分类」按钮的选中配色走 app.css 的「选中态配方」一组。 */
   .filter-chip {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: var(--accent-soft);
-    color: var(--accent);
     border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
     border-radius: var(--radius-pill);
     padding: 4px 10px;
@@ -2047,7 +2086,9 @@
     cursor: pointer;
   }
   .filter-chip .fx {
-    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
     line-height: 1;
     opacity: 0.85;
   }
@@ -2087,6 +2128,7 @@
 
   .fp-empty { color: var(--fg2); font-size: var(--fs-xs); padding-top: 5px; }
 
+  /* 筛选面板里的格式/状态标签：形状在下面，配色走 app.css 的「选中态配方」。 */
   .fp-tags .tag {
     border: 1px solid var(--line);
     background: var(--panel2);
@@ -2098,11 +2140,6 @@
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease), border-color var(--dur) var(--ease);
   }
   .fp-tags .tag:hover { background: var(--hover-bg); color: var(--fg); }
-  .fp-tags .tag.active {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  }
 
   .fp-clear {
     align-self: flex-start;
@@ -2117,10 +2154,11 @@
   .fp-clear:hover { background: var(--hover-bg); color: var(--fg); }
 
   /* ---------- 文件夹胶囊 ---------- */
+  /* 上下左右给一致的留白：原先底部贴死 --bg，胶囊下半截悬在网格上缘，缺一层缓冲。 */
   .folders {
     display: flex;
     gap: var(--sp-2);
-    padding: var(--sp-3) var(--sp-4) 0;
+    padding: var(--sp-3) var(--sp-4);
     flex-wrap: wrap;
   }
 
@@ -2146,21 +2184,43 @@
 
   .folder-chip:hover { background: var(--hover-bg); color: var(--fg); }
 
-  /* 选中态：仿分类标签 .fp-tags .tag.active。 */
-  .folder-chip.active {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  }
+  /* 选中态的配色走 app.css 的「选中态配方」一组（与筛选芯片 / 分段控件同源）。 */
 
+  /* 胶囊里的移除按钮：全项目唯一一个没走 button.icon 归一化的关闭按钮，也是观感上
+     最突兀的一个 —— 12px 的胶囊文字里塞着一个 ≥30px 高、24px 宽的 X，描边却只有 1.5，
+     于是读成「块很大但线很细」。三处修正缺一不可：
+       ① min-height 必须显式重置 —— 全局 button 带 min-height: var(--ctl-h)(30px)，
+          旧规则重置了 border/background/padding/color/border-radius 唯独漏了它，
+          整颗胶囊因此被撑到近 38px；
+       ② 图标落到 --icon-xs（14px，清除类按钮那一档，见 app.css 的图标阶梯）；
+       ③ 默认 opacity .55 降噪，悬停胶囊 / 键盘聚焦时才到 1。
+     刻意不用 opacity: 0（曾用过，见下）：0 会让元素看不见却照样接收指针事件 ——
+     书库 X 还叠了 pointer-events: none，点它事件落到胶囊上就是「选中文件夹」而不是移除，
+     而搜索弹层那颗更糟：它整个头部都是拖拽把手，事件穿透会直接启动拖拽、弹层位移。
+     两套办法都会制造「看不见却在那儿」的隐形命中区，opacity .55 既保留可见性与命中区，
+     又把对比压低，才是「不抢眼」的正确做法。全项目四颗 × 统一这一档。
+     flex-shrink: 0 是第四件：胶囊有 max-width + overflow，长路径下 X 会被横向压成一条竖线。 */
   .folder-chip .x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--ctl-h-xs);
+    min-height: var(--ctl-h-xs);
+    flex-shrink: 0;
     border: none;
     background: transparent;
-    padding: 0 4px;
+    padding: 0;
     cursor: pointer;
     color: var(--fg2);
-    border-radius: var(--radius-sm);
-    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+    border-radius: var(--radius-pill);
+    opacity: 0.55;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+      opacity var(--dur) var(--ease);
+  }
+
+  .folder-chip:hover .x,
+  .folder-chip .x:focus-visible {
+    opacity: 1;
   }
 
   .folder-chip .x:hover {
@@ -2185,10 +2245,12 @@
     -webkit-user-select: none;
   }
 
+  /* 行偏移全部由内联 top 写死（.grid-row 是 position:absolute + top），
+     这两个容器上没有任何 transform —— 常驻 will-change: transform 只会白占一块
+     合成层（虚拟滚动里每屏几十张卡，全屏尺寸的图层是真实开销）。 */
   .grid-inner {
     position: relative;
     width: 100%;
-    will-change: transform;
   }
 
   /* 每一「行」是一个绝对定位、占满内容宽的 CSS 网格：列数与列宽交给
@@ -2203,22 +2265,25 @@
     align-content: start;
   }
 
+  /* 悬停抬升：克制档 —— 底色 + 2px 位移，投影只由 .cover 那一层承担（--shadow-sm → --shadow-md），
+     封面放大也只到 1.02。此前是四重叠加（底色 + -4px + 卡片自身 --shadow-md + 封面 1.055），
+     在一屏几十张卡的网格里等于满屏都在跳；两个参考系统的卡片 hover 都只到
+     「box-shadow 0 → 0 2px 8px / 4%」这一档（minimalist-ui 的克制、Linear 的低幅抬升）。
+     用 premium 落位曲线模拟质量感（skill: haptic depth）。 */
   .card {
     width: 100%;
     box-sizing: border-box;
     cursor: pointer;
     border-radius: var(--radius-lg);
     padding: var(--sp-2);
-    /* 悬停抬升：柔和抬起 + 分层扩散阴影；用 премиум落位曲线模拟质量感（skill: haptic depth） */
+    /* 刻意不transition box-shadow：卡片自身不再有投影变化，留着只会多跑一条无用过渡 */
     transition: background var(--dur-lift) var(--ease-premium),
-      transform var(--dur-lift) var(--ease-premium),
-      box-shadow var(--dur-lift) var(--ease-premium);
+      transform var(--dur-lift) var(--ease-premium);
   }
 
   .card:hover {
     background: var(--hover-bg);
-    transform: translateY(-4px);
-    box-shadow: var(--shadow-md);
+    transform: translateY(-2px);
   }
 
   .card:active {
@@ -2263,7 +2328,7 @@
   }
 
   .card:hover .cover img {
-    transform: scale(1.055);
+    transform: scale(1.02);
   }
 
   /* 格式角标：半透明深底 + 白色小字，10px 字距 +0.015em。
@@ -2314,10 +2379,10 @@
   }
 
   /* ---------- 列表 ---------- */
+  /* 同 .grid-inner：没有 transform，不需要常驻合成层 */
   .list-inner {
     position: relative;
     width: 100%;
-    will-change: transform;
   }
 
   .row {
@@ -2368,6 +2433,48 @@
   .row-size, .row-date { color: var(--fg2); font-size: var(--fs-xs); width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
 
   /* ---------- 空状态 ---------- */
+  /* 结构照 WebdavBrowser 的 .wd-empty-cfg / .wd-empty-ico / .wd-empty-t / .wd-empty-d：
+     图标 + 标题 + 描述三段。此前这里只有一行灰字，「导入书籍」这个唯一可执行的动作
+     与说明文字挤在同一段里，用户既不知道发生了什么、也不知道下一步该点哪。
+     min-height: 100% + justify-content: center 借 .grid 的确定高度把它撑满并垂直居中
+     （同 Reader.svelte 里 .empty-state 的做法），不给它写死 vh 数值。 */
+  .lib-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    min-height: 100%;
+    padding: var(--sp-4);
+    text-align: center;
+    text-wrap: pretty;
+  }
+
+  .lib-empty-ico {
+    line-height: 1;
+    margin-bottom: var(--sp-1);
+    color: var(--fg2);
+    opacity: 0.7;
+  }
+
+  .lib-empty-t {
+    margin: 0;
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  .lib-empty-d {
+    margin: 0;
+    max-width: 42ch;
+    font-size: var(--fs-sm);
+    letter-spacing: var(--ls-sm);
+    line-height: 1.8;
+    color: var(--fg2);
+    white-space: pre-line;
+  }
+
   /* ---------- 状态栏 ---------- */
   .statusbar {
     display: flex;
@@ -2405,10 +2512,20 @@
     border-radius: var(--radius-sm);
   }
 
-  /* 当前视图高亮：让用户知道自己在哪个视图（skill: active nav indication） */
+  /* 当前视图高亮：中性选中态（--bg-elev 白实体 + --fg 深字），与 app.css 的选中态配方同源。
+     accent 只留给小面积强调，「我在哪个视图」用主色会把两枚图标按钮读成两枚标签。
+     ⚠️ 悬停必须单独兜：全局 button.icon:hover:not(:disabled) 是 (0,3,1)，本条只有
+     (0,3,0) —— 直接写 :hover 是 (0,4,0) 仍比它低一位，会被「鼠标一停上去白底就没了」。
+     故按 app.css 选中态组同样的手法加 body 锚点：(0,5,1) 稳压 (0,3,1)。 */
   .view-btn.active {
-    background: var(--accent-soft);
-    color: var(--accent);
+    background: var(--bg-elev);
+    color: var(--fg);
+    opacity: 1;
+  }
+
+  :global(body) .view-btn.active:hover:not(:disabled) {
+    background: var(--bg-elev);
+    color: var(--fg);
     opacity: 1;
   }
 

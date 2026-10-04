@@ -168,26 +168,28 @@
 
   .act-row button:active { transform: scale(0.96); }
 
-  /* 主操作「划线」用主色实底，AI 用主色描边，强调层次 */
+  /* 主操作「划线」用实底强调，AI 用描边，强调层次。
+     取值全部来自阅读区（--rdr-accent*）：本菜单浮在书页上，用外壳主色等于
+     换 UI 皮肤就改掉了这本书里划线/AI 按钮的颜色。 */
   .act-row .hl-main {
-    background: var(--accent);
+    background: var(--rdr-accent);
     border-color: transparent;
-    color: var(--accent-fg);
+    color: var(--rdr-accent-fg);
     font-weight: 600;
   }
 
   .act-row .hl-main:hover {
-    background: var(--accent-hover);
+    background: var(--rdr-accent-hover);
     border-color: transparent;
   }
 
   .act-row .ai {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+    color: var(--rdr-accent);
+    border-color: color-mix(in srgb, var(--rdr-accent) 42%, transparent);
   }
 
   .act-row .ai:hover {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--rdr-accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--rdr-accent) 55%, transparent);
   }
 </style>

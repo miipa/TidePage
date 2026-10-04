@@ -223,13 +223,15 @@
 
   .tb-btn:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
 
+  /* 播放键是阅读区浮层里唯一的「实底强调」，按纪律取阅读区自己的强调色：
+     换 UI 皮肤不该让这本书的播放键变色（此前引外壳 --accent/--accent-fg）。 */
   .tb-btn.primary {
-    background: var(--accent);
-    color: var(--accent-fg);
+    background: var(--rdr-accent);
+    color: var(--rdr-accent-fg);
     font-size: var(--fs-md);
   }
 
-  .tb-btn.primary:hover { background: var(--accent-hover); }
+  .tb-btn.primary:hover { background: var(--rdr-accent-hover); }
 
   .tb-btn.stop { color: var(--danger); }
 

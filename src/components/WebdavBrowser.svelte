@@ -311,7 +311,12 @@
 <div class="wd-browse" bind:this={browseEl}>
   <div class="wd-head">
     <span class="wd-title">{t("library.topbar.webdav.label")}</span>
-    <button class="icon" data-testid="wd-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (ui.webdavOpen = false)}><IconX /></button>
+    <!-- 独立拖拽占位：面板不再遮挡顶栏后，想挪窗口只能靠这里。
+         刻意不把 data-tauri-drag-region 挂在 .wd-head 上 —— Tauri 命中判定看的是鼠标
+         底下的那个元素，挂在父级上时点标题文字仍拖不动，做法与 Library 的
+         .spacer[data-tauri-drag-region] 一致。 -->
+    <span class="wd-head-drag" data-tauri-drag-region></span>
+    <button class="icon wd-close" data-testid="wd-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (ui.webdavOpen = false)}><IconX /></button>
   </div>
 
   {#if !configReady}
@@ -444,22 +449,54 @@
     box-sizing: border-box;
   }
 
+  /* ---- 面板头 ---- */
+  /* flex-shrink: 0 是必需的：本面板是 flex 列，标题/工具行/下载目录行都可能被窗口变矮
+     压扁甚至整行挤没（此前三处都没写，矮窗口下头部会先塌）。 */
   .wd-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: var(--sp-2);
     margin-bottom: 12px;
+    flex-shrink: 0;
   }
 
   .wd-title {
     font-weight: 600;
     font-size: var(--fs-lg);
     letter-spacing: var(--ls-md);
+    flex-shrink: 0;
+  }
+
+  /* 拖拽区：吃掉标题与关闭按钮之间的剩余宽度（1px 底线也够 Tauri 命中）。 */
+  .wd-head-drag {
+    flex: 1;
+    align-self: stretch;
+    min-width: var(--sp-4);
+  }
+
+  /* 关闭入口降噪：常驻可见，用 opacity .55 压低对比，悬停面板头或键盘聚焦时到 1。
+     此前是一个恒显 opacity .82 的 X，与面板标题、顶栏图标都不是同一套规格，
+     孤零零挂在标题右侧；改成「默认 opacity 0、悬停才显现」后又整体退回常驻：
+     看不见却仍占位、仍是「看起来不能点却又在那儿」的元素，而面板右侧本来就常显，
+     真正要解决的是对比度而不是存在与否。.82 → .55 就是本轮的全部改动。
+     与书库文件夹 X / 搜索弹层 X / 输入框清除键同档，四处一致。
+
+     同样刻意不加 pointer-events —— 那套只适合「胶囊里嵌透明按钮」的场景，
+     而这里 X 是面板头部唯一的关闭入口，想指向它必须先悬停面板、悬停就已经把它点亮了。 */
+  .wd-browse .wd-close {
+    flex-shrink: 0;
+    opacity: 0.55;
+    transition: opacity var(--dur) var(--ease);
+  }
+
+  .wd-browse:hover .wd-close,
+  .wd-browse .wd-close:focus-visible {
+    opacity: 1;
   }
 
   /* ---- 未配置空状态 ----
-     保留自己的结构（🔌 插图 + 标题 + 描述），但外层用全局 .wd-state 的排版规格，
-     字号/行高不再各写一份。插图沿用 emoji（换 Tabler 图标属下一轮图标统一的工作）。 */
+     保留自己的结构（图标 + 标题 + 描述），但外层用全局 .wd-state 的排版规格，
+     字号/行高不再各写一份。图标尺寸走 app.css 的空状态插图一档（--icon-empty）。 */
   .wd-empty-cfg {
     gap: 10px;
     text-align: center;
@@ -495,6 +532,7 @@
     flex-wrap: wrap;
     gap: 6px;
     margin-bottom: 8px;
+    flex-shrink: 0;
   }
 
   .wd-tools-gap {
@@ -571,6 +609,7 @@
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     margin-bottom: 10px;
+    flex-shrink: 0;
   }
 
   .wd-info-label {

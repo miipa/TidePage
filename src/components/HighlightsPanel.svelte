@@ -97,12 +97,25 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
       {#if onclose}<button class="icon" data-testid="hlp-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
   </div>
+  <!-- 搜索框 + 清除键：包裹层只提供定位参照与右侧留白（padding-right 契约与书库
+     .search-wrap 同一个，见 app.css 的 .fr-clear 小节），× 的规格全走公共类 .fr-clear。
+     .sp-search 的 border-bottom 留在外层，没挪到包裹层上。 -->
   <div class="sp-search">
-    <input
-      data-testid="hlp-search"
-      placeholder={t("highlight.searchPlaceholder")}
-      bind:value={query}
-    />
+    <span class="hlp-search-wrap">
+      <input
+        data-testid="hlp-search"
+        placeholder={t("highlight.searchPlaceholder")}
+        bind:value={query}
+      />
+      {#if query}
+        <button
+          class="fr-clear"
+          data-testid="hlp-search-clear"
+          title={t("common.action.clear")}
+          aria-label={t("library.toolbar.clearSearchAria")}
+          onclick={() => (query = "")}><IconX size={14} stroke={1.5} /></button>
+      {/if}
+    </span>
   </div>
   <div class="sp-list">
     {#if loading && !rows.length}
@@ -156,7 +169,12 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
     border-bottom: 1px solid var(--rdr-line);
   }
 
-  .sp-search input { width: 100%; box-sizing: border-box; }
+  /* 清除键的包裹层：position 给绝对定位的 × 提供参照（.fr-clear 容器契约第一条），
+     宽度接住原来 input 直接挂在 .sp-search 下时的 100%。 */
+  .hlp-search-wrap { display: block; width: 100%; position: relative; }
+
+  /* padding-right = 键宽 20 + 键的 inset 4 + 余量 2，与书库 .search-wrap .search 同一契约 */
+  .sp-search input { width: 100%; box-sizing: border-box; padding-right: 26px; }
 
   .hl-top { cursor: pointer; }
 

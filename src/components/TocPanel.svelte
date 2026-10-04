@@ -72,8 +72,21 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
       {#if onclose}<button class="icon" data-testid="toc-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
   </div>
+  <!-- 搜索框 + 清除键：包裹层只提供定位参照与右侧留白（padding-right 契约与书库
+       .search-wrap 同一个，见 app.css 的 .fr-clear 小节），× 的规格全走公共类 .fr-clear。
+       data-testid 必须留在 input 自身。onclick 只把绑定值置空 —— 虚拟滚动的定位/过滤照常经它生效。 -->
   <div class="sp-search">
-    <input data-testid="toc-search" placeholder={t("reader.toc.searchPlaceholder")} bind:value={query} />
+    <span class="toc-search-wrap">
+      <input data-testid="toc-search" placeholder={t("reader.toc.searchPlaceholder")} bind:value={query} />
+      {#if query}
+        <button
+          class="fr-clear"
+          data-testid="toc-search-clear"
+          title={t("common.action.clear")}
+          aria-label={t("library.toolbar.clearSearchAria")}
+          onclick={() => (query = "")}><IconX size={14} stroke={1.5} /></button>
+      {/if}
+    </span>
   </div>
   <div class="sp-list" bind:this={listEl} onscroll={onScroll}>
     {#if total === 0}
@@ -106,8 +119,19 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
     padding: 0 var(--sp-3) 10px;
   }
 
+  /* 清除键的包裹层：position 给绝对定位的 × 提供参照（.fr-clear 容器契约的第一条）。
+     display:block + width:100% —— 原来 input 直接挂在 .sp-search 下，现在多了一层包裹，
+     宽度必须由包裹层接过来，否则里面 input 的 width:100% 失去参照。 */
+  .toc-search-wrap {
+    display: block;
+    width: 100%;
+    position: relative;
+  }
+
   .sp-search input {
     width: 100%;
+    /* = 键宽 20 + 键的 inset 4 + 余量 2，与书库 .search-wrap .search 是同一个契约 */
+    padding-right: 26px;
   }
 
   /* 目录行是虚拟滚动的绝对定位列表，容器不能有横向 padding，故这里覆盖全局基类 */
@@ -145,8 +169,12 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
     background: color-mix(in srgb, var(--rdr-fg) 8%, transparent);
   }
 
+  /* 当前章节：中性色表达（深字 + 浅底 + 600），不用 accent。
+     accent 是稀缺资源，而「当前章节」与下方那一大片章节列表里的其它项是同级关系，
+     用主色会让整行读作一枚可点的标签 chip。字色取 --rdr-fg（阅读主题字色）而不是
+     外壳 --fg：本面板整体跟随阅读主题，换 UI 皮肤不该改动它的观感。 */
   .toc-item.current {
-    color: var(--accent);
+    color: var(--rdr-fg);
     font-weight: 600;
     background: color-mix(in srgb, var(--rdr-fg) 7%, transparent);
   }

@@ -587,6 +587,7 @@ export const zhCN = {
   "library.toolbar.refresh": "刷新",
   "library.toolbar.rescan": "重新扫描书库",
   "library.toolbar.searchPlaceholder": "搜索书名 / 作者…",
+  "library.toolbar.clearSearchAria": "清除搜索",
   "library.toolbar.reverseTip": "反向排序",
   "library.toolbar.category": "分类",
   "library.toolbar.filtered": "已筛选",
@@ -617,7 +618,8 @@ export const zhCN = {
   // ===== 空态 / 加载态 =====
   "library.empty.loading": "加载中…",
   "library.empty.noMatch": "无匹配结果",
-  "library.empty.blank": "书库为空\n点击「添加文件夹」导入本地书籍\n支持 TXT / EPUB / MOBI / AZW3",
+  "library.empty.blankTitle": "书库为空",
+  "library.empty.blankHint": "点击「添加文件夹」导入本地书籍\n支持 TXT / EPUB / MOBI / AZW3",
 
   // ===== 刷新进度文案 =====
   "library.refresh.phase.check": "对账缺失 {done}/{total}",

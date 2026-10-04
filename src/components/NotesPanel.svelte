@@ -158,7 +158,21 @@
   <div class="nl-bar">
     <span class="nl-title" data-testid="nl-title">{t("notes.title")}</span>
     <span class="nl-count">{shown.length}</span>
-    <input class="nl-search" data-testid="nl-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={query} />
+    <!-- 搜索框 + 清除键：包裹层【必须精确占 220px】（= .nl-search 原来的宽度），
+         否则这一行 flex 里的排序下拉与右侧按钮组会整体横向移位。
+         × 的规格全走公共类 .fr-clear；本面板整体走外壳层（根 .nl 用 --bg/--fg），
+         故那颗 × 的 hover 底色保持壳色，不加 .reader 覆盖。 -->
+    <span class="nl-search-wrap">
+      <input class="nl-search" data-testid="nl-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={query} />
+      {#if query}
+        <button
+          class="fr-clear"
+          data-testid="nl-search-clear"
+          title={t("common.action.clear")}
+          aria-label={t("library.toolbar.clearSearchAria")}
+          onclick={() => (query = "")}><IconX size={14} stroke={1.5} /></button>
+      {/if}
+    </span>
     <select data-testid="nl-sort" value={sortKey} onchange={(e) => setSort(e.currentTarget.value)}>
       <option value="recent">{t("notes.sort.recent")}</option>
       <option value="title">{t("notes.sort.title")}</option>
@@ -314,11 +328,12 @@
     flex-shrink: 0;
   }
 
+  /* 面板标题：16px 展示字，字距走 --ls-tight（与书库 .logo / 设置 .set-title-main 同一档） */
   .nl-title {
     font-weight: 600;
     font-size: var(--fs-lg);
     color: var(--accent);
-    letter-spacing: -0.015em;
+    letter-spacing: var(--ls-tight);
     user-select: none;
   }
 
@@ -330,8 +345,26 @@
     padding: 1px 8px;
   }
 
-  .nl-search {
+  /* 清除键的包裹层：position 给绝对定位的 × 提供参照（.fr-clear 容器契约第一条）。
+     inline-flex + width: 220px —— 220 是从下面 .nl-search 原来的宽度原样搬过来的，
+     必须精确相等：它是 .nl-bar 那行 flex 的一项，窄一像素右边的排序下拉与按钮组就会移位。
+     原来 input 自己占 220px，现在由包裹层占，input 在里面撑满。 */
+  .nl-search-wrap {
+    display: inline-flex;
     width: 220px;
+    position: relative;
+  }
+
+  /* min-width: 0 —— input 是上面 inline-flex 容器的 flex item，而 flex item 的 min-width
+     默认 auto，对 <input> 会取「基于内容的最小宽度」（由 size 属性推出的固有宽度，约 170–190px）。
+     窗口变窄、.nl-bar 把包裹层压到 220px 以下时，input 会拒绝收缩而溢出容器，
+     于是 .fr-clear 容器契约要求的 padding-right:26px 留白失效，长文本滑到 × 底下。
+     置 0 才能让它收缩到让出那 26px。 */
+  .nl-search {
+    width: 100%;
+    /* = 键宽 20 + 键的 inset 4 + 余量 2，与书库 .search-wrap .search 是同一个契约 */
+    padding-right: 26px;
+    min-width: 0;
   }
 
   .spacer { flex: 1; }
@@ -351,13 +384,16 @@
     align-content: start;
   }
 
+  /* 参数与书库 Library.svelte 的 .card 逐项对齐（抬升 -2px、--dur-lift/--ease-premium、
+     :active 回弹），两边注释都自称「与书库一致」但此前各写一套：书库是 -4px + --shadow-md，
+     笔记面板是 -2px + --dur/--ease 且没有 :active。hover 不再叠投影——投影只留给 .cover
+     那一层（.cover 自带 box-shadow），静态表面按层级纪律不该有第二层阴影。 */
   .card {
     padding: var(--sp-2);
     border-radius: var(--radius-lg);
     cursor: pointer;
-    transition: background var(--dur) var(--ease),
-      transform var(--dur) var(--ease),
-      box-shadow var(--dur) var(--ease);
+    transition: background var(--dur-lift) var(--ease-premium),
+      transform var(--dur-lift) var(--ease-premium);
     min-width: 0;
   }
 
@@ -365,10 +401,20 @@
   .card:focus-visible {
     background: var(--hover-bg);
     transform: translateY(-2px);
-    box-shadow: var(--shadow-md);
   }
 
-  .card.active { background: var(--accent-soft); }
+  .card:active {
+    transform: translateY(-1px) scale(0.99);
+    transition-duration: var(--dur-fast);
+  }
+
+  /* 选中的那条笔记：底色归中性（app.css 的 --sel-bg = --bg-elev）。
+     与 Library 的 `.card.selected`（accent 内环）语义不同，两者并存不矛盾：
+     内环是【操作态】（多选那种「你正在圈选」），底色是【层级态】（这一条正被读）。
+     这里能直接用 --sel-bg 而不必像文件夹胶囊那样补内环：卡片坐在面板底 --bg 上，
+     未选中是透明（透出 --bg）、选中是 --bg-elev，两套主题下都是「选中更亮」，
+     方向自动正确。放在 .card:hover 之后且同为 (0,3,0)，故 hover 不会盖掉选中底。 */
+  .card.active { background: var(--sel-bg); }
 
   /* ---------- 封面（与书库 .cover 一致：2:3、8px 圆角、极淡描边） ---------- */
   .cover {
@@ -515,9 +561,18 @@
   }
   .nl-status .build { font-size: var(--fs-xs); opacity: 0.55; }
 
+  /* 与 Library 的 .view-btn.active 同一份配方（中性选中态），两个面板的视图切换按钮
+     必须长得一样。悬停兜底的原理同 Library：全局 button.icon:hover:not(:disabled)
+     是 (0,3,1)，本条只有 (0,3,0)，故用 body 锚点抬到 (0,5,1)。 */
   .view-btn.active {
-    background: var(--accent-soft);
-    color: var(--accent);
+    background: var(--bg-elev);
+    color: var(--fg);
+    opacity: 1;
+  }
+
+  :global(body) .view-btn.active:hover:not(:disabled) {
+    background: var(--bg-elev);
+    color: var(--fg);
     opacity: 1;
   }
 

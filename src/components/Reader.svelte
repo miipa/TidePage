@@ -13,6 +13,7 @@
     toast,
     ui,
     THEMES,
+    RDR_FG2_PCT,
     appConfirm,
     BIND_DEFS,
     comboOf,
@@ -2955,10 +2956,31 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   /**
-   * 阅读区「表面令牌」子集：--rdr-bg/-fg 及其派生量（surface / line / radius / shadow）。
-   * 单独抽出来是因为书内搜索浮层要 portal 到 body —— 一旦脱离 .reader 子树就拿不到
-   * readerVars() 写在根节点上的内联值，只能由它在自身根元素上补一份。
+   * 阅读区「表面令牌」子集：--rdr-bg/-fg 及其派生量（surface / line / radius / shadow /
+   * accent / fg2 / hover / active）。单独抽出来是因为书内搜索浮层要 portal 到 body ——
+   * 一旦脱离 .reader 子树就拿不到 readerVars() 写在根节点上的内联值，只能由它在自身根元素上补一份。
    * 这里复用同一份 readerColors()，故浮层与它所浮着的书页永远同源（含「仅本书方案」覆盖）。
+   *
+   * ⚠️ 这一组是「阅读区不许引用外壳令牌」的执行点。阅读配色与 UI 皮肤是两套独立配置
+   *    （任意组合都可达），凡是用 --accent / --fg2 / --hover-bg / --shadow-* 的地方，
+   *    换皮肤就会改动正在读的这本书的观感。故下面全部由 --rdr-bg / --rdr-fg 推导：
+   *      · --rdr-accent：阅读字色压向底色 18%。THEMES（阅读主题表）只有 { bg, fg, sel }
+   *        三个字段，没有 accent —— 唯一存在的那一對 accent/accentFg（#3A2A20 / #1E7A55 /
+   *        #5B93E6…）在 stores.svelte.ts 的 UI_SKINS 里，是【外壳皮肤】的，用表注释写明
+   *        与阅读配色「完全解耦」。拿它当阅读强调色就等于把 A-4 要断的那根线接回去。
+   *        故阅读区的「强调」= 把阅读自己的字色压深/提亮一档：浅色主题上是深褐、
+   *        深色主题上是浅灰，在任何阅读底色上都有对比，且随主题自动换向。
+   *        （要让每套阅读主题有自己的品牌色，第一步是给 THEMES 增字段，那是改数据，需单独立项。）
+   *      · --rdr-accent-fg：压在强调底上的反色字，取「接近阅读底色」而不是纯白/纯黑 ——
+   *        纯白落在纸色底上会显脏，纯黑落在夜间底上会发光。
+   *      · --rdr-fg2：【文字】色（13px 空状态文案），混合比逐主题不同，见 stores 的
+   *        RDR_FG2_PCT —— 纸/白/暗/夜间 72%，护眼绿 78%（它的底与字都在中段，72% 只有
+   *        4.31:1）。夜间之所以敢用 72%，是因为它的字色源头已从 #8a8f96 抬到 #a8adb4：
+   *        底色太暗时，中间灰字自身 5.8:1 的低对比会把所有派生值一起拖到 AA 以下，
+   *        那种情况下要修的是源头，不是比例。
+   * app.css 的 :root 里有一份逐字相同的推导（首帧兜底，服务拿不到 .reader 的
+   * 独立阅读窗与 portal 浮层）；--rdr-fg2-pct 的运行时值由 applyReaderSurfaceVars()
+   * 写到 <html>，故那一份的比例是兜底档（纸色 72%），不是死值。
    */
   function readerSurfaceVars(): string {
     const { bg, fg } = readerColors();
@@ -2970,8 +2992,26 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       `--rdr-surface:color-mix(in srgb, var(--rdr-bg) 94%, var(--rdr-fg))`,
       `--rdr-line:color-mix(in srgb, var(--rdr-fg) 22%, transparent)`,
       `--rdr-radius:var(--radius-md)`,
-      `--rdr-shadow-pop:var(--shadow-md)`,
-      `--rdr-shadow-panel:var(--shadow-drawer)`,
+      // 阅读区浮层投影：一律由 --rdr-fg 派生，不再别名到外壳的 --shadow-md / --shadow-drawer。
+      // 那两个由 applyUiTheme() 按【外壳皮肤】前景色重算，别名过去就等于「换皮肤时这本书的
+      // 浮层投影跟着变」—— 与本文件头部「阅读区刻意不跟随外壳皮肤」的纪律直接冲突。
+      // 派生方向自动正确：阅读字色在浅色主题是深字（得到向下的暗影）、深色主题是浅字（得到微光）。
+      `--rdr-shadow-pop:0 2px 2px color-mix(in srgb, var(--rdr-fg) 8%, transparent), 0 8px 8px -4px color-mix(in srgb, var(--rdr-fg) 12%, transparent)`,
+      // 面板级：同结构、第二层偏移更大，承载「离开文档流」的量级（同外壳 --shadow-drawer 的 2/16）。
+      `--rdr-shadow-panel:0 2px 2px color-mix(in srgb, var(--rdr-fg) 8%, transparent), 0 16px 32px -8px color-mix(in srgb, var(--rdr-fg) 14%, transparent)`,
+      // 近距细影，同样染阅读字色而非纯黑：浅色阅读主题得到向下的暗影，
+      // 深色主题自动变成一圈微光（fg 是浅色），方向与外壳那套配方一致。
+      `--rdr-shadow-sm:0 1px 2px color-mix(in srgb, var(--rdr-fg) 26%, transparent)`,
+      `--rdr-accent:color-mix(in srgb, var(--rdr-fg) 82%, var(--rdr-bg))`,
+      `--rdr-accent-hover:color-mix(in srgb, var(--rdr-accent) 86%, var(--rdr-fg))`,
+      `--rdr-accent-fg:color-mix(in srgb, var(--rdr-fg) 12%, var(--rdr-bg))`,
+      // 次要文字的混合比逐主题不同（见 stores 的 RDR_FG2_PCT：只有护眼绿要 78%）。
+      // 它是【文字】色（.reader .empty-state / .sp-empty 的 13px 空状态文案），
+      // 按 WCAG 文字线 4.5:1 判。比例取自 effTheme()，故「仅本书方案」也走同一张表。
+      `--rdr-fg2-pct:${RDR_FG2_PCT[effTheme()] ?? "72%"}`,
+      `--rdr-fg2:color-mix(in srgb, var(--rdr-fg) var(--rdr-fg2-pct), transparent)`,
+      `--rdr-hover:color-mix(in srgb, var(--rdr-fg) 8%, transparent)`,
+      `--rdr-active:color-mix(in srgb, var(--rdr-fg) 14%, transparent)`,
     ].join(";");
   }
 
@@ -4601,7 +4641,8 @@ ${effCssExtra() || ""}
     color: #fff;
     background: rgba(0, 0, 0, 0.62);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-lg);
+    /* 浮层投影走阅读区的 --rdr-shadow-pop，不借外壳 --shadow-lg */
+    box-shadow: var(--rdr-shadow-pop);
     pointer-events: none;
     white-space: nowrap;
   }
@@ -4789,10 +4830,11 @@ ${effCssExtra() || ""}
     transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), opacity var(--dur) var(--ease);
   }
   .tb-chip:hover { background: color-mix(in srgb, var(--rdr-fg) 9%, transparent); }
+  /* 芯片「已开启」：阅读区自己的强调色（--rdr-accent），不跟外壳皮肤走 */
   .tb-chip.on {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
-    color: var(--accent);
+    background: color-mix(in srgb, var(--rdr-accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--rdr-accent) 42%, transparent);
+    color: var(--rdr-accent);
   }
   .tb-chip.fixed { cursor: default; opacity: 0.75; }
   .tb-chip.na { opacity: 0.42; }
@@ -4829,7 +4871,7 @@ ${effCssExtra() || ""}
   .manga-val { min-width: 38px; text-align: right; opacity: 0.75; }
   .manga-actions { display: flex; gap: 8px; padding: 6px; }
 
-  .font-ctl .icon.on { color: var(--accent); font-weight: 700; }
+  .font-ctl .icon.on { color: var(--rdr-accent); font-weight: 700; }
 
   .body {
     flex: 1;
@@ -5093,8 +5135,9 @@ ${effCssExtra() || ""}
     zoom: 1 !important;
   }
 
+  /* 工具栏按钮的激活态：阅读区强调色，不随 UI 皮肤变 */
   .tb-btn.on {
-    color: var(--accent);
+    color: var(--rdr-accent);
     font-weight: 700;
   }
 
@@ -5178,11 +5221,13 @@ ${effCssExtra() || ""}
     cursor: pointer;
   }
 
+  /* TTS 朗读中的当前句：底色与描边由阅读主题的强调色派生。
+     此前用外壳 --accent —— 于是换阅读主题时这一块纹丝不动，换 UI 皮肤时它反而跟着变。 */
   #chapter-content :global(mark.fr-tts) {
-    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    background: color-mix(in srgb, var(--rdr-accent) 32%, transparent);
     color: inherit;
     border-radius: var(--radius-xs);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--rdr-accent) 45%, transparent);
   }
 
   #chapter-content :global(mark.fr-hl-underline) {
@@ -5428,7 +5473,9 @@ ${effCssExtra() || ""}
     width: 100%;
     height: var(--bar-h);
     margin-top: calc(var(--bar-h) / -2);
-    background: var(--accent);
+    /* 进度与激活指示属于「accent 允许的小面积强调」，但取值必须来自阅读主题：
+       换阅读主题时进度条要跟着变（此前它是外壳主色，纹丝不动）。 */
+    background: var(--rdr-accent);
     border-radius: var(--radius-pill);
     transform-origin: left center;
     z-index: var(--z-base);
@@ -5443,8 +5490,9 @@ ${effCssExtra() || ""}
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--accent);
-    box-shadow: var(--shadow-sm);
+    background: var(--rdr-accent);
+    /* 滑块自身的细影也走阅读区（--rdr-shadow-sm 染阅读字色），不借外壳 --shadow-sm */
+    box-shadow: var(--rdr-shadow-sm);
     transform: translate(-50%, -50%);
     opacity: 0;
     pointer-events: none;
@@ -5480,12 +5528,14 @@ ${effCssExtra() || ""}
     border-radius: var(--radius-sm);
     transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
   }
+  /* 页脚左右两枚「翻章」热区：悬停/按下底色走阅读区派生量，
+     此前引外壳 --hover-bg/--active-bg，换皮肤会让阅读页脚的反馈色跟着变。 */
   .finfo:hover {
-    background: var(--hover-bg);
+    background: var(--rdr-hover);
     opacity: 1;
   }
   .finfo:active {
-    background: var(--active-bg);
+    background: var(--rdr-active);
     transform: scale(0.96);
   }
   .finfo-l { text-align: left; }
@@ -5502,10 +5552,8 @@ ${effCssExtra() || ""}
     place-items: center;
   }
 
-  .error-box {
-    opacity: 1;
-  }
-
+  /* 打开失败的空状态：排版走全局 .empty-state，这里只留它自己的两行文字规格
+     （原先还有一条 `.error-box { opacity: 1 }`，全局与组件都没别的 opacity 规则要覆盖，是残留空规则）。 */
   .error-box p {
     margin: 6px 0;
     font-weight: 600;

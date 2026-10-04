@@ -1356,7 +1356,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       <div class="set-search">
         <input placeholder={t("settings.nav.searchPlaceholder")} bind:value={navQuery} aria-label={t("settings.nav.searchAria")} onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
         {#if navQuery}
-          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}><IconX /></button>
+          <button class="fr-clear set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}><IconX size={14} stroke={1.5} /></button>
         {/if}
       </div>
       <div class="set-nav-list" use:dragSort={{ onDrop: navDrop, axis: "y" }}>
@@ -2640,6 +2640,16 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     color: var(--fg);
   }
 
+  /* 本弹窗的动作按钮【刻意不铺药丸】：圆角由 app.css 的全局 button 基线
+     （--radius-sm / 6px）承担，与 minimalist-ui 的「轻微圆角 4–6px」和 Linear 的
+     button-primary/secondary/tertiary（rounded: md）同一档。原先这里有一条
+     `.settings-root :where(button:not(...)) { border-radius: var(--radius-pill) }`
+     的兜底，把 60 多个裸按钮一次性铺成胶囊 —— 一排同级动作按钮全是胶囊时，
+     它们读起来像标签而不是「能按的东西」，形状层级（按钮 < 卡片 < 面板）整个塌掉。
+     适用边界写在 app.css「圆角阶梯」处，不要在本文件另起一份。
+     仍保留药丸的三类：.set-nav-item（轨道上的一段，同 Linear 的 pricing-tab）、
+     .set-nav-item::before 那根 2px 指示条、以及各处显式写了 --radius-pill 的标签/芯片。 */
+
   .set-head {
     display: flex;
     align-items: center;
@@ -2657,10 +2667,22 @@ let aiTestState = $state<"" | "ok" | "bad">("");
   }
 
   .set-title-main { font-weight: 600; letter-spacing: var(--ls-tight); }
-  .set-crumb { color: var(--fg2); font-weight: 400; display: inline-flex; align-items: center; }
-  .set-crumb-now { color: var(--fg2); font-size: var(--fs-sm); }
+  /* 面包屑：标题 16px/600，当前分区 12px/次要色。
+     此前把当前分区做成一枚 accent 芯片（accent 字 + accent-soft 底 + 药丸），
+     它和左侧导航的选中项在表达同一件事（「我在哪个分区」），两处都用 accent 是
+     重复消耗稀缺资源，也会让人误以为这里可点。改回普通文字：深字 + 600 字重，
+     与左导航的区分改由字号/字重承担。 */
+  .set-crumb { color: var(--fg2); font-weight: 400; display: inline-flex; align-items: center; opacity: 0.6; }
+  .set-crumb-now {
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    color: var(--fg);
+    font-weight: 600;
+  }
 
-  .set-close { font-size: 18px; line-height: 1; }
+  /* .set-close 原先有一条 `font-size: 18px; line-height: 1` —— 键里只有一枚 <IconX>，
+     而按钮内图标尺寸由 app.css 的 button.icon .tabler-icon 强制成 --icon-md(20px)，
+     font-size 对 <svg> 不生效，故整条删除。类名按原样留在 markup 上当稳定钩子。 */
 
   .set-main {
     flex: 1;
@@ -2683,33 +2705,13 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     width: 100%;
     min-height: 30px;
     font-size: var(--fs-xs);
-    padding-right: 26px;
+    padding-right: 26px; /* .fr-clear 的容器契约：键宽 20 + inset 4 + 余量 2 */
     box-sizing: border-box;
   }
-  .set-search-clear {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 20px;
-    height: 20px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: none;
-    background: transparent;
-    color: var(--fg2);
-    cursor: pointer;
-    border-radius: 50%;
-    font-size: var(--fs-md);
-    letter-spacing: var(--ls-md);
-    line-height: 1;
-    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
-  }
-  .set-search-clear:hover {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--fg);
-  }
+  /* 清除键的规格（定位参照、20×20 圆底、降噪、图标档位）已收敛到 app.css 的公共类
+     .fr-clear，与书库顶栏搜索框那颗共用同一份配方，这里不再抄第二遍。
+     .set-search-clear 这个类名按原样留在 markup 上：它是这颗按钮在本弹窗里的稳定钩子，
+     将来若要给它单独加样式不必先改 markup。 */
 
 
   .set-nav-group {
@@ -2723,7 +2725,13 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     text-transform: none;
   }
 
+  /* 左侧导航项：胶囊形 + 左侧一根 accent 指示条。
+     指示条放在左侧 10px 内边距里（left: 3px，宽 2px），因此不需要给选中态单独加
+     padding-left —— 切换 tab 时文字不会横向跳一下。绝对定位 + flex 项互不影响：
+     ::before 虽然是 button 的 flex item，position:absolute 已把它移出流。
+     opacity 过渡而非 display 切换，键盘切 tab 时指示条是滑入的而不是闪现。 */
   .set-nav-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -2733,11 +2741,25 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     background: transparent;
     color: var(--fg2);
     padding: 8px 10px;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-pill);
     font-size: var(--fs-sm);
     min-height: 34px;
     box-shadow: none;
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  }
+
+  .set-nav-item::before {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 50%;
+    translate: 0 -50%;
+    width: 2px;
+    height: 14px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    opacity: 0;
+    transition: opacity var(--dur) var(--ease);
   }
 
   .set-nav-item:hover:not(:disabled) {
@@ -2750,6 +2772,10 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     background: var(--accent-soft);
     color: var(--accent);
     font-weight: 600;
+  }
+
+  .set-nav-item.active::before {
+    opacity: 1;
   }
 
   .set-nav-glyph {
@@ -2810,6 +2836,21 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     padding: 20px 24px;
   }
 
+  /* 分组节奏：.field 之间的间距由全局 .field 的 margin-bottom 承担，
+     但「一段字段 → 下一个 .sec-title」之间此前只有 12px，扫读时分段完全看不出来。
+     给 .sec-title 补上顶部留白，分组就成了显式的节奏而不是连续的表单流。
+     分隔线同样统一到 hairline：裸 <hr> 是浏览器默认的 2px 灰立体条，
+     与本项目「静态表面只靠 hairline 表达层级」的纪律相违。 */
+  .settings-root :where(.sec-title) {
+    margin-top: var(--sp-4);
+  }
+
+  .settings-root :where(hr) {
+    border: none;
+    border-top: 1px solid var(--line);
+    margin: var(--sp-4) 0;
+  }
+
   /* pane 常驻渲染、按需 hidden：normal 流下隐藏即可（显式声明防止被其它 display 规则覆盖）。 */
   .set-pane[hidden] { display: none; }
 
@@ -2819,7 +2860,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    padding: 12px 20px;
+    padding: var(--sp-3) var(--sp-4);
     border-top: 1px solid var(--line);
     flex-shrink: 0;
   }
@@ -3191,9 +3232,12 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     justify-content: center;
   }
 
+  /* 方案卡内的「重命名 / 清空本书」两颗小按钮：22px 是手写值，比 --ctl-h-sm 还矮，
+     胶囊化之后圆角吃掉了更多水平空间、观感更挤；收到小按钮那一档（26px），
+     命中区与视觉重量才和 .scheme-actions 里的按钮一致。 */
   .scheme-menu button {
-    min-height: 22px;
-    padding: 1px 6px;
+    min-height: var(--ctl-h-sm);
+    padding: 1px var(--sp-2);
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
   }
@@ -3574,11 +3618,13 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     margin-top: 10px;
   }
 
+  /* 版本号进一步退到背景里：它是底栏里唯一与「完成」按钮无关的信息，
+     此前 12px + opacity .7 仍会跟主按钮抢注意力；降到 10px 一档后只剩一行暗记号。 */
   .ver {
-    font-size: var(--fs-xs);
-    letter-spacing: var(--ls-xs);
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
     color: var(--fg2);
-    opacity: 0.7;
+    opacity: 0.55;
     margin-right: auto;
   }
 
@@ -3590,23 +3636,16 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     line-height: 1.5;
   }
 
-
-
-  .checks input[type="checkbox"],
-  input[type="checkbox"] {
-    width: 15px;
-    height: 15px;
-    accent-color: var(--accent);
-    cursor: pointer;
-  }
-
-  input[type="range"] {
-    accent-color: var(--accent);
-    cursor: pointer;
-  }
-
   /* .field（字段容器）与 .sec-title（分组小标题）已收敛到 app.css 的全局一份，
-     不在此处重复定义 —— 原先这里那份总会覆盖全局那份，是「同一个类两套外观」的根源。 */
+     不在此处重复定义 —— 原先这里那份总会覆盖全局那份，是「同一个类两套外观」的根源。
+
+     input[type="checkbox"] / input[type="range"] 同样只保留 app.css 里的那一份：
+     这里原先又抄了一遍完全相同的四条属性（宽高 + accent-color + cursor），
+     抄第二遍的唯一后果是「改外观要改两个地方，其中一个还没人记得」。
+     要统一这类控件的外观就改 app.css，不要在这里开第三处。
+     滑块目前仍是浏览器原生轨道（只改了 accent-color）：自定义轨道/滑块头要写
+     -webkit-slider-runnable-track / ::-webkit-slider-thumb 等伪元素，而伪元素不吃
+     变量，深浅两套主题得各写一份字面色 —— 与「只写 token」冲突，本轮不做。 */
 
   /* 窄窗口（如弹出的 AI 独立窗内打开设置）：
      侧栏改为顶部横向导航条，内容占满整宽，杜绝横向滚动条并优化排版。

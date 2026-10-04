@@ -205,8 +205,12 @@ export interface ReaderConfig {
   lineHeight: number;
   paraSpacing: number;
   marginH: number;
-  /** >0 时忽略 marginH，按「每行 N 字」自动居中（宽屏更友好） */
+  /** >0 时忽略 marginH，按「每行 N 字」自动居中（宽屏更友好）。
+   *  0 = 关闭测量、纯按 marginH 给硬边距（用户显式选择，迁移不得再改回来）。 */
   maxLineChars: number;
+  /** 「按字数测量行宽」这条默认值的迁移标记，见 MEASURE_REV_MIGRATED 与
+   *  normalizeReaderConfig()。只增不改：值本身无意义，有意义的是「与没它时是否同版本」。 */
+  measureRev: number;
   marginV: number;
   indent: string;
   textAlign: TextAlign;
@@ -948,6 +952,19 @@ export function normAiGroupOrder(v: any): string[] {
   return out;
 }
 
+/// 「按字数测量行宽」这条默认值的版本标记。
+///
+/// 为什么需要它：DEFAULTS 只在**全新安装**生效，存量安装走的是
+/// `{ ...DEFAULTS.reader, ...saved.reader }` —— saved 里存着 maxLineChars: 0，
+/// 于是改 DEFAULTS 对老用户是 no-op。而 0 又是合法值，下面的 num() 兜底也写死 0，
+/// 归一化分支永不触发。也就是说：不带标记的迁移对老用户完全是静默的。
+///
+/// 判据与本文件另两处迁移同源（scrollBounceLevel 看旧字段是否存在、
+/// cssExtra 逐字比对旧默认值）：存量配置里缺这个字段 = 它来自旧版本 = 它的
+/// maxLineChars 是旧默认值，值得换成新默认值。字段一旦落盘，迁移就只跑一次 ——
+/// 用户此后把「每行字数」调回 0（= 显式选择纯 marginH 行为）不会被再改回来。
+const MEASURE_REV_MIGRATED = 1;
+
 const DEFAULTS: AppConfig = {
   reader: {
     mode: "page",
@@ -961,7 +978,8 @@ const DEFAULTS: AppConfig = {
     lineHeight: 1.75,
     paraSpacing: 0.6,
     marginH: 320,
-    maxLineChars: 0,
+    maxLineChars: 32, // 32px 字号下约 32 个汉字/行（中文排版惯例 25–35 字）；0 = 纯 marginH
+    measureRev: MEASURE_REV_MIGRATED,
     marginV: 80,
     indent: "1em",
     textAlign: "justify",
@@ -1326,6 +1344,18 @@ function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
   if (r.fontWeight !== fw) { r.fontWeight = fw; dirty = true; }
   const mlc = num(r.maxLineChars, 0, 120, 0);
   if (r.maxLineChars !== mlc) { r.maxLineChars = mlc; dirty = true; }
+  // 迁移：旧默认的「纯 marginH 硬边距」→ 按每行 32 字测量居中。
+  // 守卫用 savedRaw 里【有没有 measureRev】判断，而不是「值是不是 0」—— 0 是合法值，
+  // 用户自己设 0 与旧默认留下的 0 在数据里长得一模一样，按值判断等于把他显式的选择也改掉。
+  // 命中即无条件写新默认值并置位标记，故迁移只发生一次（幂等）。
+  // savedRaw 整体缺失 = 全新安装：merged.reader 已经是 DEFAULTS（标记与新默认值都在），不迁移。
+  if (savedRaw && savedRaw.measureRev == null) {
+    r.maxLineChars = DEFAULTS.reader.maxLineChars;
+    r.measureRev = MEASURE_REV_MIGRATED;
+    dirty = true;
+  }
+  const mr = num(r.measureRev, 0, MEASURE_REV_MIGRATED, MEASURE_REV_MIGRATED);
+  if (r.measureRev !== mr) { r.measureRev = mr; dirty = true; }
   const ta = r.textAlign === "left" ? "left" : "justify";
   if (r.textAlign !== ta) { r.textAlign = ta; dirty = true; }
   // 旧 strength/threshold → 三档 level（仅当旧字段存在且未有 level 时换算）
@@ -1475,7 +1505,28 @@ export const THEMES: Record<ThemeKey, { bg: string; fg: string; sel: string }> =
   white: { bg: "#ffffff", fg: "#2b2b2b", sel: "#eef1f4" },
   green: { bg: "#c7e6c9", fg: "#2d3a2d", sel: "#b3d9b5" },
   dark: { bg: "#23262b", fg: "#b8bcc2", sel: "#33373d" },
-  night: { bg: "#0f1115", fg: "#8a8f96", sel: "#1d2026" },
+  // 夜间字色由 #8a8f96 抬到 #a8adb4：底色 #0f1115 本身很暗，原来那个中间灰字自身只有
+  // 5.80:1，于是所有从它派生的 token 都被卡住 —— 次要文字(--rdr-fg2 72%)只有 3.58:1、
+  // 强调(--rdr-accent 82%)4.26:1、反色字(--rdr-accent-fg)3.68:1，三个都在 AA 文字线以下。
+  // 派生层再怎么调都只是把不足挪到另一处，所以抬源头一次：正文 8.37:1，
+  // 上述三项随之变成 4.82 / 5.95 / 4.91 : 1，全部过线。夜间是停留时间最长的阅读界面，
+  // 值给足比留余量重要。
+  night: { bg: "#0f1115", fg: "#a8adb4", sel: "#1d2026" },
+};
+
+/** 阅读区「次要文字」的混合比：--rdr-fg2 = 阅读字色 × 本值 + 底色 × 余量。
+ *  逐主题一份，因为不同底色的可用余量不同：纸/白/暗/夜间一律 72% 就已过 AA；
+ *  只有护眼绿 —— 底(#c7e6c9)与字(#2d3a2d)都在中段，72% 实测只有 4.31:1，需要 78%（5.00:1）。
+ *  ⚠️ 不要图省事改成全局 78%：纸色主题的次要文字会从 5.43:1 涨到 6.54:1（86% 更是 8.43:1），
+ *  次要色与正文几乎同重，层级被抹平。派生的目标是「够读且明显更轻」，不是越大越好。
+ *  唯一来源：app.css :root 的首帧兜底、Reader 的 readerSurfaceVars()、
+ *  以及 applyReaderSurfaceVars() 写 <html>（供独立阅读窗与 portal 浮层）都读这张表。 */
+export const RDR_FG2_PCT: Record<ThemeKey, string> = {
+  paper: "72%",
+  white: "72%",
+  green: "78%",
+  dark: "72%",
+  night: "72%",
 };
 
 const KEY = "tidepage.config.v1";
@@ -1602,10 +1653,14 @@ function migrateTts(savedTts: any): TtsConfig {
   return base as TtsConfig;
 }
 
-/** 归一化方案库：补齐 id/name，快照用默认配置兜底；空库时注入内置方案。 */
-function normalizeSchemes(list: any): ReaderScheme[] {
+/** 归一化方案库：补齐 id/name，快照用默认配置兜底；空库时注入内置方案。
+ *  返回 { list, dirty }：dirty = 方案快照里有配置被迁移/修正过（见 normalizeReaderConfig），
+ *  调用方要把它并进落盘标记 —— 否则迁移只活在内存里，每次启动重跑一遍，
+ *  且导出的 profile 里方案快照仍是旧值（这正是「存量方案快照的迁移不落盘」那个 bug）。 */
+function normalizeSchemes(list: any): { list: ReaderScheme[]; dirty: boolean } {
   const out: ReaderScheme[] = [];
   const seen = new Set<string>();
+  let dirty = false;
   if (Array.isArray(list)) {
     for (const s of list) {
       if (!s || typeof s !== "object") continue;
@@ -1620,12 +1675,13 @@ function normalizeSchemes(list: any): ReaderScheme[] {
         bindings: { ...structuredClone(DEFAULT_BINDINGS), ...(cfgSrc.bindings || {}) },
         zones: { ...structuredClone(DEFAULT_ZONES), ...(cfgSrc.zones || {}) },
       };
-      normalizeReaderConfig(cfg, cfgSrc);
+      if (normalizeReaderConfig(cfg, cfgSrc)) dirty = true;
       out.push({ id, name, builtin: s.builtin === true, rev: typeof s.rev === "number" ? s.rev : undefined, cfg });
     }
   }
-  if (!out.length) return builtinSchemes();
-  return out;
+  // 空库注入内置方案：本次调用改写了内容，同样要落盘（否则刷新前存储里仍为空）。
+  if (!out.length) return { list: builtinSchemes(), dirty: true };
+  return { list: out, dirty };
 }
 
 function load(): AppConfig {
@@ -1657,6 +1713,9 @@ function load(): AppConfig {
     const migratedAi = migrateAi(saved.ai);
     // 迁移：语音朗读由「扁平协议字段」改为「服务配置档案」；无 services 时需落盘一次。
     if (!Array.isArray(saved.tts?.services) || !saved.tts.services.length) ttsMigrationDirty = true;
+    // 方案库归一化要在 merged 之前算完：既要拿它的 list 填进 merged，
+    // 也要把它的 dirty 并进 readerMigrationDirty（方案快照的迁移必须落盘）。
+    const schemeNorm = normalizeSchemes(saved.readerSchemes);
     const merged: AppConfig = {
       reader: {
         ...DEFAULTS.reader,
@@ -1687,11 +1746,14 @@ function load(): AppConfig {
       uiTheme: saved.uiTheme === "light" || saved.uiTheme === "dark" ? saved.uiTheme : "system",
       uiSkinLight: resolveSkinId(saved.uiSkinLight, "light"),
       uiSkinDark: resolveSkinId(saved.uiSkinDark, "dark"),
-      readerSchemes: normalizeSchemes(saved.readerSchemes),
+      readerSchemes: schemeNorm.list,
       // i18n 接线：只认 auto / zh-CN / en，旧配置里的任意字符串（含早期空串）一律回落 auto。
       language: normLanguageSetting(saved.language),
       settingsOrder: normSettingsOrder(saved.settingsOrder),
     };
+    // 方案快照里的迁移（reader 字段默认值变更、废弃键清理等）也要落盘：
+    // 丢在内存里会导致每次启动重跑一遍，且导出的 profile 里方案快照仍是旧值。
+    if (schemeNorm.dirty) readerMigrationDirty = true;
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
     if (merged.reader.fontFamily === '"Microsoft YaHei", "Segoe UI", serif') {
       merged.reader.fontFamily = DEFAULTS.reader.fontFamily;
@@ -1969,6 +2031,10 @@ function applyReaderSurfaceVars(): void {
   const fg = config.reader.fgColor || t.fg;
   root.style.setProperty("--rdr-bg", bg);
   root.style.setProperty("--rdr-fg", fg);
+  // 次要文字的混合比逐主题不同（见 RDR_FG2_PCT），必须跟着主题一起写，否则独立阅读窗与
+  // portal 浮层里的 .reader .empty-state / .sp-empty 会退回首帧兜底的 72% ——
+  // 护眼绿在 72% 下只有 4.31:1。
+  root.style.setProperty("--rdr-fg2-pct", RDR_FG2_PCT[config.reader.theme] ?? "72%");
 }
 
 // 界面主题响应式生效：uiTheme / 皮肤变化即更新；system 时监听系统切换。
@@ -2105,7 +2171,7 @@ export function applyConfigJson(json: string) {
     obj.uiTheme = obj.uiTheme === "light" || obj.uiTheme === "dark" ? obj.uiTheme : "system";
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");
-    obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
+    obj.readerSchemes = normalizeSchemes(obj.readerSchemes).list;
     obj.language = normLanguageSetting(obj.language);
     obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
     // 跨窗广播/导出的都是「已脱敏 config」，敏感字段均为空。先记下本窗当前密钥，

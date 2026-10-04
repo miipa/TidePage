@@ -808,7 +808,9 @@ ${readerStyle.extra}
   </div>
 {/snippet}
 
-<div class="ai-panel" class:standalone class:reader={isReader} style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}>
+<!-- 类名两个都留：.sidepanel 提供通用九条声明（与目录/划线/书签面板同一份），
+     .ai-panel 承载 .standalone / .reader 变体与 .ai-* 子件选择器。宽度仍由内联压过。 -->
+<div class="sidepanel ai-panel" class:standalone class:reader={isReader} style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}>
   {#if isReader}
     {@render aiHead()}
     {@render promptBar(true)}
@@ -1071,24 +1073,22 @@ ${readerStyle.extra}
     z-index: var(--z-raised);
   }
 
-  /* AI 面板本体：与其它侧面板同一套表面规格（底色/描边/投影走 --rdr-*，
-     宽度由状态注入 --sidepanel-w，方向为右侧故不加 .sidepanel--left）。
-     阅读区内打开时额外叠一层 --ai-* 变量（面板自己的配色方案）。 */
-  .ai-panel {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: var(--sidepanel-w);
-    background: var(--rdr-surface);
-    border-left: 1px solid var(--rdr-line);
-    z-index: var(--z-drawer);
-    display: flex;
-    flex-direction: column;
-    box-shadow: var(--rdr-shadow-panel);
-    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
-  }
+  /* ---------- 面板本体 ---------- */
+  /* 规格全部走 app.css 的全局 .sidepanel（position/三边贴合/宽/底色/描边/
+   层级/flex 列/投影/入场动画九条与 .sidepanel 逐字相同，此前在这里复制了一份）。
+   类名两个都留：.sidepanel 负责那九条通用声明，.ai-panel 仍要承载 .standalone / .reader
+   两个变体与全部 .ai-* 子件选择器。
 
+   为什么删得掉且零视觉变化（两条都核过）：
+     · 模板用内联 width:{panelWidth}px 压过两边的 width: var(--sidepanel-w)，等价替换；
+     · .ai-panel.standalone / .ai-panel.reader 是 (0,3,0)，稳压全局 .sidepanel 的 (0,1,0)；
+     · 全局只有 .sidepanel 与 .sidepanel--left 两条规则，后者不挂这个元素；
+       .panel-window-root :global(.sidepanel)（独立面板窗把面板拉满并下移 40px）在
+       StandalonePanel 自己的子树内，而那棵子树只有 TocPanel / HighlightsPanel /
+       BookStatsModal / NotesPanel，AiPanel 只挂在 Reader 与 +page 的 .ai-window-root 下，
+       两者不相交。 */
+
+  /* 独立 AI 窗：整窗即面板（position/width/height/描边/投影/动画全部覆盖全局 .sidepanel）。 */
   .ai-panel.standalone {
     position: fixed;
     width: 100%;
@@ -1098,12 +1098,13 @@ ${readerStyle.extra}
     animation: none;
   }
 
+  /* 阅读区内打开时叠一层 --ai-* 变量（面板自己的配色方案）；非阅读区沿用全局 .sidepanel 的 --rdr-* */
   .ai-panel.reader {
     background: var(--ai-bg, var(--rdr-bg));
     color: var(--ai-fg, var(--rdr-fg));
   }
 
- .ai-head {
+  .ai-head {
     display: flex;
     flex-direction: column;   /* 两行：标题行 + 动作行 */
     align-items: stretch;

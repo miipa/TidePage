@@ -398,17 +398,27 @@
   }
 
   /* WebDAV 抽屉：遮罩用 --z-drawer、抽屉本体用 --z-overlay —— 刻意压在 --z-modal 之下，
-     这样即使用户先开抽屉再开设置/搜索弹窗，弹窗仍然盖住抽屉（与重构前的 991 < 1000 一致）。 */
+     这样即使用户先开抽屉再开设置/搜索弹窗，弹窗仍然盖住抽屉（与重构前的 991 < 1000 一致）。
+
+     位置：从「贴右边、顶到底的整幅面板」改成「让开顶栏、四边留白的浮动面板」。
+     ① top 让开顶栏：--fr-titlebar-h 由 Library/Reader 的 bind:clientHeight 实测写入 <html>，
+        fallback 44px 覆盖首帧还没测到值的那一瞬（独立窗不挂顶栏时也吃这个兜底）。
+        此前只有 WindowControls 消费过它做自身高度，浮层拿它做 top 偏移是第一次 ——
+        少了这一步，抽屉从视口 y=0 起铺满，右侧那 520px 内的顶栏被完全盖住，
+        视觉上就读成了「顶栏的延伸」而不是「浮在书库之上的一块面板」。
+     ② 右/下留边（走 --sp-2，不写裸 px）+ --radius-xl：读作悬浮卡片；
+        投影沿用 --shadow-drawer（这仍是 drawer 档，不换 --shadow-lg）。 */
   .wd-drawer {
     position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
+    top: var(--fr-titlebar-h, 44px);
+    right: var(--sp-2);
+    bottom: var(--sp-2);
     width: min(520px, 92vw);
     z-index: var(--z-overlay);
     background: var(--panel);
     color: var(--fg);
-    border-left: 1px solid var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
     box-shadow: var(--shadow-drawer);
     animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
     display: flex;
