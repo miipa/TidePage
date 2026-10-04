@@ -96,6 +96,15 @@
   /* ---- 侧面板 ---- */
   --sidepanel-w: 340px; /* 目录面板覆写为 320px；AI 面板由状态注入 */
 
+  /* ---- 自绘窗口按钮预留宽度 ----
+     三个无边框窗口（书库 / 阅读 / AI 独立窗）的顶栏右上角浮着同一组自绘窗口按钮
+     （最小化/最大化/关闭），顶栏必须给它们右侧留出这么宽，否则标题文字会被压住。
+     原本这个 112px 在 Reader.svelte / Library.svelte / AiPanel.svelte 里各写一遍，
+     改一处漏两处就有一个界面的标题被按钮压住 —— 现在只有这一处。
+     值 = 3 个 30×30 按钮 + 间距 + 右边距 ≈ 112px，与 WindowControls 的实际宽度对齐；
+     改按钮尺寸时改这里，不要去改那三处 padding-right。 */
+  --wc-reserve-w: 112px;
+
   /* ---- z-index 层级表（全应用唯一来源，禁止再写字面量）----
      portal 到 body 的浮层必须用 --z-portal，否则会被 modal 盖住。 */
   --z-base: 0;
@@ -1246,7 +1255,7 @@ p,
       IconX 这类子组件内部渲染的，带的是子组件的 class —— scoped 规则永远匹配不上。
       子组件内部的元素只有全局选择器能选中。 */
 .mini .tabler-icon,
-.tb-mini .tabler-icon,
+.tts-mini .tabler-icon,
 .stat-mv .tabler-icon,
 .sb-drag .tabler-icon,
 .sb-head .mini .tabler-icon,
@@ -1259,7 +1268,7 @@ p,
 .set-search-clear .tabler-icon,
 .set-crumb .tabler-icon,
 .prompt-chip .tabler-icon,
-.tb-sleep .tabler-icon,
+.tts-sleep .tabler-icon,
 .wd-ico .tabler-icon,
 .wd-btn .tabler-icon {
   width: var(--icon-xs);
@@ -1294,10 +1303,12 @@ p,
 }
 
 /* 传输控制按钮（TTS 上一句/播放暂停/下一句/停止/设置）：按钮内图标那一档。
-   刻意只限定 .tts-bar —— 阅读器工具栏也用 .tb-btn，但那一档是 20px，
-   靠上面的 button.icon 规则生效；这里若写成裸 .tb-btn，未来任何没带 .icon 的
-   .tb-btn 都会被无声地压到 16px。 */
-.tts-bar .tb-btn .tabler-icon {
+   刻意只限定 .tts-bar —— 阅读器顶栏的按钮类名是 .tb-btn（topbar），那一档是 20px，
+   靠上面的 button.icon 规则生效；这里若写成裸 .tts-btn，未来任何没带 .icon 的
+   .tts-btn 都会被无声地压到 16px。
+   ⚠️ 顺带记一笔前缀归属：.tb-* 专属 Reader 的顶栏（topbar），TTS 条一律 .tts-*。
+      两者曾在同一棵 .reader 子树里撞车（TTS 误用 .tb-btn/.tb-panel），已改名收敛。 */
+.tts-bar .tts-btn .tabler-icon {
   width: var(--icon-sm);
   height: var(--icon-sm);
 }

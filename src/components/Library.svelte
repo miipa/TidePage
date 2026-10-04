@@ -2023,8 +2023,8 @@
     align-items: center;
     gap: var(--sp-2);
     padding: var(--sp-3) var(--sp-4);
-    /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
-    padding-right: 112px;
+    /* 右侧留出自绘窗口控制按钮的宽度并留自然间距（宽度由 app.css 的 --wc-reserve-w 统一定义） */
+    padding-right: var(--wc-reserve-w);
     background: var(--panel);
     border-bottom: 1px solid var(--line);
     box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02), 0 6px 16px -12px rgba(23, 25, 30, 0.35);

@@ -90,32 +90,32 @@
 </script>
 
 <div class="tts-bar rdr-pop" class:expanded>
-  <button class="tb-btn" data-testid="tts-prev" title={t("tts.prevSentence")} onclick={ttsPrev}><IconPlayerSkipBack /></button>
-  <button class="tb-btn primary" data-testid="tts-pause" title={ttsState.paused ? t("tts.resume") : t("tts.pause")} onclick={ttsPauseResume}>
+  <button class="tts-btn" data-testid="tts-prev" title={t("tts.prevSentence")} onclick={ttsPrev}><IconPlayerSkipBack /></button>
+  <button class="tts-btn primary" data-testid="tts-pause" title={ttsState.paused ? t("tts.resume") : t("tts.pause")} onclick={ttsPauseResume}>
     {#if ttsState.paused}<IconPlayerPlay />{:else}<IconPlayerPause />{/if}
   </button>
-  <button class="tb-btn" data-testid="tts-next" title={t("tts.nextSentence")} onclick={ttsNext}><IconPlayerSkipForward /></button>
-  <button class="tb-btn stop" data-testid="tts-stop" title={t("tts.stop")} onclick={ttsStop}><IconPlayerStop /></button>
+  <button class="tts-btn" data-testid="tts-next" title={t("tts.nextSentence")} onclick={ttsNext}><IconPlayerSkipForward /></button>
+  <button class="tts-btn stop" data-testid="tts-stop" title={t("tts.stop")} onclick={ttsStop}><IconPlayerStop /></button>
 
-  <div class="tb-info" title={current?.text || ""}>
-    <span class="tb-count">
+  <div class="tts-info" title={current?.text || ""}>
+    <span class="tts-count">
       {ttsState.index >= 0 ? ttsState.index + 1 : 0}/{ttsState.total}
     </span>
-    <span class="tb-text">{current?.text || "…"}</span>
+    <span class="tts-text">{current?.text || "…"}</span>
     {#if ttsState.buffering}
-      <span class="tb-buffering" title={t("tts.generating")}>{t("tts.buffering")}</span>
+      <span class="tts-buffering" title={t("tts.generating")}>{t("tts.buffering")}</span>
     {/if}
   </div>
 
   {#if sleepLeft > 0}
-    <span class="tb-sleep" title={t("tts.timerRemain")}><IconClock /> {fmtLeft(sleepLeft)}</span>
+    <span class="tts-sleep" title={t("tts.timerRemain")}><IconClock /> {fmtLeft(sleepLeft)}</span>
   {/if}
 
-  <button class="tb-btn" data-testid="tts-settings" title={t("tts.settings")} onclick={() => (expanded = !expanded)}><IconSettings /></button>
+  <button class="tts-btn" data-testid="tts-settings" title={t("tts.settings")} onclick={() => (expanded = !expanded)}><IconSettings /></button>
 
   {#if expanded}
-    <div class="tb-panel">
-      <div class="tb-row">
+    <div class="tts-panel">
+      <div class="tts-row">
         <label>{config.tts.engine === "online" ? t("tts.voiceLabel") : t("tts.voice")}</label>
         {#if config.tts.engine === "online"}
           <select bind:value={onlineSvc.voice} onchange={saveConfig}>
@@ -136,7 +136,7 @@
             {/if}
           </select>
           <button
-            class="tb-mini"
+            class="tts-mini"
             data-testid="tts-load-voices"
             title={t("tts.loadVoices")}
             onclick={() => refreshOnlineVoices()}
@@ -162,7 +162,7 @@
           </select>
         {/if}
       </div>
-      <div class="tb-grid">
+      <div class="tts-grid">
         <label>{t("tts.rate")} {config.tts.rate.toFixed(2)}</label>
         <input type="range" min="0.5" max="2" step="0.05" bind:value={config.tts.rate} oninput={saveConfig} />
         <label>{t("tts.pitch")} {config.tts.pitch.toFixed(2)}</label>
@@ -179,7 +179,7 @@
           <option value={60}>{t("tts.minutes", { n: 60 })}</option>
         </select>
       </div>
-      <div class="tb-checks">
+      <div class="tts-checks">
         <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> {t("tts.highlightFollow")}</label>
         <label><input type="checkbox" bind:checked={config.tts.autoNextChapter} onchange={saveConfig} /> {t("tts.autoNext")}</label>
       </div>
@@ -188,6 +188,20 @@
 </div>
 
 <style>
+  /* ---- 前缀归属（改名前必读）----
+     .tb-* 专属 Reader.svelte 的顶栏（topbar = 工具条）：.tb-zone/.tb-l/.tb-c/.tb-r/.tb-btn/
+     .tb-panel/.tb-menu-item/... 那边一个字都不许动，_test 里有十几处 querySelector 依赖它。
+
+     TTS 条曾经误用过同一套 .tb-* 前缀（.tb-btn 是播放键、.tb-panel 是 TTS 设置展开区），
+     而 Reader 会把本组件渲染进 .reader 子树 —— 两个组件的类名于是落在同一棵 DOM 里。
+     后果不是样式泄漏（两边都是 scoped，编译后各带自己的 scope class，互不命中），
+     而是**全局选择器与 querySelector 会命中错的那一个**：document.querySelector('.tb-panel')
+     返回的是 DOM 顺序里的第一个，而不是「你指的那个」，今天恰好命中正确的那一个纯属
+     DOM 顺序的巧合，不是契约。任何人调整这两个组件在模板里的先后顺序，
+     或者顺手写一条裸 .tb-btn / .tb-panel 的全局规则，就会静默命中错的一套。
+
+     现在 TTS 侧统一 .tts-*，.tb-* 归顶栏专用。这段注释是防止下一个把它
+     「统一」回去的唯一依据 —— 要改前缀请先读完上面那段。 */
   /* 底色 / 描边 / 投影走全局 .rdr-pop（跟随阅读主题）；
      圆角保留药丸形——这是一条「芯片条」而非卡片，故用 --radius-pill。 */
   .tts-bar {
@@ -207,7 +221,7 @@
     animation: fr-rise-in var(--dur) var(--ease-premium) both;
   }
 
-  .tb-btn {
+  .tts-btn {
     border: none;
     background: transparent;
     color: inherit;
@@ -221,21 +235,21 @@
     justify-content: center;
   }
 
-  .tb-btn:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
+  .tts-btn:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
 
   /* 播放键是阅读区浮层里唯一的「实底强调」，按纪律取阅读区自己的强调色：
      换 UI 皮肤不该让这本书的播放键变色（此前引外壳 --accent/--accent-fg）。 */
-  .tb-btn.primary {
+  .tts-btn.primary {
     background: var(--rdr-accent);
     color: var(--rdr-accent-fg);
     font-size: var(--fs-md);
   }
 
-  .tb-btn.primary:hover { background: var(--rdr-accent-hover); }
+  .tts-btn.primary:hover { background: var(--rdr-accent-hover); }
 
-  .tb-btn.stop { color: var(--danger); }
+  .tts-btn.stop { color: var(--danger); }
 
-  .tb-info {
+  .tts-info {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
@@ -244,7 +258,7 @@
     overflow: hidden;
   }
 
-  .tb-count {
+  .tts-count {
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     opacity: 0.65;
@@ -252,7 +266,7 @@
     flex-shrink: 0;
   }
 
-  .tb-text {
+  .tts-text {
     font-size: var(--fs-sm);
     letter-spacing: var(--ls-sm);
     white-space: nowrap;
@@ -261,7 +275,7 @@
     opacity: 0.85;
   }
 
-  .tb-sleep {
+  .tts-sleep {
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     opacity: 0.75;
@@ -271,20 +285,20 @@
     align-items: center;
     gap: var(--sp-1);
   }
-  .tb-buffering {
+  .tts-buffering {
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     opacity: 0.7;
     flex-shrink: 0;
-    animation: tb-pulse 1s ease-in-out infinite;
+    animation: tts-pulse 1s ease-in-out infinite;
   }
 
-  @keyframes tb-pulse {
+  @keyframes tts-pulse {
     0%, 100% { opacity: 0.35; }
     50% { opacity: 0.85; }
   }
 
-  .tb-mini {
+  .tts-mini {
     border: none;
     background: transparent;
     color: inherit;
@@ -295,9 +309,9 @@
     flex-shrink: 0;
   }
 
-  .tb-mini:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
+  .tts-mini:hover { background: color-mix(in srgb, var(--rdr-fg) 12%, transparent); }
 
-  .tb-panel {
+  .tts-panel {
     flex-basis: 100%;
     border-top: 1px solid var(--rdr-line);
     margin-top: var(--sp-1);
@@ -308,27 +322,27 @@
     animation: fr-fade-in var(--dur-fast) var(--ease-in) both;
   }
 
-  .tb-row {
+  .tts-row {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
   }
 
-  .tb-row label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; width: 36px; }
-  .tb-row select { flex: 1; min-width: 0; font-size: var(--fs-xs); }
+  .tts-row label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; width: 36px; }
+  .tts-row select { flex: 1; min-width: 0; font-size: var(--fs-xs); }
 
-  .tb-grid {
+  .tts-grid {
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 6px 10px;
     align-items: center;
   }
 
-  .tb-grid label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; white-space: nowrap; }
-  .tb-grid input[type="range"] { width: 100%; }
-  .tb-grid select { font-size: var(--fs-xs); }
+  .tts-grid label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.7; white-space: nowrap; }
+  .tts-grid input[type="range"] { width: 100%; }
+  .tts-grid select { font-size: var(--fs-xs); }
 
-  .tb-checks {
+  .tts-checks {
     display: flex;
     gap: var(--sp-4);
     flex-wrap: wrap;

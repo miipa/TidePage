@@ -33,7 +33,17 @@ function splitFamilies(raw: string): string[] {
  *  Segoe UI 只兜拉丁/符号，避免中英混排字形割裂）。CSS 变量引用不了 TS 常量，
  *  两处只能靠纪律同步。
  *  ⚠️ 全项目只有这一处实现（Reader 与 AiPanel 都从这里 import）；改回退链时只需要同时改
- *     这里与 app.css :root 两处。 */
+ *     这里与 app.css :root 两处。
+ *
+ *  ⚠️ 全项目有【三条】字体栈，不要互相「同步」：
+ *     ① 本文件的 FONT_FALLBACK 与 app.css :root 的 font-family —— 应用级回退链，
+ *        两者必须逐字一致；
+ *     ② stores.svelte.ts 的 SANS —— 字体选择器里的「系统无衬线」选项，**故意**不同：
+ *        它带 PingFang SC / Noto Sans CJK SC，在 macOS 上覆盖更完整的中日韩字形。
+ *        把它改成上面那条回退链会毁掉 mac 上的中文渲染；
+ *     ③ 各内置阅读配色方案里钉死的 fontFamily —— 方案自己的意图，追加在回退链
+ *        【之前】（CSS 字体栈里先出现者先生效），所以方案的意图优先、回退链只兜底。
+ *     看到「三处不一致」想统一时，先读完这一段。 */
 const FONT_FALLBACK = '"Microsoft YaHei", "Segoe UI", system-ui, sans-serif';
 
 /**

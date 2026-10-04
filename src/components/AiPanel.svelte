@@ -85,12 +85,24 @@ import { fontStack } from "../lib/fontfaces";
   }
 
   // 独立 AI 窗：测标题行高度写入全局变量让右上角 WindowControls 垂直对齐。
-  // ai-head 有 10px 上下内边距，标题行 ai-head-top 从 y=10 起，故容器高度取 saHeadH + 20，
-  // 使控件中心线与标题行中心线重合。仅 standalone 时写入，避免抽屉模式污染主窗顶栏变量。
+  // ai-head 有上下内边距，标题行 ai-head-top 从第一个内边距之后起，故容器高度取
+  // saHeadH + (上下内边距之和)，使控件中心线与标题行中心线重合。
+  //
+  // ⚠️ 这条耦合必须与 .ai-head 的 padding 同步：这里历史上写死的是 +20（当时 10px×2），
+  //   改 padding 而不改这里，窗口按钮与标题行的中心线就会错开。
+  //   现在改成读实测值而非再写死一个数字 —— 与 Library 的 gridPadXNow() 同一手法：
+  //   padding 以后无论改成几，这里自动跟上，不可能再漏。
   let saHeadH = $state(0);
+  let aiHeadEl = $state<HTMLElement | null>(null);
+  // 与 .ai-head 的上下 padding 同源；元素还没挂上时退回 --sp-3 × 2（当前 token 值）。
+  function aiHeadPadYNow(): number {
+    if (!aiHeadEl) return 24;
+    const cs = getComputedStyle(aiHeadEl);
+    return (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  }
   $effect(() => {
     if (standalone && saHeadH > 0) {
-      document.documentElement.style.setProperty("--fr-titlebar-h", saHeadH + 20 + "px");
+      document.documentElement.style.setProperty("--fr-titlebar-h", saHeadH + aiHeadPadYNow() + "px");
     }
   });
 
@@ -742,7 +754,7 @@ ${readerStyle.extra}
 <!-- 共享块：顶部 header（两分支共用，无参数）。两行布局：
      第一行 = 标题 +（standalone: ⇲停靠 / 抽屉: ×）；第二行 = 动作按钮单独成行、左对齐、换行规律。 -->
 {#snippet aiHead()}
-  <div class="ai-head">
+  <div class="ai-head" bind:this={aiHeadEl}>
     <div class="ai-head-top" class:sa-head={standalone} data-tauri-drag-region={standalone ? "" : null} bind:clientHeight={saHeadH}>
       <span class="ai-title">{ctx.title || t("ai.assistantLabel")}</span>
       {#if standalone}
@@ -1102,7 +1114,12 @@ ${readerStyle.extra}
     flex-direction: column;   /* 两行：标题行 + 动作行 */
     align-items: stretch;
     gap: var(--sp-1);
-    padding: 10px 14px;
+    /* 面板头部内边距：与 NotesPanel .nl-bar、app.css 全局 .sp-head 同角色同取值
+       （原先这里是裸值 10px/14px，三处同一角色两种取值，读起来像没做完）。
+       ⚠️ 下面的 saHeadH 计算读的就是这个元素的上下 padding —— 改这里不需要改别处，
+          但必须理解那条耦合：自绘窗口按钮靠 --fr-titlebar-h 与标题行对中心线，
+          而那个值 = 标题行高 + 本元素上下内边距之和。 */
+    padding: var(--sp-3) var(--sp-4);
     border-bottom: 1px solid var(--rdr-line);
   }
 
@@ -1116,7 +1133,7 @@ ${readerStyle.extra}
   /* 独立 AI 窗：顶部第一行既是拖拽区，也要给右上角自绘窗口控制按钮留出空间，
      避免「⇲ 停靠」按钮被覆盖；空白处可拖动窗口、双击最大化/还原。 */
   .ai-head-top.sa-head {
-    padding-right: 112px;
+    padding-right: var(--wc-reserve-w);
   }
 
   .ai-panel .ai-actions .mini {

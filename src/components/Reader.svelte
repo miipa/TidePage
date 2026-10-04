@@ -4667,13 +4667,11 @@ ${effCssExtra() || ""}
     gap: var(--sp-1);
     padding: 7px var(--sp-3);
     /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
-    padding-right: 112px;
+    padding-right: var(--wc-reserve-w);
     background: color-mix(in srgb, var(--rdr-bg) 90%, black 10%);
     z-index: var(--z-raised);
     position: relative;
     user-select: none;
-    /* 顶栏下方 1px 用顶栏背景色补齐：快速滚动时滚动层与顶栏交界处不会露出背景形成亮线/接缝 */
-    box-shadow: 0 1px 0 0 var(--rdr-top);
     /* 让顶栏成为独立稳定合成层，避免滚动中边框/交界被单独合成产生一帧闪烁 */
     transform: translateZ(0);
     transition: opacity var(--dur) var(--ease);
@@ -4690,7 +4688,21 @@ ${effCssExtra() || ""}
     pointer-events: none;
   }
 
-  /* 分隔线画在顶栏自身图层内部（不用 border-bottom，避免合成层边界抗锯齿闪烁） */
+  /* 顶栏下沿 1px 分隔线（底栏那条见下方 .footer::before，两处保持同一种实现）。
+
+     为什么用 ::after 而不是 border-bottom / box-shadow：
+     顶栏有 transform: translateZ(0)（独立合成层，见上方 .topbar）。border-bottom 画在
+     盒模型边界上，快速滚动时正好压在合成层边界上，抗锯齿会在交界处闪一帧亮线/接缝；
+     用一个定位在 border box 内部的绝对定位伪元素画，位置只依赖盒内部坐标，
+     不与合成层边界耦合，那一帧闪烁就没有了。
+
+     ⚠️ 这里原先还有第二条线：.topbar 上的 box-shadow: 0 1px 0 0 var(--rdr-top)。
+        两条线的颜色不同（--rdr-top 与 --rdr-line），叠在一起实际观感是【一条双色 2px 带】，
+        与单线相比只是更重，谈不上任何设计意图，且它没有任何理由注释 —— 早期遗留。
+        已删除，只保留本条。删它不影响布局（box-shadow 不参与盒模型计算），
+        顶栏高度逐像素不变。
+
+     ⚠️ 不要"顺手"改回 border-bottom，也不要在这里再加第二条线：要分隔线就改这一处。 */
   .topbar::after {
     content: "";
     position: absolute;
@@ -4784,7 +4796,15 @@ ${effCssExtra() || ""}
      底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题）。 */
   .tb-panel {
     position: absolute;
-    top: 52px;
+    /* 面板挂在顶栏下方一条 --sp-2 处。这里不是写死 52px，而是从顶栏【实测高度】推导：
+       .tb-panel 是 .topbar 的子元素，position:absolute 的包含块是 .topbar 的 padding box，
+       而 Reader 把同一个元素的 clientHeight 写进了 --fr-titlebar-h（见模板上的 bind:clientHeight
+       与其 $effect），所以 var(--fr-titlebar-h) + --sp-2 永远等于「顶栏实测高 + 8px」。
+       顶栏高度若因改 padding / 换字号而变，这里自动跟随，不会错位。
+       fallback 44px = 顶栏 padding 7px×2 + 一行 30px 的常规高度，与实测值相等；
+       JS 尚未写入该变量时用它兜底，数值与改动前的 52px 完全一致。
+       ⚠️ .tb-panel.wd-menu（WebDAV 菜单）用内联 style 定位 top/right，不走这条声明。 */
+    top: calc(var(--fr-titlebar-h, 44px) + var(--sp-2));
     right: 12px;
     width: 290px;
     max-height: 70vh;
@@ -5455,6 +5475,29 @@ ${effCssExtra() || ""}
     z-index: var(--z-base);
     user-select: none;
     transition: opacity var(--dur) var(--ease);
+  }
+
+  /* 底栏上沿 1px 分隔线：与顶栏 .topbar::after 同一种实现（伪元素画在自身 border box 内部），
+     顶底对称。此前底栏一条都没有，顶栏却有两条（双色 2px 带），两边都不对称。
+     刻意不用 border-top —— 与顶栏保持同一种实现，将来要一起调只改两处伪元素。
+
+     两点已核过：
+     · 底栏有 opacity: 0.8（沉浸模式淡出），这条线跟着一起淡 —— 与底栏内其它文字
+       行为一致，不是缺陷。
+     · 不会被 .body 盖住：.body 虽然 z-index 更高(--z-raised=10 > --z-base=0)，但 .reader 是
+       flex column 且 .body 有 overflow: hidden，两者几何上不重叠 —— .body 的下沿就是
+       .footer 的上沿，这条线画在 .footer 盒内部（上沿往下 1px），落在 .body 盒外。
+       且本伪元素属于 .footer 的层叠上下文（.footer position:relative + z-index:0 已建立），
+       绘制次序由 .footer 决定，不会被 .body 抢到上面。 */
+  .footer::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 1px;
+    background: var(--rdr-line);
+    pointer-events: none;
   }
 
   /* 可拖拽的进度刷：16px 是命中区高度（好点按），真正的轨道厚度取全局 --bar-h */

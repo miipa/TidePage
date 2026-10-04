@@ -39,9 +39,17 @@
     } catch { /* ignore */ }
   }
 
-  // 本窗顶部标题栏固定 40px：写入全局变量让右上角 WindowControls 高度=40px、按钮垂直居中对齐。
-  onMount(() => {
-    document.documentElement.style.setProperty("--fr-titlebar-h", "40px");
+// 本窗顶部标题栏固定 40px：写入全局变量让右上角 WindowControls 高度=40px、按钮垂直居中对齐。
+  // 读的是 .win-titlebar 的【实测高度】而不是把 40 再写一遍 —— 那个 40 原本在这个文件里
+  // 手工同步了 4 处（这里的写死值 + .win-titlebar 的 height + 两处 inset/top 的 40px），
+  // 改标题栏高度漏一处就出现「面板内容被标题栏压住」或「窗口按钮与标题栏中心线错位」。
+  // 现在事实源头只有 .win-titlebar 的 height 一处，本变量与下面两处 inset/top 都从它派生。
+  // 手法与 AiPanel 的 aiHeadPadYNow() 同一思路：读事实源头，而不是再写一遍数字。
+  let titlebarH = $state(0);
+  $effect(() => {
+    if (titlebarH > 0) {
+      document.documentElement.style.setProperty("--fr-titlebar-h", titlebarH + "px");
+    }
   });
 
   onMount(async () => {
@@ -98,7 +106,7 @@
 <div class="panel-window-root">
   <!-- 顶部标题栏：无边框窗口的拖拽区（空白处拖动、双击最大化/还原）；
        右上角自绘窗口控制按钮浮于其上。面板内容整体下移让开这条 40px 的标题栏。 -->
-  <div class="win-titlebar" data-tauri-drag-region></div>
+  <div class="win-titlebar" bind:clientHeight={titlebarH} data-tauri-drag-region></div>
   {#if panel === "toc"}
     <TocPanel {toc} current={curChapter} onpick={(i) => gotoChapter(i)} />
   {:else if panel === "bookmarks"}
@@ -140,7 +148,9 @@
     overflow: hidden;
   }
 
-  /* 无边框窗口顶部标题栏拖拽区：z-index 高于面板内容(--z-drawer)、低于窗口控制按钮(--z-window) */
+/* 无边框窗口顶部标题栏拖拽区：z-index 高于面板内容(--z-drawer)、低于窗口控制按钮(--z-window)
+     ⚠️ 这个 height 是本窗标题栏高度的【唯一事实源头】：--fr-titlebar-h 由它的实测值写入，
+        下面两处 inset/top 的 fallback 也必须与它相等。改这里要一起改那两处。 */
   .win-titlebar {
     position: fixed;
     top: 0;
@@ -152,20 +162,29 @@
     -webkit-user-select: none;
   }
 
-  /* 独立窗内的 sidepanel 铺满整窗（覆盖组件内 position:absolute 的右侧贴边定位）；
-     顶部下移 40px 让开标题栏与窗口控制按钮，避免遮挡各面板自己的头部与关闭按钮。 */
+/* 独立窗内的 sidepanel 铺满整窗（覆盖组件内 position:absolute 的右侧贴边定位）；
+     顶部下移一条标题栏的高度让开标题栏与窗口控制按钮，避免遮挡各面板自己的头部与关闭按钮。
+
+     ⚠️ 下面两处的 var(--fr-titlebar-h, 40px) —— fallback 里那个 40px 与 .win-titlebar 的
+        height 是【同一个值，不是巧合】：本窗 JS 把 .win-titlebar 的实测高度写进
+        --fr-titlebar-h，而这条 inset/top 在 JS 跑之前（变量尚未写入）就必须已经正确，
+        那时的正确值恰好就是标题栏的 CSS 高度。改标题栏高度时，这三处
+        （.win-titlebar 的 height + 下面两个 fallback）要一起改。
+        为什么不给 --fr-titlebar-h 一个全局初值：这个变量在四个窗口里各写各的
+        （Library / Reader / AiPanel / StandalonePanel），值互不相同，
+        在 :root 里写死一个初值只会在另外三个窗口里变成假值。 */
   .panel-window-root :global(.sidepanel) {
     position: absolute;
-    inset: 40px 0 0 0;
+    inset: var(--fr-titlebar-h, 40px) 0 0 0;
     width: 100%;
     border: none;
     box-shadow: none;
     animation: none;
   }
 
-  /* 笔记面板（NotesPanel 根 .nl 为 fixed inset:0）同样下移 40px。 */
+  /* 笔记面板（NotesPanel 根 .nl 为 fixed inset:0）同样下移一条标题栏的高度（同上，fallback 同步）。 */
   .panel-window-root :global(.nl) {
-    top: 40px;
+    top: var(--fr-titlebar-h, 40px);
   }
 
   /* .sidepanel / .sp-head / .sp-list / .sp-item / .sp-empty 走 app.css 的全局基类。

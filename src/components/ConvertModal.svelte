@@ -206,18 +206,20 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
      flex: 0 0 auto —— 全局 .row-inline > * { flex: 1; min-width: 0 } 会把轨道拉满整行宽度，
      那样这一排会变成等分满宽、胶囊跟着一起撑开。显式收回内容宽。
 
-     高度补偿：这一排改动前的外框高是胶囊自己的 30px（全局 min-height: var(--ctl-h)）。
-     轨道若按内容撑高，会变成「胶囊 + 2px 内边距×2 + 1px 边框×2」= 36px，整排高 6px。
-     这里把【轨道】钉在 var(--ctl-h)(30px)，于是内高 = 30 - 2×2 - 2×1 = 24px，
-     段由 align-items: stretch 拉伸填满 —— 整排外框高与改动前逐像素相同，用的是既有 token、
-     不是手写的裸 px。段自身因此比改动前矮 6px（30 → 24），这是「做成分段控件」的必然结果，
-     比例与 .fr-seg 一致（26/32 = 0.81，这里 24/30 = 0.80）。 */
+     结构对齐 app.css 的 .fr-seg（本项目内这个模式的先例）：同样的轨道配方
+     （inline-flex + 2px gap + 2px padding + 1px 边框 + 圆角 + 底色），同样的段高档
+     var(--ctl-h-sm)，轨道高度因此由「padding + border + 段高」自然涌现 = 32px，
+     与设置里明暗分段控件的总高自动一致。
+
+     ⚠️ 之前这里是「钉死 height: var(--ctl-h)(30px) + 段 min-height: 0 由 stretch 拉伸」，
+        靠一段高度补偿注释撑着，与 .fr-seg 差 2px —— 同一类控件在同一应用里两个总高，
+        读起来像没做完。结构同源之后不需要任何补偿：没有钉死的高度，也就无从漂移。
+        代价是这一排从 30px 变成 32px（+2px），换取两处结构同源、以后不会再次漂移。 */
   .pill-track {
     flex: 0 0 auto;
     display: inline-flex;
     align-items: stretch;
     gap: 2px;
-    height: var(--ctl-h);
     padding: 2px;
     border: 1px solid var(--line);
     border-radius: var(--radius-pill);
@@ -225,15 +227,16 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
   }
 
   /* 段自身：未选中透明、无边（底色与边框都由轨道提供，这也是 .fr-seg button 的做法）。
-     min-height: 0 是必需的 —— 全局 button 带 min-height: var(--ctl-h)(30px)，不归零的话
-     它会把段顶出轨道（正好是上面那 6px）。归零后由轨道的 stretch 决定高度。
-     圆角保持 --radius-xl 不动 —— 它在 24px 高的段上已被视口夹成药丸形，作为「段」的圆角足够圆。 */
+     min-height 与 .fr-seg button 同为 var(--ctl-h-sm)：全局 button 带
+     min-height: var(--ctl-h)(30px)，若沿用它会比轨道还高、把段顶出轨道；
+     归零或另钉一个数都是「各自钉死」，同构到 --ctl-h-sm 才是结构对齐。
+     圆角保持 --radius-xl 不动 —— 它在 --ctl-h-sm 高的段上已被视口夹成药丸形，作为「段」的圆角足够圆。 */
   .pill {
     padding: 4px 14px;
     border-radius: var(--radius-xl);
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
-    min-height: 0;
+    min-height: var(--ctl-h-sm);
     border: none;
     background: transparent;
   }
