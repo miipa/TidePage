@@ -2009,32 +2009,35 @@ export function applyUiTheme(): void {
 }
 
 /**
- * 把**全局**阅读配色写进 <html> 的 --rdr-bg / --rdr-fg（阅读区表面变量的根）。
+ * 把**有效**阅读配色写进 <html> 的 --rdr-bg / --rdr-fg（阅读区表面变量的根）。
  *
  * 为什么需要：阅读区表面变量（--rdr-surface/-line/-shadow-*）在 app.css 里由
  * --rdr-bg/--rdr-fg 派生。正常阅读时它们写在 .reader 上（见 Reader.svelte 的
  * readerVars()，含「仅本书方案」覆盖），但有两类地方拿不到 .reader：
- *   ① 独立阅读窗 / 独立面板窗（StandaloneBook / StandalonePanel）——整窗就是阅读内容；
+ *   ① 独立阅读窗 / 独立面板窗（StandalonePanel）——整窗就是阅读内容；
  *   ② portal 到 body 的阅读区浮层（书内搜索）——脱离 .reader 子树。
  * 这两处都需要一个「阅读主题」而不是「外壳皮肤」的值，否则会出现深色外壳 + 纸色书页
  * 时浮层渲染成深色小窗的割裂感。
  *
- * 取值与 +page.svelte 的 aiRootStyle（独立 AI 窗）同源同法：本书方案拿不到（那属于
- * Reader 的职责，它会用更精确的值覆盖这里的全局值），故这里只取全局 config.reader。
+ * 取值：与 Reader 的 effTheme()/effBgColor()/effFgColor() 同源——都走
+ * effReaderSurface()，故「仅本书方案」在浮层与独立窗里同样生效。
+ * ⚠️ 取值链里的 `config.reader.bgColor || t.bg`（自定义底色优先于主题预设）**刻意
+ *    不动**：它涉及 config.reader.bgColor 的语义（空串 = 用主题预设），与本次统一无关。
  * 派生量（--rdr-surface 等）刻意不在这里写：留在 app.css 由这两个基色推导，改一处即可。
  */
 function applyReaderSurfaceVars(): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
-  const t = THEMES[config.reader.theme];
-  const bg = config.reader.bgColor || t.bg;
-  const fg = config.reader.fgColor || t.fg;
+  const s = effReaderSurface();
+  const t = THEMES[s.theme];
+  const bg = s.bg || t.bg;
+  const fg = s.fg || t.fg;
   root.style.setProperty("--rdr-bg", bg);
   root.style.setProperty("--rdr-fg", fg);
   // 次要文字的混合比逐主题不同（见 RDR_FG2_PCT），必须跟着主题一起写，否则独立阅读窗与
   // portal 浮层里的 .reader .empty-state / .sp-empty 会退回首帧兜底的 72% ——
-  // 护眼绿在 72% 下只有 4.31:1。
-  root.style.setProperty("--rdr-fg2-pct", RDR_FG2_PCT[config.reader.theme] ?? "72%");
+  // 护眼绿在 72% 下只有 4.31:1。比例取的是【有效】主题，故本书方案也走同一张表。
+  root.style.setProperty("--rdr-fg2-pct", RDR_FG2_PCT[s.theme] ?? "72%");
 }
 
 // 界面主题响应式生效：uiTheme / 皮肤变化即更新；system 时监听系统切换。
@@ -2048,6 +2051,10 @@ if (typeof window !== "undefined") {
     });
   });
   // 阅读配色变化即更新全局 --rdr-bg/-fg（供无 .reader 的阅读窗与 portal 浮层）。
+  // ⚠️ 依赖是自动的：applyReaderSurfaceVars() 内部经 effReaderSurface() 读了
+  //    ui.currentBookId 与 bookOverrides.map，这两个都是 $state，本次 effect 运行期间
+  //    的读取会被 Svelte 追踪。故开/关书、以及设置页"仅应用到本书"改动方案时，
+  //    <html> 上的值都会跟着更新，不需要在这里 void 它们。
   $effect.root(() => {
     $effect(() => {
       void config.reader.theme;
@@ -2062,7 +2069,8 @@ if (typeof window !== "undefined") {
     });
   } catch { /* ignore */ }
   applyUiTheme();
-  applyReaderSurfaceVars();
+  // ⚠️ applyReaderSurfaceVars() 的首次调用不在这里 —— 它要读 ui.currentBookId，
+  //    而 ui 声明在本文件更下方，模块初始化期调用会撞 TDZ。见 ui 声明之后那一次。
 }
 
 /** 返回一份 reader 默认配置（深拷贝，供设置页回退字体/恢复默认使用）。 */
@@ -2429,6 +2437,9 @@ export async function copyText(text: string) {  try {
 
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
+// 单本覆盖（"仅应用到本书"的阅读配色方案）住在独立的 bookcfg 模块里。
+// 依赖方向：bookcfg 不import 任何东西（只依赖 localStorage），所以这里引入它不会成环。
+import { getBookOverride } from "./bookcfg.svelte";
 
 // 版本号单一数据源：构建期由 vite.config.js 从 package.json 注入 __APP_VERSION__
 // （与 src-tauri/tauri.conf.json 的 version 保持一致），避免运行时读版本所需的权限问题。
@@ -2470,6 +2481,43 @@ export const ui = $state({
   /** 最近一次 cover-updated 的 book id（取自事件 payload.id）。 */
   lastCoverId: 0,
 });
+
+/**
+ * 「当前该用哪套阅读配色」的全应用唯一取法：优先本书的方案（"仅应用到本书"），
+ * 其次全局 config.reader。
+ *
+ * ⚠️ 这段判断此前有两处入口且各取各的键，是一处已修的历史分裂：
+ *   · Reader.svelte 的 effTheme()/effBgColor()/effFgColor() —— 取本书方案（book?.book.id）；
+ *   · 本文件的 applyReaderSurfaceVars() 写 <html> —— 只取全局 config.reader.theme。
+ *   后果：① 一本书套了 schemeTheme:"green" 而全局不是绿时，.reader 子树的
+ *   --rdr-fg2-pct 是 78%、<html> 上是 72%，同一屏两种次要文字浓度；
+ *   ② <html> 上的 --rdr-bg/-fg 不带本书方案，于是 portal 到 body 的阅读浮层
+ *   （书内搜索弹层）与独立阅读窗用的是全局主题的底/字，不是这本书的。
+ *   现在两者都调这里，分裂消除。
+ *
+ * bookId 省略时取 ui.currentBookId（阅读窗里由 Reader 打开/关闭时维护，见其
+ * openBook/清理两处）。传显式值的那一側是 Reader —— 它要的是"我这一本书"，
+ * 不依赖全局当前值，避免两个数据源各自为政。
+ *
+ * 返回的 bg/fg 是【未解析】的原始值（可能为空串），由各调用点自己接
+ * THEMES[theme] 的兜底：Reader 的 readerColors() 还要让漫画模式的独立底色
+ * 参与这条链，两边的兜底顺序并不相同，硬塞进本函数会把差异抹平。
+ */
+export function effReaderSurface(bookId?: number | null): { theme: ThemeKey; bg: string; fg: string } {
+  const id = bookId === undefined ? ui.currentBookId : bookId;
+  const o = getBookOverride(id || null);
+  return {
+    theme: (o.schemeTheme as ThemeKey) ?? config.reader.theme,
+    bg: o.schemeBg ?? config.reader.bgColor,
+    fg: o.schemeFg ?? config.reader.fgColor,
+  };
+}
+
+// ⚠️ 首次调用 applyReaderSurfaceVars() 必须放在 ui 声明之后：它经 effReaderSurface()
+//    读 ui.currentBookId，而 ui 是模块级 const —— 在它之前调用会撞 TDZ
+//    （Cannot access 'ui' before initialization）。下面 $effect.root 里那次调用是安全的
+//    （effect 体在挂载后才跑，那时 ui 已初始化）。
+applyReaderSurfaceVars();
 
 export const convertState = $state({
   open: false,

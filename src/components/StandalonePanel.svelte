@@ -10,6 +10,7 @@
   import { onMount, onDestroy } from "svelte";
   import { api } from "../lib/api";
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { ui } from "../lib/stores.svelte";
   import type { TocEntry, HighlightRow, BookmarkRow } from "../lib/types";
   import TocPanel from "./TocPanel.svelte";
   import HighlightsPanel from "./HighlightsPanel.svelte";
@@ -50,6 +51,35 @@
     if (titlebarH > 0) {
       document.documentElement.style.setProperty("--fr-titlebar-h", titlebarH + "px");
     }
+  });
+
+  /**
+   * 发布本窗对应的书，供 stores 的 effReaderSurface() 取到「本书的阅读配色方案」。
+   *
+   * 缺口背景：--rdr-* 写在 <html> 上（applyReaderSurfaceVars），供拿不到 .reader 的地方用 ——
+   * 独立阅读窗与独立面板窗都属这一类。effReaderSurface() 默认读 ui.currentBookId，
+   * 而本窗不渲染 Reader，那两处写入（Reader 的 openBook / 退出清理）永远不会发生，
+   * 于是本窗的 --rdr-* 只能退到全局阅读主题 —— 笔记/目录/划线/书签统计四个面板在独立窗里
+   * 与该书在主窗口里的观感不一致。补上这一行，四个面板才跟随本书方案。
+   *
+   * ⚠️ 为什么在这里写 ui.currentBookId 是安全的：独立面板窗是**独立的 webview**，
+   *    有自己独立的 stores 模块实例 —— 在这里赋值只影响这个窗口的 <html>，
+   *    不会漏回主窗（主窗的 ui 是另一个实例）。
+   *
+   * bookId === 0（URL 没带 book 参数）时【不写】：那说明本窗没有明确对应的书，
+   * 此时写 0 等于用"没有方案"去覆盖全局值，属于把状态清成意外值。
+   */
+  onMount(() => {
+    if (bookId > 0) ui.currentBookId = bookId;
+  });
+
+  // 还原成"未打开任何书"。窗口被关闭时整个 JS 上下文随之销毁，这一步多半不会有人看见；
+  // 它真正有用的是组件在窗口存活期间被卸载的情况。try/catch 是因为关闭过程中
+  // stores 可能已经不可用，不能让清理抛错阻断上面那几条 un* 退订。
+  onDestroy(() => {
+    try {
+      if (bookId > 0 && ui.currentBookId === bookId) ui.currentBookId = 0;
+    } catch { /* 窗口正在关闭，忽略 */ }
   });
 
   onMount(async () => {

@@ -14,6 +14,7 @@
     ui,
     THEMES,
     RDR_FG2_PCT,
+    effReaderSurface,
     appConfirm,
     BIND_DEFS,
     comboOf,
@@ -122,6 +123,29 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   // A?/A＋ 悬浮控件：默认完全隐藏（pointer-events:none），仅指针进入右下角热区才淡入，
   // 避免透明热区常驻拦截正文框选/右下角翻页点击。
   let fontCtlShow = $state(false);
+  /**
+   * 「字号控件当前是否可见」——判据与 CSS 里 `.font-ctl.show, .font-ctl:focus-within`
+   * 那条**同源**，两条显示路径都覆盖：
+   *   · 指针路径：fontCtlShow（指针进入 .body 右下角热区）
+   *   · 键盘路径：焦点在控件内（:focus-within）—— Tab 进去用回车/方向键调字号时
+   *     没有任何指针移动，只判 fontCtlShow 会漏掉这一路。
+   *
+   * ⚠️ 为什么要区分输入模态（lastInputKeyboard）：:focus-within 在【鼠标点过按钮之后】
+   *   也成立 —— 浏览器点按钮会保留焦点。若无差别地把 focus-within 当成"在用这个控件"，
+   *   「点一下字号按钮就走开」会让顶栏永远不隐藏，与沉浸模式的意图正相反，也违反
+   *   "指针不在字号控件附近时行为不变"这条。故只有焦点是【键盘进来的】才继续挡计时。
+   *
+   * fontCtlEl 刻意用 $state：它是 bind:this 的目标，模板变化时需要被重新绑定。
+   * lastInputKeyboard 刻意【不用】$state：它只在 pokeChrome() 里被同步读到，
+   * 不进任何模板或 $effect，用普通 let 即可 —— 否则每次 mousemove 都写一次信号。
+   */
+  let fontCtlEl = $state<HTMLElement | null>(null);
+  let lastInputKeyboard = false;
+  function fontCtlBusy(): boolean {
+    if (fontCtlShow) return true;
+    if (!fontCtlEl || !fontCtlEl.matches(":focus-within")) return false;
+    return lastInputKeyboard;
+  }
   let hoverRaf = 0;
   let hoverX = 0;
   let hoverY = 0;
@@ -129,11 +153,35 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   // 沉浸阅读：空闲后淡出顶栏/底栏；任何指针移动或按键立即恢复并重新计时。
   let chromeHidden = $state(false);
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * 沉浸模式的空闲阈值：从最后一次指针移动/按键起算，静置这么久才淡出顶栏与底栏。
+   *
+   * ⚠️ 它刻意【不进】 app.css 的 --dur-* 体系，也不要为它在 app.css 新增 token：
+   *   --dur-* 那一组全是**过渡时长**（120–340ms，交互反馈的快慢），
+   *   而 2600ms 是**空闲阈值**（多久不动才算 idle）—— 两者不是同一类量。
+   *   混进同一组会污染那组的语义（它现在的注释明确写着「交互反馈 100–350ms，
+   *   别混在一起看」），而且 CSS 变量也表达不了「一段静止之后才发生」这种时序。
+   *   留在这里的原因：它是本文件唯一的计时器参数，与 pokeChrome 的 setTimeout 贴在一起读。
+   */
+  const IDLE_HIDE_MS = 2600;
   function pokeChrome() {
     if (chromeHidden) chromeHidden = false;
     if (!config.reader.immersive) return;
+    // 正在用字号控件时**不进入隐藏倒计时**。
+    // 为什么要 clearTimeout 而不只是"不重启"：指针移进热区的那一刻，函数已经先跑过上面
+    // 几行，此刻 fontCtlShow 还没被下面的 rAF 置真，于是会留下一个 2600ms 后到点的
+    // 挂起定时器。若只"不重启"不"掐掉"，指针停在控件上不动时那个定时器照样触发，
+    // 顶栏底栏照样淡出 —— 要修的缺陷原样存在。所以这里两个动作都要做。
+    //
+    // 重启路径（确认存在）：指针移出热区 → onmouseleave/fontCtlShow 的 rAF 把
+    // fontCtlShow 置回 false → 此后任意一次 onReaderMove/onKeyDown 都会走到下面两行
+    // 重新计时。键盘同理：焦点离开控件后 :focus-within 为 false，下一次按键即恢复计时。
+    if (fontCtlBusy()) {
+      clearTimeout(idleTimer);
+      return;
+    }
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => (chromeHidden = true), 2600);
+    idleTimer = setTimeout(() => (chromeHidden = true), IDLE_HIDE_MS);
   }
   $effect(() => {
     if (!config.reader.immersive) {
@@ -186,15 +234,22 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const o = bookOv();
     return o.schemeTheme !== undefined || o.schemeBg !== undefined || o.schemeFg !== undefined ? o : null;
   }
-  /** 有效阅读配色：优先单本方案，其次全局。 */
+  /** 有效阅读配色：优先单本方案，其次全局。三者都走 stores 的 effReaderSurface() ——
+   *  <html> 上那份（applyReaderSurfaceVars，供独立阅读窗与 portal 浮层）用的是同一个函数，
+   *  故「本书方案」在浮层与独立窗里同样生效，两处不再各取各的键。
+   *  这里传显式的 book?.book.id 而不是用函数默认的 ui.currentBookId：本文件要的是
+   *  「我这一本书」，不该依赖另一个数据源。（见 stores 里 effReaderSurface 的注释。） */
+  function effSurface() {
+    return effReaderSurface(book?.book.id);
+  }
   function effTheme(): ThemeKey {
-    return (bookScheme()?.schemeTheme as ThemeKey) ?? config.reader.theme;
+    return effSurface().theme;
   }
   function effBgColor(): string {
-    return bookScheme()?.schemeBg ?? config.reader.bgColor;
+    return effSurface().bg;
   }
   function effFgColor(): string {
-    return bookScheme()?.schemeFg ?? config.reader.fgColor;
+    return effSurface().fg;
   }
   function effFontFamily(): string {
     return bookScheme()?.schemeFontFamily ?? config.reader.fontFamily;
@@ -2422,6 +2477,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /** 指针是否位于 .body 右下角热区（约 150×130），用 rAF 节流后短算。 */
   function onReaderMove(e: MouseEvent) {
+    lastInputKeyboard = false;
     hoverX = e.clientX;
     hoverY = e.clientY;
     pokeChrome();
@@ -2433,7 +2489,16 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       const r = el.getBoundingClientRect();
       // 控件行现有 5 个按钮，热区相应加宽，保证移到最左侧按钮时不会突然消失。
       const inCorner = hoverX >= r.right - 230 && hoverY >= r.bottom - 130;
-      if (inCorner !== fontCtlShow) fontCtlShow = inCorner;
+      if (inCorner !== fontCtlShow) {
+        fontCtlShow = inCorner;
+        // ⚠️ 状态翻转后必须【再判定一次】倒计时，否则会留下一个已经挂起的定时器：
+        //   上面那次 pokeChrome() 跑在 rAF 之前，此刻 fontCtlShow 还是旧值 —— 移进热区时
+        //   它看到"控件没显示"，于是设了个 2600ms 后到点的定时器；而"指针停在控件上不动"
+        //   不会再有新的 mousemove，没人去清它，顶栏照样按时淡出 —— 缺陷原样存在。
+        //   在这里翻转状态后再判定一次：移进热区 → 掐掉倒计时；移出热区 → 重新开始计时。
+        //   只在状态翻转时多跑一次（不是每次 mousemove），且不再多读一次布局。
+        pokeChrome();
+      }
     });
   }
 
@@ -2629,6 +2694,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   function onKeyDown(e: KeyboardEvent) {
+    lastInputKeyboard = true;
     pokeChrome();
     // F11 全屏：置于所有早退之前——先 preventDefault 挡掉 WebView2 默认全屏，再切 Tauri 全屏。
     // 焦点在输入框/文本区时仍触发（并吃掉默认行为），符合交付说明的处理方式。
@@ -3030,6 +3096,32 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function buildDynamicCss(): string {
     const r = config.reader;
+    /* ⚠️⚠️ 下面这块 overrideRule 里的 !important —— 它【对既定职责不承重】，但【压着用户的 cssExtra】。
+     这是一条【悬而未决的产品决定】，不是疏漏。删之前请读完三件事：
+
+     ① 它从来没有在和书内样式对抗。!important 只在「覆盖书籍排版」开启时才存在（下面这个三元），
+        而那一刻后端已经把原书的东西全剥了：Reader 传 keepStyles = !effOverrideCss()（见 getChapter
+        的调用处），epub.rs 据此「剥掉全部内联 style=""」且「不再内联原书 CSS」。
+        所以这里不需要靠 !important 打赢谁 —— 它打不赢的对象早就不在了。
+        （唯一还活着的样式来源是 <font face/size/color> presentational hint，但那种东西
+        特异性为 0、任何作者规则都能压过它，而 readFix 还多一道 DOM 层剥离。）
+
+     ② 但它压着用户自己的自定义 CSS。用户 cssExtra 被拼在【本块之后】（见 buildDynamicCss 的返回），
+        同一段顺序里若去掉 !important，实测：
+          现状（带 !important）：用户写 `#chapter-content p { font-size: 99px }` → 16px，被静默压死。
+          去掉 !important：              → 99px，用户的自定义 CSS 生效。
+        也就是说这个 !important 当前唯一的作用，就是让「自定义 CSS」输入框对字号/行高这些
+        属性失效 —— 这看着更像缺陷而不是特性。
+
+     ③ 但【单去 !important 并不解决它】，反而会得到"一半可控一半不可控"的半通状态：
+        同一批属性里，font-size / h5-h6 / sup 只在【注入版】声明（去掉 !important 就能被 cssExtra 覆盖），
+        而 line-height / text-indent / font-weight 等在【静态 scoped 版】也声明了，且静态版特异性
+        (1,3,1) 本来就高过本块的 (1,0,1) —— 不需要 !important 也能压过 `#chapter-content p`。
+        真要让 cssExtra 彻底可用，需要：把注入版独有的规则（h5/h6、sup）折进静态版 → 整块删掉
+        overrideRule → 排版只剩静态版一个来源。那是另一次改动，并且要一并接受"赌后端那道剥离
+        一直可靠"这个前提（万一哪天 keepStyles 的语义变了，静态版里没有 !important 兜底）。
+
+        在那之前：!important 原样保留，本块一个字都不改。 */
     const overrideRule = effOverrideCss()
       ? `
 #chapter-content { color: var(--rdr-fg) !important; font-family: var(--rdr-font) !important; text-align: var(--rdr-align) !important; }
@@ -4569,7 +4661,7 @@ ${effCssExtra() || ""}
     {/if}
 
     {#if book && !openError}
-      <div class="font-ctl" class:show={fontCtlShow}>
+      <div class="font-ctl" class:show={fontCtlShow} bind:this={fontCtlEl}>
         <div class="ctl-row">
           <button class="icon" data-testid="font-dec" title={t("reader.font.decrease")} use:repeatAction={() => bumpFont(-1)}><IconTextDecrease /></button>
           <button class="icon" data-testid="font-inc" title={t("reader.font.increase")} use:repeatAction={() => bumpFont(1)}><IconTextIncrease /></button>
@@ -4678,11 +4770,19 @@ ${effCssExtra() || ""}
   }
 
   /* 沉浸阅读：空闲后顶栏/底栏淡出（只动 opacity，不触发布局） */
+  /* ⚠️ 淡出【只做 opacity + pointer-events】，绝不改成 display:none / height:0 /
+     visibility:hidden 之类会「还布局空间」的写法 —— 顶栏与底栏合计仍占约 68px，
+     它们留在流里是有意的：一旦空闲就把那 68px 还给正文，阅读区会突然涨高，
+     正文重排、当前阅读位置跳掉（分栏模式更糟：两栏高度都变，重新分页）。
+     也就是说：每次空闲都让版面"跳一下"，比现在糟得多。
+     保持占位还有一个附带好处：顶底栏淡出后 .tb-panel 之类的绝对定位浮层
+     仍以 .topbar 的 padding box 为包含块，定位基准不会随淡出而变。 */
   .topbar.dim {
     opacity: 0;
     pointer-events: none;
   }
 
+  /* 同上：底栏同理，也只淡出、不还布局高度。 */
   .footer.dim {
     opacity: 0;
     pointer-events: none;
@@ -5175,36 +5275,58 @@ ${effCssExtra() || ""}
     font-weight: 700;
   }
 
+  /* 正文的基准三项。
+     font-family 【不许删】：它【不带 .ovr】、常开，而 overrideRule 里那条带 !important 且受
+       effOverrideCss() 门控 —— 「覆盖书籍排版」关闭时 overrideRule 整块不存在，
+       此刻正文字体只能靠这一行。属于"守卫比对应声明更宽"的承重项。
+     font-synthesis 【本轮删除】：对应声明是 buildDynamicCss() 里那条
+       `:root #chapter-content { font-synthesis: none !important }`，它【不在 overrideRule 三元里】、
+       是每次都拼进 tidepage-dynamic-css 的常开行，且带 !important、特异性还更高
+       （:root 是伪类，(1,1,0) > 本行的 (1,0,0)）→ 三条判定全部成立，删除零行为变化。
+     overflow-wrap 【不许删】：全项目没有任何对应声明（应用与注入版都没有），它【仅此一份】。 */
   #chapter-content {
     font-family: var(--rdr-font);
-    font-synthesis: none;
     overflow-wrap: break-word;
   }
 
-  /* 阅读版式覆盖仅在「覆盖书籍排版」开启时生效；关闭后由书内样式决定字号/行距/颜色等 */
+  /* 阅读版式覆盖仅在「覆盖书籍排版」开启时生效；关闭后由书内样式决定字号/行距/颜色等
+
+     ⚠️ 本块与 buildDynamicCss() 的 overrideRule【同源门控】：class:ovr={effOverrideCss()}，
+        而 overrideRule 由同一个 effOverrideCss() 的三元决定 —— 两者要么同时在、要么同时不在。
+
+     本轮删掉了三条被 overrideRule【完全遮蔽】的死代码：color / text-align /（见下一段）那三项。
+     依据三条同时成立：① 同一属性在 overrideRule 里对【同一批元素】有对应声明；
+     ② 那条带 !important（特异性再高也打不过）；③ 两者同源门控。
+     原值与 overrideRule 逐字相同（var(--rdr-fg) / var(--rdr-align)），删除零行为变化。
+
+     ⚠️ 留下的 font-size 与 line-height 【不许删】：overrideRule 根本没有在容器上声明这两项，
+        唯一声明它们的是 readFix（src/lib/readFix.ts，MOBI 老格式专用的 <font> 补丁）。
+        拿一份"针对 MOBI 的补丁"当 EPUB 正文的通用排版来源是架构错误 ——
+        它的值是 JS 在 tick() 之后写进 __read_fix 的字面量，不是活的 var(--rdr-*)。 */
   .reader.ovr #chapter-content {
     font-size: var(--rdr-fs);
     line-height: var(--rdr-lh);
-    color: var(--rdr-fg);
     letter-spacing: 0.05em;
-    text-align: var(--rdr-align, justify);
     text-justify: inter-ideograph;
   }
 
-  .reader.ovr #chapter-content :global(p) {
-    text-indent: var(--rdr-indent, 2em);
-    margin: var(--rdr-ps, 0.7em) 0;
-    font-weight: var(--rdr-fw, 400);
-  }
+  /* 原先此处有两块同选择器（.reader.ovr #chapter-content :global(p)）的规则：
+       第一块 text-indent / margin / font-weight，第二块 text-wrap / orphans / widows。
+       第一块的三项与 overrideRule 的 `#chapter-content p {... !important}` 逐字相同、
+       同元素同门控 → 被完全遮蔽，本轮连同整个第一块一起删除。
+       第二块那三项 overrideRule 从不声明，是【仅此一份】的活声明，已保留在下方。
+     ⚠️ 反过来说：如果你在 overrideRule 里新增了 p 的排版声明，别只改那里就以为静态版同步了 ——
+        静态版只剩「注入版不覆盖」的那些属性（断行/孤字控制/字距/两端对齐…）。 */
 
+  /* 标题：font-size / margin / font-weight / text-align 四项与 overrideRule 的
+     `#chapter-content :is(h1,h2,h3,h4,h5,h6) {... !important}` 逐字相同、同元素（h1–h4 是它的子集）、
+     同门控 → 被完全遮蔽，本轮删除。注意注入版覆盖到 h6，本块只列到 h4：h5/h6 仅由注入版提供，
+     删错了会立刻表现为「h5/h6 不再放大也不居中」。
+     留下的 text-wrap: balance 是【仅此一份】：避免标题末行孤字，注入版不声明它。 */
   .reader.ovr #chapter-content :global(h1),
   .reader.ovr #chapter-content :global(h2),
   .reader.ovr #chapter-content :global(h3),
   .reader.ovr #chapter-content :global(h4) {
-    font-size: 1.2em;
-    margin: 0.4em 0 0.8em;
-    font-weight: 600;
-    text-align: center;
     /* 标题避免末行孤字 */
     text-wrap: balance;
   }
@@ -5216,12 +5338,15 @@ ${effCssExtra() || ""}
     widows: 2;
   }
 
+  /* 正文的图片：尺寸由 buildDynamicCss() 的 imgRules 决定（它【常开】，不受「覆盖书籍排版」门控，
+     且每一条都带 !important），所以这里原本重复声明的 max-width / max-height / width /
+     height / object-fit 五项是被【完全遮蔽的死代码】—— 静态版特异性再高也打不过 !important。
+     已于本轮删除，删除依据：同一属性在 imgRules 里对同一批元素（img）有对应声明 + 带 !important
+     + imgRules 常开（门控条件恒真）。别再加回来：加了也不会生效，只会让"改图片尺寸该改哪"变模糊。
+
+     剩下的 display / margin 两项 imgRules 并不声明，是本规则【仅此一份】的活声明，必须留：
+     imgRules 只在 .reader.manga / .reader.fitw 两个分支里给 margin，普通正文里这一条说了算。 */
   #chapter-content :global(img) {
-    max-width: 100%;
-    max-height: calc(var(--rdr-img-h, 80vh) - 1.6em);
-    width: auto;
-    height: auto;
-    object-fit: contain;
     display: block;
     margin: 0.6em auto;
   }
