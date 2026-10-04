@@ -180,7 +180,14 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
     margin: 0;
   }
 
+/* flex: 0 0 auto —— 全局 .row-inline > * { flex: 1 } 会把剩余空间分给每一个直接子元素。
+     目标格式这一排改成轨道容器后，标签成了唯一吃剩余空间的 flex 项，盒宽涨到 191px、
+     把轨道推到 x≈222（胶囊原本从 x≈101.5 开始），中间空出约 120px。收紧成内容宽后，
+     标签贴住文字、控件紧随其后（第一颗段约落在 x≈83，比改动前左移约 19px —— 这是对的：
+     表单排版里标签与控件本来就该贴在一起）。
+     本文件里 .lbl 只有目标格式这一处用法，收紧的影响面就是这一行。 */
   .lbl {
+    flex: 0 0 auto;
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     color: var(--fg2);
