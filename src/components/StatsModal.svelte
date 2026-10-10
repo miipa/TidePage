@@ -1,0 +1,91 @@
+<script lang="ts">
+  import { t } from "../lib/i18n/index.svelte";
+  import { onMount } from "svelte";
+  import { api } from "../lib/api";
+  import { ui } from "../lib/stores.svelte";
+
+  let stats: [string, number][] = $state([]);
+
+  onMount(async () => {
+    try {
+      stats = await api.getStats();
+    } catch { /* ignore */ }
+  });
+
+  const maxVal = $derived(Math.max(1, ...stats.map((s) => s[1])));
+  const total = $derived(stats.reduce((a, s) => a + s[1], 0));
+
+  function fmt(sec: number): string {
+    const h = Math.floor(sec / 3600);
+    const m = Math.round((sec % 3600) / 60);
+    return h ? t("common.dur.hm", { h, m }) : t("common.dur.m", { m });
+  }
+</script>
+
+<div class="modal-body">
+  <h3>{t("stats.recent", { n: 14 })}</h3>
+  {#if !stats.length}
+    <div class="empty-state">{t("stats.empty")}</div>
+  {:else}
+    <div class="total">{t("stats.totalPrefix")}{fmt(total)}</div>
+    <div class="bars">
+      {#each stats as [day, sec] (day)}
+        <div class="bar-col" title="{day}: {fmt(sec)}">
+          <div class="bar" style="height:{Math.max(3, (sec / maxVal) * 100)}%"></div>
+          <div class="lbl">{day.slice(5)}</div>
+        </div>
+      {/each}
+    </div>
+  {/if}
+  <div class="close-row">
+    <button data-testid="stats-close" onclick={() => (ui.statsOpen = false)}>{t("common.action.close")}</button>
+  </div>
+</div>
+
+<style>
+  .total {
+    font-size: var(--fs-md);
+    letter-spacing: var(--ls-md);
+    font-weight: 600;
+    margin-bottom: 14px;
+    color: var(--accent);
+  }
+
+  .bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    height: 160px;
+    padding: 0 4px;
+  }
+
+  .bar-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    height: 100%;
+    justify-content: flex-end;
+  }
+
+  .bar {
+    width: 100%;
+    max-width: 36px;
+    background: linear-gradient(to top, var(--accent), color-mix(in srgb, var(--accent) 55%, white));
+    border-radius: var(--radius-xs) var(--radius-xs) 0 0;
+    min-height: 3px;
+  }
+
+  .lbl {
+    font-size: var(--fs-2xs);
+    letter-spacing: var(--ls-2xs);
+    color: var(--fg2);
+  }
+
+  .close-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 14px;
+  }
+</style>
