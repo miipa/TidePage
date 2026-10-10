@@ -93,6 +93,7 @@ IconPlus,
   import type { OnlineVoice } from "../lib/tts.svelte";
   import type { AiTestResult, TocEntry } from "../lib/types";
   import { outDissolve, outFade } from "../lib/motion";
+  import { checkForUpdates, updateState } from "../lib/update.svelte";
 
   type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
   // 默认不硬编码分区：initialTab 不传时用「排序后的第一项」，以区分调用方显式指定与未指定。
@@ -130,41 +131,15 @@ IconPlus,
   /** 「检查更新」进行中：禁用按钮并切换文案。 */
   let checkingUpdate = $state(false);
 
-  /** 语义化版本比较：a 比 b 新返回 true。只比较数字段，忽略 v 前缀与预发布后缀。 */
-  function versionNewer(a: string, b: string): boolean {
-    const parse = (s: string) =>
-      s.replace(/^v/i, "").split(/[.\-+]/).map((x) => parseInt(x, 10) || 0);
-    const av = parse(a);
-    const bv = parse(b);
-    for (let i = 0; i < Math.max(av.length, bv.length); i++) {
-      const x = av[i] ?? 0;
-      const y = bv[i] ?? 0;
-      if (x !== y) return x > y;
-    }
-    return false;
-  }
-
-  /** 查询 GitHub 最新版本：有新版本则询问并跳转下载页，否则提示已是最新。 */
+  /** 手动检查更新：按结果提示；有新版本时侧栏按钮会变为「有新版本 vX」。 */
   async function runCheckUpdate() {
     if (checkingUpdate) return;
     checkingUpdate = true;
-    try {
-      const info = await api.checkUpdate();
-      if (!info) {
-        toast(t("settings.other.noRelease"));
-      } else if (versionNewer(info.latest, APP_VERSION)) {
-        const go = await appConfirm(
-          t("settings.other.updateAvailableBody", { cur: APP_VERSION, v: info.latest }),
-        );
-        if (go) await openExternal(info.url);
-      } else {
-        toast(t("settings.other.upToDate", { v: APP_VERSION }));
-      }
-    } catch (e) {
-      toast(t("settings.other.updateFailed", { err: String(e) }), "error");
-    } finally {
-      checkingUpdate = false;
-    }
+    const r = await checkForUpdates();
+    checkingUpdate = false;
+    if (r.status === "latest") toast(t("settings.other.upToDate", { v: APP_VERSION }));
+    else if (r.status === "none") toast(t("settings.other.noRelease"));
+    else if (r.status === "error") toast(t("settings.other.updateFailed", { err: r.err }), "error");
   }
 
   /** 按持久化顺序排列的扁平分区列表（settingsOrder 已归一化，含全部合法 id）。 */
@@ -1710,6 +1685,9 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           >
             <span class="set-nav-glyph"><Icon size={16} stroke={1.5} /></span>
             <span class="set-nav-label">{t(it.labelKey)}</span>
+            {#if it.id === "other" && updateState.latest}
+              <span class="update-dot" aria-hidden="true"></span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -2991,9 +2969,15 @@ let aiTestState = $state<"" | "ok" | "bad">("");
         </div>
         <div class="about-side">
           <span class="about-ver">{t("settings.other.version")} {APP_VERSION}</span>
-          <button class="about-check" type="button" onclick={runCheckUpdate} disabled={checkingUpdate}>
-            {checkingUpdate ? t("settings.other.checking") : t("settings.other.checkUpdate")}
-          </button>
+          {#if updateState.latest}
+            <button class="about-update" type="button" onclick={() => openExternal(updateState.url ?? ABOUT_REPO_URL)}>
+              {t("settings.other.newVersion", { v: updateState.latest })}
+            </button>
+          {:else}
+            <button class="about-check" type="button" onclick={runCheckUpdate} disabled={checkingUpdate}>
+              {checkingUpdate ? t("settings.other.checking") : t("settings.other.checkUpdate")}
+            </button>
+          {/if}
         </div>
       </div>
 
@@ -4292,6 +4276,22 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     color: var(--fg);
     border-color: var(--line-strong);
     background: var(--hover-bg);
+  }
+
+  /* 有新版本时的醒目按钮，点开下载页（不弹窗）。 */
+  .about-update {
+    padding: 3px 10px;
+    min-height: 0;
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    color: var(--danger);
+    background: transparent;
+    border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  }
+
+  .about-update:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
   }
 
   /* 链接与赞赏并排：内容区够宽，两列把整页压进一屏，不出现滚动条。 */

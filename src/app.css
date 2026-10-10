@@ -1385,6 +1385,26 @@ details.adv[open] > summary .fold,
   }
 }
 
+/* ===================== 更新红点（有新版本时提示，不弹窗） ===================== */
+.update-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
+}
+/* 附在图标按钮右上角时用 .abs；宿主按钮需 position:relative（配 .has-update）。 */
+.update-dot.abs {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  box-shadow: 0 0 0 1.5px var(--bg-elev);
+  pointer-events: none;
+}
+.has-update {
+  position: relative;
+}
+
 /* ===================== 无障碍：尊重「减少动效」 ===================== */
 @media (prefers-reduced-motion: reduce) {
   *,
