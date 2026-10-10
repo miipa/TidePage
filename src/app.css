@@ -1,0 +1,1405 @@
+/* ============================================================
+   TidePage 设计系统（design tokens + 全局基元）
+   手写原生 CSS，无预处理器。所有颜色/间距/圆角/字号/投影/层级都收敛到这里，
+   组件只引用变量。主题通过 <html data-theme="light|dark"> 切换，默认跟随系统。
+
+   ---- 四套并行的 CSS 变量命名空间（刻意不合并，生命周期不同）----
+   1) 外壳（--bg / --panel / --fg / --accent / --line / --shadow-* / --z-*）
+      写者：本文件的 :root / html[data-theme] + stores.svelte.ts 的 applyUiTheme() 内联覆盖。
+      时机：应用启动、切换皮肤或明暗模式。
+      读者：书库、设置、顶栏、侧面板、弹窗、对话框、上下文菜单。
+   2) 阅读区（--rdr-*）
+      写者：Reader.svelte 的 readerVars()，内联到 .reader 根节点。
+      时机：打开一本书 / 切换阅读主题 / 自由配色。
+      读者：正文，以及所有浮在阅读区之上的浮层（划线菜单、选区菜单、TTS 条、
+            AI 快速弹窗、书内搜索、侧面板）。刻意不跟随外壳皮肤——
+            换 UI 皮肤不应该改动正在读的这本书的观感。
+   3) AI 面板（--ai-*）：写者 AiPanel.svelte，随面板展开注入。读者：AI 面板内部。
+   4) 划线色（--hl-color）：写者 readerVars()。读者：划线/高亮前景色。
+
+   ⚠️ :root / html[data-theme=light|dark] 里的色值只是「JS 跑起来之前的首帧兜底」，
+      真实值一律由 applyUiTheme() 写到 <html> 的内联样式上（内联优先级更高）。
+      两处必须同源，否则首帧会闪一下颜色。
+   ============================================================ */
+
+:root {
+  /* ---- 间距栅格（4px 基准）---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+
+  /* ---- 圆角阶梯（互不相同，按尺寸分角色；50% 另用于进度环/头像）----
+     xs 极小装饰块 / sm 控件 / md 卡片下拉 / lg 弹窗 / xl 大面板 / pill 仅芯片与药丸 */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px; /* ← 运行时被 applyUiTheme() 用皮肤 radiusCard 覆盖（12/16px） */
+  --radius-xl: 16px;
+  --radius-pill: 999px;
+
+  /* ---- 字号阶梯（外壳只用 10/12/13/14/16）---- */
+  --fs-2xs: 10px;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+
+  /* ---- 字距（Raycast 模式）----
+     12–13px 在中文界面里字腔偏挤，不加正字距会显糊；14px 及以上保持 0。 */
+  --ls-2xs: 0.4px;
+  --ls-xs: 0.2px;
+  --ls-sm: 0.1px;
+  --ls-md: 0;
+  --ls-tight: -0.015em; /* 16px+ 展示字/大标题收紧 */
+
+  /* ---- 控件尺寸（三档，替代散落的 16/22/26/28/32/34px）---- */
+  --ctl-h: 30px; /* 主控件：按钮 / 输入框 / 分段控件 */
+  --ctl-h-sm: 26px; /* 芯片行、小按钮 */
+  --ctl-h-xs: 20px; /* 徽标、状态标签 */
+  --ctl-pad-y: 6px;
+  --ctl-pad-x: 14px;
+
+  /* ---- 进度条（全局一套，轨道与填充同高）---- */
+  --bar-h: 4px; /* 细：扫描进度、AI/阅读进度 */
+  --bar-h-lg: 6px; /* 粗：WebDAV 下载进度 */
+
+  /* ---- 图标阶梯 ----
+     Tabler 图标的 size/stroke 在模板里传字面量（CSS 变量进不了组件 prop），
+     下面的 token 供「图标盒子尺寸/描边由 CSS 决定」的场景，取值与模板保持同一套。
+     ⚠️ 尺寸下限是 14px（--icon-xs）：12px 配 1.5 描边会发糊，破坏唯一样条描边值的纪律。
+        容器小于 20×20 的位置一律放 14px 图标、容器尺寸保持不变，不要为塞进小容器而降档。 */
+  --icon-xs: 14px; /* 内联图标：菜单项（配 18px 图标框）、清除类按钮、徽标 */
+  --icon-sm: 16px; /* 按钮内 / 导航项图标 */
+  --icon-md: 20px; /* 工具栏主图标、关闭类按钮 */
+--icon-lg: 28px; /* 大号目标：图片浏览灯箱的前后翻页箭头（容器 46×76）*/
+  --icon-stroke: 1.5; /* 全应用唯一样条描边值（见下方 .tabler-icon）*/
+
+  /* ---- 滚动条 ---- */
+  --scrollbar-w: 11px;
+  --scrollbar-thumb: color-mix(in srgb, var(--fg2) 34%, transparent);
+  --scrollbar-thumb-hover: color-mix(in srgb, var(--fg2) 62%, transparent);
+
+  /* ---- 侧面板 ---- */
+  --sidepanel-w: 340px; /* 目录面板覆写为 320px；AI 面板由状态注入 */
+
+  /* ---- z-index 层级表（全应用唯一来源，禁止再写字面量）----
+     portal 到 body 的浮层必须用 --z-portal，否则会被 modal 盖住。 */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 20;
+  --z-drawer: 100;
+  --z-popover: 200;
+  --z-overlay: 300;
+  --z-modal: 400;
+  --z-portal: 450; /* portal 到 body 的浮层：必须高于 modal */
+  --z-toast: 500;
+  --z-window: 600; /* WindowControls：永远可点，压过一切浮层 */
+
+  /* ---- 动效 ----
+     两类时长，别混在一起看：
+       · 交互反馈（本段全部 token）：100–350ms。太慢会被当成卡顿，太快看不见变化。
+         --dur-fast 120 / --dur 200 / --dur-page 220 / --dur-scrim 240 /
+         --dur-modal 320（弹窗重入场）/ --dur-lift 340（抽屉与卡片抬升）
+       · 循环 / 加载动画（不在本段，各自声明）：≥1s。它们的时长由「循环周期」决定，
+         不是交互反馈——不确定进度条来回扫 1.1s、骨架屏微光 1.2s、旋转 1s。
+         这些是「持续表示正在工作」的信号，砍到 300ms 会变成频闪。
+         唯一需要长期存活的循环（不确定进度条）已在 prefers-reduced-motion 块里显式豁免。 */
+  --dur: 0.2s; /* 常规过渡 */
+  --dur-fast: 0.12s; /* 极短反馈（仍 >100ms）*/
+  --dur-page: 0.22s; /* 翻页位移 */
+  --dur-scrim: 0.24s; /* 遮罩淡入 */
+  --dur-modal: 0.32s; /* dialog / 模态入场 */
+  --dur-lift: 0.34s; /* 抽屉滑入 / 悬停抬升（更从容的高级感）*/
+  --ease: cubic-bezier(0.4, 0, 0.2, 1); /* 屏内位移 */
+  --ease-in: cubic-bezier(0, 0, 0.2, 1); /* 入场：减速落位 */
+  --ease-page: cubic-bezier(0.22, 1, 0.36, 1); /* 翻页：快速起步、缓停落位 */
+  /* premium 落位：快速起步、极缓停靠——卡片抬升/弹窗入场用它模拟真实质量感 */
+  --ease-premium: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* ---- 退场（与上面几条入场曲线成对，互为镜像）----
+     入场要「有质量、慢慢落位」，退场必须「立刻走开」：让用户等一个 340ms 的滑出
+     才能进行下一步操作，动效就从质感变成了阻碍。故退场取入场的约一半，并用
+     accelerate-out（起步慢、加速离开）——与入场的 decelerate 正好相反，成对使用时
+     读起来是「一个物体被弹出画面」，而不是两次互不相干的淡入淡出。 */
+  --dur-exit: 0.16s;
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  /* 弹簧落位：用于「状态确认」类微交互（勾选徽标、目录当前章标记、芯片按下）。
+     overshoot 只到 1.06——够读出一点「越过去再回来」的余韵，又不至于变成橡皮糖。 */
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+
+  /* ---- 阅读区表面变量：只服务于「拿不到 .reader」的阅读界面 ----
+     正常阅读时这组值由 Reader.svelte 的 readerVars() 写在 .reader 上（含「仅本书方案」
+     覆盖，取值最精确）。这里的声明只服务于两类地方：
+       ① 独立阅读窗 / 独立面板窗（StandaloneBook / StandalonePanel）——整窗即阅读内容；
+       ② portal 到 body 的阅读区浮层（书内搜索）——脱离 .reader 子树，拿不到内联值。
+     --rdr-bg / --rdr-fg 由 stores.svelte.ts 的 applyReaderSurfaceVars() 从全局
+     config.reader 写入 <html>（与独立 AI 窗的 aiRootStyle 同源同法）；下面这层是
+     JS 跑起来之前的首帧兜底。派生量（surface/line/shadow）刻意留在这里由基色推导，
+     这样「浮层配方」只有这一处定义，改一处即可。
+     ⚠️ 刻意不做的事：不把外壳皮肤（--bg/--fg）当兜底。阅读区浮层跟随阅读主题，
+        不跟随外壳皮肤——两者是两套独立配置，任意组合都可达。 */
+  --rdr-bg: #fdf5e6; /* 首帧兜底 = DEFAULTS.reader 的纸色底；JS 起来后被覆盖，无可见跳变 */
+  --rdr-fg: #2c2c2c; /* 同上 = DEFAULTS.reader.fgColor */
+  --rdr-surface: color-mix(in srgb, var(--rdr-bg) 94%, var(--rdr-fg));
+  --rdr-line: color-mix(in srgb, var(--rdr-fg) 22%, transparent);
+  --rdr-radius: var(--radius-md);
+  --rdr-shadow-pop: var(--shadow-md);
+  --rdr-shadow-panel: var(--shadow-drawer);
+
+  /* 中文优先，而且首选字族必须有**完整的字重轴**。
+     原先首选「微软雅黑」：Windows 上它只有 Light / Regular / Bold 三个静态字面，
+     于是 font-weight: 500 按字体匹配规则落到 400、600 落到 700 —— 本设计系统里
+     「引入 Medium/SemiBold 拉出更细层级」这一档在中文下其实不存在
+     （.meta .t / .row-meta .t 都写了 500，实测与 400 渲染完全一致）。
+     Noto Sans SC 是随系统安装的**可变字体**（NotoSansSC-VF.ttf，wght 100–900），
+     500/600 是真插值；它的拉丁部分就是 Noto Sans，中英混排同源，不会出现两种字形风格。
+     微软雅黑 / 苹方 / Segoe 只作兜底（未安装 Noto 的机器行为不变）。 */
+  font-family: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+
+  color-scheme: light;
+}
+
+/* ===================== 浅色基底（Cursor 的暖调纪律） ===================== */
+/* 具体肤色由 applyUiTheme() 写进 <html> 内联变量；此处仅作首帧兜底，两处必须同源。
+
+   浅色模式的层级纪律（务必照此执行，不要误读成「浅色不用投影」）：
+     · 静态表面之间 —— 靠 hairline（--line / --line-soft / --line-strong）+ 面色差
+       （--bg / --bg-elev / --panel2）表达层级。这些地方一律【不】加投影：
+       工具栏、状态栏、静态面板、列表行、输入框、分段控件、卡片静置态。
+     · 浮起表面 —— 靠投影表达「离开文档流」。投影只允许出现在这四类：
+       popover（浮层/下拉/菜单）、drawer（侧面板/抽屉）、dialog（弹窗/模态）、
+       以及卡片/图块的 hover 抬升。
+   下面四档投影就是给这四类用的，配方取 Vercel 的「堆叠式」并染前景色而非纯黑
+   （更融于背景、不显脏）；<fg N%> = color-mix(in srgb, var(--fg) N%, transparent)。
+   运行时 applyUiTheme() 会按皮肤前景色重算同一套配方。 */
+:root,
+html[data-theme="light"] {
+  --bg: #f7f6f3; /* canvas 暖纸底 */
+  --bg-elev: #ffffff;
+  --panel: #ffffff;
+  --panel2: #f2f1ec;
+  --fg: #26251e; /* 暖近黑：与暖底色同源（B 通道不该最高）*/
+  --fg2: #6b6862;
+  --line: color-mix(in srgb, var(--fg) 10%, transparent);
+  --line-soft: color-mix(in srgb, var(--fg) 6%, transparent);
+  --line-strong: color-mix(in srgb, var(--fg) 18%, transparent);
+
+  --accent: #3f7d6e;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-fg: #ffffff;
+
+  --success: #2f8f5b;
+  --warning: #b8860b;
+  --danger: #c0564f;
+
+  /* 悬停/按下：≥8% 亮度差，低于此值多数显示器看不出 */
+  --hover-bg: color-mix(in srgb, var(--fg) 8%, transparent);
+  --active-bg: color-mix(in srgb, var(--fg) 14%, transparent);
+  /* 列表/表格整行悬停只加 4% 底 */
+  --hover-row: color-mix(in srgb, var(--fg) 4%, transparent);
+
+  /* 四档投影的适用场景（浅/暗两套基底共用同一组语义）：
+       --shadow-sm      卡片 / 列表行封面 / 徽标静置，以及卡片 hover 的抬升目标
+       --shadow-md      popover：下拉面板、上下文菜单、浮层、外壳取色框
+       --shadow-drawer  drawer：侧面板（目录/划线/统计/AI）、WebDAV 抽屉
+       --shadow-lg      dialog：弹窗 / 模态 / 全屏提示
+     ⚠️ 不要给静态表面（工具栏、状态栏、输入框、分段控件、普通列表行）加投影。 */
+  --shadow-sm: 0 1px 2px color-mix(in srgb, var(--fg) 6%, transparent),
+    0 1px 1px color-mix(in srgb, var(--fg) 4%, transparent);
+  --shadow-md: 0 2px 2px color-mix(in srgb, var(--fg) 5%, transparent),
+    0 8px 8px -4px color-mix(in srgb, var(--fg) 7%, transparent);
+  --shadow-drawer: 0 2px 2px color-mix(in srgb, var(--fg) 5%, transparent),
+    0 16px 32px -8px color-mix(in srgb, var(--fg) 11%, transparent);
+  --shadow-lg: 0 1px 1px color-mix(in srgb, var(--fg) 4%, transparent),
+    0 8px 16px -4px color-mix(in srgb, var(--fg) 7%, transparent),
+    0 24px 32px -8px color-mix(in srgb, var(--fg) 9%, transparent);
+  /* 内嵌发丝边：替代旧的 inset 0 1px 0 rgba(255,255,255,.75)（白面板上等于不可见）*/
+  --edge-hi: inset 0 0 0 1px color-mix(in srgb, var(--fg) 5%, transparent);
+
+  /* 遮罩两档 */
+  --scrim: color-mix(in srgb, var(--fg) 34%, transparent);
+  --scrim-strong: color-mix(in srgb, var(--fg) 46%, transparent);
+}
+
+/* ===================== 暗色基底（Linear/Raycast 面色阶梯 + Apple 微步进） ===================== */
+html[data-theme="dark"] {
+  --bg: #16181d;
+  --bg-elev: #1e2126;
+  --panel: #1e2126;
+  --panel2: #252932;
+  --fg: #e6e8ec;
+  --fg2: #9aa0a8;
+  --line: color-mix(in srgb, var(--fg) 10%, transparent);
+  --line-soft: color-mix(in srgb, var(--fg) 6%, transparent);
+  --line-strong: color-mix(in srgb, var(--fg) 18%, transparent);
+
+  --accent: #4fae95;
+  --accent-soft: color-mix(in srgb, var(--accent) 22%, transparent);
+  --accent-fg: #0f1115;
+
+  --success: #46b47c;
+  --warning: #d4a72c;
+  --danger: #e06b62;
+
+  --hover-bg: color-mix(in srgb, var(--fg) 8%, transparent);
+  --active-bg: color-mix(in srgb, var(--fg) 14%, transparent);
+  --hover-row: color-mix(in srgb, var(--fg) 4%, transparent);
+
+  --shadow-sm: 0 1px 2px color-mix(in srgb, var(--fg) 6%, transparent),
+    0 1px 1px color-mix(in srgb, var(--fg) 4%, transparent);
+  --shadow-md: 0 2px 2px color-mix(in srgb, var(--fg) 5%, transparent),
+    0 8px 8px -4px color-mix(in srgb, var(--fg) 7%, transparent);
+  --shadow-drawer: 0 2px 2px color-mix(in srgb, var(--fg) 5%, transparent),
+    0 16px 32px -8px color-mix(in srgb, var(--fg) 11%, transparent);
+  --shadow-lg: 0 1px 1px color-mix(in srgb, var(--fg) 4%, transparent),
+    0 8px 16px -4px color-mix(in srgb, var(--fg) 7%, transparent),
+    0 24px 32px -8px color-mix(in srgb, var(--fg) 9%, transparent);
+  --edge-hi: inset 0 0 0 1px color-mix(in srgb, var(--fg) 5%, transparent);
+
+  --scrim: color-mix(in srgb, var(--fg) 34%, transparent);
+  --scrim-strong: color-mix(in srgb, var(--fg) 46%, transparent);
+}
+
+/* ---- 强调色三段 ramp（Linear 模式）----
+   一个公式自动双向正确：亮色下 fg 是深色 → hover/按下变深；暗色下 fg 是浅色 → 变亮。
+   不需要写两套。 */
+:root {
+  --accent-hover: color-mix(in srgb, var(--accent) 86%, var(--fg));
+  --accent-active: color-mix(in srgb, var(--accent) 74%, var(--fg));
+}
+
+/* 深浅色由 data-theme 决定原生控件外观 */
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+#app,
+main,
+.layout-root {
+  height: 100%;
+}
+
+/* SvelteKit 注入的 <div style="display:contents">，样式搬进 CSS */
+body > div[style*="display: contents"] {
+  display: contents;
+}
+
+/* 数字（页码 / 进度 / 文件大小 / 日期 / 字数 / 时间轴 / 统计值）等宽对齐 */
+.num,
+.row-size,
+.row-date {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===================== 焦点态（两套，理由见注释） ===================== */
+/* ① 表单控件走 :focus —— 鼠标点击也必须看得见焦点（否则点进输入框就「找不到光标在哪」）。
+      规则：accent 描边 + 3px 柔和光晕。 */
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ② 其余可聚焦元素走 :focus-visible —— 只有键盘导航才画外圈，
+      避免鼠标点击时按钮上出现多余的蓝/绿框。合并原先散在 3 处的 focus 规则。 */
+button:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible,
+.set-nav-item:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent);
+  outline-offset: 1px;
+}
+
+/* ===================== 按钮 ===================== */
+button {
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--fg);
+  min-height: var(--ctl-h);
+  padding: var(--ctl-pad-y) var(--ctl-pad-x);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  font-family: inherit;
+  /* opacity 也在列：视图切换按钮（.view-btn.active）此前把 0.82 → 1 写死成瞬变，
+     缺少这一项时它会在按下的一帧直接跳满，与相邻按钮的插值读起来不是一件事。 */
+  transition: transform var(--dur) var(--ease-premium), box-shadow var(--dur) var(--ease),
+    background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease),
+    opacity var(--dur) var(--ease);
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: color-mix(in srgb, var(--fg) 8%, var(--bg-elev));
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0.5px) scale(0.985);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* 主按钮：纯色 accent，无渐变无内高光。
+   渐变 + inset 高光是全应用最高可见度的「AI 生成感」来源，去掉后层级改由
+   实底色与 --shadow-sm 承担。 */
+button.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--accent-fg);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: transparent;
+  box-shadow: var(--shadow-md);
+}
+
+button.primary:active:not(:disabled) {
+  background: var(--accent-active);
+  box-shadow: var(--shadow-sm);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg-elev));
+}
+
+/* 图标/工具按钮：图标色用 --fg（保证 ≥3:1 非文字对比度），悬停用 ≥8% 亮度差，
+   避免与背景糊在一起。 */
+
+/* 图标 + 文字的按钮：两者必须同轴，且中间要留呼吸位。
+   Tabler 的 <svg> 默认 inline（坐在文字基线上），button 又默认 inline-block，
+   于是一个 20px 图标会把 13px 文案的基线压歪 —— 表现为「图标比文字低半截」。
+
+   用显式类 .ico 而**不是** `button:has(> .tabler-icon:first-child)`：
+   CSS 的 :first-child 只数元素子节点、忽略文本节点，所以 `<button>文字<svg/></button>`
+   （按键芯片 .key-chip 那种「文字在前、删除图标在后」的写法）也会命中，
+   被误改成 flex 容器后整块高度从 1155px 塌到 937px。文字在前 / 图标在后
+   没法用选择器区分，所以宁可显式标注。
+   注：原先这里还有一条 button.icon:has(> .tabler-icon + *) { gap: 6px }，
+   它**没有设 display** —— gap 对非 flex 元素无效，那条声明一直是死的。 */
+button.ico {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+button.icon {
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg);
+  opacity: 0.82;
+  box-shadow: none;
+}
+
+button.icon:hover:not(:disabled) {
+  background: var(--hover-bg);
+  border-color: transparent;
+  color: var(--fg);
+  opacity: 1;
+  box-shadow: none;
+}
+
+button.icon:active:not(:disabled) {
+  transform: scale(0.9);
+  box-shadow: none;
+}
+
+/* 工具栏主图标统一 20px（模板里的 size 字面量也取这一档） */
+button.icon .tabler-icon {
+  width: var(--icon-md);
+  height: var(--icon-md);
+}
+
+/* 图标微动：指针进入图标按钮时，图标本身轻微放大（按钮底不变）。
+   只动 transform —— 不触发布局、不进合成层分配，虚拟滚动里上百个按钮也安全。
+   幅度取 1.07：够读出「被指到」的反馈，又不到会让人注意到的程度。
+   注意 .tabler-icon 的尺寸规则在上面按「容器角色」分组，这里只补过渡与变换，
+   不碰 width/height，否则会与那组规则互相覆盖。 */
+button.icon .tabler-icon,
+button.ico:not(.icon) .tabler-icon {
+  transition: transform var(--dur) var(--ease-premium);
+}
+
+button.icon:hover:not(:disabled) .tabler-icon,
+button.ico:not(.icon):hover:not(:disabled) .tabler-icon {
+  transform: scale(1.07);
+}
+
+button.icon:active:not(:disabled) .tabler-icon,
+button.ico:not(.icon):active:not(:disabled) .tabler-icon {
+  transform: scale(0.96);
+}
+
+/* 图标描边：全应用唯一值。Tabler 把 stroke 作为 svg 的表现属性下发，
+   而 CSS 规则优先级高于表现属性，故这一条即可统一全应用（含后续新增图标）；
+   模板里也按同一值传 stroke={1.5}，保持 DOM 与样式一致。
+   （只命中 .tabler-icon，不影响 ProgressRing 自绘的进度环。） */
+.tabler-icon {
+  stroke-width: var(--icon-stroke);
+}
+
+/* ===================== 表单控件 ===================== */
+input,
+select,
+textarea {
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--fg);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: var(--fs-sm);
+  letter-spacing: var(--ls-sm);
+  min-height: var(--ctl-h);
+  font-family: inherit;
+  outline: none;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+input:hover:not(:disabled),
+select:hover:not(:disabled),
+textarea:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--panel2);
+}
+
+input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+input[type="range"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* 分段控件（如 浅色/深色/系统） */
+.fr-seg {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+}
+
+.fr-seg button {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  border-radius: var(--radius-pill);
+  min-height: var(--ctl-h-sm);
+  padding: 3px 12px;
+  font-size: var(--fs-xs);
+  letter-spacing: var(--ls-xs);
+  color: var(--fg2);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+
+.fr-seg button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--fg);
+  box-shadow: none;
+}
+
+.fr-seg button:active:not(:disabled) {
+  transform: none;
+}
+
+.fr-seg button.active {
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm), var(--edge-hi);
+}
+
+/* ===================== 滚动条 ===================== */
+::-webkit-scrollbar {
+  width: var(--scrollbar-w);
+  height: var(--scrollbar-w);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: var(--radius-pill);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  transition: background var(--dur) var(--ease);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ===================== 弹窗 ===================== */
+dialog {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elev);
+  color: var(--fg);
+  padding: 0;
+  box-shadow: var(--shadow-lg), var(--edge-hi);
+}
+
+.settings {
+  background: var(--bg-elev);
+}
+
+/* 本项目一律用 <dialog open> 属性而非 showModal()，故没有 ::backdrop，
+   遮罩由各处的 .overlay 承担（走 --scrim token）。 */
+dialog[open] {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: fit-content;
+  height: fit-content;
+  max-height: 88vh;
+  z-index: var(--z-modal);
+  animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
+}
+
+/* 弹窗入场：轻微放大 + 上浮 + 去模糊落位，模拟从景深里浮现（skill: heavy fade-up） */
+@keyframes fr-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+.modal-body {
+  padding: 18px 22px;
+  min-width: min(440px, 92vw);
+  max-width: 720px;
+  max-height: 80vh;
+  overflow: auto;
+}
+
+/* 标题避免孤行/末行单词；正文避免难看的断行（skill: orphaned words） */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.modal-body h3,
+.sec-title {
+  text-wrap: balance;
+}
+
+p,
+.tip,
+.empty-state {
+  text-wrap: pretty;
+}
+
+.modal-body h3 {
+  margin: 0 0 14px;
+  font-size: var(--fs-lg);
+}
+
+/* ===================== 通用布局 ===================== */
+/* 表单字段：设置页/转换框/书详情共用一份（原 SettingsModal 另有一份会覆盖这份）。*/
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+
+.field label {
+  font-size: var(--fs-xs);
+  letter-spacing: var(--ls-xs);
+  color: var(--fg2);
+}
+
+/* 字段获得焦点（含 focus-within）时才显形边框：平时无噪声，操作时一眼可辨 */
+.field:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--panel);
+}
+
+.row-inline {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.row-inline > * {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 图标按钮与按键芯片不吃 flex:1。
+   否则一个 20px 的「清除 X」会被拉成 150px 宽的空盒子 —— 按钮默认居中内容，
+   于是那点 X 孤零零飘在正中间，看上去就是「字体旁边一个大 X」；
+   TTS/AI 的「新增 / 删除 / 读取中」和 AI 的按键芯片（F1…）同样是这个毛病。
+   文本按钮（选择图片…/测试连接/预览章节）继续平分整行，那是刻意的一对一手势。 */
+.row-inline > button.icon,
+.row-inline > button.key-chip-inline {
+  flex: 0 0 auto;
+}
+
+/* 同一行里输入框约 31px 高，而按钮是 padding 6px + 20px 图标 = 35px —— 齐平才不像挂了个补丁。
+   直接给行高（--ctl-h=30）比 align-self:stretch 可靠：stretch 取的是行高，
+   而行高恰恰由最高的子元素（就是它自己）决定，等于没改。 */
+.row-inline > button.icon {
+  height: var(--ctl-h);
+  min-height: 0;
+  padding-block: 0;
+}
+
+/* 一行说明文字（次要色、小字号） */
+.tip {
+  font-size: var(--fs-xs);
+  letter-spacing: var(--ls-xs);
+  color: var(--fg2);
+  line-height: 1.7;
+  margin: var(--sp-1) 0 0;
+}
+
+/* 分组小标题。不加 text-transform: uppercase —— 它对中文无效，
+   切到英文 locale 才会生效、造成布局跳变；视觉重量改由字重 + 次要色表达。 */
+.sec-title {
+  font-size: var(--fs-xs);
+  letter-spacing: var(--ls-xs);
+  font-weight: 600;
+  color: var(--fg2);
+  margin: 0 0 var(--sp-2);
+}
+
+/* 空状态（无数据 / 无搜索结果 / 无划线）：全局一份，组件不要另写。
+   现有空状态都是单行文案，故不提供可选标题行 —— 真需要时分两行写，别加一个没人用的类。 */
+.empty-state {
+  padding: 48px var(--sp-4);
+  text-align: center;
+  font-size: var(--fs-sm);
+  letter-spacing: var(--ls-sm);
+  color: var(--fg2);
+  line-height: 1.8;
+}
+
+/* ===================== 进度条（全局一套规格） ===================== */
+/* 被动的进度条共用下面这一组规则与尺寸 token（类名沿用各自的，模板与测试都依赖）：
+     Library 的 .scan-bar/.scan-fill、WebDAV 的 .wd-bar/.wd-bar-fill。
+   两个「可拖拽的进度刷」（Reader 页脚、AiPanel 回复进度）是另一种组件——它们额外有
+   16px 命中区与滑块，但轨道/填充的厚度与圆角仍取同一组 token，保证四条进度线一样粗。 */
+.scan-bar {
+  height: var(--bar-h);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--fg2) 22%, transparent);
+  overflow: hidden;
+}
+
+/* WebDAV 下载进度更粗一档，便于在抽屉里一眼看清 */
+.wd-bar {
+  height: var(--bar-h-lg);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--fg2) 22%, transparent);
+  overflow: hidden;
+}
+
+.scan-fill,
+.wd-bar-fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  transition: width var(--dur) linear;
+}
+
+/* 成功态用语义色而非主色（下载完成） */
+.wd-bar-fill.fin {
+  background: var(--success);
+}
+
+.wd-bar-fill.fail {
+  background: var(--danger);
+}
+
+/* ===================== 浮层：阅读区 vs 外壳区 ===================== */
+/* 两套配方形状完全相同，唯一区别是取哪套令牌 —— 因为「阅读主题」与「外壳皮肤」是
+   两套独立配置，任意组合都可达，浮层必须明确归属其中一套。 */
+
+/* 阅读区浮层：跟随【阅读主题】（--rdr-* 由 readerVars() / applyReaderSurfaceVars() 注入）。
+   用于划线菜单、选区菜单、TTS 起播菜单 / TTS 条、AI 快速弹窗、书内搜索、感想提示、
+   顶栏弹出面板、侧面板。 */
+.rdr-pop {
+  background: var(--rdr-surface);
+  color: var(--rdr-fg);
+  border: 1px solid var(--rdr-line);
+  border-radius: var(--rdr-radius);
+  box-shadow: var(--rdr-shadow-pop);
+}
+
+/* 外壳浮层：跟随【外壳皮肤】。用于「工具型」浮层——取色框（ColorPicker / ColorPalette）。
+   这两个组件被两种语境共用：设置弹窗（外壳）与阅读区划线菜单（阅读）。它们是配置工具，
+   不是页面内容，故两种语境下一律跟外壳皮肤，观感可预期、且底色与文字色必然成对同源。 */
+.pop {
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+/* ===================== 侧面板（目录 / 划线 / 统计 / AI） ===================== */
+/* 宽度走 --sidepanel-w（目录 320px，其余 340px，AI 面板由状态注入）。
+   打开方向由 .sidepanel--left 决定，默认右侧。 */
+.sidepanel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: var(--sidepanel-w);
+  background: var(--rdr-surface);
+  border-left: 1px solid var(--rdr-line);
+  z-index: var(--z-drawer);
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--rdr-shadow-panel);
+  animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
+}
+
+.sidepanel--left {
+  right: auto;
+  left: 0;
+  border-left: none;
+  border-right: 1px solid var(--rdr-line);
+  animation-name: fr-drawer-in-left;
+}
+
+/* 侧面板滑入：右侧抽屉用（.sidepanel），左侧抽屉用 --left 修饰。
+   方向不同的两套各写一份，因为纯 translateX 无法用一枚变量表达正负。 */
+@keyframes fr-drawer-in-right {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fr-drawer-in-left {
+  from {
+    transform: translateX(-24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* 面板标题：比列表正文重一档（--fs-md/600），底部发丝边，与内容留 8px。
+   顺带补一条 hover 底：.sp-head 同时是拖出窗口的手柄（use:dragOutHandle），
+   此前静止态没有任何可拖提示，用户要拖过 30px 才知道这块能拖。 */
+.sp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-md);
+  letter-spacing: var(--ls-md);
+  font-weight: 600;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--rdr-line);
+  cursor: grab;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.sp-head:hover {
+  background: color-mix(in srgb, var(--rdr-fg) 4%, transparent);
+}
+
+.sp-head:active {
+  cursor: grabbing;
+}
+
+.sp-list {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: var(--sp-2);
+  position: relative;
+}
+
+/* 列表行规格：行间用发丝边（border-bottom），hover 用 7% 阅读字色底。
+   横向 padding 放在行容器上，组件内的 .bm-main / .hl-top 不再自带 padding。
+   按下反馈（transform scale）此前缺失：目录/书签/划线都是高频点击区，
+   没有按下反馈时点错了行完全感知不到。 */
+.sp-item {
+  padding: 10px var(--sp-4);
+  cursor: pointer;
+  border-bottom: 1px solid color-mix(in srgb, var(--rdr-fg) 8%, transparent);
+  transition: background var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease-premium);
+}
+
+.sp-item:hover {
+  background: color-mix(in srgb, var(--rdr-fg) 7%, transparent);
+}
+
+.sp-item:active {
+  background: color-mix(in srgb, var(--rdr-fg) 11%, transparent);
+  transform: scale(0.995);
+}
+
+.sp-empty {
+  padding: 48px var(--sp-4);
+  text-align: center;
+  font-size: var(--fs-sm);
+  letter-spacing: var(--ls-sm);
+  color: var(--fg2);
+  line-height: 1.8;
+}
+
+/* ===================== 上下文菜单（全局一份规格） ===================== */
+/* 三处实现共用：ContextMenu（portal 到 body）、Library、WebdavBrowser（面板内绝对定位）。 */
+.ctx-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--sp-1);
+  min-width: 208px;
+  transform-origin: top left;
+  animation: fr-menu-in var(--dur) var(--ease-premium) both;
+}
+
+@keyframes fr-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 遮罩淡入：全应用唯一的「纯不透明度」入场。原先有 4 份同名同体的副本
+   （overlay-in / bd-overlay-in / nd-backdrop-in / iv-in），全部收敛到这里。 */
+@keyframes fr-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 轻量浮层入场（划线菜单、选区菜单、取色框、TTS 起播菜单、AI 快速弹窗…）：
+   原先有 5 份副本，仅位移差 1px（4/5/6px），肉眼无法分辨，统一取 5px。
+   刻意不带 blur —— blur 会与浮层内正在渲染的内容抢合成层。 */
+@keyframes fr-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 上浮淡入（不缩放、不带 blur）：给「本身就带 transform 定位」的浮层用。
+   ⚠️ 用的是独立的 translate 属性而不是 transform —— transform 会被动画整个覆盖，
+      而 TTS 播放条这类元素靠 transform: translateX(-50%) 居中，用 transform 做动画
+      会让它在动画期间失去居中然后突然跳回。translate 与 transform 是叠加关系。 */
+@keyframes fr-rise-in {
+  from {
+    opacity: 0;
+    translate: 0 6px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+/* 循环旋转（加载中）。循环动画不属于交互反馈，故时长自声明（1s），
+   与 --dur-* 无关；reduce-motion 下会被全局块静止。 */
+@keyframes fr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ============================================================
+   退场：实现在 lib/motion.ts，不在这里写 keyframes
+   此前全应用只有「入场」没有「退场」：抽屉、浮层、菜单、面板都是
+   340ms 滑入、0ms 消失。入场有重量、退场是硬切，读起来像元素被
+   拔掉而不是被送走；成对补上后开关的因果关系才闭合。
+   实作用 Svelte transition 实现，且**只声明 `out:`、绝不用 `transition:`**
+   （transition 是双向的，会拿同一配置再跑一遍 intro，压过本文件里的入场
+   keyframes —— WAAPI 必胜，表现为入场先淡没再弹回）：
+   out:outFade / out:outDissolve / out:outSlideR / out:outSlideL，
+   配方由 motion.ts 直接返回内联样式，配 --dur-exit / --ease-exit。
+   **不要在这里补退场 keyframes** —— 退场必须等元素卸载，CSS animation
+   结束即失效，无法承担卸载；这条路上一轮试过，7 个 keyframes 零引用。
+   ============================================================ */
+
+/* ============================================================
+   骨架屏微光
+   全应用唯一的循环动画配方（骨架 = 「形状已知、内容未到」）：
+   一道横向微光扫过占位块。1.2s 是自声明的循环周期，与 --dur-* 无关。
+   必须定义在全局：Svelte 会重命名组件内 @keyframes，导致 reduce-motion
+   覆盖无法引用。这里是唯一定义处，Reader/Library 共用。
+   ============================================================ */
+@keyframes sk-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ============================================================
+   卡片内容分层揭示（书库/阅读器封面卡）
+   封面在位后，标题与作者依次上浮。纯 transform/opacity。
+   ============================================================ */
+@keyframes fr-meta-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.ctx-item {
+  border: none;
+  background: transparent;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  letter-spacing: var(--ls-sm);
+  color: var(--fg);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.ctx-item:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.ctx-item.danger {
+  color: var(--danger);
+}
+
+.ctx-item.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+/* 菜单项图标框：18px 固定框，图标取 --icon-xs */
+.ctx-item .ci {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+}
+
+.ctx-item .ci .tabler-icon {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+/* ---- 图标尺寸：按「容器角色」统一给，不再在 30 多个调用点各写一遍字面量 ----
+   ⚠️ 这些规则必须放在全局（本文件）而不是组件的 scoped <style> 里：
+      scoped 编译后会要求 <svg> 自己也带父组件的 scope class，而 <svg> 是
+      IconX 这类子组件内部渲染的，带的是子组件的 class —— scoped 规则永远匹配不上。
+      子组件内部的元素只有全局选择器能选中。 */
+.mini .tabler-icon,
+.tb-mini .tabler-icon,
+.stat-mv .tabler-icon,
+.sb-drag .tabler-icon,
+.sb-head .mini .tabler-icon,
+.cp-add .tabler-icon,
+.cp-clear .tabler-icon,
+.key-add .tabler-icon,
+.key-chip .tabler-icon,
+.font-del .tabler-icon,
+.sel-badge .tabler-icon,
+.set-search-clear .tabler-icon,
+.prompt-chip .tabler-icon,
+.tb-sleep .tabler-icon,
+.wd-ico .tabler-icon,
+.wd-btn .tabler-icon,
+.wd-empty-ico .tabler-icon {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+/* 图片浏览灯箱的前后翻页箭头（容器 46×76）：大号目标 */
+.iv-nav .tabler-icon {
+  width: var(--icon-lg);
+  height: var(--icon-lg);
+}
+
+/* WebDAV 加载中的旋转图标：比内联图标大一档，跟「⟳ 加载中」原有的视觉重量相当 */
+.wd-spin .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* 传输控制按钮（TTS 上一句/播放暂停/下一句/停止/设置）：按钮内图标那一档。
+   刻意只限定 .tts-bar —— 阅读器工具栏也用 .tb-btn，但那一档是 20px，
+   靠上面的 button.icon 规则生效；这里若写成裸 .tb-btn，未来任何没带 .icon 的
+   .tb-btn 都会被无声地压到 16px。 */
+.tts-bar .tb-btn .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* 「已读完」进度环中心的对勾：徽标级，取下限 */
+.ring .num.check .tabler-icon {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+/* ============================================================
+   图标尺寸补漏（`_test/icon_size_probe.mjs` 全量普查后补的）
+   凡是没被上面任何一条命中的 svg.tabler-icon 都会退回 Tabler 默认 **24px** ——
+   实测设置面板 + 书库共 80 个图标里有 25 个是 24px，在 13px 文案 / 12px 芯片
+   旁边显得又大又乱（按键芯片里那个「删除 X」就是这么变大的）。
+   下面把剩下的入口按语义归到既有令牌，不新增尺寸值。
+   ============================================================ */
+
+/* ① 折叠三角：与导航字形（.set-nav-glyph，16px）同级。
+      上面 1115 行那条注释本来就声称「图标尺寸在 app.css 全局规则里」，
+      但当时只写了 flex-shrink 与旋转，尺寸一直没人管。 */
+summary .fold,
+.ai-group-head .fold {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* ② 带文字的 .ico 按钮（书库「添加书」primary.ico / 刷新、设置「重新读取字体名」、
+      AI 分组里的 .ico）：与 button.icon 的工具栏主图标同档 20px。
+      写成 :not(.icon) 是为了不和上面 button.icon 的规则重复声明。 */
+button.ico:not(.icon) .tabler-icon {
+  width: var(--icon-md);
+  height: var(--icon-md);
+}
+
+/* ③ 字体芯片里的星标：13px 文字旁边用 16px，既能认出是标记又不压过字体名。
+      ④ 皮肤卡右下角的选中角标：卡片内的徽标级。
+      ⑤ 设置面板标题旁的题头图标：与标题 fs-lg（16px）齐平。 */
+.font-opt .tabler-icon,
+.sk-check .tabler-icon,
+.set-crumb .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* 设置里的折叠三角（原先是 content: "▸"，content 里放不了 SVG）。
+   Tabler 的 transform-origin 默认在几何中心，故用 inline-flex + gap 对齐文字；
+   旋转规则也必须在全局——scoped 选择器匹配不到子组件内部的 <svg>。 */
+summary .fold,
+.ai-group-head .fold {
+  flex-shrink: 0;
+  transition: transform var(--dur) var(--ease);
+}
+
+details.adv[open] > summary .fold,
+.ai-group-head.open .fold {
+  transform: rotate(90deg);
+}
+
+/* 设置左侧导航项图标（18px 图标框内的 16px 线性图标） */
+.set-nav-glyph .tabler-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+/* 窗口控制按钮（最小化/最大化/关闭）里的图标：工具栏主图标那一档 */
+.wc-btn .tabler-icon {
+  width: var(--icon-md);
+  height: var(--icon-md);
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--line);
+}
+
+/* 菜单遮罩：只负责吃掉这次右键，不可见。
+   z-index 与菜单同为 --z-portal：必须高于 --z-modal，否则在设置弹窗里右键弹出的
+   菜单，点击弹窗内部时事件落到弹窗而非遮罩，菜单关不掉。
+   两者同为 450 时靠文档顺序决胜——菜单在遮罩之后绘制，永远在上。 */
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-portal);
+}
+
+/* ===================== 顶栏按钮真实拖拽排序 ===================== */
+/* 被拖起的原件留一个淡影占位，避免整条工具栏抖动。 */
+.fr-drag-src {
+  opacity: 0.28;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+/* 跟随指针的「拿起」浮层：只动 transform，不触发布局。 */
+.fr-drag-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: var(--z-toast);
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  border: 1px solid var(--line-strong);
+  color: var(--fg);
+  box-shadow: var(--shadow-lg);
+  will-change: transform;
+}
+
+/* 落点指示：一根跟随目标位置的竖线（横向组）/ 横线（纵向组），比硬阴影线更轻。 */
+.fr-drag-caret {
+  position: absolute;
+  border-radius: var(--radius-xs);
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  pointer-events: none;
+  transition: transform var(--dur) var(--ease);
+  will-change: transform;
+}
+
+.fr-drag-caret[data-axis="x"] {
+  top: 3px;
+  bottom: 3px;
+  left: 0;
+  width: 2px;
+}
+
+.fr-drag-caret[data-axis="y"] {
+  left: 3px;
+  right: 3px;
+  top: 0;
+  height: 2px;
+}
+
+/* ===================== 顶栏图标自定义提示 ===================== */
+/* 原生 title 提示出现在指针附近，会被鼠标/图标挡住且延迟不定；
+   这里改用 data-tip：提示统一出现在按钮正下方、无延迟、不被指针遮挡。
+   仅顶栏图标使用（挂 data-tip 的按钮同时保留 aria-label 供读屏）。 */
+[data-tip] {
+  position: relative;
+}
+
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  z-index: var(--z-toast);
+  padding: 4px 9px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--fg) 90%, transparent);
+  color: var(--bg-elev);
+  font-size: var(--fs-xs);
+  letter-spacing: var(--ls-xs);
+  line-height: 1.25;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: var(--shadow-md);
+  animation: fr-tip-in var(--dur-fast) var(--ease-in) both;
+}
+
+/* 靠近窗口左右边缘的按钮：让提示向内侧对齐，避免溢出被裁掉 */
+[data-tip].tip-left::after {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+[data-tip].tip-right::after {
+  left: 0;
+  right: auto;
+  transform: none;
+}
+
+@keyframes fr-tip-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -3px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+[data-tip].tip-left::after,
+[data-tip].tip-right::after {
+  animation-name: fr-tip-in-side;
+}
+
+@keyframes fr-tip-in-side {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ===================== 选中文本 ===================== */
+/* 阅读区用阅读主题自己的 --rdr-sel（见 Reader.svelte）；这里只管外壳区域。 */
+::selection {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* 不确定进度条（添加/扫描目录）的来回滑动 keyframes。
+   必须定义在全局：Svelte 会重命名组件内 @keyframes，导致下方 reduce-motion 覆盖无法引用。 */
+@keyframes scan-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+/* ============================================================
+   对话气泡入场（AI 面板）
+   .ai-msg 以 index 为 key，新消息追加时才挂载 → 动画只在该条上跑一次；
+   流式更新只改最后一条的文本内容、元素不重挂，故不会重播。
+   必须定义在全局：Svelte 会重命名组件内 @keyframes，reduce-motion 覆盖引用不到。
+   ============================================================ */
+@keyframes fr-bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ============================================================
+   设置面板分区切换入场
+   .set-pane 常驻渲染、靠 [hidden] 切换显示。选择器匹配「非 hidden」态，
+   故每次切到某分区时动画重新触发一次（隐藏时 display:none 不消耗动画）。
+   刻意只动 opacity、且不写 transform：分区内含 .scheme-save-backdrop 这类
+   position:fixed 子元素，任何残留/进行中的 transform 都会改变其包含块、
+   使固定定位失效。纯透明度过渡既无此风险，也与弹窗自身的入场动效不打架。
+   ============================================================ */
+@keyframes fr-set-pane-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ===================== 无障碍：尊重「减少动效」 ===================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 例外：不确定进度条（添加/扫描目录）的来回滑动动画需保留，否则「进行中」无任何可见反馈。 */
+  .scan-fill.indeterminate {
+    animation-name: scan-indeterminate !important;
+    animation-duration: 1.1s !important;
+    animation-timing-function: ease-in-out !important;
+    animation-iteration-count: infinite !important;
+  }
+}
