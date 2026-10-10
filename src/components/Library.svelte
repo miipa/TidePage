@@ -3,6 +3,7 @@
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
+  import { updateState } from "../lib/update.svelte";
   import { dragSort } from "../lib/dragSort";
   import { listen } from "@tauri-apps/api/event";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
@@ -1736,6 +1737,7 @@
         {@const Icon = b.icon}
         <button
           class="icon lib-tb-btn tip-left"
+          class:has-update={b.id === "settings" && !!updateState.latest}
           data-drag-id={b.id}
           data-testid={"lib-btn-" + b.id}
           aria-label={b.title}
@@ -1743,6 +1745,9 @@
           onclick={b.run}
         >
           <Icon size={20} stroke={1.5} />
+          {#if b.id === "settings" && updateState.latest}
+            <span class="update-dot abs" aria-hidden="true"></span>
+          {/if}
         </button>
       {/each}
     </div>

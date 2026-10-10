@@ -18,6 +18,7 @@
   import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
   import { outDissolve, outFade, outSlideR } from "../lib/motion";
+  import { checkForUpdates } from "../lib/update.svelte";
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const standalone = !!params && params.get("ai") === "1";
@@ -35,11 +36,19 @@
 
   // 自定义字体 @font-face：所有窗口（主窗口 / 独立阅读 / 独立 AI 窗口）统一注入，
   // 独立 AI 窗口不挂载 Reader，必须在这里也能加载用户安装的字体。
+  // 启动后静默检查更新（失败不提示）：有新版本时由界面（设置入口/关于）显示红点。
+  let updateCheckStarted = false;
+  $effect(() => {
+    if (updateCheckStarted || standalone || standalonePanel || standaloneBook) return;
+    updateCheckStarted = true;
+    const timer = setTimeout(() => void checkForUpdates(), 3000);
+    return () => clearTimeout(timer);
+  });
+
   $effect(() => {
     void config.reader.customFonts;
     syncCustomFontFaces();
   });
-
   // 启动即预加载设定字体，首次打开书籍时可直接以正确字体呈现（消除字体闪烁）
   //
   // fontSize 不作为依赖：preloadReaderFonts 每次调用都会对每个 family 发一次

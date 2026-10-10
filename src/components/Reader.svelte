@@ -1,5 +1,6 @@
 <script lang="ts">
   import { errText, labelOfId, t } from "../lib/i18n/index.svelte";
+  import { updateState } from "../lib/update.svelte";
   import { onMount, onDestroy, tick } from "svelte";
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
@@ -4333,6 +4334,7 @@ ${effCssExtra() || ""}
         <button
           class="icon tb-btn tip-left"
           class:on={b.on?.()}
+          class:has-update={b.id === "settings" && !!updateState.latest}
           data-drag-id={b.id}
           data-testid={"tb-" + b.id}
           aria-label={label}
@@ -4344,6 +4346,9 @@ ${effCssExtra() || ""}
           onclick={() => tbClick(b)}
         >
           <Icon size={20} stroke={1.5} />
+          {#if b.id === "settings" && updateState.latest}
+            <span class="update-dot abs" aria-hidden="true"></span>
+          {/if}
         </button>
       {/each}
     </div>
