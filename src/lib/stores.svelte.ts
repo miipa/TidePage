@@ -341,6 +341,12 @@ export interface AiProfile {
   deployment: string;
   /** azure-openai 专用：api-version */
   apiVersion: string;
+  /** 端点网络代理模式：inherit=沿用全局默认；其余同全局（direct/system/manual）。缺省 inherit。 */
+  proxyMode: "inherit" | "direct" | "system" | "manual";
+  /** manual 模式下裸 host:port 的 scheme（仅 manual 有意义）。 */
+  proxyType: "http" | "https" | "socks5";
+  /** 手动代理地址（敏感字段：仅加密落盘，localStorage 恒为空串；仅 manual 有意义）。 */
+  proxyUrl: string;
 }
 
 export interface AiProviderMeta {
@@ -433,6 +439,9 @@ export const DEFAULT_AI_PROFILES: AiProfile[] = [
     model: "deepseek-chat",
     deployment: "",
     apiVersion: "",
+    proxyMode: "inherit",
+    proxyType: "http",
+    proxyUrl: "",
   },
 ];
 
@@ -470,6 +479,16 @@ function sanitizeProvider(v: any): AiProvider {
   return "openai";
 }
 
+/** 端点代理模式归一化：仅认 inherit/direct/system/manual；旧值（custom/auto）与非法值回落 inherit。 */
+function sanitizeEndpointProxyMode(v: any): "inherit" | "direct" | "system" | "manual" {
+  return v === "direct" || v === "system" || v === "manual" ? v : "inherit";
+}
+
+/** 端点代理 scheme 归一化：仅认 http/https/socks5，非法回落 http。 */
+function sanitizeProxyType(v: any): "http" | "https" | "socks5" {
+  return v === "https" || v === "socks5" ? v : "http";
+}
+
 /** 用默认字段模板补齐单个 profile（新增字段缺失时用默认值，不丢用户已填内容）。 */
 export function normalizeProfile(p: any): AiProfile {
   const t = structuredClone(DEFAULT_AI_PROFILES[0]);
@@ -484,6 +503,11 @@ export function normalizeProfile(p: any): AiProfile {
     model: typeof src.model === "string" ? src.model : "",
     deployment: typeof src.deployment === "string" ? src.deployment : "",
     apiVersion: typeof src.apiVersion === "string" ? src.apiVersion : "",
+    // 端点代理：旧版「每端点代理」的 proxyMode/proxyUrl 字段已在 migrate 的 absorbLegacyProfileProxy
+    // 阶段被物理删除（旧 schema 无 proxyType），到这里只会是新 schema 或缺省，故可直接归一化。
+    proxyMode: sanitizeEndpointProxyMode(src.proxyMode),
+    proxyType: sanitizeProxyType(src.proxyType),
+    proxyUrl: typeof src.proxyUrl === "string" ? src.proxyUrl : "",
     id: typeof src.id === "number" && Number.isFinite(src.id) && src.id > 0 ? src.id : 0,
   };
 }
@@ -518,6 +542,9 @@ export function newAiProfile(profiles: AiProfile[], provider: AiProvider = "open
     model: "",
     deployment: "",
     apiVersion: "",
+    proxyMode: "inherit",
+    proxyType: "http",
+    proxyUrl: "",
   };
 }
 
@@ -573,6 +600,12 @@ export interface TtsService {
   appId: string;
   /** 火山引擎专用：Cluster（可留空，默认 volcano_tts） */
   cluster: string;
+  /** 端点网络代理模式：inherit=沿用全局默认；其余同全局（direct/system/manual）。缺省 inherit。 */
+  proxyMode: "inherit" | "direct" | "system" | "manual";
+  /** manual 模式下裸 host:port 的 scheme（仅 manual 有意义）。 */
+  proxyType: "http" | "https" | "socks5";
+  /** 手动代理地址（敏感字段：仅加密落盘，localStorage 恒为空串；仅 manual 有意义）。 */
+  proxyUrl: string;
 }
 
 /** 全部 TTS 接口协议 id（前端下拉与迁移校验共用）。 */
@@ -655,6 +688,9 @@ export function normalizeTtsService(s: any): TtsService {
     secretKey: typeof src.secretKey === "string" ? src.secretKey : "",
     appId: typeof src.appId === "string" ? src.appId : "",
     cluster: typeof src.cluster === "string" ? src.cluster : "",
+    proxyMode: sanitizeEndpointProxyMode(src.proxyMode),
+    proxyType: sanitizeProxyType(src.proxyType),
+    proxyUrl: typeof src.proxyUrl === "string" ? src.proxyUrl : "",
   };
 }
 
@@ -683,6 +719,9 @@ export function newTtsService(list: TtsService[]): TtsService {
     secretKey: "",
     appId: "",
     cluster: "",
+    proxyMode: "inherit",
+    proxyType: "http",
+    proxyUrl: "",
   };
 }
 
@@ -1149,6 +1188,9 @@ p {
         secretKey: "",
         appId: "",
         cluster: "",
+        proxyMode: "inherit",
+        proxyType: "http",
+        proxyUrl: "",
       },
     ],
     activeService: 0,
@@ -1581,21 +1623,27 @@ function normalizeAiProxy(p: any): { proxy: AiProxyConfig; dirty: boolean } {
  * 旧导入配置里的明文 proxyUrl 可能重新落进 localStorage。
  * 无旧字段返回 null（调用方保留原全局代理）。
  */
+/**
+ * 识别**旧版**「每端点代理」schema：profile 上带 proxyMode/proxyUrl 但**没有** proxyType。
+ * 新版每端点代理恒带 proxyType（且 proxyMode ∈ inherit/direct/system/manual），据此区分，
+ * 绝不把新版配置当旧版搬进全局。命中旧版时把 active 端点那份搬到全局，并物理删除所有端点上的旧字段。
+ */
 export function absorbLegacyProfileProxy(ai: any): AiProxyConfig | null {
   const list: any[] = Array.isArray(ai?.profiles) ? ai.profiles : [];
-  const has = list.some(
-    (p) =>
-      p &&
-      (Object.prototype.hasOwnProperty.call(p, "proxyMode") ||
-        Object.prototype.hasOwnProperty.call(p, "proxyUrl")),
-  );
-  if (!has) return null;
+  const isLegacy = (p: any) =>
+    p &&
+    typeof p === "object" &&
+    (Object.prototype.hasOwnProperty.call(p, "proxyMode") ||
+      Object.prototype.hasOwnProperty.call(p, "proxyUrl")) &&
+    !Object.prototype.hasOwnProperty.call(p, "proxyType");
+  if (!list.some(isLegacy)) return null;
   const active = list[Math.min(Math.max(ai?.active | 0, 0), Math.max(list.length - 1, 0))] || {};
+  // active 端点可能已是新版（混合配置的极端情形）：取它的旧值，没有则按 system 兜底。
   const mode: AiProxyConfig["mode"] =
     active.proxyMode === "custom" ? "manual" : active.proxyMode === "direct" ? "direct" : "system";
   const url = typeof active.proxyUrl === "string" ? active.proxyUrl : "";
   for (const p of list) {
-    if (p && typeof p === "object") {
+    if (isLegacy(p)) {
       delete p.proxyMode;
       delete p.proxyUrl;
     }
@@ -1621,6 +1669,8 @@ function migrateAi(savedAi: any): AiConfig {
     base.proxy = legacyProxy;
     // stripSecrets 已不再清 profile.proxyUrl：不置位就会出现「旧字段长期残留、每次启动重复迁移」。
     aiMigrationDirty = true;
+    // 告诉 applySecrets：本次是旧 schema 升级，旧密文键 ai:{id}:proxyUrl 应搬进全局而非回填端点。
+    legacyProxyPending = true;
   }
   base.groupOrder = normAiGroupOrder(base.groupOrder);
   if (base.display !== "reader") base.display = "chat";
@@ -1686,6 +1736,9 @@ let ttsMigrationDirty = false;
 let secretsMigrationDirty = false;
 // 旧版「每端点代理」密文刚被采纳进全局时置位，用于立刻落盘一次（新键取代旧密文键）。
 let legacyProxyAdopted = false;
+// migrate 检测到旧 schema 的「每端点代理」时置位；applySecrets 据此把旧密文键一次性搬进全局，
+// 而非回填到端点（新旧共用 ai:{id}:proxyUrl 键名，故迁移这一趟必须跳过端点回填）。
+let legacyProxyPending = false;
 // AI 配置做了结构性迁移（旧每端点代理字段、proxy 归一化修正）时置位，启动落盘一次。
 let aiMigrationDirty = false;
 
@@ -1926,12 +1979,15 @@ export function collectSecrets(cfg: AppConfig): Record<string, string> {
   for (const p of ((cfg as any)?.ai?.profiles ?? []) as any[]) {
     if (!p) continue;
     out[`ai:${p.id}:apiKey`] = typeof p.apiKey === "string" ? p.apiKey : "";
+    // 端点手动代理地址同样是敏感字段（可能含 账号:密码@host）。
+    out[`ai:${p.id}:proxyUrl`] = typeof p.proxyUrl === "string" ? p.proxyUrl : "";
   }
   for (const s of ((cfg as any)?.tts?.services ?? []) as any[]) {
     if (!s) continue;
     out[`tts:${s.id}:apiKey`] = typeof s.apiKey === "string" ? s.apiKey : "";
     out[`tts:${s.id}:secretKey`] = typeof s.secretKey === "string" ? s.secretKey : "";
     out[`tts:${s.id}:appId`] = typeof s.appId === "string" ? s.appId : "";
+    out[`tts:${s.id}:proxyUrl`] = typeof s.proxyUrl === "string" ? s.proxyUrl : "";
   }
   return out;
 }
@@ -1949,29 +2005,47 @@ export function applySecrets(cfg: AppConfig, map: Record<string, unknown> | null
     // 只有这里（密文回填拿到真实地址）能调和；地址不带 scheme 则保留用户所选类型。
     if (ai.proxy.url.includes("://")) ai.proxy.type = proxyTypeFromUrl(ai.proxy.url);
   }
-  // 兼容旧版「每端点代理」密文键 ai:{id}:proxyUrl：仅当全局地址仍为空时采纳 **active** 端点的
-  // 旧值，一次性完成迁移；下一次 saveConfigNow 会以新键整体覆盖密文，旧键随之消失。
-  if (ai && !ai.proxy.url) {
-    const list = ((ai.profiles ?? []) as any[]).filter(Boolean);
-    const active = list[Math.min(Math.max(ai.active | 0, 0), Math.max(list.length - 1, 0))];
-    const legacy = active ? map[`ai:${active.id}:proxyUrl`] : undefined;
-    if (typeof legacy === "string" && legacy) {
-      // 地址非空说明旧配置就是 custom 代理；若全局模式还是默认的 system，则一并切成 manual。
-      const mode = ai.proxy.mode === "system" ? "manual" : ai.proxy.mode;
-      ai.proxy = { mode, type: proxyTypeFromUrl(legacy), url: legacy };
-      legacyProxyAdopted = true;
+  // 一次性采纳旧版「每端点代理」密文键 ai:{id}:proxyUrl → 全局默认：仅在 migrate 检测到旧 schema
+  // （legacyProxyPending）时执行，避免把新版某端点的手动代理地址误当旧值搬进全局。旧键 ai:{id}:proxyUrl
+  // 与新版「端点手动代理」复用同名键，故这一次迁移里绝不把它再回填到端点（端点此时一律 inherit）：
+  // 下一次 saveConfigNow 以新键整体覆盖，旧值被清为空串。
+  const adoptingLegacy = !!(ai && legacyProxyPending);
+  if (ai && legacyProxyPending) {
+    legacyProxyPending = false;
+    if (!ai.proxy.url) {
+      const list = ((ai.profiles ?? []) as any[]).filter(Boolean);
+      const active = list[Math.min(Math.max(ai.active | 0, 0), Math.max(list.length - 1, 0))];
+      const legacy = active ? map[`ai:${active.id}:proxyUrl`] : undefined;
+      if (typeof legacy === "string" && legacy) {
+        // 地址非空说明旧配置就是 custom 代理；若全局模式还是默认的 system，则一并切成 manual。
+        const mode = ai.proxy.mode === "system" ? "manual" : ai.proxy.mode;
+        ai.proxy = { mode, type: proxyTypeFromUrl(legacy), url: legacy };
+        legacyProxyAdopted = true;
+      }
     }
   }
   for (const p of ((cfg as any)?.ai?.profiles ?? []) as any[]) {
     if (!p) continue;
     const ka = `ai:${p.id}:apiKey`;
     if (typeof map[ka] === "string") p.apiKey = map[ka];
+    // 新版端点手动代理地址回填（旧 schema 一次性迁移这一趟跳过，见上）。
+    const kp = `ai:${p.id}:proxyUrl`;
+    if (!adoptingLegacy && typeof map[kp] === "string") {
+      p.proxyUrl = map[kp];
+      // 地址带 scheme 时以地址为准同步 type（与全局 ai.proxy 的调和逻辑一致）。
+      if (p.proxyUrl.includes("://")) p.proxyType = proxyTypeFromUrl(p.proxyUrl);
+    }
   }
   for (const s of ((cfg as any)?.tts?.services ?? []) as any[]) {
     if (!s) continue;
     for (const f of ["apiKey", "secretKey", "appId"] as const) {
       const k = `tts:${s.id}:${f}`;
       if (typeof map[k] === "string") (s as any)[f] = map[k];
+    }
+    const kp = `tts:${s.id}:proxyUrl`;
+    if (typeof map[kp] === "string") {
+      s.proxyUrl = map[kp];
+      if (s.proxyUrl.includes("://")) s.proxyType = proxyTypeFromUrl(s.proxyUrl);
     }
   }
 }
@@ -1985,18 +2059,44 @@ export function stripSecrets(cfg: AppConfig): AppConfig {
   if (ai?.proxy) ai.proxy.url = "";
   for (const p of ((copy as any)?.ai?.profiles ?? []) as any[]) {
     p.apiKey = "";
+    p.proxyUrl = "";
   }
   for (const s of ((copy as any)?.tts?.services ?? []) as any[]) {
     s.apiKey = "";
     s.secretKey = "";
     s.appId = "";
+    s.proxyUrl = "";
   }
   return copy;
 }
 
-/** 传给后端 ai_chat / ai_test / tts_synth 的全局代理参数（一份作用于所有端点）。 */
+/** 传给后端的全局默认代理参数（端点选择「跟随全局」时解析为此值）。 */
 export function aiProxyArgs(): { proxyMode: string; proxyUrl: string; proxyType: string } {
   return { proxyMode: config.ai.proxy.mode, proxyUrl: config.ai.proxy.url, proxyType: config.ai.proxy.type };
+}
+
+/**
+ * 解析单个端点（AI profile / TTS service）实际要发给后端的代理参数：
+ *  - inherit（或缺省）→ 全局默认 config.ai.proxy；
+ *  - direct / system  → 对应模式，地址置空（后端只认 direct/system/manual）；
+ *  - manual           → 端点自带的 type/url。
+ * **绝不**把 inherit 透传给后端：后端 resolve_proxy 不认识该模式。
+ */
+export function resolveEndpointProxy(
+  ep: { proxyMode?: string; proxyType?: string; proxyUrl?: string } | null | undefined,
+): { proxyMode: string; proxyUrl: string; proxyType: string } {
+  const mode = ep?.proxyMode;
+  if (mode === "direct") return { proxyMode: "direct", proxyUrl: "", proxyType: "http" };
+  if (mode === "system") return { proxyMode: "system", proxyUrl: "", proxyType: "http" };
+  if (mode === "manual") {
+    return {
+      proxyMode: "manual",
+      proxyUrl: typeof ep?.proxyUrl === "string" ? ep.proxyUrl : "",
+      proxyType: ep?.proxyType === "https" || ep?.proxyType === "socks5" ? ep.proxyType : "http",
+    };
+  }
+  // inherit / 缺省 / 非法 → 全局默认
+  return aiProxyArgs();
 }
 
 /** 启动后异步从加密存储读回凭据并回填；各窗 api 调用依赖凭据前需 await 此 Promise。 */
@@ -2317,11 +2417,12 @@ export function applyConfigJson(json: string) {
       ...((obj.webdav && obj.webdav.backup) || {}),
     };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
-    obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.proxy = normalizeAiProxy(obj.ai.proxy).proxy;
-    // 跨窗同步/导入可能带来旧版每端点代理字段：一并搬到全局并删除，避免明文回写。
+    // 跨窗同步/导入可能带来旧版每端点代理字段：须在 normalizeProfiles **之前**于原始 profile 上识别并
+    // 搬到全局（normalize 会给每个端点补上新版 proxyType，之后就无法再判定是否旧 schema 了）。
     const legacyProxy = absorbLegacyProfileProxy(obj.ai);
     if (legacyProxy) obj.ai.proxy = legacyProxy;
+    obj.ai.profiles = normalizeProfiles(obj.ai.profiles);
     obj.ai.style = { ...structuredClone(DEFAULTS.ai.style), ...(obj.ai.style || {}) };
     obj.ai.groupOrder = normAiGroupOrder(obj.ai.groupOrder);
     if (obj.ai.failover !== false) obj.ai.failover = true;

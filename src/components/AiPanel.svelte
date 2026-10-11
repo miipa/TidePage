@@ -25,7 +25,7 @@
     THEMES,
     AI_WIN_LABEL,
     stripNonTextHtml,
-    aiProxyArgs,
+    resolveEndpointProxy,
     marginScopeOf,
     type PromptItem,
   } from "../lib/stores.svelte";
@@ -293,7 +293,7 @@
           apiVersion: p.apiVersion,
           system,
           messages: [["user", userText]],
-          ...aiProxyArgs(),
+          ...resolveEndpointProxy(p),
         });
         active = false;
         un?.();

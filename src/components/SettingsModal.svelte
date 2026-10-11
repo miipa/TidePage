@@ -48,7 +48,7 @@
     runSettingsBackup,
     builtinSchemeNames,
     SEED_SCHEME_NAME_KEYS,
-    aiProxyArgs,
+    resolveEndpointProxy,
     absorbLegacyProfileProxy,
     marginScopeOf,
   } from "../lib/stores.svelte";
@@ -1298,6 +1298,17 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     saveConfigNow();
   }
 
+  /** 端点/服务手动代理地址变更：地址自带 scheme 时以地址为准同步该端点自己的 type（逻辑同全局 onProxyUrlChange）。 */
+  function onEndpointProxyUrlChange(ep: { proxyUrl: string; proxyType: "http" | "https" | "socks5" }) {
+    const u = ep.proxyUrl.trim().toLowerCase();
+    const i = u.indexOf("://");
+    if (i > 0) {
+      const scheme = u.slice(0, i);
+      ep.proxyType = scheme === "https" ? "https" : scheme === "socks5" || scheme === "socks5h" ? "socks5" : "http";
+    }
+    saveConfigNow();
+  }
+
   async function testAi() {
     aiTesting = true;
     aiTestResult = t("settings.ai.testingHint");
@@ -1310,7 +1321,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
         model: p.model,
         deployment: p.deployment,
         apiVersion: p.apiVersion,
-        ...aiProxyArgs(),
+        ...resolveEndpointProxy(p),
       });
       aiTestResult = aiTestText(r);
       aiTestState = r.status === "ok" ? "ok" : "bad";
@@ -2474,6 +2485,34 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           </select>
         </div>
       </div>
+
+      <!-- 服务代理：每个在线语音服务可独立选择，默认「跟随全局默认」。 -->
+      <div class="field">
+        <label>{t("settings.ai.endpointProxy")}</label>
+        <select bind:value={tsvc.proxyMode} onchange={saveConfigNow}>
+          <option value="inherit">{t("settings.ai.proxyInherit")}</option>
+          <option value="direct">{t("settings.ai.proxyDirect")}</option>
+          <option value="system">{t("settings.ai.proxySystem")}</option>
+          <option value="manual">{t("settings.ai.proxyManual")}</option>
+        </select>
+        <p class="tip">{t("settings.tts.proxyTip")}</p>
+      </div>
+      {#if tsvc.proxyMode === "manual"}
+        <div class="grid2">
+          <div class="field">
+            <label>{t("settings.ai.proxyType")}</label>
+            <select bind:value={tsvc.proxyType} onchange={saveConfigNow}>
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>{t("settings.ai.proxyUrl")}</label>
+            <input bind:value={tsvc.proxyUrl} onchange={() => onEndpointProxyUrlChange(tsvc)} placeholder="http://127.0.0.1:7897" />
+          </div>
+        </div>
+      {/if}
       {#if ttsVoiceMsg}
         <p class="tip">{ttsVoiceMsg}</p>
       {/if}
@@ -2685,6 +2724,35 @@ let aiTestState = $state<"" | "ok" | "bad">("");
                   {/if}
                 </div>
 
+                <!-- 端点代理：每个 AI 端点可独立选择，默认「跟随全局默认」。 -->
+                <div class="field">
+                  <label>{t("settings.ai.endpointProxy")}</label>
+                  <select bind:value={ap.proxyMode} onchange={saveConfigNow}>
+                    <option value="inherit">{t("settings.ai.proxyInherit")}</option>
+                    <option value="direct">{t("settings.ai.proxyDirect")}</option>
+                    <option value="system">{t("settings.ai.proxySystem")}</option>
+                    <option value="manual">{t("settings.ai.proxyManual")}</option>
+                  </select>
+                  <p class="tip">{t("settings.ai.endpointProxyTip")}</p>
+                </div>
+
+                {#if ap.proxyMode === "manual"}
+                  <div class="grid2">
+                    <div class="field">
+                      <label>{t("settings.ai.proxyType")}</label>
+                      <select bind:value={ap.proxyType} onchange={saveConfigNow}>
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                        <option value="socks5">SOCKS5</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label>{t("settings.ai.proxyUrl")}</label>
+                      <input bind:value={ap.proxyUrl} onchange={() => onEndpointProxyUrlChange(ap)} placeholder="http://127.0.0.1:7897" />
+                    </div>
+                  </div>
+                {/if}
+
                 <div class="field">
                   <label class="check">
                     <input type="checkbox" bind:checked={config.ai.failover} onchange={saveConfigNow} />
@@ -2692,15 +2760,15 @@ let aiTestState = $state<"" | "ok" | "bad">("");
                   </label>
                 </div>
 
-                <!-- 全局代理：只有一份，作用于所有端点（不再绑到某个 profile 上）。 -->
+                <!-- 全局默认代理：仍只有一份；端点/语音服务选「跟随全局」时解析为此值。 -->
                 <div class="field">
-                  <label>{t("settings.ai.proxy")}</label>
+                  <label>{t("settings.ai.proxyGlobal")}</label>
                   <select bind:value={config.ai.proxy.mode} onchange={saveConfigNow}>
                     <option value="direct">{t("settings.ai.proxyDirect")}</option>
                     <option value="system">{t("settings.ai.proxySystem")}</option>
                     <option value="manual">{t("settings.ai.proxyManual")}</option>
                   </select>
-                  <p class="tip">{t("settings.ai.proxyTip")}</p>
+                  <p class="tip">{t("settings.ai.proxyGlobalTip")}</p>
                 </div>
 
                 {#if config.ai.proxy.mode === "manual"}
