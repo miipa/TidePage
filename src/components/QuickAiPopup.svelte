@@ -3,7 +3,7 @@
   import { seedEndpointLabel } from "../lib/seedNames.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { config, copyText, saveConfigNow, toast, aiProxyArgs } from "../lib/stores.svelte";
+  import { config, copyText, saveConfigNow, toast, resolveEndpointProxy } from "../lib/stores.svelte";
   import { api } from "../lib/api";
   import { esc, mdToHtml } from "../lib/md";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
@@ -152,7 +152,7 @@
           apiVersion: p.apiVersion,
           system: config.ai.system,
           messages: [["user", userText]],
-          ...aiProxyArgs(),
+          ...resolveEndpointProxy(p),
         });
         active = false;
         un?.();

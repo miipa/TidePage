@@ -1,4 +1,4 @@
-import { activeTtsService, config, saveConfig, toast } from "./stores.svelte";
+import { activeTtsService, config, resolveEndpointProxy, saveConfig, toast } from "./stores.svelte";
 import { api } from "./api";
 import { aiErrDetail, t } from "./i18n/index.svelte";
 
@@ -263,10 +263,8 @@ function resolveEndpoint(): TtsEndpoint | null {
     model: (s.model || "").trim(),
     voice: (s.voice || "").trim(),
     format: s.format || "mp3",
-    // 在线语音合成与 AI 共用同一份全局代理（不再各自为政）。
-    proxyMode: config.ai.proxy.mode,
-    proxyUrl: config.ai.proxy.url,
-    proxyType: config.ai.proxy.type,
+    // 每个语音服务可独立选择代理：inherit 回落到全局默认 config.ai.proxy。
+    ...resolveEndpointProxy(s),
     tag: `service:${s.id}:${provider}:${base}`,
   };
 }
@@ -725,14 +723,15 @@ async function ensureFixedVoice(): Promise<boolean> {
     fixedVoicePromise = (async () => {
       try {
         const base = (s.baseUrl || "").trim();
+        const pr = resolveEndpointProxy(s);
         const res = await api.ttsEnsureFixedVoice(
           base,
           s.apiKey || "",
           target,
           FIXED_VOICE_INSTRUCT,
-          config.ai.proxy.mode,
-          config.ai.proxy.url,
-          config.ai.proxy.type,
+          pr.proxyMode,
+          pr.proxyUrl,
+          pr.proxyType,
         );
         await refreshOnlineVoices();
         s.voice = res.id;
@@ -763,6 +762,7 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
   }
   ttsState.onlineVoiceLoading = true;
   try {
+    const pr = resolveEndpointProxy(s);
     const list = await api.ttsVoices(
       provider,
       base,
@@ -770,9 +770,9 @@ export async function refreshOnlineVoices(): Promise<OnlineVoice[]> {
       s?.secretKey || "",
       s?.appId || "",
       s?.cluster || "",
-      config.ai.proxy.mode,
-      config.ai.proxy.url,
-      config.ai.proxy.type,
+      pr.proxyMode,
+      pr.proxyUrl,
+      pr.proxyType,
     );
     ttsState.onlineVoices = list;
     ttsState.onlineVoiceError = list.length ? "" : t("tts.noVoiceList");
