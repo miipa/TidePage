@@ -5287,15 +5287,35 @@ ${effCssExtra() || ""}
     flex-direction: row-reverse !important;
   }
 
+  /* 一个目录章可能跨多个 spine 文档（后端 chapter_html_multi_ci 把每个文档包成
+     <div class="epub-doc">…<img>…</div> 再拼接到同一 .manga-block）。横向模式必须让
+     块内所有图片按阅读顺序「横向平铺」（每图一列），否则多图章会竖向堆叠在块内、
+     块宽≈单页宽 → mangaMaxX≈0（滚轮无反应、第 2..N 图落在屏外够不到、左右键整章跳）。
+     做法：块本身成为横排 flex 行，并把块内非媒体包裹层 display:contents 摊平，
+     使任意嵌套深度的 img/svg/video 都直接成为该行的 flex item。 */
   .reader.manga-h .manga-h-canvas :global(.manga-block) {
     flex: 0 0 auto !important;
     margin: 0 var(--rdr-img-gap, 0) 0 0 !important;
     padding: 0 !important;
     width: auto !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    gap: var(--rdr-img-gap, 0) !important;
   }
 
   .reader.manga-h .manga-h-canvas.rtl :global(.manga-block) {
     margin: 0 0 0 var(--rdr-img-gap, 0) !important;
+    flex-direction: row-reverse !important;
+  }
+
+  /* 摊平块内所有非媒体包裹层（原书的 div/p/section 等各级 wrapper），
+     让嵌套的图片直接参与 .manga-block 的横排 flex，而非被 wrapper 的块级流竖排。
+     img/svg/video 本身保留盒子（下方规则置 margin:0 并给定高度）。
+     关键：:not(svg *) 把内联 SVG 的内部元素（g/path/text…）排除在摊平之外——
+     display:contents 会打乱 SVG 自身的渲染，SVG 子树须整体作为一个媒体盒子参与横排。 */
+  .reader.manga-h .manga-h-canvas :global(.manga-block *:not(img):not(svg):not(video):not(svg *)) {
+    display: contents !important;
   }
 
   .reader.manga-h .manga-h-canvas :global(.manga-block:last-child) {
