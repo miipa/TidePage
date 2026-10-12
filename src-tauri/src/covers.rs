@@ -16,38 +16,11 @@ pub fn default_cover_path(app: &tauri::AppHandle) -> PathBuf {
     crate::data_dir(app).join("default-cover.img")
 }
 
-pub fn serve_cover(base: &Path, name: &str) -> (String, Vec<u8>) {
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return ("image/svg+xml".into(), placeholder_svg("?", "").into_bytes());
-    }
-    let full = base.join(name);
-    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
-    };
-    match std::fs::read(&full) {
-        Ok(b) => (mime.into(), b),
-        Err(_) => ("image/svg+xml".into(), placeholder_svg("📖", "").into_bytes()),
-    }
-}
-
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-/// 显示宽度：全角计 2，半角计 1（用于按显示宽度而非字符数排版）。
-pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| if (c as u32) >= 0x1100 && is_wide(c) { 2 } else { 1 })
-        .sum()
 }
 
 fn is_wide(c: char) -> bool {
@@ -147,6 +120,8 @@ pub struct CoverLayout {
     pub author: Option<String>,
     /// 文字区顶边（供渲染定位）。
     pub area_top: usize,
+    // 测试可观测：暴露 42% 文字区高度，供 covers.rs 的 fit 不变量断言 assert!(block_h <= l.area_h) 读取（生产渲染经同名局部变量计算，勿混淆）。
+    #[allow(dead_code)]
     pub area_h: usize,
 }
 
@@ -432,31 +407,9 @@ pub fn make_thumbnail(data: &[u8], out_png: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn write_placeholder(out_svg: &Path, title: &str, author: &str) -> Result<(), String> {
-    std::fs::write(out_svg, placeholder_svg(title, author)).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 写入默认封面（可带用户底图 data URL）。
-pub fn write_default_cover(
-    out_svg: &Path,
-    title: &str,
-    author: &str,
-    base_href: Option<&str>,
-) -> Result<(), String> {
-    std::fs::write(out_svg, default_cover_svg(title, author, base_href)).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn width_counts_wide_as_two() {
-        assert_eq!(display_width("中文"), 4);
-        assert_eq!(display_width("abc"), 3);
-        assert_eq!(display_width("中文abc"), 7);
-    }
 
     #[test]
     fn wrap_short_title_one_line() {

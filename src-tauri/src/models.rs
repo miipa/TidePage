@@ -80,13 +80,6 @@ pub struct Progress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SplitRule {
-    pub name: String,
-    pub pattern: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenResult {
     pub book: BookRow,
     pub toc: Vec<TocEntry>,

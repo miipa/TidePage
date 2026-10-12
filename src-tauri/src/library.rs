@@ -29,6 +29,8 @@ pub struct AppState {
     pub chapter_cache: Mutex<ChapterCache>,
     /// 全书图片列表缓存：key = book_id。
     pub image_cache: Mutex<HashMap<i64, Arc<Vec<BookImage>>>>,
+    // staged: 通用兜底 HTTP client（见 lib.rs:220-221 的蓄意预留说明）；实际各处 HTTP 各自建 client。
+    #[allow(dead_code)]
     pub http: reqwest::Client,
     /// 封面增量扫描 worker 是否在跑（进程内标记，天然不会跨崩溃残留）。
     /// 单遍串行：处理完全部 `meta_done=0` 即退出（扫完即停、不驻留、不轮询）。
@@ -95,6 +97,11 @@ impl ChapterCache {
 }
 
 const EXT_BOOK: &[&str] = &["txt", "epub", "mobi", "azw3", "prc"];
+
+/// MOBI 家族格式（mobi/azw3/prc）判定：集中一处，避免多处散落的字符串比较漂移。
+pub fn is_mobi_ext(ext: &str) -> bool {
+    ext == "mobi" || ext == "azw3" || ext == "prc"
+}
 
 pub fn ext_of(path: &str) -> Option<String> {
     Path::new(path)
@@ -430,11 +437,6 @@ pub fn ensure_scan_worker(app: &AppHandle) {
             ensure_scan_worker(&app);
         }
     });
-}
-
-/// 兼容旧调用名：清封面缓存后重新拉起增量扫描。
-pub fn reset_cover_scan(_state: &AppState) {
-    // 计数由 worker 启动时按 DB 实测重置；此处无内存队列可清（已改为 DB 驱动）。
 }
 
 /// 增量扫描主循环（单遍、串行、DB 驱动）。设计见实现提示词 A/B 节：
@@ -1078,7 +1080,7 @@ fn collect_book_images(state: &AppState, book_id: i64) -> Result<Vec<BookImage>,
                 chapter_title: if i == 0 { "封面".to_string() } else { String::new() },
             });
         }
-    } else if ext == "mobi" || ext == "azw3" || ext == "prc" {
+    } else if is_mobi_ext(&ext) {
         // 已提取到 appdata/res/<book_id>/ 的图片
         let dir = crate::data_dir(&state.app).join("res").join(book_id.to_string());
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1348,6 +1350,8 @@ pub struct RefreshResult {
 /// 2) 扫描集 = 存活记录所在目录 ∪ 已登记书库根目录及其**一级子目录**；
 ///    逐目录只扫一层，磁盘存在但索引里没有的书籍新增入库（不做全递归）；
 /// 3) 返回 {removed, added}。不触碰正在阅读的窗口/reader 状态（不强关）。
+// staged: 对账算法的唯一有测试的实现（命令 refresh_library 目前内联重写同逻辑且无测试；最干净的做法是让命令委托至此以复用其 5 项测试，属行为相邻重构，另行评审）。
+#[allow(dead_code)]
 pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
     let records = db::all_book_paths(conn);
     let mut missing: Vec<String> = Vec::new();
@@ -1849,7 +1853,7 @@ pub async fn get_chapter(
         return Ok(data);
     }
 
-    let is_mobi = ext == "mobi" || ext == "azw3" || ext == "prc";
+    let is_mobi = is_mobi_ext(&ext);
     let ver = st.rules_ver.load(Ordering::Relaxed);
     let cached_hit = {
         let m = st.txt_cache.lock().unwrap();
@@ -2095,7 +2099,7 @@ pub async fn convert_book(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let ext = ext_of(&path).unwrap_or_default();
-        let is_mobi_like = ext == "mobi" || ext == "azw3" || ext == "prc";
+        let is_mobi_like = is_mobi_ext(&ext);
         if (ext == "txt" && target == "epub")
             || (is_mobi_like && (target == "txt" || target == "epub"))
             || (ext == "epub" && target == "txt")
@@ -3999,10 +4003,6 @@ pub fn reveal_in_explorer(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
-pub fn covers_dir_of(app: &AppHandle) -> PathBuf {
-    covers::covers_dir(app)
-}
-
 #[tauri::command]
 pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<String, String> {
     let book = {
@@ -4025,7 +4025,7 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
             Some(b) => covers::make_thumbnail(&b, &out).is_ok(),
             None => false,
         }
-    } else if ext == "mobi" || ext == "azw3" || ext == "prc" {
+    } else if is_mobi_ext(&ext) {
         // MOBI/AZW3：EXTH201/202/129 或 first_image_index 起首张图
         crate::mobi::extract_cover_path(&book.path)
             .map(|b| covers::make_thumbnail(&b, &out).is_ok())
@@ -4139,7 +4139,7 @@ pub fn add_dropped_book(state: State<'_, Arc<AppState>>, path: String) -> Result
         &p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
     );
     let size = std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
-    let (id, book) = {
+    let (_id, book) = {
         let conn = state.db.0.lock().unwrap();
         let id = db::upsert_book(&conn, &path, &m.title, &ext, size, file_mtime(p))?;
         if !m.author.is_empty() {
@@ -4172,7 +4172,7 @@ pub fn suggest_meta(state: State<'_, Arc<AppState>>, path: String) -> crate::boo
     let mut head = String::new();
     if ext == "txt" || ext.is_empty() {
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open(&path) {
+        if let Ok(f) = std::fs::File::open(&path) {
             let mut buf = Vec::new();
             if f.take(8192).read_to_end(&mut buf).is_ok() {
                 let (text, _) = crate::txt::decode_bytes(&buf, None);
@@ -4206,7 +4206,7 @@ pub async fn get_book_word_count(
     }
     let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
-    let is_mobi = ext == "mobi" || ext == "azw3" || ext == "prc";
+    let is_mobi = is_mobi_ext(&ext);
     if ext == "epub" {
         let cached = load_epub(&st, &book.path, book_id)?;
         return Ok(WordCount {

@@ -164,7 +164,7 @@ pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
         let byte = data[pos];
         pos += 1;
         if let Some(old) = prev.take() {
-            let mut pair = u16::from_be_bytes([old, byte]) & 0x3FFF; // 高 2bit 为标志位
+            let pair = u16::from_be_bytes([old, byte]) & 0x3FFF; // 高 2bit 为标志位
             let offset = (pair >> 3) as usize;
             let len = ((pair & 0x07) + 3) as usize;
             let text_pos = text.len();
@@ -477,10 +477,6 @@ fn huff_decompress_bytes(mobi: &Mobi, max_bytes: usize) -> Result<Vec<u8>, Strin
         out.extend(dec.unpack(r.content, 0, &mut budget)?);
     }
     Ok(out)
-}
-
-pub fn extract_records_and_decompress(mobi: &Mobi) -> Result<Vec<u8>, String> {
-    extract_records_and_decompress_limited(mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b)
 }
 
 /// 只做"解压 + 拼接"，输出**原始字节流**；字符串解码统一由上层对整个字节流一次完成，
@@ -1244,7 +1240,7 @@ fn decode_entities_text(s: &str) -> (String, usize) {
 ///   并把解码出的 `<`/`>` 再转义防文本变标签
 /// - `<script>`/`<style>` 连内容丢弃；检测到未闭合 RAWTEXT 时改为"去标签留文本"（正文优先）
 pub fn decode_and_sanitize(html: &str) -> String {
-    use crate::sanitize::{is_dangerous_tag, is_dangerous_url, is_url_attr};
+    use crate::sanitize::{handle_dangerous_tag, is_dangerous_tag, serialize_safe_tag};
     use html5ever::tokenizer::{TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1302,16 +1298,15 @@ pub fn decode_and_sanitize(html: &str) -> String {
         }
     }
     struct Sink(Rc<RefCell<St>>);
-    impl Sink {
-        fn ser_attr_value(&self, v: &str, out: &mut String) {
-            for c in v.chars() {
-                match c {
-                    '&' => out.push_str("&amp;"),
-                    '"' => out.push_str("&quot;"),
-                    // tokenizer 对属性内畸形实体会规范产出 U+FFFD，剔除（属性值无害化）
-                    '\u{FFFD}' => {}
-                    c => out.push(c),
-                }
+    // MOBI 专属属性值转义：对比 EPUB 的 escape_attr_into 额外剔除 U+FFFD（属性内畸形实体
+    // tokenizer 会规范产出 U+FFFD，无害化）。保留在 mobi.rs，不并入共享骨架。
+    fn ser_attr_value(v: &str, out: &mut String) {
+        for c in v.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '"' => out.push_str("&quot;"),
+                '\u{FFFD}' => {}
+                c => out.push(c),
             }
         }
     }
@@ -1322,8 +1317,7 @@ pub fn decode_and_sanitize(html: &str) -> String {
             match token {
                 Token::TagToken(tag) => {
                     st.flush();
-                    let name = tag.name.to_string();
-                    let ln = name.to_ascii_lowercase();
+                    let ln = tag.name.to_string().to_ascii_lowercase();
                     // NUL 等非法字符开头的标签名（tokenizer 规范转 U+FFFD）：整体丢弃，
                     // 浏览器对这种标签同样不会渲染成界面元素
                     if !ln.starts_with(|c: char| c.is_ascii_alphabetic()) {
@@ -1332,61 +1326,17 @@ pub fn decode_and_sanitize(html: &str) -> String {
                     }
                     // 危险标签：script/style/iframe/object/applet/form 连内容丢弃，
                     // meta/base/link/frame/embed 等无内容标签只丢标签本身。
+                    // 悬空 RAWTEXT 模式下不入栈（去标签、文本按普通处理），由 dangling 吸收。
                     if is_dangerous_tag(&ln) {
-                        let void = matches!(ln.as_str(), "meta" | "base" | "link" | "frame" | "embed");
-                        if matches!(tag.kind, TagKind::EndTag) {
-                            // 从栈顶向下找同名并截断，避免内层结束标签提前解除外层丢弃态。
-                            if let Some(pos) = st.drop_stack.iter().rposition(|t| t == &ln) {
-                                st.drop_stack.truncate(pos);
-                            }
-                            return TokenSinkResult::Continue;
-                        }
-                        if !tag.self_closing && !void {
-                            if st.dangling {
-                                return TokenSinkResult::Continue; // 悬空模式：去标签，文本按普通处理
-                            }
-                            st.drop_stack.push(ln);
-                        }
+                        let is_end = matches!(tag.kind, TagKind::EndTag);
+                        let dangling = st.dangling;
+                        handle_dangerous_tag(&mut st.drop_stack, ln, is_end, tag.self_closing, dangling);
                         return TokenSinkResult::Continue;
                     }
                     if !st.drop_stack.is_empty() {
                         return TokenSinkResult::Continue;
                     }
-                    let is_end = matches!(tag.kind, TagKind::EndTag);
-                    let mut s = String::with_capacity(name.len() + 8);
-                    s.push('<');
-                    if is_end {
-                        s.push('/');
-                    }
-                    s.push_str(&name);
-                    if !is_end {
-                        for a in tag.attrs.iter() {
-                            let an = a.name.local.to_string();
-                            let anl = an.to_ascii_lowercase();
-                            // 事件属性（on*）全删；URL 属性遇危险协议整条删除。
-                            if anl.starts_with("on") {
-                                continue;
-                            }
-                            let v = a.value.to_string();
-                            if is_url_attr(&anl) && is_dangerous_url(&v) {
-                                continue;
-                            }
-                            s.push(' ');
-                            s.push_str(&an);
-                            if !v.is_empty() {
-                                s.push_str("=\"");
-                                self.ser_attr_value(&v, &mut s);
-                                s.push('"');
-                            }
-                        }
-                        if tag.self_closing {
-                            s.push_str("/>");
-                            st.out.push_str(&s);
-                            return TokenSinkResult::Continue;
-                        }
-                    }
-                    s.push('>');
-                    st.out.push_str(&s);
+                    serialize_safe_tag(&mut st.out, &tag, |v, out| ser_attr_value(v, out));
                 }
                 Token::CharacterTokens(chars) => {
                     if !st.drop_stack.is_empty() {
@@ -1419,7 +1369,7 @@ pub fn decode_and_sanitize(html: &str) -> String {
         drop_broken: 0,
     }));
     let tok = Tokenizer::new(Sink(st.clone()), html5ever::tokenizer::TokenizerOpts::default());
-    let mut q = html5ever::tokenizer::BufferQueue::default();
+    let q = html5ever::tokenizer::BufferQueue::default();
     q.push_back(html.into());
     let _res = tok.feed(&q);
     tok.end();
@@ -1501,12 +1451,6 @@ pub fn parse_full(
     }
 }
 
-/// 一次 `read` + 一次 `Mobi::new`，并完成 DRM 拦截。返回的 `Mobi` 自持内容，
-/// 不借用传入字节，调用方可立即释放文件缓冲。
-fn read_and_parse_mobi(path: &str) -> Result<Mobi, String> {
-    read_and_parse_mobi_bytes(path).map(|(m, _)| m)
-}
-
 /// 一次读取 + 一次解析，同时返回**原始文件字节**（用于正确切分记录）。
 fn read_and_parse_mobi_bytes(path: &str) -> Result<(Mobi, Vec<u8>), String> {
     // 快速失败路径：不整读文件即拦截 DRM/畸形头
@@ -1535,6 +1479,8 @@ fn read_and_parse_mobi_bytes(path: &str) -> Result<(Mobi, Vec<u8>), String> {
 /// 元数据阶段专用：**一次读取、一次解析**同时拿到 `MobiDoc` 与封面字节，
 /// 避免 `parse` + `extract_cover_path` 各整读一遍（大书是 2× 全量读盘）。
 /// 返回 `(解析结果, 封面字节)`；解析失败时封面为 None。
+// staged: MOBI 元数据阶段单次读取优化；现生产走 parse_full + extract_cover_seek。
+#[allow(dead_code)]
 pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_with_cover_inner(path))) {
         Ok(r) => r,
@@ -1547,6 +1493,8 @@ pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>
     }
 }
 
+// staged: parse_with_cover 的 catch_unwind 内核（随其一同保留）。
+#[allow(dead_code)]
 fn parse_with_cover_inner(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
     let (mobi, _data) = match read_and_parse_mobi_bytes(path) {
         Ok(m) => m,
@@ -2236,7 +2184,7 @@ mod tests {
         assert!(e.contains("ParseTimeoutOrCorrupted"), "{e}");
         let e = extract_records_and_decompress_limited(&mobi, 50_000, 8).unwrap_err();
         assert!(e.contains("ParseTimeoutOrCorrupted"), "{e}");
-        let raw = extract_records_and_decompress(&mobi).unwrap();
+        let raw = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b).unwrap();
         let html = decode_html_bytes(&raw, mobi.text_encoding(), None).text;
         let (toc, parts) = split_mobi_chapters(&html);
         assert!(html.contains("第一章") && html.contains("乙"), "{html}");
@@ -2398,7 +2346,7 @@ mod tests {
         bad[extra_pos + 1] = 4;
         let mobi = Mobi::new(&bad).unwrap();
         // 旧实现此处 panic；现在只能返回 Ok 或 Err
-        let _ = extract_records_and_decompress(&mobi);
+        let _ = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b);
     }
 
     /// 章节命名回归（问题1）：行内标签不产生假空格、首字下沉不被拆开、
@@ -2537,7 +2485,7 @@ mod tests {
         }
         .build();
         let mobi = Mobi::new(&b).unwrap();
-        let raw = extract_records_and_decompress(&mobi).unwrap();
+        let raw = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b).unwrap();
         let d = decode_html_bytes(&raw, TextEncoding::UTF8, None);
         assert!(d.warning.is_none(), "干净文本不应有警告: {:?}", d.warning);
         assert!(!d.text.contains('\u{FFFD}'), "出现替换符说明仍有 Record 级解码");
@@ -2649,7 +2597,7 @@ mod tests {
                 }
             } else if name.ends_with(".mobi") || name.ends_with(".azw3") || name.ends_with(".prc") {
                 if let Ok(mobi) = Mobi::new(&bytes) {
-                    if let Ok(raw) = extract_records_and_decompress(&mobi) {
+                    if let Ok(raw) = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES).map(|(b, _)| b) {
                         hay = raw;
                     }
                 }
@@ -2741,6 +2689,67 @@ mod tests {
         assert!(!out.contains("script"), "{out}");
         assert!(out.contains("<p>KEEP</p>"), "{out}");
     }
+    // ===== 骨架抽取特征测试（phase 1）：锁定共享骨架路径（序列化 / 危险转移 / void /
+    // 自闭合 / 属性转义）与 MOBI-only 行为（悬空 style / 破碎实体标签 / DOCTYPE）的逐字节输出。
+    // 断言值为抽取前真实输出，抽出共享 helper 后必须一字不改地通过。 =====
+    #[test]
+    fn char_dangling_style_keeps_body_exact() {
+        assert_eq!(
+            decode_and_sanitize("<p>a</p><style>.x{y:z}body text survives"),
+            "<p>a</p>.x{y:z}body text survives"
+        );
+    }
+
+    #[test]
+    fn char_broken_entity_tag_residue_stripped_exact() {
+        assert_eq!(
+            decode_and_sanitize("<p>&lt;b aid=&quot;x&quot;&gt;hello</p>"),
+            "<p>hello</p>"
+        );
+    }
+
+    #[test]
+    fn char_doctype_passthrough_exact() {
+        assert_eq!(
+            decode_and_sanitize("<!DOCTYPE html><p>x</p>"),
+            "<!DOCTYPE html><p>x</p>"
+        );
+    }
+
+    #[test]
+    fn char_void_meta_dropped_exact() {
+        assert_eq!(
+            decode_and_sanitize("<p>a</p><meta charset=\"x\"><p>b</p>"),
+            "<p>a</p><p>b</p>"
+        );
+    }
+
+    #[test]
+    fn char_self_closing_script_no_swallow_exact() {
+        assert_eq!(decode_and_sanitize("<script/>after"), "after");
+    }
+
+    #[test]
+    fn char_attr_serialize_exact() {
+        assert_eq!(
+            decode_and_sanitize("<p title=\"a&#x;b\">t</p>"),
+            "<p title=\"a&amp;#x;b\">t</p>"
+        );
+    }
+
+    #[test]
+    fn char_nul_leading_tag_text_escaped_exact() {
+        assert_eq!(decode_and_sanitize("<\u{0}p>text</p>"), "&lt;p&gt;text</p>");
+    }
+
+    #[test]
+    fn char_comment_dropped_exact() {
+        assert_eq!(
+            decode_and_sanitize("<p>a</p><!-- c --><p>b</p>"),
+            "<p>a</p><p>b</p>"
+        );
+    }
+
     /// 端到端真实文件测试：设置 TIDEPAGE_TEST_MOBI="路径1;路径2" 时运行
     #[test]
     fn real_world_samples_end_to_end() {

@@ -6,6 +6,7 @@
   import { api } from "../lib/api";
   import { esc, mdToHtml } from "../lib/md";
   import { dragSort } from "../lib/dragSort";
+import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
   import {
     IconArrowsSplit2,
@@ -143,7 +144,8 @@
     });
   }
 
-  function chapterText(html: string, limit = 9000): string {
+  const AI_CTX_CHARS = 9000;
+  function chapterText(html: string, limit = AI_CTX_CHARS): string {
     const div = document.createElement("div");
     div.innerHTML = stripNonTextHtml(html);
     const text = (div.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -333,7 +335,7 @@
     toast(t("ai.allFailedToast"), "error");
   }
 
-  function renderPrompt(p: PromptItem, limit = 9000): string {
+  function renderPrompt(p: PromptItem, limit = AI_CTX_CHARS): string {
     return p.text
       .split("{chapter}")
       .join(chapterText(ctx.html, limit))
@@ -353,15 +355,9 @@
    *  直接重排 config.ai.prompts 数组并持久化：这样「自动执行第一个提示词」(prompts[0])
    *  在排序变动后天然指向新的首位，无需另存顺序表，避免出现执行到旧首位的漂移。 */
   function promptDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = [...config.ai.prompts];
-    const fi = arr.findIndex((p) => String(p.id) === from);
-    if (fi < 0) return;
-    const [moved] = arr.splice(fi, 1);
-    const ti = arr.findIndex((p) => String(p.id) === target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, moved);
-    config.ai.prompts = arr;
+    const next = reorderByDrop(config.ai.prompts, from, target, place, (p) => String(p.id));
+    if (!next) return;
+    config.ai.prompts = next;
     saveConfig();
   }
 

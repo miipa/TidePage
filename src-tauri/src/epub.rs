@@ -25,14 +25,6 @@ pub struct EpubDoc {
 
 pub type CiMap = HashMap<String, usize>;
 
-/// 从已读入内存的 zip 字节构建条目索引（供 CachedEpub 复用，避免每章重跑）。
-pub fn build_ci_map(zip_bytes: &[u8]) -> CiMap {
-    match zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
-        Ok(mut z) => build_ci(&mut z),
-        Err(_) => CiMap::new(),
-    }
-}
-
 fn build_ci<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> CiMap {
     let mut map: CiMap = HashMap::new();
     let count = zip.len();
@@ -204,6 +196,8 @@ pub fn parse(data: &[u8]) -> Result<EpubDoc, String> {
 }
 
 /// 完整解析：额外统计每一章的字符数（供元数据/统计用，后台执行）。
+// staged: 全书字数解析，与 set_book_meta_ex 同属暂停的全量元数据管线（成对保留）。
+#[allow(dead_code)]
 pub fn parse_with_chars(data: &[u8]) -> Result<EpubDoc, String> {
     parse_impl(data, true).map(|(doc, _)| doc)
 }
@@ -736,7 +730,10 @@ pub const MAX_PARSE_CALLS: u64 = 200_000;
 
 /// worker 与看门狗共享的读取预算/取消令牌。
 pub struct CoverReadBudget {
+    // staged: 解析预算计量基准；仅 FR_EPUB_COVER cargo test cover_budget_bench 读取（校准 MAX_PARSE_CALLS）。
+    #[allow(dead_code)]
     bytes_limit: u64,
+    #[allow(dead_code)]
     calls_limit: u64,
     bytes_left: AtomicU64,
     calls_left: AtomicU64,
@@ -777,9 +774,12 @@ impl CoverReadBudget {
     }
 
     /// 解析阶段已消耗的 read 调用次数 / 字节数（供计量）。
+    /// staged: 仅 #[test] cover_budget_bench 诊断用；与上面两字段四者同加 #[allow]。
+    #[allow(dead_code)]
     pub fn calls_used(&self) -> u64 {
         self.calls_limit.saturating_sub(self.calls_left.load(Ordering::SeqCst))
     }
+    #[allow(dead_code)]
     pub fn bytes_used(&self) -> u64 {
         self.bytes_limit.saturating_sub(self.bytes_left.load(Ordering::SeqCst))
     }
@@ -943,27 +943,6 @@ pub fn mime_for_path(target: &str) -> &'static str {
     mime_of(target)
 }
 
-/// 列出单个 XHTML 文档中引用的图片（解析为 zip 内绝对路径，按出现顺序）。
-pub fn doc_image_refs<R: Read + std::io::Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    ci: &CiMap,
-    doc_path: &str,
-) -> Vec<String> {
-    let Some(bytes) = zip_read(zip, ci, doc_path) else {
-        return Vec::new();
-    };
-    let html = String::from_utf8_lossy(&bytes);
-    let img_re = Regex::new(
-        r#"(?i)(?:src|xlink:href|href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#,
-    )
-    .unwrap();
-    let mut out = Vec::new();
-    for caps in img_re.captures_iter(&html) {
-        out.push(resolve_in_doc(doc_path, &caps[1]));
-    }
-    out
-}
-
 /// 从图片字节头部解析宽高（webp/jpeg/png/gif/bmp），用于在正文里预置 `width/height`
 /// 属性，避免图片解码后布局跳变引发反复重排。
 pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -1037,10 +1016,6 @@ pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-pub fn chapter_html(zip_bytes: &[u8], doc_path: &str) -> Result<String, String> {
-    chapter_html_ci(zip_bytes, None, doc_path, None, false)
-}
-
 /// 可复用外部 `CiMap`（避免每章重跑 build_ci）与按需图片 URL（book_id=Some 时不内联 base64）。
 /// `keep_styles=true` 时保留原书样式表（作用域隔离后内联），否则剥离全部原书 CSS。
 pub fn chapter_html_ci(
@@ -1063,12 +1038,6 @@ pub fn chapter_html_ci(
     let bytes = zip_read(&mut zip, ci, doc_path).ok_or("章节文件缺失")?;
     let html = String::from_utf8_lossy(&bytes).into_owned();
     Ok(render_doc_html(&mut zip, ci, doc_path, &html, book_id, keep_styles))
-}
-
-/// 单次打开 zip，连续渲染「一章拆成多个小文件」的整段章节（一次 build_ci、
-/// 一次内联图片），避免每个 spine 文件重复开 zip/建索引。
-pub fn chapter_html_multi(zip_bytes: &[u8], doc_paths: &[String]) -> Result<String, String> {
-    chapter_html_multi_ci(zip_bytes, None, doc_paths, None, false)
 }
 
 /// 带外部 `CiMap` 与按需图片 URL 的多文件章节渲染。
@@ -1646,8 +1615,10 @@ fn process_img_tag<R: Read + std::io::Seek>(
     if !low.starts_with("<img") {
         return tag.to_string();
     }
-    let attr_re = Regex::new(r#"(?i)(src|xlink:href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#)
-        .unwrap();
+    static IMG_ATTR_RE: OnceLock<Regex> = OnceLock::new();
+    let attr_re = IMG_ATTR_RE.get_or_init(|| {
+        Regex::new(r#"(?i)(src|xlink:href)\s*=\s*"([^"]+\.(?:png|jpe?g|gif|bmp|webp|svg))""#).unwrap()
+    });
     let Some(caps) = attr_re.captures(tag) else {
         return tag.to_string();
     };
@@ -1955,40 +1926,6 @@ pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
     std::fs::copy(&tmp, path).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
     Ok(())
-}
-
-pub fn spine_docs_with_titles(zip_bytes: &[u8], spine: &[String]) -> Vec<(String, String)> {
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return spine.iter().map(|s| (String::new(), s.clone())).collect(),
-    };
-    let ci = build_ci(&mut zip);
-    let h_re = Regex::new(r"(?is)<h[1-3][^>]*>(.*?)</h[1-3]>").unwrap();
-    let tag_re = Regex::new(r"(?s)<[^>]+>").unwrap();
-    spine
-        .iter()
-        .map(|doc| {
-            let title = zip_read(&mut zip, &ci, doc)
-                .map(|b| {
-                    let html = String::from_utf8_lossy(&b).into_owned();
-                    h_re.captures(&html)
-                        .map(|c| {
-                            tag_re
-                                .replace_all(&c[1], "")
-                                .trim()
-                                .chars()
-                                .take(60)
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            let name = doc.rsplit('/').next().unwrap_or(doc).to_string();
-            let title = if title.is_empty() { name } else { title };
-            (title, doc.clone())
-        })
-        .collect()
 }
 
 #[cfg(test)]

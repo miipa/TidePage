@@ -1,10 +1,13 @@
-﻿<script lang="ts">
+<script lang="ts">
   import { onMount } from "svelte";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
   import { updateState } from "../lib/update.svelte";
   import { dragSort } from "../lib/dragSort";
+import { reorderByDrop } from "../lib/reorder";
+  import { BOOK_EXTENSIONS } from "../lib/bookExt";
+  import { effectiveState, type ReadState } from "../lib/readState";
   import { listen } from "@tauri-apps/api/event";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
   import {
@@ -145,15 +148,9 @@
   );
   /** 真实拖拽排序：把 from 插入到 target 之前/之后（顺序持久化到 config.library.topbarOrder）。 */
   function libDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = [...config.library.topbarOrder];
-    const fi = arr.indexOf(from);
-    if (fi < 0) return;
-    arr.splice(fi, 1);
-    const ti = arr.indexOf(target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
-    config.library.topbarOrder = arr;
+    const next = reorderByDrop(config.library.topbarOrder, from, target, place, (s) => s);
+    if (!next) return;
+    config.library.topbarOrder = next;
     saveConfig();
   }
 
@@ -192,9 +189,6 @@
   const desc = $derived(reversed ? !SORT_DESC[sortKey] : SORT_DESC[sortKey]);
 
   // ===== 分类筛选（格式 + 阅读状态）=====
-  // 进度「已满」阈值：与后端 db::READ_FULL_PCT 逐字同源（progress.pct 量纲 0–100）。
-  const READ_FULL_PCT = 99.5;
-  type ReadState = "unread" | "reading" | "read";
   const ALL_STATES: ReadState[] = ["unread", "reading", "read"];
   // 显示名按 id 查本地化表（状态 id 本身是要写进查询参数的持久值，绝不能翻译）。
   const STATE_LABEL_KEYS: Record<ReadState, MessageKey> = {
@@ -247,15 +241,6 @@
     selectedFolder = f;
     saveFolder();
     reload();
-  }
-
-  /** 有效阅读状态：与后端 build_book_filter 的 CASE 表达式逐字同源（§0.3 红线 3）。 */
-  function effectiveState(b: BookRow): ReadState {
-    if (b.read_state === 1) return "read";
-    if (b.read_state === 2) return "unread";
-    if (!b.last_opened) return "unread";
-    if ((b.read_pct || 0) >= READ_FULL_PCT) return "read";
-    return "reading";
   }
 
   /** 进度环显示信息：显示条件统一为 effective_read_state != 'unread'（Task E）。 */
@@ -1503,7 +1488,6 @@
     return new Date(ms).toLocaleDateString(dateLocale());
   }
 
-  const BOOK_EXT = ["txt", "epub", "mobi", "azw3", "prc"];
 
   async function handleDrop(paths: string[]) {
     let any = false;
@@ -1526,7 +1510,7 @@
         }
         continue;
       }
-      if (BOOK_EXT.includes((p.split(".").pop() || "").toLowerCase())) {
+      if (BOOK_EXTENSIONS.includes((p.split(".").pop() || "").toLowerCase())) {
         any = true;
         try {
           last = await api.addDroppedBook(p);

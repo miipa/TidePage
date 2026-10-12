@@ -4,6 +4,7 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
   import { untrack } from "svelte";
   import { api } from "../lib/api";
   import { config, convertState, saveConfig, toast } from "../lib/stores.svelte";
+  import { stripBookExt } from "../lib/bookExt";
 
   let coverPath = $state("");
   let author = $state("");
@@ -58,9 +59,9 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
 
   function baseName(): string {
     // 局部变量改名 bn：避免与 i18n 的 t() 同名遮蔽
-    const bn = (title || book?.title || "book")
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .replace(/\.(txt|epub|mobi|azw3|prc)$/i, "");
+    const bn = stripBookExt(
+      (title || book?.title || "book").replace(/[\\/:*?"<>|]/g, "_"),
+    );
     return bn || "book";
   }
 
