@@ -70,6 +70,7 @@
   } from "@tabler/icons-svelte";
   import ColorPicker from "./ColorPicker.svelte";
   import { dragSort } from "../lib/dragSort";
+import { reorderByDrop } from "../lib/reorder";
   import { seedEndpointLabel, seedPromptLabel, seedTtsLabel } from "../lib/seedNames.svelte";
   import { slide } from "svelte/transition";
   // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
@@ -406,15 +407,9 @@ IconPlus,
 
   /** 分区拖拽排序：把 from 插入到 target 之前/之后，持久化到 config.settingsOrder（与顶栏图标同款 dragSort）。 */
   function navDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = [...config.settingsOrder];
-    const fi = arr.indexOf(from);
-    if (fi < 0) return;
-    arr.splice(fi, 1);
-    const ti = arr.indexOf(target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
-    config.settingsOrder = arr;
+    const next = reorderByDrop(config.settingsOrder, from, target, place, (s) => s);
+    if (!next) return;
+    config.settingsOrder = next;
     saveConfig();
   }
   /** 漫画默认倍率滑块：先保存全局设置；若正从「正在阅读的书」打开设置，则清除本书 imgScale 覆盖，
@@ -1162,15 +1157,9 @@ let aiTestState = $state<"" | "ok" | "bad">("");
 
   /** 分类拖拽排序：把 from 插入到 target 之前/之后，持久化到 config.ai.groupOrder（同 navDrop）。 */
   function aiGroupDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = [...config.ai.groupOrder];
-    const fi = arr.indexOf(from);
-    if (fi < 0) return;
-    arr.splice(fi, 1);
-    const ti = arr.indexOf(target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
-    config.ai.groupOrder = arr;
+    const next = reorderByDrop(config.ai.groupOrder, from, target, place, (s) => s);
+    if (!next) return;
+    config.ai.groupOrder = next;
     saveConfig();
   }
 

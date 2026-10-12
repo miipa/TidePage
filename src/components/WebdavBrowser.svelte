@@ -21,13 +21,13 @@
   import { api } from "../lib/api";
   import { config, saveConfig, toast, ui } from "../lib/stores.svelte";
   import { outDissolve, outFade } from "../lib/motion";
+  import { BOOK_EXTENSIONS } from "../lib/bookExt";
 
   interface Entry { name: string; is_dir: boolean; size: number; mtime: number }
   interface DlItem { key: string; name: string; pct: number; state: "downloading" | "done" | "error"; msg: string }
   /** 剪贴板项：记录来源目录 srcDir 便于判断粘贴目标是否与来源相同。 */
   interface ClipItem { op: "copy" | "move"; name: string; path: string; is_dir: boolean; srcDir: string }
 
-  const EXT_BOOK = ["txt", "epub", "mobi", "azw3", "prc"];
 
   let path = $state("");
   let entries = $state<Entry[]>([]);
@@ -146,7 +146,7 @@
 
   function isBook(e: Entry) {
     const ext = e.name.split(".").pop()?.toLowerCase() || "";
-    return EXT_BOOK.includes(ext);
+    return BOOK_EXTENSIONS.includes(ext);
   }
 
   /** 当前目录下某条目的完整远端路径。 */

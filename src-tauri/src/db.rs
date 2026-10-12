@@ -1008,30 +1008,11 @@ pub fn set_cover_path(conn: &Connection, id: i64, cover_path: Option<&str>) -> r
     Ok(())
 }
 
-/// 按 id 批量取 (id, path, format)：队列 worker 消费时用。
-pub fn books_brief_by_ids(conn: &Connection, ids: &[i64]) -> Vec<(i64, String, String)> {
-    if ids.is_empty() {
-        return vec![];
-    }
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT id, path, format FROM books WHERE id IN ({placeholders})");
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let params: Vec<&dyn rusqlite::ToSql> =
-        ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
-    stmt.query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-}
-
 /// 写入提取结果。`meta_done` 由调用方决定（1=完成/无封面，2=可重试失败），**永不为 0**。
 /// `bump_cover_ver=true` 时该书 `cover_ver+1`（提取到新封面，令前端 per-book URL 缓存失效）。
 #[allow(clippy::too_many_arguments)]
+// staged: 全量元数据写入器（title/author/total_chars/cover_ver）；现扫描仅写封面，保留作 db 测试夹具与未来全量回填。
+#[allow(dead_code)]
 pub fn set_book_meta_ex(
     conn: &Connection,
     id: i64,
@@ -1208,6 +1189,8 @@ pub fn reset_last_read(conn: &Connection, book_id: i64) {
     .ok();
 }
 
+// staged: 持久 txt 切分缓存读取器；现生产用内存 state.txt_cache，txt_cache 表基础设施仍维护，预留跨重启持久化。
+#[allow(dead_code)]
 pub fn get_txt_cache(conn: &Connection, book_id: i64) -> Option<(String, String)> {
     conn.query_row(
         "SELECT offsets, rules_hash FROM txt_cache WHERE book_id=?1",
@@ -1218,6 +1201,8 @@ pub fn get_txt_cache(conn: &Connection, book_id: i64) -> Option<(String, String)
     .unwrap_or(None)
 }
 
+// staged: 持久 txt 切分缓存写入器；配套 txt_cache 表，彻底移除需连表与清理一起另议。
+#[allow(dead_code)]
 pub fn set_txt_cache(conn: &Connection, book_id: i64, offsets: &str, rules_hash: &str) {
     conn.execute(
         "INSERT INTO txt_cache(book_id, offsets, rules_hash) VALUES(?1,?2,?3)
@@ -2000,18 +1985,6 @@ mod cover_scan_tests {
         // 无封面（None）不递增
         set_book_meta_ex(&conn, id, "书", "", None, 1, 1, 1, false).unwrap();
         assert_eq!(get_book(&conn, id).unwrap().cover_ver, 2);
-    }
-
-    #[test]
-    fn brief_by_ids_returns_path_and_format() {
-        let conn = tmpdb("brief");
-        let a = upsert_book(&conn, "/x/a.epub", "A", "epub", 1, 1).unwrap();
-        let b = upsert_book(&conn, "/x/b.txt", "B", "txt", 1, 1).unwrap();
-        let mut got = books_brief_by_ids(&conn, &[a, b, 999999]);
-        got.sort_by_key(|x| x.0);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], (a, "/x/a.epub".into(), "epub".into()));
-        assert_eq!(got[1], (b, "/x/b.txt".into(), "txt".into()));
     }
 }
 

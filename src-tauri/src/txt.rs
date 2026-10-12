@@ -321,29 +321,6 @@ fn pick_cjk_fallback(
     best
 }
 
-pub fn render_html(body: &str) -> String {
-    let mut html = String::with_capacity(body.len() + 256);
-    html.push_str("<div class=\"txt-body\">");
-    for para in body.split('\n') {
-        let p = para.trim();
-        if p.is_empty() {
-            continue;
-        }
-        html.push_str("<p>");
-        for ch in p.chars() {
-            match ch {
-                '<' => html.push_str("&lt;"),
-                '>' => html.push_str("&gt;"),
-                '&' => html.push_str("&amp;"),
-                _ => html.push(ch),
-            }
-        }
-        html.push_str("</p>");
-    }
-    html.push_str("</div>");
-    html
-}
-
 /// 渲染 TXT 章节（第 1 段若以“第X章”等标题开头，作为 h2 标题显示）
 pub fn render_html_with_title(body: &str) -> String {
     let mut html = String::with_capacity(body.len() + 256);

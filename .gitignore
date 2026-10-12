@@ -35,3 +35,6 @@ _test/
 *.bat
 wait*.ps1
 docs/.tmp/
+
+# 便携版发布构建产物（本地打包，~15MB）：不入库
+dist-release/

@@ -8,7 +8,7 @@
 //! - URL 属性（`href`/`src`/`xlink:href`/`action`/`formaction` 等）值为
 //!   `javascript:`/`vbscript:`/非图片 `data:` 时整条删除（`data:image/...` 放行）。
 
-use html5ever::tokenizer::{TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
+use html5ever::tokenizer::{Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -31,7 +31,7 @@ pub fn is_dangerous_tag(name: &str) -> bool {
 }
 
 /// 无内容（void）危险标签：只需丢弃标签本身，后续内容不应连带丢弃。
-fn is_void_dangerous(name: &str) -> bool {
+pub fn is_void_dangerous(name: &str) -> bool {
     matches!(name, "meta" | "base" | "link" | "frame" | "embed")
 }
 
@@ -87,6 +87,70 @@ fn escape_text_into(out: &mut String, v: &str) {
     }
 }
 
+/// 安全标签透传序列化（EPUB/MOBI 共享骨架）：按 on* 跳过、危险 URL 跳过的规则逐属性输出，
+/// 自闭合写 `/>`、否则写 `>`。属性值转义器由调用方传入——EPUB 用 escape_attr_into，
+/// MOBI 用其 U+FFFD-剔除版——这是两路唯一差异，故两路输出逐字节不变。
+pub(crate) fn serialize_safe_tag(out: &mut String, tag: &Tag, escape_attr: impl Fn(&str, &mut String)) {
+    let name = tag.name.to_string();
+    let is_end = matches!(tag.kind, TagKind::EndTag);
+    let mut s = String::with_capacity(name.len() + 8);
+    s.push('<');
+    if is_end {
+        s.push('/');
+    }
+    s.push_str(&name);
+    if !is_end {
+        for a in tag.attrs.iter() {
+            let an = a.name.local.to_string();
+            let anl = an.to_ascii_lowercase();
+            if anl.starts_with("on") {
+                continue;
+            }
+            let v = a.value.to_string();
+            if is_url_attr(&anl) && is_dangerous_url(&v) {
+                continue;
+            }
+            s.push(' ');
+            s.push_str(&an);
+            if !v.is_empty() {
+                s.push_str("=\"");
+                escape_attr(&v, &mut s);
+                s.push('"');
+            }
+        }
+        if tag.self_closing {
+            s.push_str("/>");
+            out.push_str(&s);
+            return;
+        }
+    }
+    s.push('>');
+    out.push_str(&s);
+}
+
+/// 危险标签的 drop-stack 转移（EPUB/MOBI 共享）：结束标签向下截断同名；开始标签若非 void
+/// 非自闭合则压栈。`dangling=true`（仅 MOBI 悬空 RAWTEXT 模式）时不压栈——去标签、文本按
+/// 普通处理；EPUB 恒传 false，与抽取前行为逐字节一致。调用方须已判定 is_dangerous_tag(&ln)
+/// 为真，调用后立即 return（该 token 已被消费）。
+pub(crate) fn handle_dangerous_tag(
+    drop_stack: &mut Vec<String>,
+    ln: String,
+    is_end: bool,
+    self_closing: bool,
+    dangling: bool,
+) {
+    if is_end {
+        if let Some(pos) = drop_stack.iter().rposition(|t| t == &ln) {
+            drop_stack.truncate(pos);
+        }
+    } else if !self_closing && !is_void_dangerous(&ln) {
+        if dangling {
+            return;
+        }
+        drop_stack.push(ln);
+    }
+}
+
 struct St {
     out: String,
     /// 已打开的危险容器标签栈（小写）；非空时丢弃其间所有 token。
@@ -102,55 +166,16 @@ impl TokenSink for Sink {
         let mut st = self.0.borrow_mut();
         match token {
             Token::TagToken(tag) => {
-                let name = tag.name.to_string();
-                let ln = name.to_ascii_lowercase();
+                let ln = tag.name.to_string().to_ascii_lowercase();
                 let is_end = matches!(tag.kind, TagKind::EndTag);
                 if is_dangerous_tag(&ln) {
-                    if is_end {
-                        if let Some(pos) = st.drop_stack.iter().rposition(|t| t == &ln) {
-                            st.drop_stack.truncate(pos);
-                        }
-                    } else if !tag.self_closing && !is_void_dangerous(&ln) {
-                        st.drop_stack.push(ln);
-                    }
+                    handle_dangerous_tag(&mut st.drop_stack, ln, is_end, tag.self_closing, false);
                     return TokenSinkResult::Continue;
                 }
                 if !st.drop_stack.is_empty() {
                     return TokenSinkResult::Continue;
                 }
-                let mut s = String::with_capacity(name.len() + 8);
-                s.push('<');
-                if is_end {
-                    s.push('/');
-                }
-                s.push_str(&name);
-                if !is_end {
-                    for a in tag.attrs.iter() {
-                        let an = a.name.local.to_string();
-                        let anl = an.to_ascii_lowercase();
-                        if anl.starts_with("on") {
-                            continue;
-                        }
-                        let v = a.value.to_string();
-                        if is_url_attr(&anl) && is_dangerous_url(&v) {
-                            continue;
-                        }
-                        s.push(' ');
-                        s.push_str(&an);
-                        if !v.is_empty() {
-                            s.push_str("=\"");
-                            escape_attr_into(&mut s, &v);
-                            s.push('"');
-                        }
-                    }
-                    if tag.self_closing {
-                        s.push_str("/>");
-                        st.out.push_str(&s);
-                        return TokenSinkResult::Continue;
-                    }
-                }
-                s.push('>');
-                st.out.push_str(&s);
+                serialize_safe_tag(&mut st.out, &tag, |v, out| escape_attr_into(out, v));
             }
             Token::CharacterTokens(chars) if st.drop_stack.is_empty() => {
                 escape_text_into(&mut st.out, &chars);
@@ -258,5 +283,49 @@ mod tests {
         let out = cleaned(r#"<p>a &lt;b&gt; c &amp; d</p>"#);
         assert!(out.contains("&lt;b&gt;"), "{out}");
         assert!(out.contains("&amp;"), "{out}");
+    }
+
+    // ===== 骨架抽取特征测试（phase 1）：锁定序列化/危险转移/属性转义的逐字节输出，
+    // 证明抽出共享 helper 后两路输出不变。断言值为抽取前的真实输出。 =====
+    #[test]
+    fn char_self_closing_dangerous_not_swallow() {
+        // 自闭合危险标签只丢自身，不入 drop-stack，不吞后续文本。
+        assert_eq!(sanitize_fragment("<script/>after<embed/>end"), "afterend");
+    }
+
+    #[test]
+    fn char_void_meta_dropped_content_flows() {
+        assert_eq!(
+            sanitize_fragment("<p>a</p><meta charset=\"x\"><p>b</p>"),
+            "<p>a</p><p>b</p>"
+        );
+    }
+
+    #[test]
+    fn char_attr_escaping_exact() {
+        assert_eq!(
+            sanitize_fragment("<a href=\"x?a=1&b=2\" title='q\"q'>t</a>"),
+            "<a href=\"x?a=1&amp;b=2\" title=\"q&quot;q\">t</a>"
+        );
+    }
+
+    #[test]
+    fn char_img_self_closing_preserved_exact() {
+        assert_eq!(
+            sanitize_fragment("<p><img src=\"a.jpg\" alt=\"c\"/></p>"),
+            "<p><img src=\"a.jpg\" alt=\"c\"/></p>"
+        );
+    }
+
+    // 固定 void 危险标签集：mobi.rs::decode_and_sanitize 复用此判定，
+    // 这里钉死集合，防止两条清洗路径对 void 集静默分叉。
+    #[test]
+    fn void_dangerous_set_is_pinned() {
+        for t in ["meta", "base", "link", "frame", "embed"] {
+            assert!(is_void_dangerous(t), "expected void-dangerous: {t}");
+        }
+        for t in ["script", "style", "iframe", "object", "form", "p", "img"] {
+            assert!(!is_void_dangerous(t), "must not be void-dangerous: {t}");
+        }
     }
 }

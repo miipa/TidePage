@@ -150,7 +150,6 @@ pub fn run() {
             // 设置页现已简化为单个「灰度抗锯齿」复选框，只写入
             // --disable-lcd-text（勾选）或 --enable-lcd-text（取消）；
             // 旧版 GDI/自定义参数值仍原样尊重，保证升级用户配置不失效。
-            let mut main_window_args = String::new();
             {
                 let webview_args = db::get_setting(&conn, "render.webviewArgs").unwrap_or_default();
                 let raw = webview_args.trim().to_string();
@@ -209,7 +208,7 @@ pub fn run() {
                 // 记录本次启动实际生效的参数串：JS 端创建的子窗口必须使用
                 // 完全相同的 WebView2 启动参数，否则同 user-data-dir 下新建
                 // 环境会静默失败，产生无法加载页面的"幽灵窗口"
-                main_window_args = full.clone();
+                let main_window_args = full.clone();
                 wb = wb.additional_browser_args(&full);
                 wb.build()?;
                 db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);

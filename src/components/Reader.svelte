@@ -35,6 +35,7 @@
   } from "../lib/stores.svelte";
   import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import { dragSort } from "../lib/dragSort";
+import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
@@ -379,15 +380,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /** 拖拽排序：把 from 插入到 target 之前/之后（在完整顺序数组内重排，隐藏项位置一并保留）。 */
   function tbDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = [...config.reader.topbarOrder];
-    const fi = arr.indexOf(from);
-    if (fi < 0) return;
-    arr.splice(fi, 1);
-    const ti = arr.indexOf(target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, from);
-    config.reader.topbarOrder = arr;
+    const next = reorderByDrop(config.reader.topbarOrder, from, target, place, (s) => s);
+    if (!next) return;
+    config.reader.topbarOrder = next;
     saveConfig();
   }
 
@@ -1271,7 +1266,6 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   function prevChapter(toEnd = false) {
-    console.log("Prev Chapter Triggered, toEnd:", toEnd, "chapterNum:", chapterNum);
     if (book && chapterNum > 0) {
       // 回溯语义统一为"接着看上一章的结尾"（翻页与显式上一章均落章末）
       loadChapter(chapterNum - 1, undefined, toEnd ? { at: "tail", extra: 0 } : undefined);
@@ -4253,15 +4247,15 @@ ${effCssExtra() || ""}
 
   /** 状态项拖拽排序（与顶栏按钮共用 dragSort 视觉）。 */
   function statusDrop(from: string, target: string, place: "before" | "after") {
-    if (!from || from === target) return;
-    const arr = config.reader.statusItems.map((x) => ({ ...x }));
-    const fi = arr.findIndex((x) => x.id === from);
-    if (fi < 0) return;
-    const [m] = arr.splice(fi, 1);
-    const ti = arr.findIndex((x) => x.id === target);
-    if (ti < 0) return;
-    arr.splice(place === "after" ? ti + 1 : ti, 0, m);
-    config.reader.statusItems = arr;
+    const next = reorderByDrop(
+      config.reader.statusItems.map((x) => ({ ...x })),
+      from,
+      target,
+      place,
+      (x) => x.id,
+    );
+    if (!next) return;
+    config.reader.statusItems = next;
     saveConfig();
   }
 

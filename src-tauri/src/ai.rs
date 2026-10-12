@@ -844,10 +844,7 @@ fn bearer_headers(api_key: &str) -> Vec<(String, String)> {
 fn stream_delta(p: Provider, v: &serde_json::Value) -> Option<String> {
     match p {
         Provider::Ollama => v.pointer("/message/content").and_then(|c| c.as_str()).map(str::to_string),
-        Provider::OpenAi | Provider::Azure => {
-            v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(str::to_string)
-        }
-        Provider::DashScope => {
+        Provider::OpenAi | Provider::Azure | Provider::DashScope => {
             v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()).map(str::to_string)
         }
         Provider::Anthropic => {
@@ -869,13 +866,7 @@ fn full_content(p: Provider, v: &serde_json::Value) -> Option<String> {
             .or_else(|| v.pointer("/response"))
             .and_then(|c| c.as_str())
             .map(str::to_string),
-        Provider::OpenAi | Provider::Azure => v
-            .pointer("/choices/0/message/content")
-            .or_else(|| v.pointer("/choices/0/delta/content"))
-            .or_else(|| v.pointer("/choices/0/text"))
-            .and_then(|c| c.as_str())
-            .map(str::to_string),
-        Provider::DashScope => v
+        Provider::OpenAi | Provider::Azure | Provider::DashScope => v
             .pointer("/choices/0/message/content")
             .or_else(|| v.pointer("/choices/0/delta/content"))
             .or_else(|| v.pointer("/choices/0/text"))
@@ -1420,16 +1411,6 @@ pub fn breeze_root(base: &str) -> String {
         }
     }
     b
-}
-
-/// 由网关根地址推导克隆合成端点。
-pub fn breeze_clone_url(base: &str) -> String {
-    format!("{}/api/tts/clone", breeze_root(base))
-}
-
-/// 由网关根地址推导音色列表端点。
-pub fn breeze_voices_url(base: &str) -> String {
-    format!("{}/api/voices", breeze_root(base))
 }
 
 /// Breeze 网关标准监听端口（app.py 启动 uvicorn 的默认端口）。
@@ -2591,47 +2572,6 @@ mod tests {
         assert!(is_breeze_provider("breeze_tts"));
         assert!(!is_breeze_provider("openai"));
         assert!(!is_breeze_provider("dashscope"));
-
-        assert_eq!(
-            breeze_clone_url("http://127.0.0.1:7863"),
-            "http://127.0.0.1:7863/api/tts/clone"
-        );
-        assert_eq!(
-            breeze_clone_url("http://127.0.0.1:7863/"),
-            "http://127.0.0.1:7863/api/tts/clone"
-        );
-        assert_eq!(
-            breeze_clone_url("http://127.0.0.1:7863/api"),
-            "http://127.0.0.1:7863/api/tts/clone"
-        );
-        assert_eq!(
-            breeze_clone_url("http://127.0.0.1:7863/v1"),
-            "http://127.0.0.1:7863/api/tts/clone"
-        );
-        assert_eq!(
-            breeze_clone_url("http://127.0.0.1:7863/api/tts/clone"),
-            "http://127.0.0.1:7863/api/tts/clone"
-        );
-        assert_eq!(
-            breeze_voices_url("http://127.0.0.1:7863"),
-            "http://127.0.0.1:7863/api/voices"
-        );
-        assert_eq!(
-            breeze_voices_url("http://127.0.0.1:7863/api"),
-            "http://127.0.0.1:7863/api/voices"
-        );
-        assert_eq!(
-            breeze_voices_url("http://127.0.0.1:7863/v1"),
-            "http://127.0.0.1:7863/api/voices"
-        );
-        assert_eq!(
-            breeze_voices_url("http://127.0.0.1:7863/v1/"),
-            "http://127.0.0.1:7863/api/voices"
-        );
-        assert_eq!(
-            breeze_voices_url("http://127.0.0.1:7863/api/voices"),
-            "http://127.0.0.1:7863/api/voices"
-        );
 
         assert_eq!(detect_tts_language("你好，世界"), "Chinese");
         assert_eq!(detect_tts_language("hello world"), "English");
