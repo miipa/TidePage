@@ -39,6 +39,18 @@ import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { SmoothScroller } from "../lib/smoothScroll";
+  import {
+    classifyPointerUp,
+    isWheelLocal,
+    mangaWheelDelta,
+    normalizeWheelDelta,
+    reduceWheelTurn,
+    scrollKeyRoute,
+    shouldDedupeLoad,
+    WHEEL_TURN_IDLE,
+    type WheelAxis,
+    type WheelTurnState,
+  } from "../lib/readerInput";
 import { prefersReducedMotion } from "../lib/reducedMotion";
   import { outSlideL, outSlideR } from "../lib/motion";
 
@@ -129,6 +141,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let book: OpenResult | null = $state(null);
   let chapter: ChapterData | null = $state(null);
   let loadingChapter = $state(false);
+  /** 正在加载的目标章号（-1=无）。与 loadingChapter 成对维护：供同章去重判断复用在途请求，
+   *  连按/连滚指向同一章时不再重复 ++loadGeneration（见 loadChapter）。非响应式即可。 */
+  let loadingIdx = -1;
   let chapterNum = $state(0);
 
   let scrollWrap: HTMLDivElement | undefined = $state();
@@ -1103,9 +1118,20 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   async function loadChapter(
     idx: number,
     restore?: Progress,
-    entry?: { at: "head" | "tail"; extra?: number }
+    entry?: { at: "head" | "tail"; extra?: number },
+    /** 是否由「滚动到章边界」触发（handleScrollEdge）：只有这类加载才允许在落地后
+     *  补触发 pendingEdge。目录/书签/搜索/朗读等显式跳章与上一轮滚动无关，若让它
+     *  补触发，就会出现「跳章后自动又前进一章」。 */
+    fromEdge = false
   ) {
     if (!book) return;
+    // 同章在途且不带定位：直接复用这次请求（gen 语义保留给「不同章节之间」的跳转）。
+    // 旧实现每次调用都 ++loadGeneration，连按 N 次就让前 N-1 次在途结果全部作废，
+    // 表现为「按 N 下只前进 1 章、且每按一下都重新发一次请求」。
+    // 带 entry / restore 的请求是显式定位，一律放行（见 shouldDedupeLoad）。
+    if (shouldDedupeLoad(loadingChapter, loadingIdx, idx, { restore, entry })) return;
+    // 通过去重检查后立刻丢弃陈旧的跨章意图：非 edge 跳章不能补触发上一轮滚动留下的意图。
+    if (!fromEdge) pendingEdge = null;
     if (ttsState.playing) stopTts(); // 手动切换章节时停止朗读（自动续读在 onTtsChapterEnd 中处理）
     // 竞态：快速连续翻页时，只有最后一次请求的结果才允许落地。
     const gen = ++loadGeneration;
@@ -1114,8 +1140,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 命中缓存：立即同步切换，不显示任何 loading。
     if (cached) {
       loadingChapter = false;
+      loadingIdx = -1;
       await applyChapter(idx, cached, restore, entry, gen);
       prefetchAround(idx);
+      afterChapterApplied(fromEdge);
       return;
     }
 
@@ -1129,17 +1157,24 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 请求在途期间保持 loadingChapter=true：handleScrollEdge 因此不再继续跨章，
     // 避免连续滚动时不断 ++loadGeneration，把已返回的章节结果全部当作过期丢弃
     // （表现为滚到底后卡住、不再显示后续章节）。占位内容仍照常显示，不空白。
+    // 被挡下的 edge 意图改由 pendingEdge 缓存，落地后补触发（见 handleScrollEdge）。
     loadingChapter = true;
+    loadingIdx = idx;
 
     try {
       const ch = await fetchChapter(idx);
       if (gen !== loadGeneration) return; // 已被更新的翻页取代
       loadingChapter = false;
+      loadingIdx = -1;
       await applyChapter(idx, ch, restore, entry, gen);
       prefetchAround(idx);
+      afterChapterApplied(fromEdge);
     } catch (e) {
       if (gen === loadGeneration) {
         loadingChapter = false;
+        loadingIdx = -1;
+        // 本章失败：丢掉缓存的跨章意图，避免用户稍后跳到别处时突然补跳一章。
+        pendingEdge = null;
         toast(errText(e), "error");
       }
     }
@@ -1440,6 +1475,26 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /* ================= scroll mode ================= */
   let lastEdgeAt = 0;
+  /** 章节加载期间被丢弃的跨章意图（dir=±1、carry=剩余行程）。
+   *  旧实现 loadingChapter 时直接 return，意图没有任何补偿 → 滚到底后必须再滚一次才有反应。
+   *  这里缓存最后一次，edge 触发的章节落地后由 flushPendingEdge() 补触发（同 pendingMangaCarry 的思路）。 */
+  let pendingEdge: { dir: number; carry: number } | null = null;
+
+  /** 换章落地后补触发一次被丢弃的跨章意图（skipThrottle 跳过 320ms 节流，但仍受加载态与章边界约束）。
+   *  先取走再置 null：补触发链里再次遇到 loadingChapter 时还能继续缓存，不会自锁。 */
+  function flushPendingEdge() {
+    const p = pendingEdge;
+    pendingEdge = null;
+    if (p) handleScrollEdge(p.dir, p.carry, true);
+  }
+
+  /** 章节落地后的统一收尾。只有 edge 触发的加载才补触发跨章意图；
+   *  目录/书签/搜索/朗读等非 edge 跳章一律丢弃——加载期间新产生的意图也是相对旧位置的，
+   *  补触发只会「跳完目标章又自动跳到下一章」。 */
+  function afterChapterApplied(fromEdge: boolean) {
+    if (fromEdge) flushPendingEdge();
+    else pendingEdge = null;
+  }
 
   function measureScroll() {
     if (!contentEl || !scrollArea) return;
@@ -1580,7 +1635,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (mangaCanvas) mangaCanvas.style.transform = "translate3d(0,0,0)";
   }
 
-  function handleScrollEdge(dir: number, carry: number) {
+  function handleScrollEdge(dir: number, carry: number, skipThrottle = false) {
     if (!book) return;
     // 漫画模式（两种布局共用）：连续窗口在两端自动续章，不重建窗口（保持视觉连续）。
     // 窗口两端是「人造边界」，不让 SmoothScroller 的 overshoot 表现成回弹：清掉越界量，
@@ -1593,16 +1648,22 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       void extendMangaWindow(dir > 0 ? 1 : -1);
       return;
     }
+    // 加载中丢弃的意图必须留痕（补触发用），否则「滚到底」的第一下会被无声吞掉。
+    if (loadingChapter) {
+      pendingEdge = { dir, carry };
+      return;
+    }
     const now = Date.now();
-    if (now - lastEdgeAt < 320 || loadingChapter) return;
+    if (!skipThrottle && now - lastEdgeAt < 320) return;
     if (dir > 0) {
       if (chapterNum >= book.toc.length - 1) return;
       lastEdgeAt = now;
-      loadChapter(chapterNum + 1, undefined, { at: "head", extra: config.reader.scrollBounce ? 0 : carry });
+      // 第四个参数 fromEdge=true：落地后允许补触发 pendingEdge（连滚跨章的意图链）。
+      loadChapter(chapterNum + 1, undefined, { at: "head", extra: config.reader.scrollBounce ? 0 : carry }, true);
     } else {
       if (chapterNum <= 0) return;
       lastEdgeAt = now;
-      loadChapter(chapterNum - 1, undefined, { at: "tail", extra: config.reader.scrollBounce ? 0 : carry });
+      loadChapter(chapterNum - 1, undefined, { at: "tail", extra: config.reader.scrollBounce ? 0 : carry }, true);
     }
   }
 
@@ -2067,6 +2128,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (!book) return;
     const gen = ++loadGeneration;
     loadingChapter = true;
+    loadingIdx = idx;
     const total = book.toc.length;
     // 按「图片数量」建窗：先取当前章保证至少含它；不足初值则向两侧交替扩，累计图片达 MANGA_IMG_INIT 即停。
     // 一张图一章 → 约 MANGA_IMG_INIT 章；每章很多图 → 当前章一张就超初值 → 窗口仅 1~2 章。
@@ -2113,6 +2175,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     mangaWindow = next;
     chapter = objs.get(idx) ?? chapter;
     loadingChapter = false;
+    loadingIdx = -1; // 与 loadingChapter 成对收尾，避免去重状态残留
     await tick();
     if (gen !== loadGeneration) return;
     if (scrollLayout()) {
@@ -2454,7 +2517,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function onMangaWheel(e: WheelEvent) {
     e.preventDefault();
-    const delta = e.deltaX !== 0 ? e.deltaX : (e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY);
+    // 横向量优先（既有横向平移语义不变）；没有横向量时回落纵向，用与正文同一套
+    // 换算（旧实现只换算 line，deltaMode=2 的映射设备每下只挪 1px，表现为滚轮没反应）。
+    const delta = mangaWheelDelta(e.deltaX, e.deltaMode, e.deltaY);
     if (Math.abs(delta) < 1) return;
     const before = mangaPosX;
     mangaPosX = Math.max(0, Math.min(mangaMaxX, mangaPosX + delta));
@@ -2637,47 +2702,39 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   /* ================= input: wheel / keys / zones ================= */
-  let wheelAcc = 0;
-  let wheelLockUntil = 0;
+  // 滚轮翻页状态（累积量/上次事件时间/锁到期）。判定本身是纯函数
+  // reduceWheelTurn()（lib/readerInput.ts），这里只负责把上一拍的状态传下去。
+  let wheelState: WheelTurnState = WHEEL_TURN_IDLE;
 
-  /** 阅读界面内这些区域的滚轮属于它自己（目录/侧栏列表、顶栏弹出面板、表单控件），
-   *  不能冒泡到这里被当成正文滚动 —— 否则光标停在目录上滚轮滚的却是正文。 */
-  const WHEEL_LOCAL_SEL = ".sidepanel, .ai-panel, .tb-panel, .panel-slot, .set-pane, input, textarea, select";
+  /** 滚轮归属：只有「目标（或其祖先）真的可滚」或命中表单控件时才归本地、交给它自己滚。
+   *  旧实现按固定选择器一刀切——光标停在展开但不可滚的抽屉/弹出菜单上时，既不翻正文、
+   *  容器自身又滚不了，表现就是「滚了完全没动静（看起来随机）」。 */
   function wheelIsLocal(e: WheelEvent): boolean {
-    const el = e.target as Element | null;
-    return !!el && typeof el.closest === "function" && !!el.closest(WHEEL_LOCAL_SEL);
+    const dy = Math.abs(e.deltaY);
+    const dx = Math.abs(e.deltaX);
+    const axis: WheelAxis = dy >= dx ? "y" : "x";
+    return isWheelLocal(e.target, axis);
   }
 
   function onWheel(e: WheelEvent) {
     if (!contentEl) return;
     // 判定必须在 mangaHorizontal() 之前：漫画模式同样受用（onMangaWheel 只被 onWheel 调用）。
-    if (wheelIsLocal(e)) return; // 面板/浮层/输入控件内的滚轮不归正文
+    if (wheelIsLocal(e)) return; // 面板/浮层/表单控件自己能滚时滚它们，其余归正文
     if (mangaHorizontal()) {
       onMangaWheel(e);
       return;
     }
-    const d = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
     if (!scrollLayout()) {
       if (!config.reader.wheelTurnPage) return;
       e.preventDefault();
-      const now = Date.now();
-      if (now < wheelLockUntil) {
-        wheelAcc = 0;
-        return;
-      }
-      wheelAcc += d;
-      if (wheelAcc >= 100) {
-        nextPage();
-        wheelAcc = 0;
-        wheelLockUntil = now + 240;
-      } else if (wheelAcc <= -100) {
-        prevPage();
-        wheelAcc = 0;
-        wheelLockUntil = now + 240;
-      }
+      const r = reduceWheelTurn(wheelState, e.deltaMode, e.deltaY, Date.now());
+      wheelState = r.state;
+      if (r.turn > 0) nextPage();
+      else if (r.turn < 0) prevPage();
       return;
     }
     e.preventDefault();
+    const d = normalizeWheelDelta(e.deltaMode, e.deltaY);
     if (maxScroll <= 1 || !scroller) {
       if (d > 0) handleScrollEdge(1, 0);
       else if (d < 0) handleScrollEdge(-1, 0);
@@ -2688,6 +2745,13 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   function scrollStep(dy: number) {
+    // 防御：非滚动布局没有滚动行程（maxScroll 恒为 0），落到底部那个分支会既被 320ms 节流
+    // 吃掉、又会一按跳整章 —— 这里直接回翻页语义，与 next/prev 同义、不跨章。
+    if (!scrollLayout()) {
+      if (dy > 0) nextPage();
+      else if (dy < 0) prevPage();
+      return;
+    }
     if (!scroller || maxScroll <= 1) {
       if (dy > 0) handleScrollEdge(1, 0);
       else if (dy < 0) handleScrollEdge(-1, 0);
@@ -2711,14 +2775,23 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         else if (scrollLayout()) scrollStep(-vh);
         else prevPage();
         break;
-      case "scrollDown":
-        if (mangaHorizontal()) { mangaPosX = Math.min(mangaMaxX, mangaPosX + vh * 0.4); clampManga(); applyMangaPan(); }
+      case "scrollDown": {
+        // 翻页布局下 ↑/↓（多数映射设备的默认输出）必须等价于 next/prev：
+        // 旧实现只有漫画横向与滚动两个分支，落到 scrollStep 后因 maxScroll 恒为 0 走
+        // handleScrollEdge，既被 320ms 节流连按丢弃、又会一按跳整章。
+        const route = scrollKeyRoute({ mangaHorizontal: mangaHorizontal(), scrollLayout: scrollLayout() });
+        if (route === "pan") { mangaPosX = Math.min(mangaMaxX, mangaPosX + vh * 0.4); clampManga(); applyMangaPan(); }
+        else if (route === "page") nextPage();
         else scrollStep(vh * 0.4);
         break;
-      case "scrollUp":
-        if (mangaHorizontal()) { mangaPosX = Math.max(0, mangaPosX - vh * 0.4); clampManga(); applyMangaPan(); }
+      }
+      case "scrollUp": {
+        const route = scrollKeyRoute({ mangaHorizontal: mangaHorizontal(), scrollLayout: scrollLayout() });
+        if (route === "pan") { mangaPosX = Math.max(0, mangaPosX - vh * 0.4); clampManga(); applyMangaPan(); }
+        else if (route === "page") prevPage();
         else scrollStep(-vh * 0.4);
         break;
+      }
       case "chapterNext":
         if (mangaHorizontal()) nextChapter(true);
         else if (scrollLayout()) handleScrollEdge(1, 0);
@@ -2808,15 +2881,16 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
-  let ptr: { x: number; y: number; t: number; id: number } | null = null;
+  let ptr: { x: number; y: number; id: number } | null = null;
 
   function onContentPointerDown(e: PointerEvent) {
     if (mangaHorizontal()) return; // 漫画双页：手势由横向视口单独处理
     if (e.button !== 0) {
+      // 非主键不参与选区/点击判定；侧键（3/4）由 mousedown/mouseup 单独处理。
       ptr = null;
       return;
     }
-    ptr = { x: e.clientX, y: e.clientY, t: Date.now(), id: e.pointerId };
+    ptr = { x: e.clientX, y: e.clientY, id: e.pointerId };
     // 新手势开始前清掉旧选区：避免「点空白处既保留上次选区、又把它扩成一大段」。
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) sel.removeAllRanges();
@@ -2829,31 +2903,36 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       return;
     }
     const moved = Math.hypot(e.clientX - ptr.x, e.clientY - ptr.y);
-    const quick = Date.now() - ptr.t < 450;
     ptr = null;
-    // 只有「主动拖拽出的选区」才弹划词菜单（划线 / 全文 / 浏览器 / AI）；
-    // 纯点击（未拖动）一律不弹，直接走点击区域动作。
-    if (contentEl && moved > 4) {
-      const sel = window.getSelection();
-      if (sel && !sel.isCollapsed && sel.rangeCount) {
-        const root = contentRoot();
-        const range = sel.getRangeAt(0);
-        if (root && root.contains(range.commonAncestorContainer)) {
-          const text = sel.toString().replace(/\s+/g, " ").trim();
-          const offs = selectionOffsets(root, range);
-          if (text && offs && offs.end > offs.start) {
-            showSelectionMenu(text, offs, range.getBoundingClientRect());
-            return;
-          }
+    if (!contentEl) return;
+    // 意图顺序由 classifyPointerUp 决定，且**选区最优先、与位移无关**。
+    // 旧实现把「位移超过阈值」排在选区判定之前：拖选 1–2 个字常常只有 4–8px，
+    // 会先落到点击分支 —— removeAllRanges() 清掉刚拖出的选区再按热区翻页（划词回归）。
+    // 时长仍不参与判定：映射设备常模拟带延时的长按，旧的 450ms 硬门槛会让点击完全没反应。
+    const sel = window.getSelection();
+    const hasSel = !!sel && !sel.isCollapsed && sel.rangeCount > 0;
+    const intent = classifyPointerUp({ hasSelection: hasSel, moved });
+    if (intent === "select" && sel) {
+      // sel 非空由 hasSel 保证（intent==="select" ⇒ hasSel）；再 && 一次只为让 TS 收窄，避免类型断言。
+      const root = contentRoot();
+      const range = sel.getRangeAt(0);
+      if (root && root.contains(range.commonAncestorContainer)) {
+        const text = sel.toString().replace(/\s+/g, " ").trim();
+        const offs = selectionOffsets(root, range);
+        if (text && offs && offs.end > offs.start) {
+          showSelectionMenu(text, offs, range.getBoundingClientRect());
+          return;
         }
       }
-      return; // 拖拽但没形成有效选区：不当作点击翻页
+      return; // 有选区但不属于正文或为空：交给浏览器，绝不清选区、不翻页
     }
+    if (intent !== "click") return; // 拖过但没选中东西 = 划词/拖拽手势，不当作点击翻页
     // 纯点击：清掉可能残留的选区（含浏览器在空白处“整块选中”），避免误选与菜单复现。
     window.getSelection()?.removeAllRanges();
+    const tgt = e.target as HTMLElement | null;
     // 点击已有划线 → 打开划线设置（改颜色 / 改样式 / 删除）
-    const markEl = (e.target as HTMLElement | null)?.closest?.("mark.fr-hl") as HTMLElement | null;
-    if (markEl && contentEl && contentEl.contains(markEl)) {
+    const markEl = tgt?.closest?.("mark.fr-hl") as HTMLElement | null;
+    if (markEl && contentEl.contains(markEl)) {
       const id = Number(markEl.dataset.hlid);
       const h = highlights.find((x) => x.id === id);
       if (h) {
@@ -2861,9 +2940,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         return;
       }
     }
-    if (moved > 10 || !quick || !contentEl) return;
     // 纯点击正文图片 → 屏蔽选择模式下屏蔽该图；否则打开全书图片查看器（不触发翻页/区域动作）。
-    const imgEl = (e.target as HTMLElement | null)?.closest?.("img") as HTMLImageElement | null;
+    const imgEl = tgt?.closest?.("img") as HTMLImageElement | null;
     if (imgEl && contentEl.contains(imgEl)) {
       e.preventDefault();
       e.stopPropagation();
@@ -2880,6 +2958,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       openViewerForImage(imgEl);
       return;
     }
+    // 可交互元素分流：链接交给 onBodyClick（跳章/复制），button/input 等交给各自处理器；
+    // 只有正文空白处才按 config.reader.zones 热区翻页，否则点控件会「既点它又翻页」。
+    if (tgt?.closest?.("a, button, input, textarea, select")) return;
     const rect = contentEl.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
@@ -2892,6 +2973,22 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const action = config.reader.zones[zone];
     if (!action || action === "none") return;
     runAction(action);
+  }
+
+  /** 鼠标侧键（button 3=XButton1「后退」、4=XButton2「前进」）翻页：
+   *  映射设备常把翻页映射到侧键，而旧实现 button!==0 直接丢弃 → 完全没反应；
+   *  WebView2 还可能顺手把侧键当历史前进/后退，两处 preventDefault 都是为了阻断它
+   *  （mousedown/mouseup 各挡一次：不同 Chromium 版本在不同阶段取消默认行为）。
+   *  走 mouse 系事件而非 pointer 系：Chromium 对「非主键按下」不保证派发 pointerdown/up，
+   *  但 mouse 系一定有；主键点击不受影响（这里只认 button 3/4）。 */
+  function onContentMouseDown(e: MouseEvent) {
+    if (e.button === 3 || e.button === 4) e.preventDefault();
+  }
+
+  function onContentMouseUp(e: MouseEvent) {
+    if (e.button !== 3 && e.button !== 4) return;
+    e.preventDefault();
+    runAction(e.button === 3 ? "prev" : "next");
   }
 
   function onBodyClick(e: MouseEvent) {
@@ -2929,9 +3026,72 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
+  /** DEV 输入日志条目（__frDebug.inputLog）：取证用，release 构建随 DEV 块一起被摇掉。
+   *  记 mouseup 而非 pointerup：侧键（button 3/4）不一定有 pointer 系事件，而 mouse 系一定有，
+   *  且我们的侧键翻页本就挂在 mouseup 上。各事件类型不共有的字段用 -1/false 占位，避免类型断言。 */
+  type InputLogRec = {
+    type: "wheel" | "keydown" | "mouseup";
+    key: string;
+    code: string;
+    deltaMode: number;
+    deltaX: number;
+    deltaY: number;
+    button: number;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+    altKey: boolean;
+    repeat: boolean;
+    target: string;
+    t: number;
+  };
+  /** DEV 输入日志监听的注销函数；release 构建下恒为 undefined。 */
+  let devInputOff: (() => void) | undefined;
+
   onMount(() => {
     // 开发期调试钩子：便于自动化验证搜索框/笔记交互（仅 DEV 构建，release 不含）。
     if (import.meta.env.DEV) {
+      // 输入取证：映射设备到底发 wheel 还是 keydown、deltaMode/deltaX 各是多少，
+      // 用户自己也说不清，这里环形留最近 50 条原始事件供 __frDebug.inputLog() 读取。
+      // 用捕获阶段挂 window：即使后面有 stopPropagation，日志也一定先记到。
+      const inputLog: InputLogRec[] = [];
+      const pushInput = (rec: Omit<InputLogRec, "t">) => {
+        inputLog.push({ ...rec, t: Date.now() });
+        if (inputLog.length > 50) inputLog.splice(0, inputLog.length - 50);
+      };
+      const classNameOf = (t: EventTarget | null): string => {
+        const el = t as Element | null;
+        return el && typeof el.className === "string" ? el.className : "";
+      };
+      const onInWheel = (e: WheelEvent) =>
+        pushInput({
+          type: "wheel", key: "", code: "",
+          deltaMode: e.deltaMode, deltaX: e.deltaX, deltaY: e.deltaY, button: e.button,
+          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: false,
+          target: classNameOf(e.target),
+        });
+      const onInKey = (e: KeyboardEvent) =>
+        pushInput({
+          type: "keydown", key: e.key, code: e.code,
+          deltaMode: -1, deltaX: 0, deltaY: 0, button: -1,
+          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: e.repeat,
+          target: classNameOf(e.target),
+        });
+      const onInMouse = (e: MouseEvent) =>
+        pushInput({
+          type: "mouseup", key: "", code: "",
+          deltaMode: -1, deltaX: 0, deltaY: 0, button: e.button,
+          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: false,
+          target: classNameOf(e.target),
+        });
+      window.addEventListener("wheel", onInWheel, true);
+      window.addEventListener("keydown", onInKey, true);
+      window.addEventListener("mouseup", onInMouse, true);
+      devInputOff = () => {
+        window.removeEventListener("wheel", onInWheel, true);
+        window.removeEventListener("keydown", onInKey, true);
+        window.removeEventListener("mouseup", onInMouse, true);
+      };
+
       (window as any).__frDebug = {
         // i18n-allow:用户内容：全文搜索输入框的默认关键词，是用户输入的初值而非界面文案。
         openSearch: (q = "的") => {
@@ -2975,6 +3135,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         },
         /** 当前 hoverNote 文本（供断言）。 */
         hoverNoteText: () => hoverNote?.note ?? null,
+        /** 最近 50 条输入事件（wheel/keydown/mouseup）的副本，按到达顺序。 */
+        inputLog: () => inputLog.slice(),
       };
     }
     ttsSetCallbacks({
@@ -3027,6 +3189,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     });
     return () => {
       ttsStop();
+      devInputOff?.(); // 仅 DEV 注册过输入取证监听；release 下是 undefined
       scroller?.destroy();
       if (statsTimer) clearInterval(statsTimer);
       if (mangaPanRaf) cancelAnimationFrame(mangaPanRaf);
@@ -4474,6 +4637,8 @@ ${effCssExtra() || ""}
           onclick={onBodyClick}
           onpointerdown={onContentPointerDown}
           onpointerup={onContentPointerUp}
+          onmousedown={onContentMouseDown}
+          onmouseup={onContentMouseUp}
           onmouseover={onContentHover}
           onmouseleave={() => (hoverNote = null)}
         >
