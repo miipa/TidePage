@@ -11,9 +11,9 @@
   import StandalonePanel from "../components/StandalonePanel.svelte";
   import NotesPanel from "../components/NotesPanel.svelte";
   import WindowControls from "../components/WindowControls.svelte";
-  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, openPanelWindow } from "../lib/stores.svelte";
+  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
   import { t } from "../lib/i18n/index.svelte";
-  import { IconArrowsSplit2, IconCopy, IconX } from "@tabler/icons-svelte";
+  import { IconCopy, IconX } from "@tabler/icons-svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
@@ -147,8 +147,11 @@
     return () => window.removeEventListener("keydown", onKey, true);
   });
 
+  // 独立 AI 窗的尺寸与生命周期标记（fr.ai.winw/winh、fr.ai.open、ai-window-status）。
+  // 守卫必须是 !standalone：只让 AI 窗自己记自己的尺寸，否则写进去的是主窗口的
+  // innerWidth/innerHeight，openAiWindow() 会按「主窗口尺寸」创建 AI 窗。
   $effect(() => {
-    if (standalone) return;
+    if (!standalone) return;
     try {
       localStorage.setItem("fr.ai.open", "1");
     } catch { /* ignore */ }
@@ -256,12 +259,6 @@
   {/if}
 
   {#if ui.notesOpen}
-    <!-- 笔记面板弹出入口：置于 NotesPanel 之外（不改其组件本体），成功后关闭内联笔记面板 -->
-    <button
-      class="notes-popout-btn"
-      title={t("notes.popoutTip")}
-      onclick={async () => { const ok = await openPanelWindow("notes", ui.currentBookId || 0, t("library.topbar.notes.label")); if (ok) ui.notesOpen = false; }}
-    ><IconArrowsSplit2 /></button>
     <NotesPanel />
   {/if}
 
@@ -394,21 +391,6 @@
     to { opacity: 0; }
   }
 
-  .notes-popout-btn {
-    position: fixed;
-    top: 10px;
-    right: 56px;
-    z-index: var(--z-window);
-    width: 30px;
-    height: 30px;
-    border-radius: var(--radius-md);
-    background: rgba(128, 128, 128, 0.18);
-    border: none;
-    cursor: pointer;
-    font-size: 15px;
-  }
-  .notes-popout-btn:hover { background: rgba(128, 128, 128, 0.32); }
-
   .overlay {
     position: fixed;
     inset: 0;
@@ -426,17 +408,20 @@
   }
 
   /* WebDAV 抽屉：遮罩用 --z-drawer、抽屉本体用 --z-overlay —— 刻意压在 --z-modal 之下，
-     这样即使用户先开抽屉再开设置/搜索弹窗，弹窗仍然盖住抽屉（与重构前的 991 < 1000 一致）。 */
+     这样即使用户先开抽屉再开设置/搜索弹窗，弹窗仍然盖住抽屉（与重构前的 991 < 1000 一致）。
+     形态是「顶栏之下的悬浮卡片」（top 让出自绘顶栏，四边留 --sp-2、四角 --radius-xl），
+     不再 top:0 贴边满高——那会与右上角自绘窗口按钮同层相撞。 */
   .wd-drawer {
     position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
+    top: var(--fr-titlebar-h, 44px);
+    right: var(--sp-2);
+    bottom: var(--sp-2);
     width: min(520px, 92vw);
     z-index: var(--z-overlay);
     background: var(--panel);
     color: var(--fg);
-    border-left: 1px solid var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
     box-shadow: var(--shadow-drawer);
     animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
     display: flex;

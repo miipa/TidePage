@@ -18,7 +18,13 @@ mod update;
 use library::AppState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri_plugin_window_state::StateFlags;
+use tauri_plugin_window_state::{StateFlags, WindowExt};
+
+/// window-state 统一标志：排除 DECORATIONS（历史保存值 decorated=true 会把原生标题栏带回来）。
+/// 仅去掉 DECORATIONS，位置/大小/最大化等其余状态仍正常持久化。
+const WINDOW_STATE_FLAGS: StateFlags = StateFlags::all().difference(StateFlags::DECORATIONS);
+/// 主窗口手动恢复用：去掉 VISIBLE，保持既有「建窗后 140ms 再 show」的启动观感。
+const MAIN_RESTORE_FLAGS: StateFlags = WINDOW_STATE_FLAGS.difference(StateFlags::VISIBLE);
 
 /// 应用数据目录（数据库/封面/字体/提取资源）。
 /// 默认使用系统的 app_data_dir；当设置了 `TIDEPAGE_DATA_DIR` 时改为该目录，
@@ -116,16 +122,63 @@ fn cache_control_for(path: &str) -> Option<&'static str> {
     None
 }
 
+/// 主窗口几何的手动恢复（仅 Windows）。
+///
+/// 背景：主窗口以 `.visible(false)` 创建，窗口一直隐藏时 tao 收不到 `WM_NCCALCSIZE`，
+/// 客户区仍是建窗时按原生边框样式算出的旧值；此时 window-state 若自动 `set_size(PhysicalSize)`，
+/// tao 的 Windows `set_inner_size` 会按当前 `window_rect - client_rect` 差值做补偿，把这份
+/// 差值固化进真实客户区 → 每启动一次窗口就向下（向右）长高一点。
+/// 修法与上游 readest PR #6546 一致：先 `SWP_FRAMECHANGED` 强制重算非客户区，再手动恢复几何。
+#[cfg(windows)]
+fn restore_main_window_state(window: &tauri::WebviewWindow) {
+    use ::windows::Win32::Foundation::HWND;
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    // ① 强制重算非客户区。tauri 的 HWND 可能来自另一个 windows 小版本，
+    //    取裸句柄 `hwnd.0` 重新用本 crate 的 HWND 包一层最稳。
+    if let Ok(raw) = window.hwnd() {
+        let hwnd = HWND(raw.0);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SET_WINDOW_POS_FLAGS(
+                    SWP_FRAMECHANGED.0
+                        | SWP_NOMOVE.0
+                        | SWP_NOSIZE.0
+                        | SWP_NOZORDER.0
+                        | SWP_NOACTIVATE.0,
+                ),
+            );
+        }
+    }
+
+    // ② 再恢复几何（不含 VISIBLE，仍由既有「建窗后 140ms show」的线程负责显示）。
+    //    失败时 show 兜底，绝不留下永远不可见的主窗口。
+    if window.restore_state(MAIN_RESTORE_FLAGS).is_err() {
+        let _ = window.show();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // 排除 DECORATIONS 标志：window-state 插件默认会持久化并恢复窗口装饰，
         // 历史保存值为 true 会覆盖 builder 的 .decorations(false) 导致原生标题栏复现。
-        // 仅去掉 DECORATIONS，位置/大小/最大化等其余状态仍正常持久化。
+        // 主窗口跳过自动恢复（隐藏创建会触发 tao 的尺寸补偿漂移），改由
+        // restore_main_window_state 在建窗后手动恢复；插件仍会跟踪 main 并在退出时保存。
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                .with_state_flags(StateFlags::all() & !StateFlags::DECORATIONS)
+                .with_state_flags(WINDOW_STATE_FLAGS)
+                .skip_initial_state("main")
                 .build(),
         )
         .setup(|app| {
@@ -210,7 +263,11 @@ pub fn run() {
                 // 环境会静默失败，产生无法加载页面的"幽灵窗口"
                 let main_window_args = full.clone();
                 wb = wb.additional_browser_args(&full);
-                wb.build()?;
+                let main_window = wb.build()?;
+                // 建窗后立刻重算非客户区并手动恢复几何（防「每启动一次窗口长高一点」），
+                // 仍早于其余 setup 工作，且不改变「140ms 后才 show」的启动观感。
+                #[cfg(windows)]
+                restore_main_window_state(&main_window);
                 db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);
             }
 

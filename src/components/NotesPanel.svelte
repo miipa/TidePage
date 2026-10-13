@@ -2,13 +2,15 @@
      网格/列表/状态栏沿用书库的视觉与几何；列宽交给 CSS 自适应
      （minmax(min(168px,100%),1fr)），任何窗口尺寸下封面都不会越界被窗口边缘裁掉。 -->
 <script lang="ts">
-  import { dateLocale, errText, labelOfId, t } from "../lib/i18n/index.svelte";
+  import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
-  import { toast, ui, requestOpenBook, APP_VERSION } from "../lib/stores.svelte";
+  import { toast, ui, requestOpenBook, APP_VERSION, openPanelWindow } from "../lib/stores.svelte";
   import { onMount } from "svelte";
   import { outDissolve, outSlideR } from "../lib/motion";
   import { listen } from "@tauri-apps/api/event";
   import {
+    IconArrowLeft,
+    IconArrowsSplit2,
     IconLayoutGrid,
     IconLayoutList,
     IconRefresh,
@@ -80,6 +82,12 @@
   function setSort(v: string) {
     sortKey = v === "title" || v === "count" ? v : "recent";
     try { localStorage.setItem("tidepage.notes.sort", sortKey); } catch { /* ignore */ }
+  }
+
+  /** 弹出为独立窗口：成功后关掉内联笔记面板（逻辑照搬原 +page.svelte 的浮动按钮）。 */
+  async function popout() {
+    const ok = await openPanelWindow("notes", ui.currentBookId || 0, t("library.topbar.notes.label"));
+    if (ok) ui.notesOpen = false;
   }
 
   async function openDetail(b: NoteBook) {
@@ -157,6 +165,8 @@
 
 <div class="nl" out:outDissolve>
   <div class="nl-bar">
+    <!-- 返回（原为条尾 ✕）：条首摆放后不再与右上角自绘窗口按钮并排出现两个关闭图标 -->
+    {#if !standalone}<button class="icon" data-testid="nl-close" title={t("common.action.back")} aria-label={t("common.action.back")} onclick={() => (ui.notesOpen = false)}><IconArrowLeft /></button>{/if}
     <span class="nl-title" data-testid="nl-title">{t("notes.title")}</span>
     <span class="nl-count">{shown.length}</span>
     <input class="nl-search" data-testid="nl-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={query} />
@@ -166,8 +176,8 @@
       <option value="count">{t("notes.sort.count")}</option>
     </select>
     <div class="spacer"></div>
+    {#if !standalone}<button class="icon" data-testid="nl-popout" title={t("notes.popoutTip")} aria-label={t("notes.popoutTip")} onclick={popout}><IconArrowsSplit2 /></button>{/if}
     <button class="icon" data-testid="nl-refresh" title={t("common.action.refresh")} aria-label={t("common.action.refresh")} onclick={load}><IconRefresh /></button>
-    {#if !standalone}<button class="icon" data-testid="nl-close" title={labelOfId("bind", "close")} aria-label={labelOfId("bind", "close")} onclick={() => (ui.notesOpen = false)}><IconX /></button>{/if}
   </div>
 
   <div class="nl-body">
@@ -297,7 +307,12 @@
   .nl {
     animation: fr-fade-in var(--dur-fast) var(--ease-premium) both;
     position: fixed;
-    inset: 0;
+    /* 顶栏之下：右上角只归自绘窗口按钮，笔记条自成一行；
+       独立笔记窗由此露出 40px 的 .win-titlebar 拖动区 */
+    top: var(--fr-titlebar-h, 44px);
+    left: 0;
+    right: 0;
+    bottom: 0;
     z-index: var(--z-drawer);
     background: var(--bg);
     color: var(--fg);
@@ -333,7 +348,9 @@
   }
 
   .nl-search {
-    width: 220px;
+    /* 条首新增「返回」、条尾新增「弹出」后，窄窗下让搜索框先收缩，避免整行换行挤压 */
+    flex: 0 1 220px;
+    min-width: 0;
   }
 
   .spacer { flex: 1; }
@@ -536,7 +553,7 @@
 
   .drawer {
     position: fixed;
-    top: 0;
+    top: var(--fr-titlebar-h, 44px);
     right: 0;
     bottom: 0;
     width: min(460px, 92vw);
