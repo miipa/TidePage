@@ -30,6 +30,7 @@ import { reorderByDrop } from "../lib/reorder";
     marginScopeOf,
     type PromptItem,
   } from "../lib/stores.svelte";
+  import { reduceWheelTurn, WHEEL_TURN_IDLE, type WheelTurnState } from "../lib/readerInput";
 
   let { chapterTitle = "", chapterHtml = "", standalone = false, onclose }: {
     chapterTitle?: string;
@@ -61,8 +62,15 @@ import { reorderByDrop } from "../lib/reorder";
   /* ---------- 阅读样式（翻页）相关 ---------- */
   let aiClip: HTMLDivElement | undefined = $state();
   let aiInner: HTMLDivElement | undefined = $state();
+  /** 面板根元素：判断「焦点是否在面板内」（按键接管条件之一）用。 */
+  let panelEl: HTMLDivElement | undefined = $state();
+  /** 指针是否停在面板上（由 .ai-panel 的 pointerenter/leave 维护）。
+   *  非响应式：只在按键事件处理里读，写成 $state 会让相关 effect 白跑。 */
+  let pointerOnPanel = false;
   let aiPage = $state(0);
   let aiPages = $state(1);
+  /** 面板内滚轮翻页的累积状态（判定在 lib/readerInput.reduceWheelTurn）。 */
+  let aiWheelState: WheelTurnState = WHEEL_TURN_IDLE;
   let aiColW = 0;
   let aiStep = 0;
   let measureTimer: ReturnType<typeof setTimeout> | undefined;
@@ -621,14 +629,39 @@ ${readerStyle.extra}
     return !!b && b.length > 0;
   }
 
+  /** 面板是否「持有输入」：焦点在面板内，或指针停在面板上。
+   *  独立窗里没有正文可让，默认持有（保持既有行为）。 */
+  function aiHoldsInput(): boolean {
+    if (standalone) return true;
+    if (pointerOnPanel) return true;
+    const a = document.activeElement;
+    return !!a && !!panelEl && panelEl.contains(a);
+  }
+
+  /**
+   * 阅读抽屉的按键接管（window 捕获阶段，早于 Reader.onKeyDown 的冒泡阶段）。
+   *
+   * 旧实现只要 isReader 就对方向键/PageUp/PageDown 无条件 preventDefault + stopPropagation，
+   * 结果 AI 只有 1 页时 aiFlip 被 clamp 成空操作，而正文那边又被 stopPropagation 挡死 —— 按键
+   * 完全没反应。现在加三重条件，任一不满足就放行给正文：
+   *   ① 抽屉确实展开：本组件只在 Reader 的 aiDrawerOpen 为真（或作为独立窗）时挂载，挂载即成立；
+   *   ② aiPages > 1：AI 确有多页可翻，否则接管只是白吃一次按键；
+   *   ③ 面板持有输入（焦点在面板内 / 指针停在面板上）。
+   * ↑/↓ 不写死进键表：正文侧有 scrollDown/scrollUp 绑定，只有面板确实持有输入时才归 AI 消费。
+   */
   function onReaderKeys(e: KeyboardEvent) {
     if (!isReader) return;
     const tgt = e.target as HTMLElement | null;
     if (tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)) return;
     if (ui.settingsOpen) return;
+    const held = aiHoldsInput();
+    if (!standalone) {
+      if (aiPages <= 1) return; // ② 单页无页可翻 → 放行
+      if (!held) return;        // ③ 焦点与指针都不在面板 → 放行
+    }
     const k = e.key;
-    const nextKeys = ["ArrowRight", "PageDown", "ArrowDown", ...(aiTurnBind("next") ? config.reader.bindings.next : [])];
-    const prevKeys = ["ArrowLeft", "PageUp", "ArrowUp", ...(aiTurnBind("prev") ? config.reader.bindings.prev : [])];
+    const nextKeys = ["ArrowRight", "PageDown", ...(held ? ["ArrowDown"] : []), ...(aiTurnBind("next") ? config.reader.bindings.next : [])];
+    const prevKeys = ["ArrowLeft", "PageUp", ...(held ? ["ArrowUp"] : []), ...(aiTurnBind("prev") ? config.reader.bindings.prev : [])];
     if (nextKeys.includes(k)) {
       e.preventDefault();
       e.stopPropagation();
@@ -649,11 +682,16 @@ ${readerStyle.extra}
 
   function onListWheel(e: WheelEvent) {
     if (!isReader) return;
+    // 单页时不拦截：让滚轮继续冒泡回落到正文（否则停在面板上滚轮两边都没反应）。
     if (aiPages <= 1) return;
     e.preventDefault();
-    const d = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-    if (Math.abs(d) < 2) return;
-    aiFlip(d > 0 ? 1 : -1);
+    // 已消费这次滚轮，必须断掉冒泡：否则正文 onWheel 会再翻一页，AI 与正文同时动。
+    e.stopPropagation();
+    // 与正文共用同一套归一化 + 阈值判定：deltaMode=2 的设备 deltaY=1 也能翻，
+    // 小步进先累积再翻，而不是像旧实现那样 |d|<2 直接吞掉。
+    const r = reduceWheelTurn(aiWheelState, e.deltaMode, e.deltaY, Date.now());
+    aiWheelState = r.state;
+    if (r.turn !== 0) aiFlip(r.turn);
   }
 
   let aiProgDrag = $state(false);
@@ -875,7 +913,17 @@ ${readerStyle.extra}
   </div>
 {/snippet}
 
-<div class="ai-panel" class:standalone class:reader={isReader} style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}>
+<!-- pointerenter/leave 维护 pointerOnPanel：按键接管条件③（指针在面板内）的来源 -->
+<div
+  class="ai-panel"
+  class:standalone
+  class:reader={isReader}
+  role="group"
+  bind:this={panelEl}
+  onpointerenter={() => (pointerOnPanel = true)}
+  onpointerleave={() => (pointerOnPanel = false)}
+  style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}
+>
   {#if isReader}
     {@render aiHead()}
     {@render promptBar(true)}
