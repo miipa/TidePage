@@ -5,7 +5,8 @@ import type { BookRow } from "./types";
 const base: BookRow = {
   id: 1, path: "/b", title: "t", author: "a", format: "epub",
   size: 0, mtime: 0, added_at: 0, cover_path: null, meta_done: 0,
-  last_read: 0, cover_ver: 0, read_pct: 0, read_state: 0, last_opened: 0,
+  last_read: 0, total_chars: 0, total_text_chars: 0,
+  cover_ver: 0, read_pct: 0, read_state: 0, last_opened: 0,
 };
 const row = (o: Partial<BookRow>): BookRow => ({ ...base, ...o });
 

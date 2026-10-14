@@ -14,6 +14,28 @@ pub struct CachedEpub {
     pub data: Arc<Vec<u8>>,
     /// zip 条目名 → 索引（含 basename 兜底），解析一次复用，避免每章重跑 build_ci。
     pub ci: crate::epub::CiMap,
+    /// 解析时该文件的指纹（大小, mtime）。命中缓存前必须与磁盘现读指纹一致，
+    /// 否则「同一路径的文件被就地替换」后正文与目录会一直是旧文件的内容。
+    pub stamp: Option<(i64, i64)>,
+}
+
+/// TXT/MOBI 解析缓存条目。
+/// 只有 rules_ver（编码/切分规则）发现不了「同一路径的文件被替换」，必须再比文件指纹。
+/// Clone：读缓存时先克隆一份出锁，再做指纹比对（避免持锁期间读盘/解析）。
+#[derive(Clone)]
+pub struct CachedText {
+    pub ver: u64,
+    pub stamp: Option<(i64, i64)>,
+    pub doc: Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>,
+}
+
+/// EPUB 字数统计缓存条目：文件指纹 + 每章字数 + 全书 total/pure。
+/// 指纹不匹配就整条作废，避免「清了 DB 又被旧缓存回填回去」。
+pub struct EpubStats {
+    pub stamp: Option<(i64, i64)>,
+    pub per_chapter: Vec<i64>,
+    pub total: i64,
+    pub pure: i64,
 }
 
 pub struct AppState {
@@ -22,8 +44,12 @@ pub struct AppState {
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub last_fs_event: AtomicU64,
     pub rules_ver: AtomicU64,
-    pub txt_cache: Mutex<HashMap<i64, (u64, Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>)>>,
+    pub txt_cache: Mutex<HashMap<i64, CachedText>>,
     pub epub_cache: Mutex<HashMap<i64, Arc<CachedEpub>>>,
+    /// EPUB 字数统计缓存：key = book_id → EpubStats（带文件指纹）。
+    /// 「全书总页数」（book_char_counts）与书详情/本书统计（get_book_word_count）共用同一份，
+    /// 避免同一本书被完整解析两次；容量很小（4），因为一条就够几 MB 的逐章数组。
+    pub epub_stats_cache: Mutex<HashMap<i64, Arc<EpubStats>>>,
     /// 已渲染章节 LRU：key = (book_id, chapter_index) → ChapterData。
     /// 避免每次 get_chapter 重开 zip/重跑正则/重复 base64 内联图片；随书切换/规则变化清理。
     pub chapter_cache: Mutex<ChapterCache>,
@@ -111,12 +137,51 @@ pub fn ext_of(path: &str) -> Option<String> {
 }
 
 fn file_mtime(p: &Path) -> i64 {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    file_stamp_of(p).map(|s| s.1).unwrap_or(0)
+}
+
+/// 文件指纹：(大小, mtime 毫秒)。读缓存前用它判断「同一路径的文件是否被就地替换」——
+/// 只按 book_id 命中缓存，会让正文、目录、字数全部停在旧文件上（id 由路径派生，替换后不变）。
+/// 取不到（不存在/无权限）返回 None：调用方一律按「不可复用」处理，宁可重算。
+fn file_stamp_of(p: &Path) -> Option<(i64, i64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((m.len() as i64, mtime))
+}
+
+fn file_stamp(path: &str) -> Option<(i64, i64)> {
+    file_stamp_of(Path::new(path))
+}
+
+/// 缓存里的文件指纹是否仍然可用：两侧都得有值且完全一致。
+/// 缓存侧缺失 = 当初就没拿到指纹（这种条目不该入缓存）；当前侧缺失 = 现在读不到文件。
+/// 两种情况都不复用，绝不把「没有指纹」当成永远有效。
+fn stamp_matches(cached: Option<(i64, i64)>, current: Option<(i64, i64)>) -> bool {
+    matches!((cached, current), (Some(a), Some(b)) if a == b)
+}
+
+/// DB 里缓存的字数是否可用：必须有值，且行上的 size/mtime 与磁盘当前指纹一致。
+/// 抽成纯函数便于单测（不碰文件系统）。
+/// 为什么 DB 短路也要校验：扫描（upsert_book 更新 size/mtime）不一定在用户打开书详情之前跑到，
+/// 只靠「扫描时清列」会漏掉这一段窗口。
+fn db_chars_usable(
+    total_chars: i64,
+    book_size: i64,
+    book_mtime: i64,
+    disk: Option<(i64, i64)>,
+) -> bool {
+    if total_chars <= 0 {
+        return false;
+    }
+    match disk {
+        Some((size, mtime)) => size == book_size && mtime == book_mtime,
+        None => false,
+    }
 }
 
 fn quick_title(path: &str) -> String {
@@ -959,16 +1024,60 @@ where
     m.insert(key, value);
 }
 
+/// EPUB 字数统计（每章字数 + 全书 total/pure）：先查共享缓存，未命中则读盘并完整解析一次，随后回填 DB。
+///
+/// 为什么共享缓存：book_char_counts（全书总页数）与 get_book_word_count（书详情/本书统计）
+/// 要的是同一份统计，各解析一次就是把整本书解析两遍（数千章是秒级）。
+/// 为什么回填 DB：books.total_chars > 0 是这两个命令的短路条件，回填后同一本书不再重算。
+///
+/// 本函数是阻塞的（读盘 + rayon 逐章统计），**只能在 spawn_blocking 里调用**。
+fn epub_stats_for(state: &Arc<AppState>, book_id: i64, path: &str) -> Result<Arc<EpubStats>, String> {
+    let stamp = file_stamp(path);
+    let hit = state.epub_stats_cache.lock().unwrap().get(&book_id).cloned();
+    if let Some(h) = hit {
+        if stamp_matches(h.stamp, stamp) {
+            return Ok(h);
+        }
+        // 文件换过了：旧条目立刻移除，避免它被其它入口（book_char_counts / 书详情）再读走。
+        state.epub_stats_cache.lock().unwrap().remove(&book_id);
+    }
+    let data = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let (per_chapter, total, pure) = crate::epub::epub_word_stats(&data)?;
+    let stats = Arc::new(EpubStats { stamp, per_chapter, total, pure });
+    // 指纹取不到就不入缓存：否则这条「无法校验」的条目会一直命中。
+    if stamp.is_some() {
+        push_cache(&state.epub_stats_cache, book_id, stats.clone(), 4);
+    }
+    backfill_book_chars(state, book_id, stats.total, stats.pure);
+    Ok(stats)
+}
+
+/// 把统计出来的字数回填到 books 的两列（尽力而为：失败只记日志，不影响本次返回）。
+fn backfill_book_chars(state: &Arc<AppState>, book_id: i64, total: i64, pure: i64) {
+    let wrote = {
+        let conn = state.db.0.lock().unwrap();
+        db::set_book_chars(&conn, book_id, total, pure)
+    };
+    if let Err(e) = wrote {
+        eprintln!("[chars] backfill failed book={book_id}: {e}");
+    }
+}
+
 pub fn load_txt(
     state: &AppState,
     path: &str,
     book_id: i64,
 ) -> Result<Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>, String> {
     let ver = state.rules_ver.load(Ordering::Relaxed);
-    if let Some(cached) = state.txt_cache.lock().unwrap().get(&book_id) {
-        if cached.0 == ver {
-            return Ok(cached.1.clone());
+    // 命中必须同时满足「规则版本一致」与「文件指纹一致」：只比版本的话，
+    // 同一路径的文件被就地替换后正文会一直是旧文件的。
+    let stamp = file_stamp(path);
+    let hit = state.txt_cache.lock().unwrap().get(&book_id).cloned();
+    if let Some(c) = hit {
+        if c.ver == ver && stamp_matches(c.stamp, stamp) {
+            return Ok(c.doc.clone());
         }
+        state.txt_cache.lock().unwrap().remove(&book_id);
     }
     let pattern = get_rules(state);
     // 手动兜底:正文字符编码设置(与 MOBI 共用 `mobi.encoding` 键)也作用于 TXT。
@@ -983,13 +1092,26 @@ pub fn load_txt(
     };
     let doc = txt::decode_and_split(path, Some(&pattern), forced.as_deref())?;
     let result = Arc::new((doc.text, doc.ranges, doc.toc));
-    push_cache(&state.txt_cache, book_id, (ver, result.clone()), 3);
+    if stamp.is_some() {
+        push_cache(
+            &state.txt_cache,
+            book_id,
+            CachedText { ver, stamp, doc: result.clone() },
+            3,
+        );
+    }
     Ok(result)
 }
 
 pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<CachedEpub>, String> {
-    if let Some(c) = state.epub_cache.lock().unwrap().get(&book_id) {
-        return Ok(c.clone());
+    // 指纹校验：文件被就地替换后必须重解析（否则正文/toc/spine 全是旧文件的）。
+    let stamp = file_stamp(path);
+    let hit = state.epub_cache.lock().unwrap().get(&book_id).cloned();
+    if let Some(c) = hit {
+        if stamp_matches(c.stamp, stamp) {
+            return Ok(c.clone());
+        }
+        state.epub_cache.lock().unwrap().remove(&book_id);
     }
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -1005,8 +1127,11 @@ pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<Cache
         doc,
         data: Arc::new(data),
         ci,
+        stamp,
     });
-    push_cache(&state.epub_cache, book_id, cached.clone(), 3);
+    if stamp.is_some() {
+        push_cache(&state.epub_cache, book_id, cached.clone(), 3);
+    }
     Ok(cached)
 }
 
@@ -1693,12 +1818,19 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         // 拆包取所有权，避免再 clone 一份可能很大的 html（push_cache 本来就要一份）。
         let crate::mobi::MobiDoc { html, toc, parts, warning, .. } = doc;
         let ver = st.rules_ver.load(Ordering::Relaxed);
-        push_cache(
-            &st.txt_cache,
-            id,
-            (ver, Arc::new((html.clone(), parts.clone(), toc.clone()))),
-            3,
-        );
+        let stamp = file_stamp(&book.path);
+        if stamp.is_some() {
+            push_cache(
+                &st.txt_cache,
+                id,
+                CachedText {
+                    ver,
+                    stamp,
+                    doc: Arc::new((html.clone(), parts.clone(), toc.clone())),
+                },
+                3,
+            );
+        }
         mobi_probe = Some((html, parts, toc.clone()));
         (toc, Vec::new(), warning)
     };
@@ -1855,9 +1987,13 @@ pub async fn get_chapter(
 
     let is_mobi = is_mobi_ext(&ext);
     let ver = st.rules_ver.load(Ordering::Relaxed);
+    // 与 load_txt 同一套判据：规则版本 + 文件指纹都对上才复用。
+    let stamp = file_stamp(&book.path);
     let cached_hit = {
         let m = st.txt_cache.lock().unwrap();
-        m.get(&book_id).filter(|c| c.0 == ver).map(|c| c.1.clone())
+        m.get(&book_id)
+            .filter(|c| c.ver == ver && stamp_matches(c.stamp, stamp))
+            .map(|c| c.doc.clone())
     };
     let (content, ranges, toc) = match cached_hit {
         Some(c) => c.as_ref().clone(),
@@ -1877,7 +2013,15 @@ pub async fn get_chapter(
             )
             .await
             .map_err(|e| e.to_string())??;
-            push_cache(&st.txt_cache, book_id, (ver, entry.clone()), 3);
+            // 指纹取不到就不入缓存：无法校验的条目会一直命中。
+            if stamp.is_some() {
+                push_cache(
+                    &st.txt_cache,
+                    book_id,
+                    CachedText { ver, stamp, doc: entry.clone() },
+                    3,
+                );
+            }
             entry.as_ref().clone()
         }
     };
@@ -4198,38 +4342,81 @@ pub async fn get_book_word_count(
         let conn = state.db.0.lock().unwrap();
         db::get_book(&conn, book_id).ok_or("书籍不存在")?
     };
-    if book.total_chars > 0 {
+    // DB 短路：字数已回填过**且文件没被换过**才直接用。
+    // 光看 total_chars > 0 不够：同一路径的文件被就地替换后 id 不变、扫描也不一定跑过，
+    // 只按值短路会把旧文件的字数一直报下去。
+    let disk = file_stamp(&book.path);
+    if db_chars_usable(book.total_chars, book.size, book.mtime, disk) {
         return Ok(WordCount {
             total: book.total_chars,
             pure: book.total_text_chars,
         });
     }
-    let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
-    let is_mobi = is_mobi_ext(&ext);
-    if ext == "epub" {
-        let cached = load_epub(&st, &book.path, book_id)?;
-        return Ok(WordCount {
-            total: cached.doc.total_chars,
-            pure: cached.doc.total_text_chars,
-        });
-    }
-    let (content, _r, _t) = if is_mobi {
-        let doc = mobi_doc_for(&st, &book.path, book_id)?;
-        (doc.html, Vec::new(), Vec::new())
-    } else {
-        load_txt(&st, &book.path, book_id)?.as_ref().clone()
-    };
-    let text = if is_mobi {
-        crate::epub::html_to_text(&content)
-    } else {
-        content
-    };
-    let total = text.chars().count() as i64;
-    let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-    Ok(WordCount { total, pure })
+    let path = book.path.clone();
+    let ext = ext_of(&path).unwrap_or_default();
+    // 三条现算分支全部放进阻塞线程池：EPUB 是完整解析（rayon 逐章文本统计，数千章可达数秒），
+    // MOBI/TXT 也要读盘 + 全量解码。旧实现在 async fn 里直接同步调用 load_epub / mobi_doc_for /
+    // load_txt —— 会占住 async 运行时线程，把这段时间内的其它 IPC 一并拖住
+    // （open_book 对同类调用有明确注释要求放阻塞线程池）。
+    tauri::async_runtime::spawn_blocking(move || -> Result<WordCount, String> {
+        if ext == "epub" {
+            // 与 book_char_counts 同源：命中同一份缓存时不会再解析第二遍。
+            let stats = epub_stats_for(&st, book_id, &path)?;
+            return Ok(WordCount {
+                total: stats.total,
+                pure: stats.pure,
+            });
+        }
+        let is_mobi = is_mobi_ext(&ext);
+        let (content, _r, _t) = if is_mobi {
+            let doc = mobi_doc_for(&st, &path, book_id)?;
+            (doc.html, Vec::new(), Vec::new())
+        } else {
+            load_txt(&st, &path, book_id)?.as_ref().clone()
+        };
+        let text = if is_mobi {
+            crate::epub::html_to_text(&content)
+        } else {
+            content
+        };
+        let total = text.chars().count() as i64;
+        let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+        // 同样回填：下一次调用直接走 DB 短路。
+        backfill_book_chars(&st, book_id, total, pure);
+        Ok(WordCount { total, pure })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
+
+/// 全书每章字数（EPUB）：底栏「全书总页数」要用真实字数才能估算。
+/// 打开书籍走的是快速解析（不做全书逐章统计，toc.chars 恒为 0），故按需补算一次；
+/// 非 EPUB 返回空 Vec（前端据此放弃本次补算，不会在轮询里反复调用）。
+///
+/// 与 get_book_word_count 共用 epub_stats_cache：先跑过书详情/本书统计的书，
+/// 这里直接命中缓存，不会再解析第二遍。
+#[tauri::command]
+pub async fn book_char_counts(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+) -> Result<Vec<i64>, String> {
+    let book = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?
+    };
+    if ext_of(&book.path).unwrap_or_default() != "epub" {
+        return Ok(Vec::new());
+    }
+    let st = state.inner().clone();
+    let path = book.path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        epub_stats_for(&st, book_id, &path).map(|s| s.per_chapter.clone())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[cfg(test)]
 mod cover_container_tests {
@@ -5008,6 +5195,61 @@ mod epub_meta_tests {
         let doc = crate::epub::parse(&data).unwrap();
         assert_eq!(doc.title, "新标题 & <tag>");
         assert_eq!(doc.author, "新作者");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cache_stamp_tests {
+    //! 任务六：读缓存 / DB 短路之前的文件指纹校验。
+    //! 同一路径的文件被就地替换后 book_id 不变，只按 id 命中缓存（或只看 DB 有值）
+    //! 会让正文、目录、字数全部停在旧文件上。这几个纯函数就是那道闸门。
+    use super::*;
+
+    #[test]
+    fn stamp_matches_requires_both_sides_equal() {
+        assert!(stamp_matches(Some((10, 20)), Some((10, 20))));
+        assert!(!stamp_matches(Some((10, 20)), Some((11, 20))), "大小变了");
+        assert!(!stamp_matches(Some((10, 20)), Some((10, 21))), "mtime 变了");
+        assert!(!stamp_matches(Some((10, 20)), None), "当前取不到指纹");
+        assert!(!stamp_matches(None, Some((10, 20))), "缓存条目没有指纹");
+        assert!(!stamp_matches(None, None));
+    }
+
+    #[test]
+    fn db_chars_usable_needs_value_and_matching_stamp() {
+        assert!(db_chars_usable(100, 10, 20, Some((10, 20))));
+        assert!(!db_chars_usable(0, 10, 20, Some((10, 20))), "没有值");
+        assert!(!db_chars_usable(-5, 10, 20, Some((10, 20))), "负值视为无效");
+        assert!(!db_chars_usable(100, 10, 20, Some((11, 20))), "size 与磁盘不一致");
+        assert!(!db_chars_usable(100, 10, 20, Some((10, 21))), "mtime 与磁盘不一致");
+        assert!(!db_chars_usable(100, 10, 20, None), "文件读不到时不拿旧值冒充");
+    }
+
+    #[test]
+    fn file_stamp_reflects_size_and_missing_path() {
+        let dir = std::env::temp_dir().join(format!("fr_stamp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, b"abc").unwrap();
+        let s1 = file_stamp(p.to_str().unwrap()).expect("正常文件应有指纹");
+        assert_eq!(s1.0, 3, "指纹第一项是文件大小");
+
+        let missing = dir.join("nope.txt");
+        assert!(
+            file_stamp(missing.to_str().unwrap()).is_none(),
+            "不存在的路径必须返回 None（调用方按不可复用处理）"
+        );
+
+        // 就地替换：内容长度变化必然改变指纹
+        std::fs::write(&p, b"abcdefgh").unwrap();
+        let s2 = file_stamp(p.to_str().unwrap()).unwrap();
+        assert_eq!(s2.0, 8);
+        assert_ne!(s1, s2, "内容变化后指纹必须不同");
+
+        // file_mtime 与 file_stamp 同源：mtime 部分一致
+        assert_eq!(file_mtime(&p), s2.1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -38,14 +38,19 @@
 import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
+  import { clampMarginH } from "../lib/readLayout";
   import { SmoothScroller } from "../lib/smoothScroll";
   import {
     classifyPointerUp,
+    formControlOf,
     isWheelLocal,
     mangaWheelDelta,
     normalizeWheelDelta,
+    pushVerdict,
+    recentVerdicts,
     reduceWheelTurn,
     scrollKeyRoute,
+    setVerdictSink,
     shouldDedupeLoad,
     WHEEL_TURN_IDLE,
     type WheelAxis,
@@ -894,6 +899,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       prefetchQueue = [];
       prefetchActive = 0;
       loadGeneration++;
+      // 换书复位加载态：上一本的请求可能仍在途，残留的 loadingChapter 会让首屏骨架屏不消失。
+      loadingChapter = false;
+      loadingIdx = -1;
+      pendingEdge = null;
+      clearTimeout(edgeFlushTimer);
       mangaWindow = [];
       lastMangaAnchorTop = -1;
       // 换书：重置漫画模式/布局追踪，避免切书时误触发多余的窗口重建（首章加载由 applyChapter 负责）。
@@ -905,6 +915,29 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       book = await api.openBook(bookId);
       // 全书总字数只在这里算一次（见 tocCharsTotal 处的说明）
       tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
+      // EPUB 快速解析不做全书逐章统计（toc.chars 全 0）→ 「全书总页数」估不出来，按需补算一次。
+      // 只在翻页模式、且总字数确实为 0 时调用：滚动/漫画模式用不到页数，几千章的完整解析可达数秒。
+      if (tocCharsTotal === 0 && !scrollLayout() && !mangaHorizontal()) {
+        const wantId = book.book.id;
+        api
+          .bookCharCounts(wantId)
+          .then((counts) => {
+            // 回调可能晚于换书：书已换或目录条数对不上就整体丢弃。
+            if (!book || book.book.id !== wantId) return;
+            if (!counts.length || counts.length !== book.toc.length) return;
+            // 赋新数组而非就地改元素：绕开 Svelte 5 深层代理的依赖追踪疑虑。
+            book.toc = book.toc.map((t, i) => ({ ...t, chars: counts[i] || 0 }));
+            tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
+            // 当前章的 ChapterData 也要补上（EPUB 快速解析给的是 0）。
+            if (chapter && chapterNum >= 0 && chapterNum < counts.length) {
+              chapter.chars = counts[chapterNum] || 0;
+            }
+          })
+          .catch((err) => {
+            // 静默失败会让「全书总页数不显示」无从定位；DEV 下留一行痕迹，不影响用户。
+            if (import.meta.env.DEV) console.warn("[bookChars] failed", err);
+          });
+      }
       ui.currentBookId = book.book.id;
       if (book.encoding_warning) console.log(book.encoding_warning);
       // 漫画书首次引导：全局只提示一次（写入 config.reader.mangaGuideDone），
@@ -986,6 +1019,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     book = null;
     tocCharsTotal = 0;
     chapter = null;
+    // 关书复位加载态与跨章意图：否则下一本书的首段可能被判成「同章在途」而复用在途请求。
+    loadingChapter = false;
+    loadingIdx = -1;
+    pendingEdge = null;
+    clearTimeout(edgeFlushTimer);
     mangaWindow = [];
     ui.currentBookId = 0;
   }
@@ -1129,7 +1167,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 旧实现每次调用都 ++loadGeneration，连按 N 次就让前 N-1 次在途结果全部作废，
     // 表现为「按 N 下只前进 1 章、且每按一下都重新发一次请求」。
     // 带 entry / restore 的请求是显式定位，一律放行（见 shouldDedupeLoad）。
-    if (shouldDedupeLoad(loadingChapter, loadingIdx, idx, { restore, entry })) return;
+    if (shouldDedupeLoad(loadingChapter, loadingIdx, idx, { restore, entry })) {
+      pushVerdict("swallowed:loadingDedupe");
+      return;
+    }
     // 通过去重检查后立刻丢弃陈旧的跨章意图：非 edge 跳章不能补触发上一轮滚动留下的意图。
     if (!fromEdge) pendingEdge = null;
     if (ttsState.playing) stopTts(); // 手动切换章节时停止朗读（自动续读在 onTtsChapterEnd 中处理）
@@ -1488,6 +1529,13 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (p) handleScrollEdge(p.dir, p.carry, true);
   }
 
+  /** 节流窗口的补触发定时器：被 320ms 节流压下的意图在窗口过后补上一次，而不是丢弃。 */
+  let edgeFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleEdgeFlush(delay: number) {
+    clearTimeout(edgeFlushTimer);
+    edgeFlushTimer = setTimeout(flushPendingEdge, Math.max(0, delay) + 10);
+  }
+
   /** 章节落地后的统一收尾。只有 edge 触发的加载才补触发跨章意图；
    *  目录/书签/搜索/朗读等非 edge 跳章一律丢弃——加载期间新产生的意图也是相对旧位置的，
    *  补触发只会「跳完目标章又自动跳到下一章」。 */
@@ -1498,6 +1546,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function measureScroll() {
     if (!contentEl || !scrollArea) return;
+    // 滚动模式的左右内缩同样先夹取（.col-scroll 是单列流，duo 不参与）。
+    syncMhEff(scrollArea.clientWidth, false);
     // 滚动模式采用原生滚动容器（.scroll-area 程序化 scrollTop）：正文由浏览器分块绘制，
     // 不再把超长正文整体提升为合成层用 transform 平移，从根本上避免超大图层撕裂/空白。
     maxScroll = Math.max(0, scrollArea.scrollHeight - scrollArea.clientHeight);
@@ -1651,10 +1701,18 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 加载中丢弃的意图必须留痕（补触发用），否则「滚到底」的第一下会被无声吞掉。
     if (loadingChapter) {
       pendingEdge = { dir, carry };
+      pushVerdict("swallowed:loadingDedupe");
       return;
     }
     const now = Date.now();
-    if (!skipThrottle && now - lastEdgeAt < 320) return;
+    if (!skipThrottle && now - lastEdgeAt < 320) {
+      // 节流窗口内不丢弃：缓存意图，窗口一过立刻补触发。
+      // 旧实现直接 return，映射设备连按/连滚时几拍里只有一拍生效（看着像「有时翻不动」）。
+      pendingEdge = { dir, carry };
+      pushVerdict("swallowed:edgeThrottle");
+      scheduleEdgeFlush(320 - (now - lastEdgeAt));
+      return;
+    }
     if (dir > 0) {
       if (chapterNum >= book.toc.length - 1) return;
       lastEdgeAt = now;
@@ -1669,6 +1727,12 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /* ================= page mode ================= */
   let screenCols = 1;
+  /** 夹取后的有效左右内缩（px）；null = 尚未测量，CSS 回落到 --rdr-mh。
+   *  与 measurePages() 的排版宽度同源：.clip / .col-scroll 都读它，杜绝「JS 按 A 宽排版、
+   *  CSS 按 B 宽裁切」。只在数值真变化时赋值，避免 scheduleRelayout 空转。 */
+  let mhEff = $state<number | null>(null);
+  /** 最近一次排版实际占用的宽度（measurePages 的 effAvail），供 DEV layout() 取证。 */
+  let effAvail = 0;
   /** 待恢复的阅读比例：页数在首次测量后仍可能变化，用它把目标页重新落位。 */
   let pendingPageRatio: number | null = null;
 
@@ -1690,9 +1754,56 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     return isMangaMode() ? config.reader.manga.marginV : config.reader.margins[marginScopeOf(config.reader)].v;
   }
 
+  /** 把有效左右内缩同步给 CSS（--rdr-mh-eff），并返回本次应使用的值。
+   *  滚动模式按单列口径算（.col-scroll 是单列流）。0.25px 内视为同一值：避免窗口缩放时的
+   *  小数抖动反复写 $state 触发重渲染。 */
+  function syncMhEff(viewportW: number, duo: boolean): number {
+    const next = clampMarginH({
+      contentW: viewportW,
+      marginH: effMarginH(),
+      duo,
+      colGap: config.reader.colGap,
+      fontSize: effFontSize(),
+    });
+    if (mhEff === null || Math.abs(mhEff - next) > 0.25) mhEff = next;
+    return next;
+  }
+
+  /** DEV 排版几何快照：翻页模式 clipW 必须 ≥ pageWrapW、滚动正文 scrollWidth ≤ clientWidth。 */
+  function layoutSnapshot() {
+    const clip = contentEl?.querySelector(".clip") as HTMLElement | null;
+    const colScroll = contentEl?.querySelector(".col-scroll") as HTMLElement | null;
+    const cs = colScroll ? getComputedStyle(colScroll) : null;
+    const cc = contentRoot();
+    const round = (v: number) => Math.round(v * 100) / 100;
+    return {
+      contentW: contentEl?.clientWidth ?? 0,
+      mh: effMarginH(),
+      mhEff: mhEff ?? null,
+      clipW: clip ? round(clip.getBoundingClientRect().width) : 0,
+      pageWrapW: pageWrap ? round(pageWrap.getBoundingClientRect().width) : 0,
+      effAvail: round(effAvail),
+      colW,
+      screenCols,
+      colScrollPadding: cs ? `${cs.paddingLeft}/${cs.paddingRight}` : "",
+      contentScrollW: cc?.scrollWidth ?? 0,
+      contentClientW: cc?.clientWidth ?? 0,
+    };
+  }
+
+  /** DEV：几何值变化时打一条 [layout]（release 构建随 DEV 块摇掉）。 */
+  let lastLayoutKey = "";
+  function logLayout() {
+    if (!import.meta.env.DEV) return;
+    const s = layoutSnapshot();
+    const key = JSON.stringify(s);
+    if (key === lastLayoutKey) return;
+    lastLayoutKey = key;
+    console.log("[layout]", s);
+  }
+
   function measurePages() {
     if (!contentEl || !pageWrap || !chapter) return;
-    const mh = effMarginH();
     const mv = effMarginV();
     const W = contentEl.clientWidth;
     const H = contentEl.clientHeight;
@@ -1703,13 +1814,15 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       measureRaf = requestAnimationFrame(() => measurePages());
       return;
     }
-    // 可用宽度不足时兜底（窄窗口 + 大边距）：保证列宽为正。
-    const avail = Math.max(160, W - mh * 2);
-    const vh = Math.max(200, H - mv * 2);
     gap = config.reader.colGap;
     screenCols = config.reader.duo ? 2 : 1;
-    colW = Math.max(40, Math.floor((avail - (screenCols - 1) * gap) / screenCols));
-    const effAvail = screenCols * colW + (screenCols - 1) * gap;
+    // 先夹取有效左右内缩：窄窗口 + 大边距时收窄边距，而不是让 .clip 比排版窄（正文被裁成竖排）。
+    // JS 排版宽度与 CSS 可见盒（.clip / .col-scroll）都取这一个值，几何值只有一个来源。
+    const mhUse = syncMhEff(W, config.reader.duo);
+    const avail = Math.max(1, W - mhUse * 2);
+    const vh = Math.max(200, H - mv * 2);
+    colW = Math.max(1, Math.floor((avail - (screenCols - 1) * gap) / screenCols));
+    effAvail = screenCols * colW + (screenCols - 1) * gap;
     stepPx = screenCols * (colW + gap);
     // 图片最大高度=单列可视高，保证任何图片都不超过一页/一列（自适应屏幕）。
     imgMaxH = vh;
@@ -1731,7 +1844,19 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     });
   }
 
-/** 页面偏移统一走 transform 合成（GPU 合成层），animate=true 时不会带动页面滚动 */
+  // DEV：几何值落定、DOM 更新之后再打 [layout]，把「排版宽度 vs 可见盒」一次看全。
+  $effect(() => {
+    if (!import.meta.env.DEV) return;
+    void mhEff;
+    void screenCols;
+    void colW;
+    void effAvail;
+    void chapter;
+    void scrollLayout();
+    tick().then(() => logLayout());
+  });
+
+  /** 页面偏移统一走 transform 合成（GPU 合成层），animate=true 时不会带动页面滚动 */
   let lastPageX = Number.NaN;
   function applyPage(animate = false) {
     if (!pageWrap) return;
@@ -2174,10 +2299,12 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     for (let i = lo; i <= hi; i++) next.push(items.get(i) ?? mangaItem(i, ""));
     mangaWindow = next;
     chapter = objs.get(idx) ?? chapter;
+    await tick();
+    // 只有最后一次加载才允许清 loading 标记：更晚的加载（gen 更新）接手时若被这里清掉，
+    // 去重/节流就会误判成空闲 —— 漫画路径原先在 gen 校验之前清，属于同一类竞态。
+    if (gen !== loadGeneration) return;
     loadingChapter = false;
     loadingIdx = -1; // 与 loadingChapter 成对收尾，避免去重状态残留
-    await tick();
-    if (gen !== loadGeneration) return;
     if (scrollLayout()) {
       measureFlow();
       // 定位到目标章块的顶部，再按章内比例下移：保证恢复/跳转落回「该章」而非窗口比例的任意位置。
@@ -2863,25 +2990,59 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       return;
     }
     const tgt = e.target as HTMLElement | null;
-    if (tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)) return;
+    // 焦点在表单控件（INPUT/TEXTAREA/SELECT/contenteditable）上时方向键归控件自己。
+    // 新增两条：① SELECT 原先没纳入，焦点在下拉上按 → 会同时改选项并冒泡翻页；
+    // ② 只有控件**可见**才早退——display:none / visibility:hidden 的输入框看不见，
+    //    早退只会让按键无声消失（外接设备场景下表现就是「按不动」）。
+    const formDev = formControlOf(tgt);
+    if (formDev === "visible") {
+      pushVerdict("swallowed:formControl(visible)", e);
+      return;
+    }
+    if (formDev === "hidden") pushVerdict("swallowed:formControl(hidden)", e);
 
     // 任何弹窗/抽屉/确认框打开时都不响应阅读快捷键（Esc 关闭弹窗由 +page 全局处理）
-    if (ui.settingsOpen || ui.searchOpen || ui.statsOpen || ui.webdavOpen || convertState.open || confirmBox.active) return;
+    const modal = modalOpenId();
+    if (modal) {
+      pushVerdict(`swallowed:modal(${modal})`, e);
+      return;
+    }
     // 图库打开时，按键只由 ImageViewer 处理（否则 Esc 会同时触发 Reader 的“返回书库”）
-    if (viewerIndex !== null) return;
+    if (viewerIndex !== null) {
+      pushVerdict("swallowed:modal(imageViewer)", e);
+      return;
+    }
 
     const combo = comboOf(e);
     const b = config.reader.bindings;
     for (const def of BIND_DEFS) {
       const keys = b[def.id];
       if (keys && keys.some((k) => bindKeyMatches(k, combo))) {
+        pushVerdict(`binding:${def.id}`, e);
         runAction(def.id, e);
         return;
       }
     }
+    // 无任何绑定命中：把 combo 一起记下——映射设备残留 Shift/Ctrl/Alt 时 combo 会是
+    // "Shift+ArrowRight"，与绑定的 "ArrowRight" 不匹配而静默失效，一眼可辨。
+    pushVerdict(`noMatch(${combo})`, e);
+  }
+
+  /** 当前打开着的模态/浮层标识（早退取证用；判定顺序与旧实现完全一致，只是加了留痕）。 */
+  function modalOpenId(): string {
+    if (ui.settingsOpen) return "settingsOpen";
+    if (ui.searchOpen) return "searchOpen";
+    if (ui.statsOpen) return "statsOpen";
+    if (ui.webdavOpen) return "webdavOpen";
+    if (convertState.open) return "convert";
+    if (confirmBox.active) return "confirm";
+    return "";
   }
 
   let ptr: { x: number; y: number; id: number } | null = null;
+
+  /** 最近一次点击命中的阅读热区（DEV reader() 取证用）。只记录，不参与 zones 判定与执行。 */
+  let lastZone: ZoneKey | null = null;
 
   function onContentPointerDown(e: PointerEvent) {
     if (mangaHorizontal()) return; // 漫画双页：手势由横向视口单独处理
@@ -2970,6 +3131,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     else if (x >= 0.5 && y < 0.5) zone = "tr";
     else if (x < 0.5) zone = "bl";
     else zone = "br";
+    lastZone = zone; // 只做取证记录，zones 判定与执行完全不变
     const action = config.reader.zones[zone];
     if (!action || action === "none") return;
     runAction(action);
@@ -3027,21 +3189,37 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   /** DEV 输入日志条目（__frDebug.inputLog）：取证用，release 构建随 DEV 块一起被摇掉。
-   *  记 mouseup 而非 pointerup：侧键（button 3/4）不一定有 pointer 系事件，而 mouse 系一定有，
-   *  且我们的侧键翻页本就挂在 mouseup 上。各事件类型不共有的字段用 -1/false 占位，避免类型断言。 */
+   *  覆盖 pointer/mouse/click/auxclick/keydown/wheel 八类：映射设备可能只发其中一部分
+   *  （例如只有 click、没有 pointer 系），少记一类就分不清「事件没进来」与「进来被吞了」。
+   *  各事件类型不共有的字段用 -1/0/false 占位，避免类型断言。 */
+  type InputLogType =
+    | "pointerdown"
+    | "pointerup"
+    | "mousedown"
+    | "mouseup"
+    | "click"
+    | "auxclick"
+    | "keydown"
+    | "wheel";
   type InputLogRec = {
-    type: "wheel" | "keydown" | "mouseup";
+    type: InputLogType;
     key: string;
     code: string;
     deltaMode: number;
     deltaX: number;
     deltaY: number;
     button: number;
+    buttons: number;
+    pointerId: number;
     ctrlKey: boolean;
     shiftKey: boolean;
     altKey: boolean;
     repeat: boolean;
     target: string;
+    /** 最终是否被某处 preventDefault（微任务里回读，捕获阶段读到的恒为 false）。 */
+    defaultPrevented: boolean;
+    /** 该事件最终判定落到哪（由 pushVerdict 回填；空串=当次没产生判定）。 */
+    verdict: string;
     t: number;
   };
   /** DEV 输入日志监听的注销函数；release 构建下恒为 undefined。 */
@@ -3050,46 +3228,116 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   onMount(() => {
     // 开发期调试钩子：便于自动化验证搜索框/笔记交互（仅 DEV 构建，release 不含）。
     if (import.meta.env.DEV) {
-      // 输入取证：映射设备到底发 wheel 还是 keydown、deltaMode/deltaX 各是多少，
-      // 用户自己也说不清，这里环形留最近 50 条原始事件供 __frDebug.inputLog() 读取。
+      // 输入取证：映射设备到底发 wheel 还是 keydown/click、deltaMode/deltaX 各是多少、
+      // 有没有夹带修饰键，用户自己也说不清，这里环形留最近 80 条原始事件供 __frDebug.inputLog() 读取。
       // 用捕获阶段挂 window：即使后面有 stopPropagation，日志也一定先记到。
+      const INPUT_LOG_MAX = 80;
       const inputLog: InputLogRec[] = [];
-      const pushInput = (rec: Omit<InputLogRec, "t">) => {
-        inputLog.push({ ...rec, t: Date.now() });
-        if (inputLog.length > 50) inputLog.splice(0, inputLog.length - 50);
-      };
+      /** 最近一条原始事件：判定结论（pushVerdict）回填到它身上，一行就能看出「事件 → 落到哪」。 */
+      let lastInputRec: InputLogRec | null = null;
       const classNameOf = (t: EventTarget | null): string => {
         const el = t as Element | null;
         return el && typeof el.className === "string" ? el.className : "";
       };
-      const onInWheel = (e: WheelEvent) =>
-        pushInput({
-          type: "wheel", key: "", code: "",
-          deltaMode: e.deltaMode, deltaX: e.deltaX, deltaY: e.deltaY, button: e.button,
-          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: false,
-          target: classNameOf(e.target),
-        });
+      const mkRec = (
+        type: InputLogType,
+        e: Event,
+        over: Partial<
+          Pick<
+            InputLogRec,
+            "key" | "code" | "deltaMode" | "deltaX" | "deltaY" | "button" | "buttons" | "pointerId"
+            | "ctrlKey" | "shiftKey" | "altKey" | "repeat"
+          >
+        >,
+      ): Omit<InputLogRec, "t" | "verdict" | "defaultPrevented"> => ({
+        type,
+        key: "",
+        code: "",
+        deltaMode: -1,
+        deltaX: 0,
+        deltaY: 0,
+        button: -1,
+        buttons: 0,
+        pointerId: -1,
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+        repeat: false,
+        target: classNameOf(e.target),
+        ...over,
+      });
+      const pushInput = (rec: Omit<InputLogRec, "t" | "verdict" | "defaultPrevented">, e: Event) => {
+        const full: InputLogRec = { ...rec, defaultPrevented: e.defaultPrevented, verdict: "", t: Date.now() };
+        inputLog.push(full);
+        if (inputLog.length > INPUT_LOG_MAX) inputLog.splice(0, inputLog.length - INPUT_LOG_MAX);
+        lastInputRec = full;
+        // 捕获阶段读到的 defaultPrevented 恒为 false：延到微任务（同一次派发全部监听跑完）再回读终值。
+        queueMicrotask(() => { full.defaultPrevented = e.defaultPrevented; });
+      };
       const onInKey = (e: KeyboardEvent) =>
-        pushInput({
-          type: "keydown", key: e.key, code: e.code,
-          deltaMode: -1, deltaX: 0, deltaY: 0, button: -1,
-          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: e.repeat,
-          target: classNameOf(e.target),
-        });
+        pushInput(
+          mkRec("keydown", e, {
+            key: e.key, code: e.code,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: e.repeat,
+          }),
+          e,
+        );
+      const onInWheel = (e: WheelEvent) =>
+        pushInput(
+          mkRec("wheel", e, {
+            deltaMode: e.deltaMode, deltaX: e.deltaX, deltaY: e.deltaY,
+            button: e.button, buttons: e.buttons,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+          }),
+          e,
+        );
+      const onInPointer = (e: PointerEvent) =>
+        pushInput(
+          mkRec(e.type as InputLogType, e, {
+            button: e.button, buttons: e.buttons, pointerId: e.pointerId,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+          }),
+          e,
+        );
       const onInMouse = (e: MouseEvent) =>
-        pushInput({
-          type: "mouseup", key: "", code: "",
-          deltaMode: -1, deltaX: 0, deltaY: 0, button: e.button,
-          ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: false,
-          target: classNameOf(e.target),
-        });
-      window.addEventListener("wheel", onInWheel, true);
+        pushInput(
+          mkRec(e.type as InputLogType, e, {
+            button: e.button, buttons: e.buttons,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+          }),
+          e,
+        );
+      const elDesc = (el: Element | null): string => {
+        if (!el) return "";
+        const cls = typeof el.className === "string" && el.className
+          ? `.${el.className.split(/\s+/)[0]}`
+          : "";
+        return `${el.tagName}${cls}`;
+      };
+      // 判定结论回填到最近一条原始事件（同一个任务内完成）。
+      setVerdictSink((v) => {
+        if (lastInputRec && Date.now() - lastInputRec.t < 300 && !lastInputRec.verdict) {
+          lastInputRec.verdict = v;
+        }
+      });
+      for (const type of ["pointerdown", "pointerup"] as const) {
+        window.addEventListener(type, onInPointer, true);
+      }
+      for (const type of ["mousedown", "mouseup", "click", "auxclick"] as const) {
+        window.addEventListener(type, onInMouse, true);
+      }
       window.addEventListener("keydown", onInKey, true);
-      window.addEventListener("mouseup", onInMouse, true);
+      window.addEventListener("wheel", onInWheel, true);
       devInputOff = () => {
-        window.removeEventListener("wheel", onInWheel, true);
+        setVerdictSink(undefined);
+        for (const type of ["pointerdown", "pointerup"] as const) {
+          window.removeEventListener(type, onInPointer, true);
+        }
+        for (const type of ["mousedown", "mouseup", "click", "auxclick"] as const) {
+          window.removeEventListener(type, onInMouse, true);
+        }
         window.removeEventListener("keydown", onInKey, true);
-        window.removeEventListener("mouseup", onInMouse, true);
+        window.removeEventListener("wheel", onInWheel, true);
       };
 
       (window as any).__frDebug = {
@@ -3135,8 +3383,25 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         },
         /** 当前 hoverNote 文本（供断言）。 */
         hoverNoteText: () => hoverNote?.note ?? null,
-        /** 最近 50 条输入事件（wheel/keydown/mouseup）的副本，按到达顺序。 */
+        /** 最近 80 条输入事件（八类）的副本，按到达顺序；verdict 是回填的判定结论。 */
         inputLog: () => inputLog.slice(),
+        /** 最近 80 条输入判定结论（不掺原始事件，便于快速定位吞键的那一类）。 */
+        inputVerdicts: () => recentVerdicts(),
+        /** 阅读态快照：把「被吞掉」与「执行了但视觉没变化」分开（排版塌缩时翻页成功也看不出来）。 */
+        reader: () => ({
+          page,
+          pageCount,
+          chapterNum,
+          loadingChapter,
+          loadingIdx,
+          progBusy,
+          scrollLayout: scrollLayout(),
+          mangaHorizontal: mangaHorizontal(),
+          activeElement: elDesc(document.activeElement),
+          zone: lastZone,
+        }),
+        /** 排版几何快照（任务一）：clipW 与 pageWrapW / effAvail 是否同源一眼可见。 */
+        layout: () => layoutSnapshot(),
       };
     }
     ttsSetCallbacks({
@@ -3297,6 +3562,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       `--rdr-lh:${effLineHeight()}`,
       `--rdr-ps:${effParaSpacing()}em`,
       `--rdr-mh:${effMarginH()}px`,
+      // 可见盒（.clip）与滚动内缩（.col-scroll）专用：夹取后的有效边距。未测量时回落到 --rdr-mh。
+      `--rdr-mh-eff:${mhEff ?? effMarginH()}px`,
       `--rdr-img-h:${imgMaxH > 0 ? imgMaxH + "px" : "80vh"}`,
       `--rdr-img-scale:${effImgScale()}`,
       `--rdr-img-gap:${config.reader.manga.imgGap}px`,
@@ -4297,7 +4564,17 @@ ${effCssExtra() || ""}
   }
 
   function progMove(e: PointerEvent) {
-    if (progDrag) progSeek(progFromEvent(e));
+    if (!progDrag) return;
+    // e.buttons===0 说明指针已抬起（例如 pointerup 没送达：setPointerCapture 抛错、指针移出窗口、
+    // 窗口失焦）。此时就地把这次拖动收尾，既不留下「stale 状态让之后每次鼠标移动都拖动进度」，
+    // 也不把焦点留在滑块上（那会让 ←/→ 永久只 seek 不翻页）。
+    if (e.buttons === 0) {
+      progDrag = false;
+      (e.currentTarget as HTMLElement).blur();
+      saveProgressDebounced();
+      return;
+    }
+    progSeek(progFromEvent(e));
   }
 
   /** 进度条键盘操作：←/→ 微调 1%，Shift 加速 5%，Home/End 到首尾。 */
@@ -4309,6 +4586,12 @@ ${effCssExtra() || ""}
     else if (e.key === "End") delta = Infinity;
     else return;
     e.preventDefault();
+    // 焦点在滑块上时方向键属于滑块：必须一并 stopPropagation。
+    // 否则事件继续冒泡到 <svelte:window onkeydown>，同一次按键既 seek 又翻页；
+    // 跨章时 progSeek 的 loadChapter 置起 loadingChapter，冒泡上来的翻页随即被换章去重吃掉
+    // ——表现就是「按一下只动进度条 / 按不动，过一阵又能动」。
+    e.stopPropagation();
+    pushVerdict("slider:progressSeek", e);
     const next = Math.max(0, Math.min(100, totalPct() + delta)) / 100;
     void progSeek(next).then(() => saveProgressDebounced());
   }
@@ -4344,14 +4627,42 @@ ${effCssExtra() || ""}
   /** 全书总字数。estTotalPages 只依赖它，原先每次调用都对 book.toc 做一遍 reduce。
    *  底栏状态项在滚动中会被反复求值（bookProgress 那档还依赖 scrollTop），
    *  于是「显示全书页数」开着时，长篇（数千章）的每次刷新都是 O(章节数) 次代理读。
-   *  这里在开书时算一次存成标量；用普通变量而非 $state —— 它只随 book 变化，
-   *  而 book 本身已是响应式的，estTotalPages 顶部的 book 解引用足以建立依赖。 */
-  let tocCharsTotal = 0;
+   *  这里在开书时算一次存成标量。必须是 $state：EPUB 的字数由 book_char_counts
+   *  异步补算回来（见 open()），普通变量改了不会重算，页数会一直空着。 */
+  let tocCharsTotal = $state(0);
+
+  /** 当前章字数（$derived 复用，别在 estTotalPages 里每次做深层代理读）。
+   *  回落到目录项的字数：EPUB 的 get_chapter 走快速解析（spine_chars 全 0），
+   *  chapter.chars 恒为 0，而 book.toc 的字数由 book_char_counts 补算回来 ——
+   *  不回落到目录，estTotalPages 的「每页多少字」就永远是 0，页数照样不显示。 */
+  // 取值走函数体：$derived 的内联表达式里 svelte-check 会把 $state 变量收窄成 never
+  // （"Property 'chars' does not exist on type 'never'"），放进普通函数即可规避。
+  function chapterCharsOf(): number {
+    return chapter?.chars || book?.toc?.[chapterNum]?.chars || 0;
+  }
+  const chapterChars = $derived(chapterCharsOf());
+
+  /** BOOKPAGES_DEV：底栏「全书总页数」算不出值时留一份取证（同一组值只打一次）。 */
+  let devBookPagesKey = "";
+  function devLogBookPages() {
+    if (!import.meta.env.DEV) return;
+    const key = `${book?.book.id ?? 0}:${tocCharsTotal}:${chapterChars}:${pageCount}`;
+    if (key === devBookPagesKey) return;
+    devBookPagesKey = key;
+    console.log("[bookPages]", {
+      tocCharsTotal,
+      chapterChars,
+      pageCount,
+      scrollLayout: scrollLayout(),
+      mangaHorizontal: mangaHorizontal(),
+      tp: estTotalPages(),
+    });
+  }
 
   /** 全书总页数（按当前章“每页多少字”估算；仅翻页模式有效）。 */
   function estTotalPages(): number {
     if (!book || scrollLayout() || mangaHorizontal()) return 0;
-    const chars = chapter?.chars || 0;
+    const chars = chapterChars;
     if (pageCount <= 0 || chars <= 0) return 0;
     const cpp = chars / pageCount;
     const total = tocCharsTotal;
@@ -4376,6 +4687,7 @@ ${effCssExtra() || ""}
           : `${Math.round(currentRatio() * 100)}%`;
       case "bookPages": {
         const tp = estTotalPages();
+        if (!tp) devLogBookPages(); // DEV：算不出页数时留取证（release 摇掉）
         return tp ? t("reader.status.pagesEst", { n: tp }) : "";
       }
       case "pagePercent":
@@ -4402,6 +4714,10 @@ ${effCssExtra() || ""}
   }
 
   const enabledStatusItems = $derived(config.reader.statusItems.filter((i) => i.enabled));
+  /** 底栏两侧的状态项。先 $derived 求值再用于「有没有内容」判断与渲染，
+   *  避免同一次渲染里对 footerItems() 求值两遍（它是 O(项数) 的文本计算）。 */
+  const leftFooterItems = $derived(footerItems(config.reader.footerLeft));
+  const rightFooterItems = $derived(footerItems(config.reader.footerRight));
 
   function footerItems(ids: StatusItemId[]): { id: StatusItemId; text: string }[] {
     if (!book) return [];
@@ -4428,6 +4744,13 @@ ${effCssExtra() || ""}
     if (!progDrag) return;
     progDrag = false;
     progSeek(progFromEvent(e)).then(() => saveProgressDebounced());
+    // 指针交互结束即把焦点从滑块上摘掉，交还正文。
+    // progKey 会让滑块吃掉 ←/→（避免「seek + 翻页」双动作），但 tabindex=0 的滑块在
+    // pointerdown 时会被 Chromium 聚焦且不会自己失焦 —— 不摘焦点的话，点/拖过进度条之后
+    // 每按一次 → 都只 seek 1%、永远不翻页，只能靠「点一下正文」把焦点挪走，
+    // 表现就是偶发「按不动，过一阵又能动」（与旧版双动作同一处陷阱的另一种形态）。
+    // 只摘指针交互的焦点：Tab 聚焦仍保留 progKey 的 ←/→ 微调语义。
+    (e.currentTarget as HTMLElement).blur();
   }
 </script>
 
@@ -4720,18 +5043,20 @@ ${effCssExtra() || ""}
         </div>
       </div>
       <div class="footer" class:dim={chromeHidden} bind:this={footerEl}>
-        <span
-          class="finfo finfo-l"
-          role="button"
-          tabindex="0"
-          aria-label={t("reader.prevChapter")}
-          onclick={() => prevChapter()}
-          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); prevChapter(); } }}
-        >
-          {#each footerItems(config.reader.footerLeft) as x, i (x.id)}
-            {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
-          {/each}
-        </span>
+        {#if leftFooterItems.length}
+          <span
+            class="finfo finfo-l"
+            role="button"
+            tabindex="0"
+            aria-label={t("reader.prevChapter")}
+            onclick={() => prevChapter()}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); prevChapter(); } }}
+          >
+            {#each leftFooterItems as x, i (x.id)}
+              {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
+            {/each}
+          </span>
+        {/if}
         <div
           class="progress-track"
           class:dragging={progDrag}
@@ -4750,18 +5075,20 @@ ${effCssExtra() || ""}
           <div class="progress-fill" style="transform:scaleX({totalPct() / 100})"></div>
           <div class="progress-knob" style="left:{totalPct()}%"></div>
         </div>
-        <span
-          class="finfo finfo-r"
-          role="button"
-          tabindex="0"
-          aria-label={t("reader.nextChapter")}
-          onclick={() => nextChapter()}
-          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nextChapter(); } }}
-        >
-          {#each footerItems(config.reader.footerRight) as x, i (x.id)}
-            {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
-          {/each}
-        </span>
+        {#if rightFooterItems.length}
+          <span
+            class="finfo finfo-r"
+            role="button"
+            tabindex="0"
+            aria-label={t("reader.nextChapter")}
+            onclick={() => nextChapter()}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nextChapter(); } }}
+          >
+            {#each rightFooterItems as x, i (x.id)}
+              {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
+            {/each}
+          </span>
+        {/if}
       </div>
     {/if}
 
@@ -5344,9 +5671,11 @@ ${effCssExtra() || ""}
     position: absolute;
     top: 0;
     bottom: 0;
-    /* fallback 同上：取真实默认值 320px，避免首帧先按 56px 排一版 */
-    left: var(--rdr-mh, 320px);
-    right: var(--rdr-mh, 320px);
+    /* fallback 同上：取真实默认值 320px，避免首帧先按 56px 排一版。
+       优先 --rdr-mh-eff（= measurePages 夹取后的边距）：可见盒恒不窄于排版宽度，
+       窗口稍窄时不能再按无下限的 --rdr-mh 裁切正文。 */
+    left: var(--rdr-mh-eff, var(--rdr-mh, 320px));
+    right: var(--rdr-mh-eff, var(--rdr-mh, 320px));
     overflow: hidden;
   }
 
@@ -5409,7 +5738,7 @@ ${effCssExtra() || ""}
     /* 上下留白用 --rdr-edge（=min(48px, --rdr-mv)，见 .content）：章节首/末行永远落在边界渐隐带
        之外，否则滚到章末时最后一行会永久停在半透明区里；左右仍是 --rdr-mh。
        fallback 取与 readerVars() 一致的默认值，避免首帧先按别的值排一版再跳。 */
-    padding: var(--rdr-edge, 48px) var(--rdr-mh, 320px);
+    padding: var(--rdr-edge, 48px) var(--rdr-mh-eff, var(--rdr-mh, 320px));
     box-sizing: border-box;
   }
 
@@ -5640,6 +5969,16 @@ ${effCssExtra() || ""}
   #chapter-content :global(blockquote) {
     margin: 0.8em 1.5em;
     opacity: 0.85;
+  }
+
+  /* 嵌套 blockquote 不再累加左右边距与透明度：旧式 MOBI 的插图说明页有十层以上嵌套，
+     1.5em × 11 ≈ 16.5em（默认字号下约 528px）会把内容盒压成 0 宽（每行 1 字），
+     opacity 叠乘 0.85^11 ≈ 0.17 让文字几乎不可见、插图也算成 0 宽而看不见。
+     最外层保持原观感，内层复原。 */
+  #chapter-content :global(blockquote blockquote) {
+    margin-left: 0;
+    margin-right: 0;
+    opacity: 1;
   }
 
   #chapter-content :global(a) {

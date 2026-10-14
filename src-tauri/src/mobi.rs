@@ -1862,14 +1862,25 @@ fn split_mobi_chapters(html: &str) -> (Vec<TocEntry>, Vec<(usize, usize)>) {
         bounds.extend(pb_re.find_iter(html).map(|m| m.start()));
         bounds.push(html.len());
         bounds.dedup();
-        let segs: Vec<(usize, usize)> = bounds
-            .windows(2)
-            .map(|w| (w[0], w[1]))
-            .filter(|(s, e)| {
-                let body = &html[*s..*e];
-                !segment_text(body, 5).is_empty() || body.contains("<img")
-            })
-            .collect();
+        let raw: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+        // 章节切分必须连续覆盖 [0, len)：被丢弃的「纯空白且无图」段不能留成空洞
+        // （该区间的字符不属于任何 part，正文永久不可见），一律并入相邻的保留段：
+        // 前面的丢弃段归到下一个保留段的起点，结尾的丢弃段并进最后一个保留段。
+        let mut segs: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
+        let mut dropped_from: Option<usize> = None;
+        for (s, e) in raw.iter().copied() {
+            let body = &html[s..e];
+            if !segment_text(body, 5).is_empty() || body.contains("<img") {
+                segs.push((dropped_from.take().unwrap_or(s), e));
+            } else if dropped_from.is_none() {
+                dropped_from = Some(s);
+            }
+        }
+        if dropped_from.is_some() {
+            if let Some(last) = segs.last_mut() {
+                last.1 = html.len();
+            }
+        }
         // 首个含多个 filepos 链接的段视为目录：其（含）之前为卷首，之后为正文
         let toc_at = segs
             .iter()
@@ -2467,6 +2478,32 @@ mod tests {
         let cover2 = extract_cover_path(file.to_str().unwrap()).expect("extract_cover_path 应可用");
         assert_eq!(cover2.len(), cover.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pagebreak 回退分支丢弃「纯空白且无图」段时，parts 仍必须连续覆盖 [0, len)：
+    /// 被丢区间无人覆盖 → 该段字符永久不可见（真实样本 榮耀之城．伊斯坦堡.mobi 的 94 字）。
+    #[test]
+    fn pagebreak_split_covers_whitespace_only_segments() {
+        let html = concat!(
+            "<html><body>",
+            "<div><img src=\"a.jpg\"/></div><mbp:pagebreak/>",
+            "<div>   </div><mbp:pagebreak/>",
+            "<div><p>正文一</p></div><mbp:pagebreak/>",
+            "<div>\n\t </div>",
+            "</body></html>"
+        );
+        let (_toc, parts) = split_mobi_chapters(html);
+        assert_eq!(parts.first().map(|p| p.0), Some(0), "首个 part 未从 0 起: {parts:?}");
+        assert_eq!(
+            parts.last().map(|p| p.1),
+            Some(html.len()),
+            "末个 part 未到 html.len(): {parts:?}"
+        );
+        for w in parts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "parts 之间有空洞: {parts:?}");
+        }
+        let covered: usize = parts.iter().map(|(s, e)| html[*s..*e].chars().count()).sum();
+        assert_eq!(covered, html.chars().count(), "parts 未连续覆盖: {parts:?}");
     }
 
     /// 汉字被切断在 Record 边界时，全局一次性解码必须无损还原（不得出现任何 U+FFFD）

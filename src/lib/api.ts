@@ -37,6 +37,8 @@ export const api = {
   fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
   pathIsDir: (path: string) => invoke<boolean>("path_is_dir", { path }),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
+  /** 全书每章字数（EPUB；非 EPUB 返回空数组）：「全书总页数」的估算来源。 */
+  bookCharCounts: (bookId: number) => invoke<number[]>("book_char_counts", { bookId }),
   getChapter: (bookId: number, chapterIndex: number, keepStyles = false) =>
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex, keepStyles }),
   listBookImages: (bookId: number) => invoke<BookImage[]>("list_book_images", { bookId }),

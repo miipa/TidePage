@@ -10,6 +10,10 @@ export interface BookRow {
   cover_path: string | null;
   meta_done: number;
   last_read: number;
+  /** 全书字数（EPUB 由 get_book_word_count/book_char_counts 首次统计后回填；未统计为 0）。 */
+  total_chars: number;
+  /** 全书纯文字字数（去掉空白后的字数，同上）。 */
+  total_text_chars: number;
   /** 该书自己的封面版本：提取/更换封面时 +1，令 per-book 封面 URL 缓存失效。 */
   cover_ver: number;
   /** 反规范化的阅读进度（0–100，量纲同 progress.pct）：由写入路径维护，供封面进度环与状态过滤。 */
