@@ -195,12 +195,27 @@ pub fn parse(data: &[u8]) -> Result<EpubDoc, String> {
     parse_impl(data, false).map(|(doc, _)| doc)
 }
 
-/// 完整解析：额外统计每一章的字符数（供元数据/统计用，后台执行）。
-// staged: 全书字数解析，与 set_book_meta_ex 同属暂停的全量元数据管线（成对保留）。
-#[allow(dead_code)]
+/// 完整解析：额外统计每一章的字符数（供全书字数/总页数估算，后台执行）。
+/// 打开书籍与取章节走快速路径（`parse` / `parse_with_ci`），不统计字数。
 pub fn parse_with_chars(data: &[u8]) -> Result<EpubDoc, String> {
     parse_impl(data, true).map(|(doc, _)| doc)
 }
+
+/// 全书字数统计：`(每章字数, 全书字数 total_chars, 纯字数 total_text_chars)`。
+///
+/// `total / pure` 必须取 `EpubDoc` 的 spine 逐文档求和，**不能把 toc 的字数求和**：
+/// 同一个 spine 文档被多个目录项指向时会被重复计数；toc 数组只服务「全书总页数」的按章估算。
+///
+/// 为什么单独走一次完整解析：快速解析刻意不做全书逐章统计（数千章可达数秒），
+/// 于是 toc 里的 chars 与 total_chars 全是 0。调用方（书详情/本书统计、全书总页数）
+/// 按需补算一次，并共享同一份缓存。
+pub fn epub_word_stats(data: &[u8]) -> Result<(Vec<i64>, i64, i64), String> {
+    let doc = parse_with_chars(data)?;
+    let per_chapter = doc.toc.iter().map(|t| t.chars).collect();
+    Ok((per_chapter, doc.total_chars, doc.total_text_chars))
+}
+
+
 
 /// 快速解析并**同时返回条目索引**（避免调用方再扫一遍 zip 建 CiMap）。
 pub fn parse_with_ci(data: &[u8]) -> Result<(EpubDoc, CiMap), String> {
@@ -2170,5 +2185,75 @@ mod tests {
         eprintln!("[epubimg] urls={total} resolved={ok}");
         assert!(total > 0, "no epubimg urls generated");
         assert_eq!(total, ok, "some epubimg urls did not resolve");
+    }
+
+    /// 任务三/五共用的内存 EPUB 夹具：2 章、NCX 目录、正文可统计字数。
+    fn tiny_epub() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("mimetype", stored).unwrap();
+            zw.write_all(b"application/epub+zip").unwrap();
+            zw.start_file("META-INF/container.xml", deflated).unwrap();
+            zw.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+            zw.start_file("OEBPS/content.opf", deflated).unwrap();
+            zw.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#).unwrap();
+            zw.start_file("OEBPS/toc.ncx", deflated).unwrap();
+            zw.write_all(
+                r#"<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap><navPoint id="n1" playOrder="1"><navLabel><text>第一章</text></navLabel><content src="c1.xhtml"/></navPoint><navPoint id="n2" playOrder="2"><navLabel><text>第二章</text></navLabel><content src="c2.xhtml"/></navPoint></navMap></ncx>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            for (name, body) in [
+                ("OEBPS/c1.xhtml", "第一章正文，这里是一段足够长的文字用来统计字数。"),
+                ("OEBPS/c2.xhtml", "第二章正文，同样是一段用来统计字数的文字。"),
+            ] {
+                zw.start_file(name, deflated).unwrap();
+                zw.write_all(format!("<html><body><p>{body}</p></body></html>").as_bytes()).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// 任务三/五的共用路径（book_char_counts 与 get_book_word_count 都走 epub_word_stats）：
+    /// 快速解析 parse 不给任何字数，完整解析必须给出每章真实字数与全书 total/pure，
+    /// 且与 parse_with_chars 逐项一致；total/pure 取自 spine 逐文档求和（不是 toc 求和）。
+    #[test]
+    fn full_parse_fills_chapter_and_total_chars() {
+        let data = tiny_epub();
+        let fast = parse(&data).unwrap();
+        assert!(fast.toc.len() >= 2, "目录应有两条: {:?}", fast.toc.len());
+        assert!(
+            fast.toc.iter().all(|t| t.chars == 0),
+            "快速解析不得统计每章字数: {:?}",
+            fast.toc.iter().map(|t| t.chars).collect::<Vec<_>>()
+        );
+        assert_eq!(fast.total_chars, 0, "快速解析不得统计全书字数");
+        assert_eq!(fast.total_text_chars, 0);
+
+        let (per_chapter, total, pure) = epub_word_stats(&data).unwrap();
+        assert_eq!(per_chapter.len(), fast.toc.len(), "每章字数条数应等于目录条数");
+        assert!(
+            per_chapter.iter().all(|c| *c > 0),
+            "每章字数应大于 0: {per_chapter:?}"
+        );
+        assert!(total > 0, "total 应大于 0: {total}");
+        assert!(pure > 0, "pure 应大于 0: {pure}");
+        assert!(pure <= total, "纯字数不应超过总字数: {pure}/{total}");
+
+        let full = parse_with_chars(&data).unwrap();
+        assert_eq!(total, full.total_chars, "total 必须等于 parse_with_chars 的 total_chars");
+        assert_eq!(pure, full.total_text_chars, "pure 必须等于 total_text_chars");
+        assert_eq!(
+            per_chapter,
+            full.toc.iter().map(|t| t.chars).collect::<Vec<_>>(),
+            "每章字数应与完整解析的目录字数逐项一致"
+        );
     }
 }

@@ -8,6 +8,8 @@ import {
   WHEEL_TURN_IDLE,
   WHEEL_TURN_THRESHOLD,
   classifyPointerUp,
+  formControlOf,
+  isFormControlTarget,
   isWheelLocal,
   mangaWheelDelta,
   normalizeWheelDelta,
@@ -249,5 +251,96 @@ describe("mangaWheelDelta — 漫画横向平移换算", () => {
     expect(mangaWheelDelta(0, 2, 1)).toBe(100);
     expect(mangaWheelDelta(0, 1, 3)).toBe(48);
     expect(mangaWheelDelta(0, 0, 42)).toBe(42);
+  });
+});
+
+describe("isFormControlTarget — 表单控件焦点早退（含可见性）", () => {
+  const base = { tagName: "INPUT", isContentEditable: false, isConnected: true, rectCount: 1 };
+  it("INPUT / TEXTAREA / SELECT 可见时早退（select 是本次补上的漏网标签）", () => {
+    for (const tag of ["INPUT", "TEXTAREA", "SELECT", "option", "select"]) {
+      expect(isFormControlTarget({ ...base, tagName: tag })).toBe("visible");
+    }
+  });
+  it("contenteditable 容器同理", () => {
+    expect(isFormControlTarget({ ...base, tagName: "DIV", isContentEditable: true })).toBe("visible");
+  });
+  it("不可见控件不早退：已摘除 / 零尺寸（<input type=hidden>、display:none）", () => {
+    expect(isFormControlTarget({ ...base, isConnected: false })).toBe("hidden");
+    expect(isFormControlTarget({ ...base, rectCount: 0 })).toBe("hidden");
+  });
+  it("普通元素 / 非元素返回 null（按键继续归阅读快捷键）", () => {
+    expect(isFormControlTarget({ ...base, tagName: "DIV" })).toBe(null);
+    expect(isFormControlTarget({ ...base, tagName: "P", isContentEditable: false, rectCount: 0 })).toBe(null);
+  });
+  it("tagName 大小写与空值健壮", () => {
+    expect(isFormControlTarget({ ...base, tagName: "input" })).toBe("visible");
+    expect(isFormControlTarget({ ...base, tagName: "" })).toBe(null);
+  });
+});
+
+describe("formControlOf — DOM 适配层", () => {
+  it("真实元素形状（tagName/isConnected/getClientRects）", () => {
+    expect(
+      formControlOf({
+        tagName: "SELECT",
+        isContentEditable: false,
+        isConnected: true,
+        getClientRects: () => [1, 2],
+      }),
+    ).toBe("visible");
+  });
+  it("零尺寸控件 → hidden（DEV verdict 里能区分两类误吞）", () => {
+    expect(
+      formControlOf({
+        tagName: "INPUT",
+        isContentEditable: false,
+        isConnected: true,
+        getClientRects: () => [],
+      }),
+    ).toBe("hidden");
+  });
+  it("visibility:hidden 必须判 hidden（getClientRects 仍有盒子，只看它认不出来）", () => {
+    // 真实 Chromium：visibility:hidden 的元素 getClientRects().length = 1，
+    // 只有 checkVisibility 会返回 false。
+    expect(
+      formControlOf({
+        tagName: "INPUT",
+        isContentEditable: false,
+        isConnected: true,
+        getClientRects: () => [1],
+        checkVisibility: () => false,
+      }),
+    ).toBe("hidden");
+  });
+  it("checkVisibility 为 true 时按可见处理", () => {
+    expect(
+      formControlOf({
+        tagName: "SELECT",
+        isContentEditable: false,
+        isConnected: true,
+        getClientRects: () => [1],
+        checkVisibility: () => true,
+      }),
+    ).toBe("visible");
+  });
+  it("checkVisibility 抛错时退回 getClientRects（不因异常放行）", () => {
+    expect(
+      formControlOf({
+        tagName: "INPUT",
+        isContentEditable: false,
+        isConnected: true,
+        getClientRects: () => [],
+        checkVisibility: () => { throw new Error("boom"); },
+      }),
+    ).toBe("hidden");
+  });
+  it("没有 getClientRects 的环境按「可见」处理，不因缺 API 放行按键", () => {
+    expect(formControlOf({ tagName: "TEXTAREA", isContentEditable: false, isConnected: true })).toBe("visible");
+  });
+  it("window/document/普通对象/空值 → null", () => {
+    expect(formControlOf(null)).toBe(null);
+    expect(formControlOf(undefined)).toBe(null);
+    expect(formControlOf({})).toBe(null);
+    expect(formControlOf({ tagName: 5 })).toBe(null);
   });
 });

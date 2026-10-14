@@ -148,6 +148,131 @@ export function isWheelLocal(target: unknown, axis: WheelAxis = "y"): boolean {
   return false;
 }
 
+/* ================= 键盘：控件焦点早退判定 ================= */
+
+/** 会自己吃掉方向键的表单控件标签（select 原先漏掉了：焦点在下拉上按 → 会同时改选项并冒泡翻页）。 */
+export const FORM_CONTROL_TAGS = ["INPUT", "TEXTAREA", "SELECT", "OPTION"] as const;
+
+/** 判定所需的最小结构：真实 HTMLElement 天然满足，测试用假对象即可。 */
+export interface FormControlNode {
+  tagName: string;
+  isContentEditable: boolean;
+  /** false = 已从文档摘除 */
+  isConnected: boolean;
+  /** getClientRects().length：0 表示渲染为不可见（display:none / visibility:hidden / 零尺寸） */
+  rectCount: number;
+}
+
+/**
+ * 焦点元素是否属于「该早退」的表单控件。
+ *
+ * 返回 null = 不是控件（按键继续归阅读快捷键）；
+ * 返回 "visible" / "hidden" = 是控件，按可见性区分早退理由（供 DEV 取证区分两类误吞）。
+ *
+ * 关键的一条是可见性：`isContentEditable` 在隐藏的 contenteditable 容器上同样为真，
+ * 而 `<input type="hidden">` / display:none 的输入框也满足 tagName 判定 —— 原来只看标签名，
+ * 这些「看不见的控件」会把方向键无声吃掉，表现就是「按了没反应」。
+ */
+export function isFormControlTarget(o: FormControlNode): "visible" | "hidden" | null {
+  const tag = (o.tagName || "").toUpperCase();
+  const isControl =
+    (FORM_CONTROL_TAGS as readonly string[]).includes(tag) || !!o.isContentEditable;
+  if (!isControl) return null;
+  return o.isConnected && o.rectCount > 0 ? "visible" : "hidden";
+}
+
+/** DOM 适配层：把事件目标收敛成判定输入（Reader.onKeyDown 与 AiPanel.onReaderKeys 共用）。
+ *  非元素目标（window/document）返回 null。
+ *
+ *  可见性优先用 Element.checkVisibility（同时覆盖 display:none、visibility:hidden、
+ *  opacity:0、content-visibility:hidden）；**不能只看 getClientRects**——visibility:hidden
+ *  的元素照旧生成盒子，getClientRects().length 仍大于 0，「看不见的控件吃掉按键」就漏掉了。
+ *  没有该 API 的环境退回 getClientRects 盒子数。 */
+export function formControlOf(el: unknown): "visible" | "hidden" | null {
+  const e = el as
+    | (Partial<HTMLElement> & { checkVisibility?: (options?: Record<string, boolean>) => boolean })
+    | null;
+  if (!e || typeof e.tagName !== "string") return null;
+  const boxes = typeof e.getClientRects === "function" ? e.getClientRects().length : 1;
+  let cssVisible: boolean | null = null;
+  if (typeof e.checkVisibility === "function") {
+    try {
+      cssVisible = e.checkVisibility({
+        // 兼容新老两套选项名（Chromium 105+ 用 check* / opacityProperty / visibilityProperty）。
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+        opacityProperty: true,
+        visibilityProperty: true,
+      });
+    } catch {
+      cssVisible = null;
+    }
+  }
+  return isFormControlTarget({
+    tagName: e.tagName,
+    isContentEditable: !!e.isContentEditable,
+    isConnected: e.isConnected !== false,
+    rectCount: cssVisible === null ? boxes : cssVisible ? Math.max(1, boxes) : 0,
+  });
+}
+
+/* ================= DEV：输入判定取证 ================= */
+
+/** 一条输入判定结论（DEV 用，release 不产出）。 */
+export interface InputVerdict {
+  verdict: string;
+  key: string;
+  code: string;
+  target: string;
+  t: number;
+}
+
+const VERDICT_MAX = 80;
+const devVerdicts: InputVerdict[] = [];
+
+/** 判定回填器：Reader 在 DEV 下注册，把结论写回它最近一条原始事件记录，
+ *  于是 __frDebug.inputLog() 的一条事件自带「最后落到哪」。 */
+let verdictSink: ((verdict: string) => void) | undefined;
+
+export function setVerdictSink(fn?: (verdict: string) => void): void {
+  verdictSink = fn;
+}
+
+/** 事件里判定需要的字段（KeyboardEvent/WheelEvent/PointerEvent 都满足）。 */
+export interface InputVerdictEvent {
+  key?: string;
+  code?: string;
+  target?: EventTarget | null;
+}
+
+/**
+ * 记录一条输入判定结论：`binding:next` / `swallowed:formControl(visible)` /
+ * `swallowed:modal(settingsOpen)` / `swallowed:aiPanel(focus)` / `swallowed:loadingDedupe` /
+ * `swallowed:edgeThrottle` / `slider:progressSeek` / `noMatch`。
+ *
+ * 为什么单独记结论而不是只记原始事件：原始事件只说明「事件进来了」，
+ * 分不清「被守卫吞了」与「执行了但视觉没变化」（排版塌缩时翻页成功也看不出来）。
+ * release 构建中 import.meta.env.DEV 为 false，整个函数体被摇掉。
+ */
+export function pushVerdict(verdict: string, e?: InputVerdictEvent): void {
+  if (!import.meta.env.DEV) return;
+  const el = (e?.target ?? null) as Element | null;
+  devVerdicts.push({
+    verdict,
+    key: e?.key ?? "",
+    code: e?.code ?? "",
+    target: el && typeof el.className === "string" ? el.className : "",
+    t: Date.now(),
+  });
+  if (devVerdicts.length > VERDICT_MAX) devVerdicts.splice(0, devVerdicts.length - VERDICT_MAX);
+  verdictSink?.(verdict);
+}
+
+/** 最近 VERDICT_MAX 条判定结论（供 __frDebug.inputVerdicts() 取用）。 */
+export function recentVerdicts(): InputVerdict[] {
+  return devVerdicts.slice();
+}
+
 /* ================= 键盘：按布局路由 ================= */
 
 /** 「下滚一段/上滚一段」在当前布局下的实际执行分支。 */

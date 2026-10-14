@@ -30,7 +30,13 @@ import { reorderByDrop } from "../lib/reorder";
     marginScopeOf,
     type PromptItem,
   } from "../lib/stores.svelte";
-  import { reduceWheelTurn, WHEEL_TURN_IDLE, type WheelTurnState } from "../lib/readerInput";
+  import {
+    formControlOf,
+    pushVerdict,
+    reduceWheelTurn,
+    WHEEL_TURN_IDLE,
+    type WheelTurnState,
+  } from "../lib/readerInput";
 
   let { chapterTitle = "", chapterHtml = "", standalone = false, onclose }: {
     chapterTitle?: string;
@@ -64,9 +70,6 @@ import { reorderByDrop } from "../lib/reorder";
   let aiInner: HTMLDivElement | undefined = $state();
   /** 面板根元素：判断「焦点是否在面板内」（按键接管条件之一）用。 */
   let panelEl: HTMLDivElement | undefined = $state();
-  /** 指针是否停在面板上（由 .ai-panel 的 pointerenter/leave 维护）。
-   *  非响应式：只在按键事件处理里读，写成 $state 会让相关 effect 白跑。 */
-  let pointerOnPanel = false;
   let aiPage = $state(0);
   let aiPages = $state(1);
   /** 面板内滚轮翻页的累积状态（判定在 lib/readerInput.reduceWheelTurn）。 */
@@ -629,11 +632,12 @@ ${readerStyle.extra}
     return !!b && b.length > 0;
   }
 
-  /** 面板是否「持有输入」：焦点在面板内，或指针停在面板上。
+  /** 面板是否「持有输入」：只看焦点是否在面板子树内。
+   *  不再看「指针停在面板上」——鼠标恰好停在抽屉上时，→ 会被面板整段吃掉，
+   *  正文一动不动，用户完全看不出是悬停导致的。滚轮归属（onListWheel/isWheelLocal）不受影响。
    *  独立窗里没有正文可让，默认持有（保持既有行为）。 */
   function aiHoldsInput(): boolean {
     if (standalone) return true;
-    if (pointerOnPanel) return true;
     const a = document.activeElement;
     return !!a && !!panelEl && panelEl.contains(a);
   }
@@ -646,18 +650,26 @@ ${readerStyle.extra}
    * 完全没反应。现在加三重条件，任一不满足就放行给正文：
    *   ① 抽屉确实展开：本组件只在 Reader 的 aiDrawerOpen 为真（或作为独立窗）时挂载，挂载即成立；
    *   ② aiPages > 1：AI 确有多页可翻，否则接管只是白吃一次按键；
-   *   ③ 面板持有输入（焦点在面板内 / 指针停在面板上）。
+   *   ③ 面板持有输入（焦点确实在面板子树内；指针悬停不算——悬停抢键会让正文「按不动」）。
    * ↑/↓ 不写死进键表：正文侧有 scrollDown/scrollUp 绑定，只有面板确实持有输入时才归 AI 消费。
    */
   function onReaderKeys(e: KeyboardEvent) {
     if (!isReader) return;
-    const tgt = e.target as HTMLElement | null;
-    if (tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)) return;
-    if (ui.settingsOpen) return;
+    // 与 Reader.onKeyDown 共用同一判定（INPUT/TEXTAREA/SELECT/contenteditable，且必须可见）。
+    const formDev = formControlOf(e.target);
+    if (formDev === "visible") {
+      pushVerdict("swallowed:formControl(visible)", e);
+      return;
+    }
+    if (formDev === "hidden") pushVerdict("swallowed:formControl(hidden)", e);
+    if (ui.settingsOpen) {
+      pushVerdict("swallowed:modal(settingsOpen)", e);
+      return;
+    }
     const held = aiHoldsInput();
     if (!standalone) {
       if (aiPages <= 1) return; // ② 单页无页可翻 → 放行
-      if (!held) return;        // ③ 焦点与指针都不在面板 → 放行
+      if (!held) return;        // ③ 焦点不在面板内 → 放行（不再看指针悬停）
     }
     const k = e.key;
     const nextKeys = ["ArrowRight", "PageDown", ...(held ? ["ArrowDown"] : []), ...(aiTurnBind("next") ? config.reader.bindings.next : [])];
@@ -665,10 +677,12 @@ ${readerStyle.extra}
     if (nextKeys.includes(k)) {
       e.preventDefault();
       e.stopPropagation();
+      pushVerdict("swallowed:aiPanel(focus)", e);
       aiFlip(1);
     } else if (prevKeys.includes(k)) {
       e.preventDefault();
       e.stopPropagation();
+      pushVerdict("swallowed:aiPanel(focus)", e);
       aiFlip(-1);
     }
   }
@@ -913,15 +927,12 @@ ${readerStyle.extra}
   </div>
 {/snippet}
 
-<!-- pointerenter/leave 维护 pointerOnPanel：按键接管条件③（指针在面板内）的来源 -->
 <div
   class="ai-panel"
   class:standalone
   class:reader={isReader}
   role="group"
   bind:this={panelEl}
-  onpointerenter={() => (pointerOnPanel = true)}
-  onpointerleave={() => (pointerOnPanel = false)}
   style={(isReader ? readerVars + ";" : "") + (!standalone ? `width:${panelWidth}px;` : "")}
 >
   {#if isReader}

@@ -6,6 +6,10 @@
 //      font-family / font-size / line-height / color / background；
 //      背景额外覆盖 html / body / #chapter-content / #chapter-content * 共四层。
 //      ——刻意不用标签白名单（p/div/span/li/...）：白名单漏掉任一标签就会穿透。
+//      唯一的例外是划线标记（mark.fr-hl / mark.fr-tts）**及其后代**：背景单独成一条规则并
+//      排除它们（见 READ_FIX_BG_SELECTOR）。否则 "荧光笔" 样式的底色会被这条 !important
+//      涂成页面底色；且 paintHighlights() 会把原书的 <font>/<span> 搬进 mark 内部，
+//      只排除 mark 自身盖不住它们。四项覆盖不排除任何元素。
 //   2) DOM 就绪后直接 removeAttribute 剥离 <font> 的 face / size / color：
 //      属性不存在 → presentational hint 不存在，比再加样式更彻底。
 //
@@ -30,6 +34,21 @@ export interface ReadFixOptions {
 
 export const READ_FIX_STYLE_ID = "__read_fix";
 
+/** 四项覆盖（字体/字号/行高/字色）的选择器：#chapter-content 及其全部后代，无例外。 */
+export const READ_FIX_TEXT_SELECTOR = "#chapter-content, #chapter-content *";
+
+/**
+ * 背景覆盖的选择器：排除划线标记（mark.fr-hl / mark.fr-tts）**及其全部后代**。
+ *
+ * 为什么必须排除后代：paintHighlights()（src/lib/highlights.ts）用 range.extractContents()
+ * 把原书的 <font>/<span> 搬进 mark 内部，它们仍会命中 `:not(mark.fr-hl)` 之后的 `*` 规则，
+ * 把荧光笔的底色整块盖回页面底色 —— 只排除 mark 自身等于没排除。
+ * 也不采用「给 mark.fr-hl-background 补 !important」：盖不住内部元素的背景，
+ * 还会搅乱 box/note 圆点那几层的层叠。
+ */
+export const READ_FIX_BG_SELECTOR =
+  "#chapter-content, #chapter-content *:not(mark.fr-hl):not(mark.fr-hl *):not(mark.fr-tts):not(mark.fr-tts *)";
+
 const DEFAULT_MONO = "Consolas, \"Courier New\", monospace";
 
 /** 拼出最终下发到页面的 CSS。font-family 放在首行，便于 READ_CSS 的 head 直接核对新值。 */
@@ -41,12 +60,15 @@ export function buildReadFixCss(o: ReadFixOptions): string {
   const BG = o.background;
   const TEXT = o.color;
   return [
-    // 五项全量覆盖：命中 #chapter-content 及其所有后代
-    "#chapter-content, #chapter-content * {",
+    // 四项全量覆盖：命中 #chapter-content 及其所有后代，不排除任何元素
+    `${READ_FIX_TEXT_SELECTOR} {`,
     `  font-family: ${FONT_FAMILY} !important;`,
     `  font-size: ${SIZE}px !important;`,
     `  line-height: ${LH} !important;`,
     `  color: ${TEXT} !important;`,
+    "}",
+    // 背景单独一条并排除划线标记及其后代：否则 "荧光笔" 的底色会被涂成页面底色
+    `${READ_FIX_BG_SELECTOR} {`,
     `  background: ${BG} !important;`,
     "}",
     // 背景四层：html / body / #chapter-content（上面已含）/ #chapter-content *（上面已含）

@@ -584,10 +584,16 @@ pub fn upsert_book(
     mtime: i64,
 ) -> Result<i64, String> {
     let id = path_id(path);
+    // 文件真变了（size/mtime 与库中不一致）时顺手把字数两列清 0：读时指纹校验已能挡住旧值，
+    // 这一步只是让 DB 自身也一致，避免「文件换了、两列还是旧数字」的中间态被别处读到。
+    // 注意 DO UPDATE 的表达式引用的是**原行**值（因此用表名限定，并写在 size/mtime 赋值之前）。
     let res = conn.execute(
         "INSERT INTO books(id, path, title, author, format, size, mtime, added_at, meta_done)
          VALUES(?1,?2,?3,'',?4,?5,?6,?7,0)
-         ON CONFLICT(path) DO UPDATE SET id=?1, size=?5, mtime=?6, meta_done=0",
+         ON CONFLICT(path) DO UPDATE SET
+             total_chars = CASE WHEN books.size<>?5 OR books.mtime<>?6 THEN 0 ELSE books.total_chars END,
+             total_text_chars = CASE WHEN books.size<>?5 OR books.mtime<>?6 THEN 0 ELSE books.total_text_chars END,
+             id=?1, size=?5, mtime=?6, meta_done=0",
         params![id, path, title, format, size, mtime, now_ms()],
     );
     if res.is_err() {
@@ -1040,6 +1046,108 @@ pub fn set_book_meta_ex(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 窄写入器：只回填字数两列，其余列一律不动。
+///
+/// 为什么单独开一个而不复用 `set_book_meta_ex`：后者会连 title/author/cover_path/meta_done
+/// 一起写（`meta_done` 是扫描 worker 的 CAS 状态，乱写会让书被反复重扫或永远不扫）。
+/// 字数统计发生在打开书详情/本书统计这类**只读**路径上，只能碰这两列。
+pub fn set_book_chars(conn: &Connection, id: i64, total: i64, pure: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE books SET total_chars=?2, total_text_chars=?3 WHERE id=?1",
+        params![id, total, pure],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod book_chars_tests {
+    //! 任务五：字数回填只动两列，且能被 get_book 读回（DB 短路与书详情的取值来源）。
+    use super::*;
+
+    #[test]
+    fn set_book_chars_backfills_only_char_columns() {
+        let dir = std::env::temp_dir().join(format!("fr_db_bookchars_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.db");
+        let conn = init(&p).unwrap();
+        let path = "C:/x/book.epub";
+        let id = path_id(path);
+        conn.execute(
+            "INSERT INTO books(id,path,title,author,format,size,mtime,added_at,meta_done)
+             VALUES(?1,?2,'原书名','原作者','epub',10,20,30,0)",
+            params![id, path],
+        )
+        .unwrap();
+        let before = get_book(&conn, id).expect("书应存在");
+        assert_eq!(before.total_chars, 0, "初始应为未统计");
+        assert_eq!(before.total_text_chars, 0);
+
+        set_book_chars(&conn, id, 123_456, 111_111).unwrap();
+        let after = get_book(&conn, id).unwrap();
+        assert_eq!(after.total_chars, 123_456);
+        assert_eq!(after.total_text_chars, 111_111);
+        // 其余列不受影响（尤其 meta_done/title/author）
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.author, before.author);
+        assert_eq!(after.meta_done, before.meta_done);
+        assert_eq!(after.cover_path, before.cover_path);
+
+        // 不存在的 id：不报错，也不影响其它行
+        set_book_chars(&conn, id + 1, 9, 9).unwrap();
+        assert!(get_book(&conn, id + 1).is_none());
+        assert_eq!(get_book(&conn, id).unwrap().total_chars, 123_456);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod upsert_chars_tests {
+    //! 任务六：扫描发现文件真变了（size/mtime 不一致）时才清字数两列。
+    use super::*;
+
+    #[test]
+    fn upsert_resets_chars_only_when_file_changed() {
+        let dir = std::env::temp_dir().join(format!("fr_db_upsert_chars_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.db");
+        let conn = init(&p).unwrap();
+        let path = "C:/x/book.txt";
+
+        upsert_book(&conn, path, "原书名", "txt", 100, 1000).unwrap();
+        let id = get_book_by_path(&conn, path).expect("应落库").id;
+        set_book_chars(&conn, id, 500, 400).unwrap();
+
+        // 同一文件再扫一次（size/mtime 不变）：字数保留
+        upsert_book(&conn, path, "原书名", "txt", 100, 1000).unwrap();
+        let same = get_book(&conn, id).unwrap();
+        assert_eq!(same.total_chars, 500, "文件没变不得清字数");
+        assert_eq!(same.total_text_chars, 400);
+        assert_eq!(same.title, "原书名", "conflict 分支不覆写 title（既有行为）");
+
+        // 大小变化：两列清零
+        upsert_book(&conn, path, "原书名", "txt", 200, 1000).unwrap();
+        let changed = get_book(&conn, id).unwrap();
+        assert_eq!(changed.total_chars, 0, "size 变化应清字数");
+        assert_eq!(changed.total_text_chars, 0);
+        assert_eq!(changed.meta_done, 0, "meta_done 仍归 0（既有行为）");
+
+        // 再写回字数，然后只改 mtime：同样清零
+        set_book_chars(&conn, id, 700, 600).unwrap();
+        upsert_book(&conn, path, "原书名", "txt", 200, 2000).unwrap();
+        let mtime_only = get_book(&conn, id).unwrap();
+        assert_eq!(mtime_only.total_chars, 0, "仅 mtime 变化也应清字数");
+        assert_eq!(mtime_only.total_text_chars, 0);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 删除书籍（G1 分级）。`keep_notes=true` 时保留带笔记的划线（并落 orphan 快照），
