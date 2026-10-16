@@ -1010,7 +1010,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           ` style="position:absolute !important;left:0 !important;top:${top}px !important;width:${box.w}px !important;height:${sh}px !important;max-width:none !important;max-height:none !important;zoom:1 !important;margin:0 !important;display:block !important" alt="">`,
       );
     });
-    // 链接热点：z-index 低于文本层（不挡划选）、高于切片位图（可点）。
+    // 链接热点：z-index 高于切片位图与文本层，重叠处优先接收指针（点得动）。
+    // 文本层刻意不设 z-index（见 .pdf-page .textLayer 的说明）：定位元素 + z-index 会自成
+    // 层叠上下文，mark 的 mix-blend-mode 就乘不到下方位图。
     // 坐标用 [0,1] 分数乘显示尺寸 —— 缩放/切片重建时自然重算，不会错位。
     const hot = links
       .map((l) => {
@@ -1036,7 +1038,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       ` style="position:relative !important;width:${box.w}px !important;height:${box.h}px !important;margin:0 auto !important;zoom:1 !important">` +
       parts.join("") +
       hot +
-      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:2 !important;pointer-events:none !important"></div></div>`
+      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;pointer-events:none !important"></div></div>`
     );
   }
 
@@ -6424,11 +6426,75 @@ ${effCssExtra() || ""}
     -webkit-user-select: text;
   }
 
-  /* PDF 的正文是位图、文字层只有透明文字：实色荧光笔/朗读蒙层会盖住字迹。
-     multiply 让色块与下方位图相乘（像真荧光笔压在纸上），并降透明度让字迹透出来。
+  /* PDF 高亮的底色 / 下划线 / 框线：**与 #chapter-content 那组规则同步维护**（两份声明必须一致）。
+     为什么必须镜像：PDF 的正文根是 .pdf-page，一条 #chapter-content 规则都匹配不到 ——
+     不镜像的话 mark 只剩浏览器对 <mark> 的 UA 默认黄底，用户选的 --hl-color 完全不参与。
+     头一条把默认黄底清掉（与 #chapter-content mark.fr-hl 的 background:transparent 对齐），
+     后面各样式再各自上色。--hl-color 由阅读器根写入并继承，无需在这里另设。 */
+  .reader.pdf :global(mark.fr-hl) {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  .reader.pdf :global(mark.fr-hl-underline) {
+    text-decoration-line: underline;
+    text-decoration-color: var(--hl-color);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  .reader.pdf :global(mark.fr-hl-wavy) {
+    text-decoration-line: underline;
+    text-decoration-style: wavy;
+    text-decoration-color: var(--hl-color);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+  }
+
+  .reader.pdf :global(mark.fr-hl-dotted) {
+    text-decoration-line: underline;
+    text-decoration-style: dotted;
+    text-decoration-color: var(--hl-color);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  .reader.pdf :global(mark.fr-hl-double) {
+    text-decoration-line: underline;
+    text-decoration-style: double;
+    text-decoration-color: var(--hl-color);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+  }
+
+  .reader.pdf :global(mark.fr-hl-strike) {
+    text-decoration-line: line-through;
+    text-decoration-color: var(--hl-color);
+    text-decoration-thickness: 2px;
+  }
+
+  .reader.pdf :global(mark.fr-hl-box) {
+    box-shadow: 0 0 0 1.5px var(--hl-color);
+    border-radius: var(--radius-xs);
+  }
+
+  /* 背景类装饰（荧光笔 / 朗读蒙层）：PDF 的正文是位图、文字层只有透明文字，实色叠上去会盖住
+     字迹，故用 multiply 让色块与下方位图相乘（像真荧光笔压在纸上），并降透明度让字迹透出来。
      选择器挂在 .reader.pdf 上 —— EPUB/TXT 的观感保持不变。 */
-  .reader.pdf :global(mark.fr-hl-background),
+  .reader.pdf :global(mark.fr-hl-background) {
+    background: color-mix(in srgb, var(--hl-color) 38%, transparent);
+    border-radius: var(--radius-xs);
+    mix-blend-mode: multiply;
+    opacity: 0.3;
+  }
+
   .reader.pdf :global(mark.fr-tts) {
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    color: inherit;
+    border-radius: var(--radius-xs);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
     mix-blend-mode: multiply;
     opacity: 0.3;
   }
@@ -6441,7 +6507,10 @@ ${effCssExtra() || ""}
   }
 
   /* PDF 双层 DOM 的文本层：只用于选取/划线定位，文字必须不可见（画面由位图提供）。
-     作用域限定在 .pdf-page 下 —— 绝不整文件引入 pdf_viewer.css（其 .page/.pdfViewer 会撞现有类）。 */
+     作用域限定在 .pdf-page 下 —— 绝不整文件引入 pdf_viewer.css（其 .page/.pdfViewer 会撞现有类）。
+     **刻意不设 z-index**：定位元素 + z-index 会自成层叠上下文，mark 的 mix-blend-mode 就只能与
+     文本层自己的透明背景相乘（乘积恒等于原色，等于空转），够不到下方位图。
+     不设 z-index 后文本层仍在切片位图之上（DOM 在后）；链接热点（z-index:1）则浮到它之上。 */
   .content :global(.pdf-page .textLayer) {
     position: absolute;
     inset: 0;
@@ -6450,7 +6519,6 @@ ${effCssExtra() || ""}
     -webkit-text-size-adjust: none;
     text-size-adjust: none;
     transform-origin: 0 0;
-    z-index: 1;
   }
   .content :global(.pdf-page .textLayer span),
   .content :global(.pdf-page .textLayer br) {
@@ -6459,7 +6527,8 @@ ${effCssExtra() || ""}
     white-space: pre;
     cursor: text;
     transform-origin: 0 0;
-    /* 容器 pointer-events:none（让下层链接热点可点），只有真正有文字的位置接收指针 → 仍可选字 */
+    /* 容器 pointer-events:none；只有真正有文字的位置接收指针 → 文字处仍可拖选
+       （与链接热点重叠处由热点先收指针，见 pdfPageHtmlFor 的热点注记） */
     pointer-events: auto;
   }
   /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
@@ -6700,6 +6769,12 @@ ${effCssExtra() || ""}
      漫画保持 hidden —— 横向布局有自己的 transform 平移，不该冒出原生滚动条。 */
   .reader.pdf .manga-flow-viewport {
     overflow-x: auto !important;
+    /* 常驻竖直滚动条槽 —— **仅 PDF**。重建窗口时 mangaWindow 会先换成「空占位块」（高 0），
+       .manga-flow-canvas 是 width:100%：没有槽时视口内容宽会瞬间 +11px（滚动条宽度），
+       而 pdfViewKey() 含这个宽度 ⇒ 键变 ⇒ 再重建 ⇒ 内容又变高 ⇒ 槽又出现……自激成重建循环。
+       槽常驻后内容宽恒定，视图键不再被「重建自身」扰动。
+       不挂到通用 .manga-flow-viewport：漫画没有这张视图键，套上去只会白占 11px 并把内容左移。 */
+    scrollbar-gutter: stable;
   }
 
   .manga-flow-viewport {
@@ -6708,11 +6783,6 @@ ${effCssExtra() || ""}
     overflow-y: auto !important;
     overflow-x: hidden !important;
     overflow-anchor: none;
-    /* 常驻竖直滚动条槽。重建窗口时 mangaWindow 会先换成「空占位块」（高 0），
-       .manga-flow-canvas 是 width:100%：没有槽时视口内容宽会瞬间 +11px（滚动条宽度），
-       而 pdfViewKey() 含这个宽度 ⇒ 键变 ⇒ 再重建 ⇒ 内容又变高 ⇒ 槽又出现……自激成重建循环。
-       槽常驻后内容宽恒定，视图键不再被「重建自身」扰动。 */
-    scrollbar-gutter: stable;
   }
 
   .manga-flow-canvas {
