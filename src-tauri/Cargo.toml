@@ -1,6 +1,6 @@
 [package]
 name = "tidepage"
-version = "0.1.28"
+version = "0.1.27"
 description = "TidePage - a fast local reading app"
 authors = ["you"]
 edition = "2021"
