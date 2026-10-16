@@ -4427,20 +4427,25 @@ ${effCssExtra() || ""}
     return base.join("|");
   }
   let lastPdfViewKey = "";
-  /** 硬闸：同一个视图键最多重建一次（键再变只重渲染切片，不改窗口结构）。
-   *  兜住任何残余反馈环 —— 宁可少一次重建，也不能让 webview 陷入重渲染风暴。 */
-  const pdfRebuiltKeys = new Set<string>();
+  /** 同一视图键的重复重建去抖：150ms 内只允许一次。
+   *  为什么不是「见过的 key 永久跳过」——适宽 true→false→true 时第三次点击的 key 与最初相同，
+   *  永久跳过会把这次真实操作静默吞掉（用户实测：连点三次适宽，第三次没反应）。
+   *  去抖同样挡得住重建风暴（风暴的特征是同一键在毫秒级来回变），但不会吃掉几秒后的真实操作。 */
+  const pdfRebuildAt = new Map<string, number>();
   function schedulePdfRebuildIfSizeChanged() {
     if (!isPdfBook() || !book) return;
     const k = pdfViewKey();
     if (k === lastPdfViewKey) return;
-    lastPdfViewKey = k;
-    if (pdfRebuiltKeys.has(k)) {
+    const now = Date.now();
+    if ((pdfRebuildAt.get(k) ?? 0) > now - 150) {
       scheduleSliceCheck();
       return;
     }
-    if (pdfRebuiltKeys.size > 8) pdfRebuiltKeys.clear();
-    pdfRebuiltKeys.add(k);
+    lastPdfViewKey = k;
+    pdfRebuildAt.set(k, now);
+    if (pdfRebuildAt.size > 32) {
+      for (const [kk, tt] of pdfRebuildAt) if (tt < now - 5000) pdfRebuildAt.delete(kk);
+    }
     loadGeneration++;
     void loadMangaWindow(chapterNum);
   }
