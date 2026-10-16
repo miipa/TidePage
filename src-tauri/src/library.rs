@@ -122,7 +122,33 @@ impl ChapterCache {
     }
 }
 
-const EXT_BOOK: &[&str] = &["txt", "epub", "mobi", "azw3", "prc"];
+const EXT_BOOK: &[&str] = &["txt", "epub", "mobi", "azw3", "prc", "pdf"];
+
+/// 设置项键名：PDF 页数（`pdf.pages.<book_id>`）。Rust 不解析 PDF，页数只由前端
+/// 用 pdf.js 解析后上报；后端只负责按它生成页码目录。集中此处避免键名漂移。
+pub fn pdf_pages_key(book_id: i64) -> String {
+    format!("pdf.pages.{book_id}")
+}
+
+/// PDF 页码目录：**一个 PDF 页 = 一个章节**（页码即 chapter_index）。
+/// 页数只来自前端上报的设置项（后端不解析 PDF）；缺失/非法时返回空目录，
+/// 前端用 pdf.js 解析出真实页数后会重建目录并回写该设置项。
+fn pdf_page_toc(state: &AppState, book_id: i64) -> Vec<TocEntry> {
+    let pages = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_setting(&conn, &pdf_pages_key(book_id))
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(0)
+    };
+    (0..pages)
+        .map(|i| TocEntry {
+            title: format!("第 {} 页", i + 1),
+            index: i as usize,
+            chars: 0,
+        })
+        .collect()
+}
 
 /// MOBI 家族格式（mobi/azw3/prc）判定：集中一处，避免多处散落的字符串比较漂移。
 pub fn is_mobi_ext(ext: &str) -> bool {
@@ -1808,6 +1834,12 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
             .await
             .map_err(|e| e.to_string())??;
         (cached.2.clone(), Vec::new(), None)
+    } else if ext == "pdf" {
+        // PDF：后端不解析内容，正文由前端 pdf.js 逐页渲染（见 Reader.svelte）。
+        // 目录 = 页码列表，页数来自前端上次上报的设置项；缺失时先给空目录。
+        // is_manga 保持 false：漫画判据依赖图片清单，PDF 走的是「前端恒判漫画模式」这条路
+        // （见 Reader.svelte 的 isMangaMode），渲染仍复用漫画的按图块管线。
+        (pdf_page_toc(&st, id), Vec::new(), None)
     } else {
         // MOBI/AZW3 解压 + 切分：放阻塞线程池。
         let st2 = st.clone();
@@ -1983,6 +2015,11 @@ pub async fn get_chapter(
             .unwrap()
             .put((book_id, idx as i64, keep_styles), Arc::new(data.clone()));
         return Ok(data);
+    }
+
+    if ext == "pdf" {
+        // PDF 正文由阅读器前端用 pdf.js 渲染成位图，后端没有「按章取文」这条路。
+        return Err("PDF 由阅读器前端渲染，不支持按章取文".into());
     }
 
     let is_mobi = is_mobi_ext(&ext);
@@ -2402,6 +2439,78 @@ pub fn set_custom_cover(
     }
     // 该本封面已变：通知前端刷新，per-book URL 因 cover_ver+1 而失效重取。
     state.app.emit("book-updated", ()).ok();
+    Ok(())
+}
+
+/// 读取整本 PDF 的原始字节，供前端 pdf.js 解析。
+/// 走 `tauri::ipc::Response` 原始字节通道（与 `list_order_index` 同一套）：前端
+/// `invoke<ArrayBuffer>` 直接拿到 ArrayBuffer，不做 base64 往返（大 PDF 可省一倍内存）。
+/// 只允许 pdf：否则这里就成了任意文件的读取口。
+#[tauri::command]
+pub async fn read_book_bytes(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+) -> Result<tauri::ipc::Response, String> {
+    let path = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?.path
+    };
+    if ext_of(&path).as_deref() != Some("pdf") {
+        return Err("仅 PDF 支持按原始字节读取".into());
+    }
+    // 几十 MB 的整读放阻塞线程池，避免占用 async 运行时拖住其它 IPC。
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// PDF 首页封面：前端把 pdf.js 渲染出的 PNG（base64，去掉 data URL 前缀）传上来。
+/// 后端无法栅格化 PDF，所以封面图必须由前端给；落盘与落库流程与 `set_custom_cover` 一致
+/// （缩略图 + cover_path/cover_ver + book-updated），保证书库封面即时刷新且 URL 失效重取。
+#[tauri::command]
+pub fn set_book_cover_image(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    png_base64: String,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(png_base64.trim())
+        .map_err(|e| format!("封面数据解码失败: {e}"))?;
+    let dir = covers::covers_dir(&state.app);
+    let name = format!("custom-{book_id}.png");
+    let out = dir.join(&name);
+    covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
+    {
+        let conn = state.db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
+            rusqlite::params![book_id, name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    state.app.emit("book-updated", ()).ok();
+    Ok(())
+}
+
+/// 前端回传的「某页纯文本」：写入既有 chapter_text（划词全文搜索 / FTS 的数据源）。
+/// 后端不解析 PDF —— 文字只能由前端 pdf.js 抽取后回传；乱码页前端不会回传（见 pdfTextUsable）。
+#[tauri::command]
+pub fn set_pdf_page_text(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    page_index: i64,
+    title: String,
+    text: String,
+) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+        rusqlite::params![book_id, page_index, title, text],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3761,6 +3870,25 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
                 )
             })
             .collect()
+    } else if ext == "pdf" {
+        // PDF 的文字**只能由前端 pdf.js 抽取后回传**（后端不解析 PDF）：直接用回传结果。
+        // 没回传过（扫描版 / 乱码页 / 尚未访问的页）就是空 —— 搜索与朗读自然跳过，不报错。
+        let conn = state.db.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT chapter_index, title, body FROM chapter_text WHERE book_id=?1 ORDER BY chapter_index")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([book_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        rows
     } else {
         let doc = mobi_doc_for(state, &book.path, book_id)?;
         doc.toc
@@ -4367,6 +4495,10 @@ pub async fn get_book_word_count(
                 total: stats.total,
                 pure: stats.pure,
             });
+        }
+        if ext == "pdf" {
+            // PDF 不参与字数统计：不读盘、不回填（回填 0 会让 DB 短路判定失效）。
+            return Ok(WordCount { total: 0, pure: 0 });
         }
         let is_mobi = is_mobi_ext(&ext);
         let (content, _r, _t) = if is_mobi {

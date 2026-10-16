@@ -1994,7 +1994,9 @@ import { reorderByDrop } from "../lib/reorder";
         {/if}
         <div class="ctx-sep"></div>
         <button class="ctx-item" data-testid="lib-ctx-cover" onclick={() => { setCover(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconPhoto size={16} stroke={1.5} /></span>{t("library.ctx.setCover")}</button>
-        <button class="ctx-item" data-testid="lib-ctx-reextract" onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={16} stroke={1.5} /></span>{t("library.ctx.reextract")}</button>
+        {#if ctxMenu.book.format !== "pdf"}
+          <button class="ctx-item" data-testid="lib-ctx-reextract" onclick={() => { reextract(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconRefresh size={16} stroke={1.5} /></span>{t("library.ctx.reextract")}</button>
+        {/if}
         {#if effectiveState(ctxMenu.book) !== "read"}
           <button class="ctx-item" data-testid="lib-ctx-mark-read" onclick={() => { markReadState(ctxMenu!.book, "read"); ctxMenu = null; }}><span class="ci"><IconCircleCheck size={16} stroke={1.5} /></span>{t("library.ctx.markRead")}</button>
         {/if}

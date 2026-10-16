@@ -4,7 +4,9 @@
   "description": "",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/copy-pdfjs-assets.mjs",
     "dev": "vite dev",
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -20,7 +22,8 @@
   "dependencies": {
     "@tabler/icons-svelte": "^3.48.0",
     "@tauri-apps/api": "^2.12.3",
-    "@tauri-apps/plugin-opener": "^2.7.1"
+    "@tauri-apps/plugin-opener": "^2.7.1",
+    "pdfjs-dist": "^4.10.38"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

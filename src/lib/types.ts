@@ -34,6 +34,8 @@ export interface TocEntry {
   title: string;
   index: number;
   chars: number;
+  /** PDF 自带目录（outline）的嵌套层级：仅用于目录面板缩进；其余格式不设此字段。 */
+  depth?: number;
 }
 
 export interface ChapterData {
