@@ -72,7 +72,11 @@ export const zhCN = {
   "common.imgViewer.prev": "上一张 (←)",
   "common.imgViewer.next": "下一张 (→)",
   "common.imgViewer.empty": "本书未找到图片",
-  "common.imgViewer.hint": "滚轮 / ← → 切换，点击图片缩放，点击图片外空白处或 Esc 关闭",
+    "common.imgViewer.zoomIn": "放大",
+  "common.imgViewer.zoomOut": "缩小",
+  "common.imgViewer.fit": "适配",
+  "common.imgViewer.zoomPct": "缩放比例",
+"common.imgViewer.hint": "滚轮 / ← → 切换，点击图片缩放，点击图片外空白处或 Esc 关闭",
 
   // ===== 取色器 / 调色板 =====
   "common.color.pick": "取色",
