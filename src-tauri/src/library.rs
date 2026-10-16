@@ -68,6 +68,10 @@ pub struct AppState {
     /// 本轮扫描已处理数 / 待处理总数（进度条分子分母，worker 启动时按 DB 实测赋值）。
     pub cover_scan_done: AtomicU64,
     pub cover_scan_total: AtomicU64,
+    /// 封面扫描总开关（首选项「封面扫描」）。false = **只跳过「提取封面」这一步**：
+    /// 元数据/字数照旧写入、meta_done 照旧置 1 —— 否则整轮扫描会卡在缺封面的书上，
+    /// 后面所有书的字数/元数据也跟着停。
+    pub cover_scan_enabled: std::sync::atomic::AtomicBool,
     /// 封面默认底图 id 与解析规则版本，参与缓存失效（F5）。
     pub cover_style_ver: AtomicU64,
 }
@@ -609,6 +613,24 @@ fn on_startup(state: Arc<AppState>) {
                 return None;
             }
         }
+        // 手动模式：只跳过「提取封面」这一步 —— 仍照常把 meta_done 置 1（元数据/字数流程不变），
+        // 也**不碰 cover_path**（已存在的封面不能被这轮扫描抹掉），更不打开文件。
+        if !state.cover_scan_enabled.load(Ordering::SeqCst) {
+            let wrote = {
+                let conn = state.db.0.lock().unwrap();
+                let r = db::mark_meta(&conn, id, 1, None);
+                db::delete_priority(&conn, id);
+                match r {
+                    Ok(()) => true,
+                    Err(e) => { eprintln!("[scan] mark_meta(1) failed id={id}: {e}"); false }
+                }
+            };
+            if wrote {
+                state.app.emit("cover-updated", serde_json::json!({ "id": id })).ok();
+            }
+            return Some(false);
+        }
+
         // 解析在**不持 DB 锁**时进行（全库共用一个 Mutex<Connection>，持锁解析会冻结 UI）。
         // 只提取封面，绝不读全文、不产出 title/author/chars。
         // 看门狗：个别损坏/异常文件可能让封面解析长时间不返回（如 zip 中央目录条目损坏触发
@@ -4372,6 +4394,22 @@ pub fn reveal_in_explorer(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 缺封面的 PDF（仅 id，升序）：给书架「后台补封面」用。
+/// 为什么不复用 list_books：那是整表全量行（含 path/title 字符串），16 万本时每次书库刷新
+/// 拉一遍太重；这里只取 id，代价是一次列扫描。format 落库时已是小写（ext_of 归一）。
+#[tauri::command]
+pub fn pdf_books_missing_cover(state: State<'_, Arc<AppState>>) -> Result<Vec<i64>, String> {
+    let conn = state.db.0.lock().unwrap();
+    Ok(db::list_pdf_ids_missing_cover(&conn))
+}
+
+/// 设置封面扫描开关（首选项「封面扫描」）。语义见 AppState::cover_scan_enabled 的说明。
+#[tauri::command]
+pub fn set_cover_scan(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
+    state.cover_scan_enabled.store(enabled, Ordering::SeqCst);
     Ok(())
 }
 

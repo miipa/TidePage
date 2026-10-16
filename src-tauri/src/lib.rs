@@ -297,6 +297,7 @@ pub fn run() {
                 scan_start_count: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_done: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_total: std::sync::atomic::AtomicU64::new(0),
+                cover_scan_enabled: std::sync::atomic::AtomicBool::new(true),
                 cover_style_ver: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
@@ -559,6 +560,8 @@ pub fn run() {
             library::pdf_file_size,
             library::pdf_read_range,
             library::set_book_cover_image,
+            library::set_cover_scan,
+            library::pdf_books_missing_cover,
             library::set_pdf_page_text,
             library::webdav_test,
             library::webdav_backup_settings,

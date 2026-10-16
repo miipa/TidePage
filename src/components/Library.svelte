@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
+  import { renderCoverPng } from "../lib/pdf";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
@@ -1111,6 +1112,49 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
+  /** PDF 后台补封面（仅「自动」模式）。
+   *  为什么需要它：后端封面扫描的 cover_source 只支持 epub/cbz/mobi，PDF 只能由前端用 pdf.js
+   *  栅格化；否则「PDF 不打开就没封面、其它书自动扫全库」。
+   *  串行、一次一本；每本渲染**前**都重查模式与 ui.view —— renderCoverPng 复用阅读器的 pdf.js
+   *  单例，用户一打开书（ui.view 变 reader）就必须立刻收手，否则会把阅读器正在用的文档释放掉。
+   *  tried 记本轮已试过的书：单本失败不能让它被反复选中（死循环）。 */
+  let pdfCoverToken = 0;
+  let pdfCoverRunning = false;
+  async function backfillPdfCovers() {
+    if (pdfCoverRunning) return;
+    const token = ++pdfCoverToken;
+    pdfCoverRunning = true;
+    const tried = new Set<number>();
+    try {
+      for (;;) {
+        if (token !== pdfCoverToken || config.library.coverScan !== "auto" || ui.view !== "library") return;
+        const ids = await api.pdfBooksMissingCover().catch(() => null);
+        if (!ids) return;
+        const id = ids.find((n) => !tried.has(n));
+        if (id == null) return; // 没有待补的：收工（新导入会再由 library-changed 触发）
+        // 渲染前再查一次：用户可能刚好在这一刻点开了书
+        if (token !== pdfCoverToken || config.library.coverScan !== "auto" || ui.view !== "library") return;
+        tried.add(id);
+        try {
+          const dataUrl = await renderCoverPng(id, 800);
+          const b64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+          if (b64 && b64 !== dataUrl) await api.setBookCoverImage(id, b64);
+        } catch {
+          /* 单本失败静默：封面是锦上添花，不弹错、也不拖住后面的书 */
+        }
+      }
+    } finally {
+      if (token === pdfCoverToken) pdfCoverRunning = false;
+    }
+  }
+  /** 起一轮补封面（重复调用安全）；关闭/切手动后令牌失效，循环自行退出。 */
+  function kickPdfCovers() {
+    if (config.library.coverScan !== "auto") return;
+    void backfillPdfCovers();
+  }
+  // 离开书架（组件卸载）即停止：令牌 +1 让在跑的循环在下一次检查点退出。
+  onDestroy(() => { pdfCoverToken++; });
+
   // C1：路由重新进入本组件时 onMount 会重跑 reload()（本应用书库/阅读是 {#if} 切换，非 keep-alive）。
   // 另外响应全局 cover-updated 信号（ui.coverTick，来自 +page 根组件监听）重拉当前窗口，
   // 令扫描/打开插队扫出的新封面即时显示。queueMicrotask 逃离响应式追踪，避免误依赖内部变量成环。
@@ -1559,6 +1603,7 @@ import { reorderByDrop } from "../lib/reorder";
     loadFolders();
     loadFormats();
     reload();
+    kickPdfCovers(); // 进书库就补一轮缺封面的 PDF（手动模式内部直接返回）
     // 启动竞态修复：首次 `meta-progress` 常在 webview 挂载前发出而丢失，仅靠事件会让底栏空着。
     // 挂载后主动拉一次当前进度快照初始化（若已有事件先到则保留更新值；后续帧仍由 meta-progress 事件更新）。
     api
@@ -1586,6 +1631,7 @@ import { reorderByDrop } from "../lib/reorder";
         });
         // 格式可能新增/消失：刷新格式列表并清理失效选中。
         loadFormats();
+        kickPdfCovers(); // 新导入的 PDF 也要能自动出封面（本组件只处理 pdf）
       }, 120);
     });
     const u2 = listen("library-meta", () => {
