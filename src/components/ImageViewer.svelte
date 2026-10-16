@@ -103,8 +103,11 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
       const s = stageEl;
       if (!s) return;
       // 缩放后的留白按新尺寸重算：scroll = 新留白 + 锚点内容偏移×倍率 − 光标位置
-      // 留白必须与布局用同一个基准（缓存的 stageW/stageH）：live 的 clientWidth 已扣掉滚动条，
-      // 与布局值差约 7.5px，混用会让缩放那一帧的锚点偏这么多。
+      // 先把舞台客户区尺寸刷新成 live 值：滚动条出现/消失会让 clientWidth 变化，
+      // 而 stageW 只在挂载与 resize 时测（那时可能还没有滚动条）⇒ 陈旧值会让图比可见区宽 ~12px，
+      // 表现为「适配」后 scrollLeft/Top 不是 0、中心偏移十几像素。刷新后再算留白，基准就始终一致。
+      stageW = s.clientWidth;
+      stageH = s.clientHeight;
       const mR1 = Math.max(0, (stageW - fit.w * k1) / 2);
       const mT1 = Math.max(0, (stageH - fit.h * k1) / 2);
       s.scrollLeft = mR1 + cx * f - px;
