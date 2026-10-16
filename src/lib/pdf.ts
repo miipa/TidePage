@@ -1,4 +1,4 @@
-import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport, TextLayer, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import workerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { api } from "./api";
 import { pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
@@ -13,6 +13,8 @@ GlobalWorkerOptions.workerSrc = workerSrc;
 interface PdfSession {
   bookId: number;
   doc: PDFDocumentProxy;
+  /** 走 range 分块时保留传输对象：换书/关书要 abort 掉在途请求。 */
+  range?: PDFDataRangeTransport;
 }
 
 /** 未被钉住的位图上限（张）：一张普通页位图约 4~16MB，6 张 ≈ 上限百 MB 级。 */
@@ -20,6 +22,11 @@ const PAGE_CACHE_MAX = 6;
 /** 渲染并发上限：pdf.js 单条切片很贵（数百毫秒 + 数 MB 位图），并发会瞬间吃满内存与主线程。 */
 /** 渲染并发（同时最多 2 条切片在渲染）。导出给 Reader 做「每帧最多新发 2 条」的限流同一口径。 */
 export const RENDER_CONCURRENCY = 2;
+
+/** 小于这个大小就整份读入（一次 IPC 换最少往返）；大于等于则走 range 分块。 */
+const PDF_RANGE_MIN_BYTES = 8 * 1024 * 1024;
+/** 首个分块：pdf.js 需要先拿到头部才能开始解析（64KB 足够覆盖 xref 头）。 */
+const PDF_RANGE_FIRST = 64 * 1024;
 
 let session: PdfSession | null = null;
 let sessionBookId = -1;
@@ -97,10 +104,24 @@ function sweep() {
 
 /** 登记「哪些切片贴着视口」：被登记切片的位图只归阅读器的视口判定决定生死。 */
 export function pinSlices(bookId: number, tokens: string[]): void {
-  if (!session || session.bookId !== bookId) return;
-  pinnedTokens.clear();
+  // 只重建「切片」钉子，保留 full# 前缀的整页图钉子：否则这里一 clear 就把图库正在显示的那张
+  // 整页图丢了钉子，sweep() 会把它 revoke 掉 —— 图库中途白屏。
+  for (const t of [...pinnedTokens]) {
+    if (!t.startsWith("full#")) pinnedTokens.delete(t);
+  }
   for (const t of tokens) if (bitmaps.has(t)) pinnedTokens.add(t);
   sweep();
+}
+
+/** 释放整页图（图库关闭 / 换图前调用）：revoke 并从缓存删除。
+ *  尺寸修正后单张可达 ~48MB，不能像切片那样等 LRU 慢慢淘汰，否则每长按一页就常驻一张。 */
+export function releaseFullPage(): void {
+  for (const [token, b] of [...bitmaps]) {
+    if (!token.startsWith("full#")) continue;
+    revoke(b.url);
+    bitmaps.delete(token);
+    pinnedTokens.delete(token);
+  }
 }
 
 /** 取当前这本书的 PDF 文档（换书时先释放上一本的文档与全部位图）。 */
@@ -111,22 +132,61 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
   sessionBookId = bookId;
   const gen = generation;
   const p = (async (): Promise<PdfSession> => {
-    const buf = await api.readBookBytes(bookId);
-    const task = getDocument({
-      data: new Uint8Array(buf),
+    // 小文件整读（往返少），大文件走 range 分块：pdf.js 只拉它真正需要的字节，
+    // 进程内存不再随文件大小线性上涨（90MB 级扫描件尤其明显）。
+    const len = await api.pdfFileSize(bookId);
+    const opts: Record<string, unknown> = {
       cMapUrl: "/pdfjs/cmaps/",
       cMapPacked: true,
       standardFontDataUrl: "/pdfjs/standard_fonts/",
       // pdf.js 默认用 eval 加速，CSP 不允许；这里也没有收益。
       isEvalSupported: false,
-    });
+    };
+    let range: PDFDataRangeTransport | null = null;
+    if (len >= PDF_RANGE_MIN_BYTES) {
+      range = new PDFDataRangeTransport(len, null, false);
+      const rt = range;
+      // 失败重试一次：range 请求偶发失败会让 pdf.js 直接报损坏，重试一次能挡住抖动
+      const fetchRange = async (begin: number, end: number, retry: boolean) => {
+        try {
+          const buf = await api.pdfReadRange(bookId, begin, end);
+          if (gen !== generation) return; // 换书后到达的分块直接丢
+          rt.onDataRange(begin, new Uint8Array(buf));
+        } catch (e) {
+          if (retry && gen === generation) {
+            await fetchRange(begin, end, false);
+          } else {
+            throw e;
+          }
+        }
+      };
+      rt.requestDataRange = (begin: number, end: number) => {
+        void fetchRange(begin, end, true).catch(() => {});
+      };
+      opts.range = rt;
+      opts.length = len;
+    } else {
+      const buf = await api.readBookBytes(bookId);
+      opts.data = new Uint8Array(buf);
+    }
+    const task = getDocument(opts as Parameters<typeof getDocument>[0]);
+    if (range) {
+      // 先把头部喂进去：pdf.js 要先看到 %PDF- 头才会开始解析
+      const rt = range;
+      void api
+        .pdfReadRange(bookId, 0, Math.min(PDF_RANGE_FIRST, len))
+        .then((buf) => {
+          if (gen === generation) rt.onDataRange(0, new Uint8Array(buf));
+        })
+        .catch(() => {});
+    }
     const doc = await task.promise;
     // 等待期间换了书：这份文档直接销毁，别留下无人引用的 worker。
     if (gen !== generation) {
       await doc.destroy().catch(() => {});
       throw new Error("已切换书籍");
     }
-    session = { bookId, doc };
+      session = { bookId, doc, range: range ?? undefined };
     return session;
   })();
   sessionPromise = p;
@@ -371,18 +431,37 @@ export async function buildTextLayer(
 
 /** 整页位图（图库用）：按长边 ≤ maxLong 渲染，独立于切片缓存（图库看的是整页，不是切片）。
  *  仍登记进位图表（合成 token）→ 关书/换书时一并 revoke，不留悬挂 blob。 */
-export async function renderPageImageFull(bookId: number, page: number, maxLong = 2000): Promise<string> {
+export async function renderPageImageFull(bookId: number, page: number, maxW = 1400, maxPx = 12_000_000): Promise<string> {
   const { doc } = await ensurePdf(bookId);
   const gen = generation;
-  const token = `full#${page}@${maxLong}`;
+  // 尺寸必须**先算出来**再当缓存键：键里含最终宽高，尺寸策略一变就不会命中旧图。
+  // 为什么不能只按长边夹：15、Nginx.pdf 是 1693×11221pt，按长边 2000 只得到 302×2000，
+  // 适配看着还行，一放大就是 302 源像素硬撑（必糊）。改按宽度 1400 定 scale，再用总像素
+  // 1200 万收紧 → 该页约 1345×8919（≈1199 万像素），400%/800% 下文字仍清楚。
+  const probe = await doc.getPage(page + 1);
+  let baseW = 1;
+  let baseH = 1;
+  try {
+    const vp0 = probe.getViewport({ scale: 1 });
+    baseW = Math.max(1, vp0.width);
+    baseH = Math.max(1, vp0.height);
+  } finally {
+    probe.cleanup();
+  }
+  let w = Math.min(maxW, baseW); // 不放大原图
+  let h = (w * baseH) / baseW;
+  if (w * h > maxPx) {
+    const k = Math.sqrt(maxPx / (w * h));
+    w = Math.max(1, Math.floor(w * k));
+    h = Math.max(1, Math.floor(h * k));
+  }
+  const token = `full#${page}@${w}x${h}`;
   const hit = bitmaps.get(token);
   if (hit) return hit.url;
   return withSlot(async () => {
     const p = await doc.getPage(page + 1);
     try {
-      const base = p.getViewport({ scale: 1 });
-      const scale = Math.max(0.05, maxLong / Math.max(base.width, base.height));
-      const viewport = p.getViewport({ scale });
+      const viewport = p.getViewport({ scale: w / baseW });
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(viewport.width));
       canvas.height = Math.max(1, Math.round(viewport.height));
@@ -434,6 +513,8 @@ export async function renderCoverPng(bookId: number, maxWidth = 800): Promise<st
 /** 释放当前 PDF：回收全部位图、销毁文档（关书/换书/组件销毁时调用；非 PDF 时是空操作）。 */
 export function releaseAll(): void {
   generation++;
+  // 换书/关书：取消在途 range 请求，别让上一本的字节继续往这里送
+  session?.range?.abort();
   for (const e of bitmaps.values()) revoke(e.url);
   bitmaps.clear();
   pinnedTokens.clear();

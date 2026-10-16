@@ -43,6 +43,10 @@ export const api = {
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex, keepStyles }),
   /** 读取整本 PDF 的原始字节（仅 pdf）：返回 ArrayBuffer，交前端 pdf.js 解析渲染。 */
   readBookBytes: (bookId: number) => invoke<ArrayBuffer>("read_book_bytes", { bookId }),
+  /** PDF 字节总数（决定整读还是 range 分块）与区间读取（pdf.js range 传输用）。 */
+  pdfFileSize: (bookId: number) => invoke<number>("pdf_file_size", { bookId }),
+  pdfReadRange: (bookId: number, begin: number, end: number) =>
+    invoke<ArrayBuffer>("pdf_read_range", { bookId, begin, end }),
   /** PDF 某页纯文本回传（前端 pdf.js 抽取）：写入 chapter_text，供划词全文搜索/FTS/朗读复用。
    *  乱码页/扫描版不回传（见 pdfTextUsable），后端不解析 PDF。 */
   setPdfPageText: (bookId: number, pageIndex: number, title: string, text: string) =>

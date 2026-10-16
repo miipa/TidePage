@@ -2466,6 +2466,87 @@ pub async fn read_book_bytes(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// 解析书籍路径并确认是 PDF（两个 range 命令共用前置校验）。
+/// 非 pdf 一律拒绝：否则这两个命令就成了任意文件读取口。
+fn pdf_book_path(state: &State<'_, Arc<AppState>>, book_id: i64) -> Result<std::path::PathBuf, String> {
+    let path = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?.path
+    };
+    if ext_of(&path).as_deref() != Some("pdf") {
+        return Err("仅 PDF 支持按区间读取".into());
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// 单次 range 上限 8MB：pdf.js 单次顶多取这么多（默认分块几十 KB），
+/// 卡住上限可避免「某处 bug 一次要回整本」把 IPC 通道退化成整读。
+const PDF_RANGE_MAX: u64 = 8 * 1024 * 1024;
+/// 同时在途 range 上限：pdf.js 打开 range 后会并发拉取，无上限会在后端堆积。
+const PDF_RANGE_CONCURRENCY: usize = 4;
+static PDF_RANGE_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// PDF 文件字节总数：前端据此决定「整份读入」还是「range 分块拉取」。
+#[tauri::command]
+pub async fn pdf_file_size(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<u64, String> {
+    let path = pdf_book_path(&state, book_id)?;
+    tauri::async_runtime::spawn_blocking(move || std::fs::metadata(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|m| m.len())
+        .map_err(|e| format!("读取文件失败：{e}"))
+}
+
+/// 读取 PDF 的 [begin, end) 原始字节（供 pdf.js 的 PDFDataRangeTransport 按需拉取）。
+/// 只返回原始字节，不做 base64 往返：大 PDF 能省一倍内存。
+#[tauri::command]
+pub async fn pdf_read_range(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    begin: u64,
+    end: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let path = pdf_book_path(&state, book_id)?;
+    if end <= begin {
+        return Err("range 非法：end 必须大于 begin".into());
+    }
+    let want = end - begin;
+    if want > PDF_RANGE_MAX {
+        return Err(format!("单次 range 过大：{want} 字节（上限 {PDF_RANGE_MAX}）"));
+    }
+    // RAII 守卫：任何提前返回都会归还并发名额
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PDF_RANGE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    if PDF_RANGE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        >= PDF_RANGE_CONCURRENCY
+    {
+        PDF_RANGE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return Err("range 请求过于频繁（并发上限 4）".into());
+    }
+    let _guard = Guard;
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&path).map_err(|e| format!("打开文件失败：{e}"))?;
+        let total = f.metadata().map_err(|e| e.to_string())?.len();
+        if begin >= total {
+            return Err(format!("range 越界：begin {begin} ≥ 文件大小 {total}"));
+        }
+        // 末尾不足按实际长度返回（pdf.js 能接受短读，不能读失败）
+        let len = std::cmp::min(want, total - begin);
+        f.seek(SeekFrom::Start(begin)).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; len as usize];
+        f.read_exact(&mut buf).map_err(|e| format!("读取失败：{e}"))?;
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// PDF 首页封面：前端把 pdf.js 渲染出的 PNG（base64，去掉 data URL 前缀）传上来。
 /// 后端无法栅格化 PDF，所以封面图必须由前端给；落盘与落库流程与 `set_custom_cover` 一致
 /// （缩略图 + cover_path/cover_ver + book-updated），保证书库封面即时刷新且 URL 失效重取。
