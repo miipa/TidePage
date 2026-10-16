@@ -2373,13 +2373,16 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** 单本：图片适应阅读器宽度开关。 */
   function toggleFitWidth() {
     const on = !effFitWidth();
-    setOv({ fitWidth: on, fitHeight: false });
+    // 开关语义：未激活 → 进入适宽；已激活再点 → 回到原大小（100%）。
+    // 只把 fitWidth 置 false 不够 —— effImgScale 会回落到全局漫画倍率，所以显式把本书倍率钉到 1。
+    setOv(on ? { fitWidth: true, fitHeight: false } : { fitWidth: false, fitHeight: false, imgScale: 1 });
   }
 
   /** 单本：图片适应阅读器高度开关（与适宽互斥）。 */
   function toggleFitHeight() {
     const on = !effFitHeight();
-    setOv({ fitHeight: on, fitWidth: false });
+    // 同上：已激活再点 = 回到原大小（100%）
+    setOv(on ? { fitHeight: true, fitWidth: false } : { fitHeight: false, fitWidth: false, imgScale: 1 });
   }
 
   /* ================= 漫画双页（横向连续阅读） ================= */
@@ -6323,6 +6326,15 @@ ${effCssExtra() || ""}
   .content :global(#chapter-content *) {
     user-select: text;
     -webkit-user-select: text;
+  }
+
+  /* PDF 的正文是位图、文字层只有透明文字：实色荧光笔/朗读蒙层会盖住字迹。
+     multiply 让色块与下方位图相乘（像真荧光笔压在纸上），并降透明度让字迹透出来。
+     选择器挂在 .reader.pdf 上 —— EPUB/TXT 的观感保持不变。 */
+  .reader.pdf :global(mark.fr-hl-background),
+  .reader.pdf :global(mark.fr-tts) {
+    mix-blend-mode: multiply;
+    opacity: 0.3;
   }
 
   /* PDF 文本层同样可选中；扫描版没有文本层，自然不可选。 */

@@ -289,7 +289,15 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
     onpointermove={onStagePointerMove}
     onpointerup={onStagePointerUp}
     onpointercancel={onStagePointerUp}
-    onclick={(e) => { if (e.target === e.currentTarget) onclose(); }}
+    onclick={(e) => {
+      // 拖拽后 pointer capture 会让 click 也落在 stage 上：这种 click 必须吞掉，
+      // 否则「放大后拖到四角再松手」会直接把图库关掉。吞掉的同时复位标记，不残留。
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
+      if (e.target === e.currentTarget) onclose();
+    }}
   >
     {#if current}
       <img
