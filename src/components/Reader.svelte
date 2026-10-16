@@ -1032,8 +1032,15 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const id = book?.book.id ?? 0;
     const w = Number(pageEl.dataset.pdfW ?? 0);
     const ptw = Number(pageEl.dataset.pdfPtw ?? 0);
+    // host 必须是 .textLayer 本身：buildTextLayer 会先清空 host 再渲染文本层，
+    // 传页容器会把同级的切片 <img> 一起清掉（页容器只该被清文本层那一层）。
+    const layerEl = pageEl.querySelector<HTMLElement>(".textLayer");
+    if (!layerEl) {
+      delete pageEl.dataset.textBusy;
+      return;
+    }
     try {
-      const res = await buildTextLayer(id, pageIdx, pageEl, { displayW: w, ptW: ptw });
+      const res = await buildTextLayer(id, pageIdx, layerEl, { displayW: w, ptW: ptw });
       pageEl.dataset.textDone = "1";
       if (!pdfTextOk && res.usable) pdfTextOk = true;
       if (res.usable) void uploadPageText(pageIdx, res.text);
