@@ -18,7 +18,8 @@ interface PdfSession {
 /** 未被钉住的位图上限（张）：一张普通页位图约 4~16MB，6 张 ≈ 上限百 MB 级。 */
 const PAGE_CACHE_MAX = 6;
 /** 渲染并发上限：pdf.js 单条切片很贵（数百毫秒 + 数 MB 位图），并发会瞬间吃满内存与主线程。 */
-const RENDER_CONCURRENCY = 2;
+/** 渲染并发（同时最多 2 条切片在渲染）。导出给 Reader 做「每帧最多新发 2 条」的限流同一口径。 */
+export const RENDER_CONCURRENCY = 2;
 
 let session: PdfSession | null = null;
 let sessionBookId = -1;

@@ -5,7 +5,7 @@
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
-  import { buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
+  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
   import {
     PDF_SLICE_MAX_SCREENS,
     buildPageToc,
@@ -1083,6 +1083,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const lo = r.top - near;
     const hi = r.bottom + near;
     const tokens: string[] = [];
+    // 本帧在飞名额：包含「本次新发」与「早已在渲染」的，上限 = 渲染并发。
+    // 一帧给几十条排队没有意义（都要排队），还会让已滚走的切片继续占用渲染槽。
+    let inFlight = 0;
     for (const blk of vp.querySelectorAll<HTMLElement>(".manga-block")) {
       const idx = Number(blk.dataset.index);
       if (!Number.isFinite(idx)) continue;
@@ -1101,10 +1104,14 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
             tokens.push(t);
             continue;
           }
-          if (!im.dataset.loading) {
-            im.dataset.loading = "1";
-            void fillSlice(im, idx);
+          if (im.dataset.loading) {
+            inFlight++; // 已在渲染中，同样占名额
+            continue;
           }
+          if (inFlight >= RENDER_CONCURRENCY) continue; // 本帧名额用完，留到下一帧
+          im.dataset.loading = "1";
+          inFlight++;
+          void fillSlice(im, idx);
         } else if (im.getAttribute("src")) {
           // 离开视口：解除 DOM 引用，位图交给 pdf.ts 的 LRU（同页同活切片数因此有上限）
           im.removeAttribute("src");
@@ -1112,18 +1119,37 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         }
       }
     }
-    if (tokens.length) pinSlices(book.book.id, tokens);
+    // 空数组也要调：否则上一帧钉住的位图会一直被钉住，永远进不了 LRU 回收。
+    pinSlices(book.book.id, tokens);
   }
 
   /** 渲染一条切片并把位图 URL 写进 <img>（失败保持空盒，不抛错阻断滚动）。 */
   async function fillSlice(im: HTMLImageElement, pageIdx: number) {
     const id = book?.book.id ?? 0;
+    const gen = loadGeneration;
+    const ok = () => {
+      if (!isPdfBook() || gen !== loadGeneration || im.dataset.loading !== "1") return false;
+      const vp = mangaHorizontal() ? mangaViewport : mangaFlowViewport;
+      if (!vp) return true;
+      const r = vp.getBoundingClientRect();
+      const near = r.height * PDF_SLICE_NEAR_SCREENS;
+      const ir = im.getBoundingClientRect();
+      return !(ir.bottom < r.top - near || ir.top > r.bottom + near);
+    };
+    // 真正渲染前重测一次：在并发队列里等的那几秒，元素很可能早已滚出视口，
+    // 再渲染就是白烧 8M 像素（200% 超长页尤其致命）。
+    if (!ok()) {
+      delete im.dataset.loading;
+      return;
+    }
     const slice = Number(im.dataset.slice ?? 0);
     const f0 = Number(im.dataset.f0 ?? 0);
     const f1 = Number(im.dataset.f1 ?? 1);
     const bitH = Number(im.dataset.bith ?? 0);
     try {
       const { url, token } = await renderPageSlice(id, { page: pageIdx, slice, f0, f1, bitH });
+      // 渲染期间可能已经换书/重建/滚走：这时不挂 src，位图交给 LRU 淘汰（不钉住就不会积压）
+      if (!ok()) return;
       im.dataset.token = token;
       im.src = url;
     } catch {
@@ -4383,14 +4409,29 @@ ${effCssExtra() || ""}
   /** PDF 视图尺寸键：倍率/适宽/适高/布局/容器高 任一变化 ⇒ 位图必须按新尺寸重渲染。
    *  缓存键含位图高度，不重建窗口就等于继续用旧分辨率的图 —— 缩放后必然发虚。 */
   function pdfViewKey(): string {
-    return [effImgScale(), effFitWidth(), effFitHeight(), config.reader.manga.layout, imgMaxH, pdfContainerH(), pdfContainerW()].join("|");
+    // 只放「决定显示尺寸」的量。**绝不能放 imgMaxH / 纵向容器高**：窗口重建期间内容被清成
+    // 占位块 ⇒ 横向滚动条消失 ⇒ clientHeight 变大 ⇒ imgMaxH 变大 ⇒ 键再变 ⇒ 又重建，
+    // 每轮按 200% 重渲染整页切片，webview 直接被拖死（重建风暴）。纵向显示尺寸只由
+    // 倍率/适宽/容器**宽**决定，去掉是安全的；横向按容器高定尺寸且没有纵向滚动条参与，才追加容器高。
+    const base = [effImgScale(), effFitWidth(), effFitHeight(), config.reader.manga.layout, pdfContainerW()];
+    if (mangaHorizontal()) base.push(pdfContainerH());
+    return base.join("|");
   }
   let lastPdfViewKey = "";
+  /** 硬闸：同一个视图键最多重建一次（键再变只重渲染切片，不改窗口结构）。
+   *  兜住任何残余反馈环 —— 宁可少一次重建，也不能让 webview 陷入重渲染风暴。 */
+  const pdfRebuiltKeys = new Set<string>();
   function schedulePdfRebuildIfSizeChanged() {
     if (!isPdfBook() || !book) return;
     const k = pdfViewKey();
     if (k === lastPdfViewKey) return;
     lastPdfViewKey = k;
+    if (pdfRebuiltKeys.has(k)) {
+      scheduleSliceCheck();
+      return;
+    }
+    if (pdfRebuiltKeys.size > 8) pdfRebuiltKeys.clear();
+    pdfRebuiltKeys.add(k);
     loadGeneration++;
     void loadMangaWindow(chapterNum);
   }
