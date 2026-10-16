@@ -2479,9 +2479,10 @@ fn pdf_book_path(state: &State<'_, Arc<AppState>>, book_id: i64) -> Result<std::
     Ok(std::path::PathBuf::from(path))
 }
 
-/// 单次 range 上限 8MB：pdf.js 单次顶多取这么多（默认分块几十 KB），
-/// 卡住上限可避免「某处 bug 一次要回整本」把 IPC 通道退化成整读。
-const PDF_RANGE_MAX: u64 = 8 * 1024 * 1024;
+/// 单次 range 上限 32MB：扫描页的单个嵌入图片流常见十几 MB，卡到 8MB 会让该页直接渲染失败；
+/// 32MB 仍然是一道「单次内存上限」，只是不会误伤正常的按需读取。超限直接报错，**不截断返回**
+/// （截断一个对象流会把它损坏）。
+const PDF_RANGE_MAX: u64 = 32 * 1024 * 1024;
 /// 同时在途 range 上限：pdf.js 打开 range 后会并发拉取，无上限会在后端堆积。
 const PDF_RANGE_CONCURRENCY: usize = 4;
 static PDF_RANGE_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
