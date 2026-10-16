@@ -14,6 +14,7 @@
     pdfDisplayBox,
     pdfPageErrorHtml,
     pdfSliceRanges,
+    hlBlocksFromRects,
   } from "../lib/pdfPage";
   import {
     config,
@@ -1066,13 +1067,17 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         return `<a class="pdf-link" ${attr} style="position:absolute !important;left:${left}px !important;top:${top}px !important;width:${w}px !important;height:${h}px !important;z-index:1 !important;background:transparent !important;display:block !important;cursor:pointer !important"></a>`;
       })
       .join("");
-    // 双层 DOM：位图（canvas img）在下、透明文本层在上。页容器宽高写死，文本层与位图同一坐标系，
-    // 缩放只换位图分辨率、不改布局，选区/划线偏移因此稳定。
+    // 三层 DOM：位图（canvas img）在下、高亮叠层居中、透明文本层在上。页容器宽高写死，
+    // 三层同一坐标系，缩放只换位图分辨率、不改布局，选区/划线偏移因此稳定。
+    // 高亮叠层刻意**不设 z-index / transform / opacity** —— 任一都会让它自己成为层叠上下文，
+    // multiply 又只能与透明背景相乘（mark 失效就是这个原因）；它必须与切片位图同处一个层叠上下文。
+    const hlLayer = `<div class="pdf-hl-layer" style="position:absolute !important;inset:0 !important;pointer-events:none !important"></div>`;
     return (
       `<div class="pdf-page" data-pdf-page="${pageIdx}" data-pdf-w="${box.w}" data-pdf-h="${box.h}"` +
       ` data-pdf-ptw="${geo.ptW}" data-pdf-pth="${geo.ptH}"` +
       ` style="position:relative !important;width:${box.w}px !important;height:${box.h}px !important;margin:0 auto !important;zoom:1 !important">` +
       parts.join("") +
+      hlLayer +
       hot +
       `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:2 !important;pointer-events:none !important"></div></div>`
     );
@@ -4662,10 +4667,39 @@ ${effCssExtra() || ""}
     return (contentEl?.querySelector("#chapter-content") as HTMLElement | null) ?? null;
   }
 
+  /** PDF 独立高亮叠层：把 mark 的**背景**搬到 .pdf-page 直系的 .pdf-hl-layer 里重画。
+   *  为什么必须这样：mark 在 pdf.js 的 span 内，而 span 带 `transform: scaleX(...)`
+   *  （非 none 的 transform 自成层叠上下文），span 里没有切片位图 ⇒ mark 的 mix-blend-mode
+   *  只能与透明背景相乘，退化成平铺。叠层不含 transform/z-index/opacity，与位图同处一个
+   *  层叠上下文，multiply 才真的乘到位图上。文本层仍在上层，负责选中与点击。
+   *  非 PDF 的根（#chapter-content）没有这一层，直接返回，EPUB/TXT 观感不受影响。 */
+  function paintHlLayer(root: HTMLElement | null): void {
+    const layer = root?.querySelector<HTMLElement>(":scope > .pdf-hl-layer") ?? null;
+    if (!layer) return;
+    layer.textContent = ""; // 先清空再重画：mark 被拆/重建后旧色块不能留下
+    const pageRect = root?.getBoundingClientRect();
+    if (!root || !pageRect) return;
+    for (const m of root.querySelectorAll<HTMLElement>("mark.fr-hl-background, mark.fr-tts")) {
+      const isTts = m.classList.contains("fr-tts");
+      const color = isTts ? "" : m.style.getPropertyValue("--hl-color");
+      for (const b of hlBlocksFromRects(pageRect, Array.from(m.getClientRects()))) {
+        const el = document.createElement("div");
+        el.className = isTts ? "pdf-hl-block pdf-hl-tts" : "pdf-hl-block";
+        el.style.left = b.left + "px";
+        el.style.top = b.top + "px";
+        el.style.width = b.width + "px";
+        el.style.height = b.height + "px";
+        if (color) el.style.setProperty("--hl-color", color);
+        layer.appendChild(el);
+      }
+    }
+  }
+
   function paintNow() {
     const root = contentRoot();
     if (!root) return;
     paintHighlights(root, chapterHighlights);
+    paintHlLayer(root);
   }
 
   async function refreshHighlights() {
@@ -5086,6 +5120,7 @@ ${effCssExtra() || ""}
         const range = charRangeToRange(root, seg.start, seg.end);
         if (range) scrollToRange(range);
       }
+      paintHlLayer(root); // 朗读蒙层也在叠层里画：mark 一变就跟着重算
     }
     // 朗读时按「读到的字符位置」保存进度（节流），关掉软件重开可回到朗读处。
     if (seg) {
@@ -5279,7 +5314,10 @@ ${effCssExtra() || ""}
     const ratio = ttsRatio;
     ttsStop();
     const root = contentRoot();
-    if (root) clearTtsMark(root);
+    if (root) {
+      clearTtsMark(root);
+      paintHlLayer(root);
+    }
     ttsCurrent = null;
     // 仅当确实在朗读时才落盘，避免“未朗读点停止”把已有阅读进度覆盖成 0。
     if (wasActive && book) void doSaveProgress(ratio);
@@ -6537,23 +6575,39 @@ ${effCssExtra() || ""}
     border-radius: var(--radius-xs);
   }
 
-  /* 背景类装饰（荧光笔 / 朗读蒙层）：PDF 的正文是位图、文字层只有透明文字，实色叠上去会盖住
-     字迹，故用 multiply 让色块与下方位图相乘（像真荧光笔压在纸上），并降透明度让字迹透出来。
+  /* PDF 高亮叠层：位图之上、文本层之下。**刻意不设 z-index / transform / opacity** ——
+     任一都会让它自己成为层叠上下文，multiply 又只能与透明背景相乘（mark 失效正是这个原因）。
+     multiply 挂在整个叠层上，色块自身不再设，避免同一处混两次。 */
+  .content :global(.pdf-page .pdf-hl-layer) {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+  }
+  /* 色块必须用**浅色**：直接拿 --hl-color 相乘会把纸面压成暗红。45% 用户色 + 白，与纸面
+     相乘后纸面呈浅色、黑字仍黑 —— 真实荧光笔的效果。 */
+  .content :global(.pdf-page .pdf-hl-block) {
+    position: absolute;
+    border-radius: var(--radius-xs);
+    background: color-mix(in srgb, var(--hl-color) 45%, white);
+  }
+  .content :global(.pdf-page .pdf-hl-block.pdf-hl-tts) {
+    background: color-mix(in srgb, var(--accent) 45%, white);
+  }
+
+  /* PDF 的 mark 只留行为与「线条类」装饰：背景色交给上面的叠层，所以这里必须透明 ——
+     否则 mark 自己那层（乘不到位图的）平铺色会盖在叠层上，等于白做。
+     下划线 / 波浪 / 点线 / 双线 / 删除线 / 方框仍由 mark 承担（见上面那组镜像规则）。
      选择器挂在 .reader.pdf 上 —— EPUB/TXT 的观感保持不变。 */
   .reader.pdf :global(mark.fr-hl-background) {
-    background: color-mix(in srgb, var(--hl-color) 38%, transparent);
-    border-radius: var(--radius-xs);
-    mix-blend-mode: multiply;
-    opacity: 0.3;
+    background: transparent;
   }
 
   .reader.pdf :global(mark.fr-tts) {
-    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    background: transparent;
     color: inherit;
     border-radius: var(--radius-xs);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
-    mix-blend-mode: multiply;
-    opacity: 0.3;
   }
 
   /* PDF 文本层同样可选中；扫描版没有文本层，自然不可选。 */

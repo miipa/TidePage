@@ -208,6 +208,22 @@ export function pdfPageErrorHtml(): string {
   return `<div class="pdf-page-error" style="height:60vh"></div>`;
 }
 
+/** 把一个 mark 的 client rect 列表换算成高亮叠层里的绝对色块（原点 = .pdf-page 的视口矩形）。
+ *  为什么抽成纯函数：跨行 mark 会给出多个矩形，负坐标（滚出视口）与零/负尺寸都很常见，
+ *  这些边界在 DOM 里不好构造，单独测更省事。负坐标保留（相对于页面原点本来就是负的），
+ *  尺寸非正的矩形丢弃（画出来是空块，还会白占一个 DOM 节点）。 */
+export function hlBlocksFromRects(
+  pageRect: { left: number; top: number },
+  rects: readonly { left: number; top: number; width: number; height: number }[],
+): { left: number; top: number; width: number; height: number }[] {
+  const out: { left: number; top: number; width: number; height: number }[] = [];
+  for (const r of rects) {
+    if (!(r.width > 0) || !(r.height > 0)) continue;
+    out.push({ left: r.left - pageRect.left, top: r.top - pageRect.top, width: r.width, height: r.height });
+  }
+  return out;
+}
+
 /** 整页图（图库）缓存的小 LRU 步进：给定现有顺序（旧→新）、本次要用的 token 与容量，
  *  返回新顺序与本次被淘汰的 token（旧→新，可能一次淘汰多个）。
  *  为什么抽成纯函数：淘汰是「revoke 掉 blob」的前置判定，最容易写错（重复插入、命中后变旧、
