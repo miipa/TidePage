@@ -215,12 +215,41 @@ export function pdfPageErrorHtml(): string {
 export function hlBlocksFromRects(
   pageRect: { left: number; top: number },
   rects: readonly { left: number; top: number; width: number; height: number }[],
+  mergeGapPx = 1.5,
 ): { left: number; top: number; width: number; height: number }[] {
-  const out: { left: number; top: number; width: number; height: number }[] = [];
+  const boxes: { left: number; top: number; width: number; height: number }[] = [];
   for (const r of rects) {
     if (!(r.width > 0) || !(r.height > 0)) continue;
-    out.push({ left: r.left - pageRect.left, top: r.top - pageRect.top, width: r.width, height: r.height });
+    boxes.push({ left: r.left - pageRect.left, top: r.top - pageRect.top, width: r.width, height: r.height });
   }
+  // 同一行的相邻/重叠矩形合并成一块：跨 span 的划线会切出几十个紧挨的小矩形，
+  // 每个都带圆角 —— 交界处会露出「发丝缝」（荧光笔样式下最明显）。合并后一行一块，
+  // 既无缝也少 DOM。判据：竖直重叠超过较矮者的 50%（同一行）且水平相接（gap ≤ 容差）。
+  boxes.sort((a, b) => a.top - b.top || a.left - b.left);
+  const out = boxes.map((b) => ({ ...b }));
+  let merged = true;
+  while (merged) {
+    merged = false;
+    outer: for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i];
+        const b = out[j];
+        const overlapY = Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
+        if (overlapY < Math.min(a.height, b.height) * 0.5) continue;
+        const gapX = Math.max(a.left, b.left) - Math.min(a.left + a.width, b.left + b.width);
+        if (gapX > mergeGapPx) continue;
+        const left = Math.min(a.left, b.left);
+        const top = Math.min(a.top, b.top);
+        const right = Math.max(a.left + a.width, b.left + b.width);
+        const bottom = Math.max(a.top + a.height, b.top + b.height);
+        out[i] = { left, top, width: right - left, height: bottom - top };
+        out.splice(j, 1);
+        merged = true;
+        break outer;
+      }
+    }
+  }
+  out.sort((a, b) => a.top - b.top || a.left - b.left);
   return out;
 }
 

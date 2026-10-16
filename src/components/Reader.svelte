@@ -337,7 +337,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const o = bookOv();
     return o.mangaMode ?? (config.reader.manga.autoDetect ? (book?.is_manga ?? false) : false);
   }
-  /** 漫画横向（横向连续阅读）：仅漫画模式下的「横向」布局。 */
+  /** 漫画横向（横向连续阅读）：漫画模式与 PDF 下的「横向」布局。 */
   function mangaHorizontal(): boolean {
     return isMangaMode() && config.reader.manga.layout === "horizontal";
   }
@@ -2194,7 +2194,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 漫画模式（两种布局共用）：连续窗口在两端自动续章，不重建窗口（保持视觉连续）。
     // 窗口两端是「人造边界」，不让 SmoothScroller 的 overshoot 表现成回弹：清掉越界量，
     // 把越界行程留给续章（窗口补齐后由 onsettled 把 carry 补滚一次）。横向没有 scrollTop，
-    // 续章本身就会拉长 mangaMaxX，故同样只需清掉越界量。只影响漫画模式，
+    // 续章本身就会拉长 mangaMaxX，故同样只需清掉越界量。只影响漫画模式与 PDF，
     // 普通文本滚动的翻章/回弹行为完全不变（见下一段代码）。
     if (isMangaMode()) {
       scroller?.consumeEdge();
@@ -2685,8 +2685,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     return html ? (html.match(/<img/gi)?.length ?? 0) : 0;
   }
 
-  /** 仅漫画路径：给没有 loading 的 <img 补 loading="lazy"（保留后端已加的 decoding="async"），
-      使单章即便几百张图也只解码视口附近几张。页模式（普通阅读）绝不调用此函数。 */
+  /** 仅漫画窗口路径（漫画与 PDF 都经它建窗口条目）：给没有 loading 的 <img 补 loading="lazy"
+      （保留后端已加的 decoding="async"），使单章即便几百张图也只解码视口附近几张。
+      页模式（普通阅读：EPUB/TXT）绝不调用此函数。 */
   function injectMangaLazy(html: string): string {
     if (!html) return "";
     return html.replace(/<img\b(?![^>]*\bloading=)/gi, '<img loading="lazy"');
@@ -4703,17 +4704,29 @@ ${effCssExtra() || ""}
     layer.textContent = ""; // 先清空再重画：mark 被拆/重建后旧色块不能留下
     const pageRect = root?.getBoundingClientRect();
     if (!root || !pageRect) return;
+    // 先按划线（hlid）归组再算色块：一条跨 span 的划线现在会切出很多个 mark，
+    // 若逐个 mark 出块，一天里的相邻块各带圆角、交界处会露发丝缝（合并逻辑在纯函数里）。
+    const groups = new Map<string, { isTts: boolean; color: string; rects: DOMRect[] }>();
     for (const m of root.querySelectorAll<HTMLElement>("mark.fr-hl-background, mark.fr-tts")) {
       const isTts = m.classList.contains("fr-tts");
-      const color = isTts ? "" : m.style.getPropertyValue("--hl-color");
-      for (const b of hlBlocksFromRects(pageRect, Array.from(m.getClientRects()))) {
+      const key = isTts ? "tts" : m.dataset.hlid ?? "";
+      let g = groups.get(key);
+      if (!g) {
+        g = { isTts, color: isTts ? "" : m.style.getPropertyValue("--hl-color"), rects: [] };
+        groups.set(key, g);
+      }
+      if (!g.color && !isTts) g.color = m.style.getPropertyValue("--hl-color");
+      for (const r of m.getClientRects()) g.rects.push(r);
+    }
+    for (const g of groups.values()) {
+      for (const b of hlBlocksFromRects(pageRect, g.rects)) {
         const el = document.createElement("div");
-        el.className = isTts ? "pdf-hl-block pdf-hl-tts" : "pdf-hl-block";
+        el.className = g.isTts ? "pdf-hl-block pdf-hl-tts" : "pdf-hl-block";
         el.style.left = b.left + "px";
         el.style.top = b.top + "px";
         el.style.width = b.width + "px";
         el.style.height = b.height + "px";
-        if (color) el.style.setProperty("--hl-color", color);
+        if (g.color) el.style.setProperty("--hl-color", g.color);
         layer.appendChild(el);
       }
     }

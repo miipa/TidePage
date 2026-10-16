@@ -227,7 +227,7 @@ describe("hlBlocksFromRects（PDF 高亮叠层色块）", () => {
     ]);
   });
 
-  it("跨行 mark：每个矩形各成一块（这是「一个 mark → 多块」的判据）", () => {
+  it("跨行：不同行各成一块（竖直重叠 < 较矮者一半不合并）", () => {
     expect(
       hlBlocksFromRects(page, [
         { left: 120, top: 80, width: 300, height: 24 },
@@ -236,6 +236,37 @@ describe("hlBlocksFromRects（PDF 高亮叠层色块）", () => {
     ).toEqual([
       { left: 20, top: 30, width: 300, height: 24 },
       { left: 20, top: 58, width: 80, height: 24 },
+    ]);
+  });
+
+  it("同一行相邻的多个矩形合并成一块（发丝缝的判据）", () => {
+    expect(
+      hlBlocksFromRects(page, [
+        { left: 120, top: 80, width: 40, height: 24 },
+        { left: 160, top: 80, width: 40, height: 24 },
+        { left: 200, top: 80, width: 40, height: 24 },
+      ]),
+    ).toEqual([{ left: 20, top: 30, width: 120, height: 24 }]);
+  });
+
+  it("同一行重叠的矩形也合并（pdf.js 会给出重叠的影子矩形）", () => {
+    expect(
+      hlBlocksFromRects(page, [
+        { left: 120, top: 80, width: 60, height: 24 },
+        { left: 150, top: 80, width: 60, height: 24 },
+      ]),
+    ).toEqual([{ left: 20, top: 30, width: 90, height: 24 }]);
+  });
+
+  it("间距超过容差不合并（真的是两个独立色块）", () => {
+    expect(
+      hlBlocksFromRects(page, [
+        { left: 120, top: 80, width: 40, height: 24 },
+        { left: 170, top: 80, width: 40, height: 24 },
+      ]),
+    ).toEqual([
+      { left: 20, top: 30, width: 40, height: 24 },
+      { left: 70, top: 30, width: 40, height: 24 },
     ]);
   });
 
