@@ -105,6 +105,46 @@ export function findTextRange(root: Node, needle: string): Range | null {
   return charRangeToRange(root, at, at + q.length);
 }
 
+/** range 覆盖到的每个文本节点，以及它在本节点内的相交区间（半开 [from,to)）。 */
+function intersectingTexts(range: Range): { node: Text; from: number; to: number }[] {
+  const container = range.commonAncestorContainer;
+  const rootEl =
+    container.nodeType === Node.ELEMENT_NODE ? (container as Element) : container.parentElement;
+  if (!rootEl) return [];
+  const out: { node: Text; from: number; to: number }[] = [];
+  for (const node of textNodes(rootEl)) {
+    if (!range.intersectsNode(node)) continue;
+    const len = node.nodeValue?.length ?? 0;
+    let from = node === range.startContainer ? range.startOffset : 0;
+    let to = node === range.endContainer ? range.endOffset : len;
+    from = Math.max(0, Math.min(from, len));
+    to = Math.max(0, Math.min(to, len));
+    if (to > from) out.push({ node, from, to });
+  }
+  return out;
+}
+
+/** **就地**把 range 包进一个或多个 <mark>，只切分文本节点、不搬动任何元素。
+ *
+ *  为什么不是 range.extractContents() + insertNode(mark)：PDF 文本层里每个 span 都靠自身的
+ *  position:absolute + left/top 定位，跨 span 选区用 extractContents 会把整段 span 搬进 mark，
+ *  它们随即退回普通流、堆到文本层原点 —— 划线跑到页面左上角就是这个原因。
+ *  跨多个文本节点会生成多个 <mark>（共享同一个 data-hlid），每个都带齐样式类与 --hl-color。 */
+function wrapRange(range: Range, makeMark: () => HTMLElement): void {
+  for (const { node, from, to } of intersectingTexts(range)) {
+    try {
+      const target = from > 0 ? node.splitText(from) : node;
+      const len = to - from;
+      if ((target.nodeValue?.length ?? 0) > len) target.splitText(len);
+      const mark = makeMark();
+      target.parentNode?.insertBefore(mark, target);
+      mark.appendChild(target);
+    } catch {
+      /* 单个文本节点切分失败：跳过它，不影响其余片段 */
+    }
+  }
+}
+
 function unwrapMarks(root: ParentNode): void {
   root.querySelectorAll("mark.fr-hl").forEach((m) => {
     const parent = m.parentNode;
@@ -131,15 +171,11 @@ export function paintTtsMark(root: HTMLElement, start: number, end: number): voi
   if (start < 0 || end <= start) return;
   const range = charRangeToRange(root, start, end);
   if (!range) return;
-  const mark = document.createElement("mark");
-  mark.className = "fr-tts";
-  try {
-    const frag = range.extractContents();
-    mark.appendChild(frag);
-    range.insertNode(mark);
-  } catch {
-    /* ignore */
-  }
+  wrapRange(range, () => {
+    const mark = document.createElement("mark");
+    mark.className = "fr-tts";
+    return mark;
+  });
 }
 
 /** 把当前章节的划线绘制到 root（先清除旧标记再重绘）。 */
@@ -153,16 +189,12 @@ export function paintHighlights(root: HTMLElement, highlights: HighlightRow[]): 
   for (const h of sorted) {
     const range = charRangeToRange(root, h.pos_start, h.pos_end);
     if (!range) continue;
-    const mark = document.createElement("mark");
-    mark.className = `fr-hl fr-hl-${h.style || "underline"}${h.note && h.note.trim() ? " fr-has-note" : ""}`;
-    mark.dataset.hlid = String(h.id);
-    if (h.color) mark.style.setProperty("--hl-color", h.color);
-    try {
-      const frag = range.extractContents();
-      mark.appendChild(frag);
-      range.insertNode(mark);
-    } catch {
-      /* 跨节点异常时跳过该条 */
-    }
+    wrapRange(range, () => {
+      const mark = document.createElement("mark");
+      mark.className = `fr-hl fr-hl-${h.style || "underline"}${h.note && h.note.trim() ? " fr-has-note" : ""}`;
+      mark.dataset.hlid = String(h.id);
+      if (h.color) mark.style.setProperty("--hl-color", h.color);
+      return mark;
+    });
   }
 }

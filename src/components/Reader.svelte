@@ -1115,6 +1115,18 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     });
   }
 
+  /** 「视口 ± 邻带」判据：横向布局按 x 轴、纵向按 y 轴。
+   *  为什么必须分轴：横向时页与页是左右排列，若仍拿 top/bottom 判，所有已挂载页都算「可见」——
+   *  离开视口的切片不会被回收，本帧渲染名额还会被远处的页占掉。 */
+  function withinNearBand(vp: DOMRect, r: DOMRect): boolean {
+    if (mangaHorizontal()) {
+      const near = vp.width * PDF_SLICE_NEAR_SCREENS;
+      return !(r.right < vp.left - near || r.left > vp.right + near);
+    }
+    const near = vp.height * PDF_SLICE_NEAR_SCREENS;
+    return !(r.bottom < vp.top - near || r.top > vp.bottom + near);
+  }
+
   /** 视口驱动：给可见切片补位图、给可见页补文本层，把离开视口的切片位图交还回收。
    *  为什么必须这样：一页在 100%/200% 下的完整位图可达几十到几百 MB，只有「按显示尺寸切片 +
    *  只在视口附近存活」才能既清晰又有界。 */
@@ -1123,9 +1135,6 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const vp = mangaHorizontal() ? mangaViewport : mangaFlowViewport;
     if (!vp || !mangaWindow.length) return;
     const r = vp.getBoundingClientRect();
-    const near = r.height * PDF_SLICE_NEAR_SCREENS;
-    const lo = r.top - near;
-    const hi = r.bottom + near;
     const tokens: string[] = [];
     // 本帧在飞名额：包含「本次新发」与「早已在渲染」的，上限 = 渲染并发。
     // 一帧给几十条排队没有意义（都要排队），还会让已滚走的切片继续占用渲染槽。
@@ -1135,13 +1144,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       if (!Number.isFinite(idx)) continue;
       const pageEl = blk.querySelector<HTMLElement>(".pdf-page");
       if (pageEl) {
-        const pr = pageEl.getBoundingClientRect();
-        const pageVisible = pr.bottom > lo && pr.top < hi;
+        const pageVisible = withinNearBand(r, pageEl.getBoundingClientRect());
         if (pageVisible) void ensurePageTextLayer(pageEl, idx);
       }
       for (const im of blk.querySelectorAll<HTMLImageElement>("img.pdf-page-slice")) {
-        const ir = im.getBoundingClientRect();
-        const visible = ir.bottom > lo && ir.top < hi;
+        const visible = withinNearBand(r, im.getBoundingClientRect());
         if (visible) {
           const t = im.dataset.token;
           if (t) {
@@ -1175,10 +1182,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       if (!isPdfBook() || gen !== loadGeneration || im.dataset.loading !== "1") return false;
       const vp = mangaHorizontal() ? mangaViewport : mangaFlowViewport;
       if (!vp) return true;
-      const r = vp.getBoundingClientRect();
-      const near = r.height * PDF_SLICE_NEAR_SCREENS;
-      const ir = im.getBoundingClientRect();
-      return !(ir.bottom < r.top - near || ir.top > r.bottom + near);
+      return withinNearBand(vp.getBoundingClientRect(), im.getBoundingClientRect());
     };
     // 真正渲染前重测一次：在并发队列里等的那几秒，元素很可能早已滚出视口，
     // 再渲染就是白烧 8M 像素（200% 超长页尤其致命）。
@@ -6665,19 +6669,32 @@ ${effCssExtra() || ""}
     pointer-events: auto;
   }
   /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
-     不得改字号/行高，也不得让文字变可见，否则会破坏文本层与位图的对齐。 */
-  .content :global(.pdf-page .textLayer mark),
-  .content :global(.pdf-page .textLayer mark *) {
+     不得改字号/行高，也不得让文字变可见，否则会破坏文本层与位图的对齐。
+     mark 自身 static：文本层用绝对定位，mark 不该另立一套定位。
+     **后代不再强制 static**：跨 span 的划线已改为就地包文本节点，mark 里只会有文本节点；
+     万一有元素落进来（如嵌套的朗读 mark），也必须保留它自己的定位。 */
+  .content :global(.pdf-page .textLayer mark) {
     color: transparent !important;
     font-size: inherit !important;
     line-height: inherit !important;
     position: static !important;
+  }
+  .content :global(.pdf-page .textLayer mark *) {
+    color: transparent !important;
+    font-size: inherit !important;
+    line-height: inherit !important;
   }
 
   /* 阅读区选区底色跟随「阅读主题」的 --rdr-sel（5 套主题 + 自由配色各自一份），
      与外壳区域的 ::selection（app.css，走 --accent）刻意不同。 */
   .content :global(::selection) {
     background: var(--rdr-sel);
+  }
+  /* PDF 的正文是位图、文本层只有透明文字：选区底色若不透，就把位图上的字迹盖住了。
+     这里只对 PDF 文本层稀释（35%），字迹仍从下方位图透出来。 */
+  .content :global(.pdf-page .textLayer ::selection) {
+    background: color-mix(in srgb, var(--rdr-sel) 35%, transparent);
+    color: transparent !important;
   }
 
   /* 单本「全部关闭图片」：隐藏正文里的图片/SVG 图 */
@@ -6856,9 +6873,12 @@ ${effCssExtra() || ""}
   /* 摊平块内所有非媒体包裹层（原书的 div/p/section 等各级 wrapper），
      让嵌套的图片直接参与 .manga-block 的横排 flex，而非被 wrapper 的块级流竖排。
      img/svg/video 本身保留盒子（下方规则置 margin:0 并给定高度）。
-     关键：:not(svg *) 把内联 SVG 的内部元素（g/path/text…）排除在摊平之外——
-     display:contents 会打乱 SVG 自身的渲染，SVG 子树须整体作为一个媒体盒子参与横排。 */
-  .reader.manga-h .manga-h-canvas :global(.manga-block *:not(img):not(svg):not(video):not(svg *)) {
+     关键一：:not(svg *) 把内联 SVG 的内部元素（g/path/text…）排除在摊平之外——
+     display:contents 会打乱 SVG 自身的渲染，SVG 子树须整体作为一个媒体盒子参与横排。
+     关键二：:not(.pdf-page):not(.pdf-page *) 把 PDF 页子树整体排除——
+     .pdf-page 是「一页 = 一个块」的实体盒子（宽高写死在 data-pdf-w/h），
+     摊平它会让块内每页退化成 0×0、页与页无法横向排布（横向拖动看不到连续页面）。 */
+  .reader.manga-h .manga-h-canvas :global(.manga-block *:not(img):not(svg):not(video):not(svg *):not(.pdf-page):not(.pdf-page *)) {
     display: contents !important;
   }
 
