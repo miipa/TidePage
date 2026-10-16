@@ -2417,19 +2417,25 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
-  /** 单本：图片适应阅读器宽度开关。 */
-  function toggleFitWidth() {
-    const on = !effFitWidth();
-    // 开关语义：未激活 → 进入适宽；已激活再点 → 回到原大小（100%）。
-    // 只把 fitWidth 置 false 不够 —— effImgScale 会回落到全局漫画倍率，所以显式把本书倍率钉到 1。
+  /** 单本：适宽开关的**唯一实现**（工具栏按钮与「页面布局」面板复选框共用）。
+   *  on ⇒ 进适宽（与适高互斥）；off ⇒ 回原大小（100%）。
+   *  为什么 off 要显式写 imgScale:1：只把 fitWidth 置 false 不够 —— effImgScale 会回落到
+   *  全局漫画倍率，可能不是 100%。两处各写一份判定迟早会分叉（面板原来 off 只写 fitWidth:false）。 */
+  function setFitWidth(on: boolean) {
     setOv(on ? { fitWidth: true, fitHeight: false } : { fitWidth: false, fitHeight: false, imgScale: 1 });
   }
 
-  /** 单本：图片适应阅读器高度开关（与适宽互斥）。 */
-  function toggleFitHeight() {
-    const on = !effFitHeight();
-    // 同上：已激活再点 = 回到原大小（100%）
+  /** 单本：适高开关的唯一实现（语义与 setFitWidth 对称）。 */
+  function setFitHeight(on: boolean) {
     setOv(on ? { fitHeight: true, fitWidth: false } : { fitHeight: false, fitWidth: false, imgScale: 1 });
+  }
+
+  function toggleFitWidth() {
+    setFitWidth(!effFitWidth());
+  }
+
+  function toggleFitHeight() {
+    setFitHeight(!effFitHeight());
   }
 
   /* ================= 漫画双页（横向连续阅读） ================= */
@@ -5748,8 +5754,8 @@ ${effCssExtra() || ""}
           <p class="tb-panel-hint">{t("reader.pdfLayout.scaleHint")}</p>
         </div>
         <div class="pdf-lay-checks">
-          <label><input type="checkbox" data-testid="pdf-lay-fitw" checked={effFitWidth()} onchange={(e) => setOv(e.currentTarget.checked ? { fitWidth: true, fitHeight: false } : { fitWidth: false })} /> {t("settings.manga.fitWidth")}</label>
-          <label><input type="checkbox" data-testid="pdf-lay-fith" checked={effFitHeight()} onchange={(e) => setOv(e.currentTarget.checked ? { fitHeight: true, fitWidth: false } : { fitHeight: false })} /> {t("settings.manga.fitHeight")}</label>
+          <label><input type="checkbox" data-testid="pdf-lay-fitw" checked={effFitWidth()} onchange={(e) => setFitWidth(e.currentTarget.checked)} /> {t("settings.manga.fitWidth")}</label>
+          <label><input type="checkbox" data-testid="pdf-lay-fith" checked={effFitHeight()} onchange={(e) => setFitHeight(e.currentTarget.checked)} /> {t("settings.manga.fitHeight")}</label>
         </div>
         <button class="tb-menu-item" data-testid="pdf-lay-reset" onclick={resetPdfImageOverride}>{t("reader.pdfLayout.reset")}</button>
         <div class="pdf-lay-field">
@@ -6589,10 +6595,10 @@ ${effCssExtra() || ""}
   .content :global(.pdf-page .pdf-hl-block) {
     position: absolute;
     border-radius: var(--radius-xs);
-    background: color-mix(in srgb, var(--hl-color) 45%, white);
+    background: color-mix(in srgb, var(--hl-color) 35%, white);
   }
   .content :global(.pdf-page .pdf-hl-block.pdf-hl-tts) {
-    background: color-mix(in srgb, var(--accent) 45%, white);
+    background: color-mix(in srgb, var(--accent) 35%, white);
   }
 
   /* PDF 的 mark 只留行为与「线条类」装饰：背景色交给上面的叠层，所以这里必须透明 ——
