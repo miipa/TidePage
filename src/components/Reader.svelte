@@ -556,20 +556,24 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let lpTimer: ReturnType<typeof setTimeout> | undefined;
   let lpStartX = 0;
   let lpStartY = 0;
-  let lpHit: HTMLImageElement | null = null;
+  /** 长按命中物：图片（漫画）或 .pdf-page（PDF 页；文字上命中的是文本层 span，取不到 img）。 */
+  let lpHit: HTMLElement | null = null;
   let lpFired = false;
+  /** 文本层上长按多用于「按住选字」，阈值放宽以压误触（其余仍是 450ms）。 */
+  const LONG_PRESS_TEXT_MS = 800;
 
   function startLongPress(target: EventTarget | null, x: number, y: number) {
     cancelLongPress();
     // 屏蔽图片模式仍是单击生效：长按计时不启动，避免「长按屏蔽」与单击语义打架。
     if (blockPickMode) return;
     const el = target as HTMLElement | null;
-    const img = (el?.closest?.("img") ?? null) as HTMLImageElement | null;
-    if (!img) return;
-    lpHit = img;
+    const hit = (el?.closest?.("img, .pdf-page") ?? null) as HTMLElement | null;
+    if (!hit) return;
+    lpHit = hit;
     lpStartX = x;
     lpStartY = y;
     lpFired = false;
+    const ms = hit.closest(".pdf-page .textLayer") ? LONG_PRESS_TEXT_MS : LONG_PRESS_MS;
     lpTimer = setTimeout(() => {
       lpTimer = undefined;
       const hit = lpHit;
@@ -577,7 +581,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       lpFired = true;
       suppressMangaClick(); // 长按已触发：抑制随之而来的 click（沿用既有吞点击套路）
       void openGalleryForImage(hit);
-    }, LONG_PRESS_MS);
+    }, ms);
   }
   function moveLongPress(x: number, y: number) {
     if (!lpTimer) return;
@@ -598,13 +602,15 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /** 长按后的图库：PDF 用**整页位图**（切片只有一屏高，直接开图库会是空图/半页），
    *  其它格式沿用既有图片清单定位。 */
-  async function openGalleryForImage(img: HTMLImageElement) {
+  async function openGalleryForImage(hit: Element) {
     if (!isPdfBook()) {
-      openViewerForImage(img);
+      // 漫画：需要真正的 img 才能按 URL 在图片清单里定位
+      const img = hit.closest("img") as HTMLImageElement | null;
+      if (img) openViewerForImage(img);
       return;
     }
     const id = book?.book.id ?? 0;
-    const pageEl = img.closest(".pdf-page") as HTMLElement | null;
+    const pageEl = hit.closest(".pdf-page") as HTMLElement | null;
     const page = Number(pageEl?.dataset.pdfPage ?? chapterNum);
     try {
       const url = await renderPageImageFull(id, page, 2000);
@@ -3140,7 +3146,19 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** PDF 页内链接：外链走既有 opener 路径，内链跳目标页。
    *  必须 stopPropagation —— 否则点链接会同时触发内容区的热区翻页/其它点击语义。 */
   async function onPdfLinkClick(e: MouseEvent) {
-    const el = (e.target as HTMLElement | null)?.closest?.("[data-pdf-url],[data-pdf-jump]") as HTMLElement | null;
+    // 链接文字上命中的是文本层 span（z-index 2 > 热点 1），closest 通常打不中热点，
+    // 所以先试 closest，失败再按坐标自上而下找：elementsFromPoint 会把透明热点也算进来。
+    // 不改 z 序 —— 热点压到文本层之上就没法在链接文字上拖选复制了。
+    let el = (e.target as HTMLElement | null)?.closest?.("[data-pdf-url],[data-pdf-jump]") as HTMLElement | null;
+    if (!el) {
+      for (const node of document.elementsFromPoint(e.clientX, e.clientY)) {
+        const hit = (node as HTMLElement).closest?.("[data-pdf-url],[data-pdf-jump]") as HTMLElement | null;
+        if (hit) {
+          el = hit;
+          break;
+        }
+      }
+    }
     if (!el) return;
     e.preventDefault();
     e.stopPropagation();

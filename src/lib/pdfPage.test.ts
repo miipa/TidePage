@@ -170,6 +170,23 @@ describe("pdfTextUsable", () => {
   });
 });
 
+describe("clampBitmapSize 长边上限（必修3：8192 才能让超宽页 200% 不降采样）", () => {
+  it("15、Nginx.pdf 200% 的单切片 4515×1726 不再被长边夹取，且总像素 ≤ 1200 万", () => {
+    const b = clampBitmapSize(4515, 1726, 1);
+    expect(b.bitW).toBe(4515);
+    expect(b.bitH).toBe(1726);
+    expect(b.bitW * b.bitH).toBeLessThanOrEqual(PDF_BITMAP_MAX_PIXELS);
+    // 旧上限 4096 会把它降成 0.91×（上采样），这里显式钉住回归
+    expect(b.bitW).toBeGreaterThan(4096);
+  });
+
+  it("极端长条仍被长边挡住", () => {
+    const b = clampBitmapSize(2000, 40000, 1);
+    expect(Math.max(b.bitW, b.bitH)).toBeLessThanOrEqual(PDF_BITMAP_MAX_LONG);
+    expect(b.bitW * b.bitH).toBeLessThanOrEqual(PDF_BITMAP_MAX_PIXELS);
+  });
+});
+
 describe("mergeOutlineTitles", () => {
   const base = buildPageToc(4, (n) => `第 ${n} 页`);
 

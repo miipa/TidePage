@@ -7,8 +7,9 @@ import type { TocEntry } from "./types";
  *  这是「页面按真实尺寸呈现」的基准：A4（595×842pt）→ 793×1123 CSS px。 */
 export const PDF_PX_PER_PT = 4 / 3;
 
-/** 位图长边上限（物理像素）：单张位图的内存上限（4096² × 4B ≈ 67MB 已是极限）。 */
-export const PDF_BITMAP_MAX_LONG = 4096;
+/** 位图长边上限（物理像素）：只挡「极端长条」，真正的内存硬闸是下面的总像素上限。
+ *  取 8192 是因为超宽页在 200% 下单切片宽可达 ~4500px（4096 会把 200% 降成 ~0.91× 的上采样）。 */
+export const PDF_BITMAP_MAX_LONG = 8192;
 /** 位图总像素上限（约 1200 万）：≈48MB/张 RGBA，配合并发 2 与缓存上限控制峰值内存。 */
 export const PDF_BITMAP_MAX_PIXELS = 12_000_000;
 
@@ -133,8 +134,9 @@ export function mergeOutlineTitles(
  *   - 缺 /ToUnicode 的文件（15、Nginx.pdf）抽出文本里 **25% 是控制字符**，而真实文本为 0%；
  *   - 缺字形的文件会给出 U+FFFD 或私用区（U+E000–U+F8FF）码位；
  *   - 扫描版根本没有文字项（空）；
- *   - 非 ASCII 占多数时（中日韩文档正常）还要求其中 CJK/假名/谚文/全角标点占比够高，
- *     否则视为「码位看似合法但并非可读文字」。
+ *   - 最后一道是「主导文种」判据：把码位归入 11 个文种桶，要求最大桶占比 ≥ 50%
+ *     或前两桶合计 ≥ 80%（乱码文本的码位往往散布在大量互不相干的文种里）。
+ *     **不得**改用 CJK 占比阈值 —— 那会把俄语/希腊语/阿拉伯语等整类文档误杀。
  *  宁可误判为不可用（少一个功能）也不误判为可用（划出来的线、搜出来的命中全是垃圾）。 */
 export function pdfTextUsable(text: string, ctrlMax = 0.02, badMax = 0.02): boolean {
   const t = (text || "").replace(/\s+/g, "");
