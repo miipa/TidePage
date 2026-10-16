@@ -92,16 +92,21 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
     const rect = el.getBoundingClientRect();
     const px = anchorX == null ? el.clientWidth / 2 : anchorX - rect.left;
     const py = anchorY == null ? el.clientHeight / 2 : anchorY - rect.top;
-    const cx = px + el.scrollLeft;
-    const cy = py + el.scrollTop;
+    // 内容坐标必须把「居中留白」减掉：图比舞台小时有 mR/mT 留白，一旦放大到超出舞台，
+    // 留白会从正数变成 0；不减掉这一项，锚点就会跟着留白的变化跳（表现为第一次放大整幅图位移）。
+    const cx = px + el.scrollLeft - mR;
+    const cy = py + el.scrollTop - mT;
     const f = k1 / scale;
     scale = k1;
     // 等一帧：宽度/边距要等 DOM 落定后再写滚动量，否则用的是旧尺寸，锚点会跑偏
     requestAnimationFrame(() => {
       const s = stageEl;
       if (!s) return;
-      s.scrollLeft = cx * f - px;
-      s.scrollTop = cy * f - py;
+      // 缩放后的留白按新尺寸重算：scroll = 新留白 + 锚点内容偏移×倍率 − 光标位置
+      const mR1 = Math.max(0, (s.clientWidth - fit.w * k1) / 2);
+      const mT1 = Math.max(0, (s.clientHeight - fit.h * k1) / 2);
+      s.scrollLeft = mR1 + cx * f - px;
+      s.scrollTop = mT1 + cy * f - py;
     });
   }
 
