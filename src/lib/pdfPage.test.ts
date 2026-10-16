@@ -12,6 +12,7 @@ import {
   pdfSliceRanges,
   retitlePdfPageToc,
   fullPageLruStep,
+  hlBlocksFromRects,
 } from "./pdfPage";
 
 describe("pdfDisplayBox", () => {
@@ -214,6 +215,43 @@ describe("PDF 页占位 HTML", () => {
     const html = pdfPageErrorHtml();
     expect(html).toContain("height:60vh");
     expect(html).not.toContain("<img");
+  });
+});
+
+describe("hlBlocksFromRects（PDF 高亮叠层色块）", () => {
+  const page = { left: 100, top: 50 };
+
+  it("单矩形：换算成相对页面原点的块", () => {
+    expect(hlBlocksFromRects(page, [{ left: 120, top: 80, width: 200, height: 24 }])).toEqual([
+      { left: 20, top: 30, width: 200, height: 24 },
+    ]);
+  });
+
+  it("跨行 mark：每个矩形各成一块（这是「一个 mark → 多块」的判据）", () => {
+    expect(
+      hlBlocksFromRects(page, [
+        { left: 120, top: 80, width: 300, height: 24 },
+        { left: 120, top: 108, width: 80, height: 24 },
+      ]),
+    ).toEqual([
+      { left: 20, top: 30, width: 300, height: 24 },
+      { left: 20, top: 58, width: 80, height: 24 },
+    ]);
+  });
+
+  it("负坐标保留（页面原点右上/左上之外的块），零或负尺寸丢弃", () => {
+    expect(
+      hlBlocksFromRects(page, [
+        { left: 60, top: 20, width: 40, height: 10 },
+        { left: 120, top: 80, width: 0, height: 24 },
+        { left: 120, top: 80, width: 200, height: -3 },
+        { left: 120, top: 80, width: Number.NaN, height: 10 },
+      ]),
+    ).toEqual([{ left: -40, top: -30, width: 40, height: 10 }]);
+  });
+
+  it("空输入给空数组", () => {
+    expect(hlBlocksFromRects(page, [])).toEqual([]);
   });
 });
 
