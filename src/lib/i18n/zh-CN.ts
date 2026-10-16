@@ -72,6 +72,7 @@ export const zhCN = {
   "common.imgViewer.prev": "上一张 (←)",
   "common.imgViewer.next": "下一张 (→)",
   "common.imgViewer.empty": "本书未找到图片",
+  "common.imgViewer.loading": "正在生成页面…",
     "common.imgViewer.zoomIn": "放大",
   "common.imgViewer.zoomOut": "缩小",
   "common.imgViewer.fit": "适配",

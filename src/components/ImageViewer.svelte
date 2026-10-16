@@ -34,6 +34,9 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
 
   const total = $derived(images.length);
   const current = $derived(images[Math.max(0, Math.min(index, total - 1))] ?? null);
+  /** 该 URL 解码失败（例如整页图已被 LRU revoke）：退回占位，绝不停在破图图标上。
+   *  URL 一变就复位（见下方切图 effect），所以同一页重渲染后能正常显示。 */
+  let imgBroken = $state(false);
 
   /** 适配尺寸：按舞台可用区等比缩到装得下，且**不放大原图**（避免小图被硬撑成糊图）。 */
   const fit = $derived.by(() => {
@@ -133,9 +136,11 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
     if (e.button !== 0) return;
     const el = stageEl;
     if (!el) return;
-    if (el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight) return;
-    // 每次按下都复位：否则「拖拽后点空白（click 落在 stage，不消费标记）」会把下一次点图片吞掉
+    // 每次按下都复位：否则「拖拽后点空白（click 落在 stage，不消费标记）」会把下一次点图片吞掉。
+    // 必须放在「内容不溢出就早退」之前——适配后图不再溢出，pointerdown 会早退，
+    // 不复位就永远吞掉拖拽后的第一次点击（图库点空白关不掉）。
     suppressClick = false;
+    if (el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight) return;
     dragPid = e.pointerId;
     dragX = e.clientX;
     dragY = e.clientY;
@@ -232,6 +237,7 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
   $effect(() => {
     void index;
     void current?.url;
+    imgBroken = false;
     scale = 1;
     requestAnimationFrame(() => {
       measure();
@@ -299,16 +305,21 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
       if (e.target === e.currentTarget) onclose();
     }}
   >
-    {#if current}
+    {#if current && current.url && !imgBroken}
       <img
         bind:this={imgEl}
         src={current.url}
         alt=""
         draggable="false"
         onload={onImgLoad}
+        onerror={() => (imgBroken = true)}
         style="width:{dispW}px;height:{dispH}px;margin:{mT}px {mR}px;"
         onclick={onImgClick}
       />
+    {:else if current}
+      <!-- 懒渲染：清单每页一项，URL 由 Reader 按需回填。空 URL 必须走占位 ——
+           直接 <img src=""> 会显示浏览器的破图图标。 -->
+      <div class="iv-loading" data-testid="iv-loading">{t("common.imgViewer.loading")}</div>
     {:else}
       <div class="iv-empty" data-testid="iv-empty">{t("common.imgViewer.empty")}</div>
     {/if}
@@ -463,4 +474,13 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
   }
 
   .iv-empty { color: rgba(255, 255, 255, 0.6); font-size: var(--fs-md); }
+
+  /* 懒渲染占位：清单项在、位图还没到。居中的中性块，绝不用 <img src=""> 的破图图标。 */
+  .iv-loading {
+    display: grid;
+    place-items: center;
+    min-height: 240px;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: var(--fs-md);
+  }
 </style>

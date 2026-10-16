@@ -207,3 +207,21 @@ export function buildPageToc(pages: number, label: (pageNo: number) => string): 
 export function pdfPageErrorHtml(): string {
   return `<div class="pdf-page-error" style="height:60vh"></div>`;
 }
+
+/** 整页图（图库）缓存的小 LRU 步进：给定现有顺序（旧→新）、本次要用的 token 与容量，
+ *  返回新顺序与本次被淘汰的 token（旧→新，可能一次淘汰多个）。
+ *  为什么抽成纯函数：淘汰是「revoke 掉 blob」的前置判定，最容易写错（重复插入、命中后变旧、
+ *  容量为 0），单独测比在 pdf.ts 里边渲染边观察便宜得多。
+ *  命中会刷新为最新，其余元素相对顺序不变 —— 这才是 LRU；图库来回翻页时不会把刚看过的页淘汰掉。 */
+export function fullPageLruStep(
+  order: readonly string[],
+  token: string,
+  capacity: number,
+): { order: string[]; evicted: string[] } {
+  const cap = Math.max(0, Math.floor(capacity));
+  const next = order.filter((t) => t !== token);
+  next.push(token);
+  const evicted: string[] = [];
+  while (next.length > cap) evicted.push(next.shift() as string);
+  return { order: next, evicted };
+}

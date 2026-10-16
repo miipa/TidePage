@@ -5,7 +5,7 @@
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
-  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, releaseFullPage, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
+  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, fullPageCacheTokens, isFullPageCached, pageGeometry, pageLinks, pinSlices, releaseAll, releaseFullPage, releaseFullPageUrl, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
   import {
     PDF_SLICE_MAX_SCREENS,
     buildPageToc,
@@ -601,7 +601,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
 
   /** 长按后的图库：PDF 用**整页位图**（切片只有一屏高，直接开图库会是空图/半页），
-   *  其它格式沿用既有图片清单定位。 */
+   *  其它格式沿用既有图片清单定位。
+   *  PDF 的清单是**全书每页一项**（下标=页号），长按页即定位到它；URL 先留空，由
+   *  fillGalleryImage 按「当前页 ±1」回填 —— 于是能翻整本，又不会一次渲染整本。 */
   async function openGalleryForImage(hit: Element) {
     if (!isPdfBook()) {
       // 漫画：需要真正的 img 才能按 URL 在图片清单里定位
@@ -609,16 +611,51 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       if (img) openViewerForImage(img);
       return;
     }
-    const id = book?.book.id ?? 0;
     const pageEl = hit.closest(".pdf-page") as HTMLElement | null;
     const page = Number(pageEl?.dataset.pdfPage ?? chapterNum);
+    const pages = book?.toc.length ?? 0; // PDF 的 toc 下标即页号（buildPageToc/mergeOutlineTitles 保证）
+    if (pages <= 0) return;
+    bookImages = Array.from({ length: pages }, (_, i) => ({
+      url: "", // 空 URL → 图库渲染占位，不出现破图图标
+      chapter_index: i,
+      chapter_title: pdfPageTitle(i),
+    }));
+    viewerIndex = page;
+  }
+
+  /** 正在渲染的图库页号：清单回填会触发 effect 重跑，没有它同一页会被反复排队。 */
+  const galleryInflight = new Set<number>();
+  /** 图库代次：关闭时 +1。用来遗弃「关闭之后才渲染完」的结果（否则缓存里会留一个悬挂 blob）。 */
+  let galleryEpoch = 0;
+
+  /** 回填图库某一页的整页位图：URL 仍在缓存里才算命中；失败保持空 URL（占位而非破图）。
+   *  注意不能只看「URL 非空」——整页图缓存只有 3 张，翻远之后再翻回来，清单里的 URL
+   *  早已被 LRU revoke 掉；当成命中就会给 <img> 一个死 URL，直接是破图。 */
+  async function fillGalleryImage(page: number) {
+    const list = bookImages;
+    if (!list || page < 0 || page >= list.length) return;
+    if (galleryInflight.has(page)) return;
+    const cur = list[page].url;
+    if (cur && isFullPageCached(cur)) return;
+    // 已失效：先清空让图库回占位（而不是先破图再被替换），再重新渲染。
+    if (cur) bookImages = list.map((it, i) => (i === page ? { ...it, url: "" } : it));
+    const epoch = galleryEpoch;
+    galleryInflight.add(page);
     try {
-      releaseFullPage(); // 先把上一张整页图还掉，别让它们随长按次数线性堆积
-      const url = await renderPageImageFull(id, page);
-      bookImages = [{ url, chapter_index: page, chapter_title: pdfPageTitle(page) }];
-      viewerIndex = 0;
+      const url = await renderPageImageFull(book?.book.id ?? 0, page);
+      // 渲染期间关了图库（或换了书）：这张位图已无人引用，按 URL 精确遗弃，别留在缓存里。
+      if (epoch !== galleryEpoch || !bookImages || page >= bookImages.length) {
+        releaseFullPageUrl(url);
+        return;
+      }
+      if (bookImages[page].url === url) return;
+      // 换新数组而不是原地改：$state 的深层代理对数组元素赋值也能触发，但整份替换让
+      // ImageViewer 的 current 与清单一定同拍（少一类「URL 到了但视图没更新」的时序问题）。
+      bookImages = bookImages.map((it, i) => (i === page ? { ...it, url } : it));
     } catch {
-      toast(t("reader.toast.hlCreateFailed", { err: "render" }), "error");
+      /* 单页失败：保持占位；翻过去再回来会重试 */
+    } finally {
+      galleryInflight.delete(page);
     }
   }
 
@@ -1010,9 +1047,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           ` style="position:absolute !important;left:0 !important;top:${top}px !important;width:${box.w}px !important;height:${sh}px !important;max-width:none !important;max-height:none !important;zoom:1 !important;margin:0 !important;display:block !important" alt="">`,
       );
     });
-    // 链接热点：z-index 高于切片位图与文本层，重叠处优先接收指针（点得动）。
-    // 文本层刻意不设 z-index（见 .pdf-page .textLayer 的说明）：定位元素 + z-index 会自成
-    // 层叠上下文，mark 的 mix-blend-mode 就乘不到下方位图。
+    // 链接热点：z-index 低于文本层（不挡划选）、高于切片位图（可点）。
+    // 文本层压在热点上时，点击靠 onPdfLinkClick 里的 document.elementsFromPoint 兜底命中热点。
     // 坐标用 [0,1] 分数乘显示尺寸 —— 缩放/切片重建时自然重算，不会错位。
     const hot = links
       .map((l) => {
@@ -1038,7 +1074,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       ` style="position:relative !important;width:${box.w}px !important;height:${box.h}px !important;margin:0 auto !important;zoom:1 !important">` +
       parts.join("") +
       hot +
-      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;pointer-events:none !important"></div></div>`
+      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:2 !important;pointer-events:none !important"></div></div>`
     );
   }
 
@@ -4025,6 +4061,14 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         }),
         /** 排版几何快照（任务一）：clipW 与 pageWrapW / effAvail 是否同源一眼可见。 */
         layout: () => layoutSnapshot(),
+        /** 图库快照（DEV 取证）：清单长度 / 已回填页数 / 整页图缓存 token / 在途页号。 */
+        gallery: () => ({
+          viewerIndex,
+          total: bookImages?.length ?? 0,
+          rendered: (bookImages ?? []).filter((b) => !!b.url).length,
+          cache: fullPageCacheTokens(),
+          inflight: [...galleryInflight],
+        }),
         /** 一次性取证（PDF 划线点击后消失）：种一条划线 / 点击前后各打一组快照。
          *  rootProbeId 是关键：它只在 contentRoot() 换成另一个元素时才跳号，
          *  一跳就说明页面 DOM（含 .textLayer）被整块重建过 —— mark 随旧元素一起消失。 */
@@ -4492,9 +4536,22 @@ ${effCssExtra() || ""}
 
   // PDF 切片按需加载：窗口内容变化（换页/裁剪/续章/重建）后按视口补位图与文本层，
   // 并把离开视口的切片位图交还 pdf.ts 回收（切片级内存上限，rAF 合并避免滚动中抖）。
-  // 图库关闭（viewerIndex 回 null）时把整页图还掉：它不在切片 LRU 的常规节奏里。
+  // 图库开/关与翻页：
+  //  - 关闭（viewerIndex 回 null）：代次 +1 并回收**全部**整页图 —— 它们不在切片 LRU 的节奏里，
+  //    不主动还就会一直占着（单张可达 ~48MB）。
+  //  - 打开/翻页：给当前页与前后各一页补位图（容量 3 正好对应这三页），其余页显示占位；
+  //    迟到的渲染结果由 galleryEpoch 判定并精确遗弃，所以「关闭后存活 0」不会被在途任务破坏。
   $effect(() => {
-    if (viewerIndex === null) releaseFullPage();
+    const v = viewerIndex;
+    if (v === null) {
+      galleryEpoch++;
+      releaseFullPage();
+      return;
+    }
+    if (!isPdfBook() || !bookImages) return;
+    void fillGalleryImage(v);
+    void fillGalleryImage(v - 1);
+    void fillGalleryImage(v + 1);
   });
 
   $effect(() => {
@@ -6508,9 +6565,11 @@ ${effCssExtra() || ""}
 
   /* PDF 双层 DOM 的文本层：只用于选取/划线定位，文字必须不可见（画面由位图提供）。
      作用域限定在 .pdf-page 下 —— 绝不整文件引入 pdf_viewer.css（其 .page/.pdfViewer 会撞现有类）。
-     **刻意不设 z-index**：定位元素 + z-index 会自成层叠上下文，mark 的 mix-blend-mode 就只能与
-     文本层自己的透明背景相乘（乘积恒等于原色，等于空转），够不到下方位图。
-     不设 z-index 后文本层仍在切片位图之上（DOM 在后）；链接热点（z-index:1）则浮到它之上。 */
+     z-index 必须为正：文本层因此压在链接热点（z-index:1）之上，正文拖选到处可用；链接改由
+     onPdfLinkClick 的 elementsFromPoint 兜底命中（已验可用）。
+     代价：文本层自成层叠上下文，mark 的 mix-blend-mode 乘不到下方位图 —— 真因还有 pdf.js 给
+     每个 span 加的 transform: scaleX(...)（同样自成层叠上下文），去 z-index 救不回混合。
+     PDF 的真混合交给独立高亮叠层方案（C），不在这里绕。 */
   .content :global(.pdf-page .textLayer) {
     position: absolute;
     inset: 0;
@@ -6519,6 +6578,7 @@ ${effCssExtra() || ""}
     -webkit-text-size-adjust: none;
     text-size-adjust: none;
     transform-origin: 0 0;
+    z-index: 1;
   }
   .content :global(.pdf-page .textLayer span),
   .content :global(.pdf-page .textLayer br) {
@@ -6527,8 +6587,7 @@ ${effCssExtra() || ""}
     white-space: pre;
     cursor: text;
     transform-origin: 0 0;
-    /* 容器 pointer-events:none；只有真正有文字的位置接收指针 → 文字处仍可拖选
-       （与链接热点重叠处由热点先收指针，见 pdfPageHtmlFor 的热点注记） */
+    /* 容器 pointer-events:none（让下层链接热点可点），只有真正有文字的位置接收指针 → 仍可选字 */
     pointer-events: auto;
   }
   /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
