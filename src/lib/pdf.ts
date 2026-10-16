@@ -23,6 +23,19 @@ const PAGE_CACHE_MAX = 6;
 /** 渲染并发（同时最多 2 条切片在渲染）。导出给 Reader 做「每帧最多新发 2 条」的限流同一口径。 */
 export const RENDER_CONCURRENCY = 2;
 
+/** range 路径的打开超时：pdf.js 的断言被吞掉时表现为「不报错也不成功」，必须自己兜住。 */
+const PDF_RANGE_OPEN_TIMEOUT = 20_000;
+/** 给 Promise 加超时（range 路径最怕无限挂起，超时后要能退化整读）。 */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((res, rej) => {
+    const t = setTimeout(() => rej(new Error(`打开超时（${ms}ms）`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); res(v); },
+      (e) => { clearTimeout(t); rej(e); },
+    );
+  });
+}
+
 /** 小于这个大小就整份读入（一次 IPC 换最少往返）；大于等于则走 range 分块。 */
 const PDF_RANGE_MIN_BYTES = 8 * 1024 * 1024;
 /** 首个分块：pdf.js 需要先拿到头部才能开始解析（64KB 足够覆盖 xref 头）。 */
@@ -178,8 +191,28 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       const buf = await api.readBookBytes(bookId);
       opts.data = new Uint8Array(buf);
     }
-    const task = getDocument(opts as Parameters<typeof getDocument>[0]);
-    const doc = await task.promise;
+    // range 只负责「更快打开 + 更低内存」；它一旦失败/超时，绝不能让用户「打不开这本书」，
+    // 所以这里兜一层：range 异常即 abort 掉传输并退回整读重开，只有两条路都失败才报错。
+    let task = getDocument(opts as Parameters<typeof getDocument>[0]);
+    let doc: PDFDocumentProxy;
+    try {
+      doc = range ? await withTimeout(task.promise, PDF_RANGE_OPEN_TIMEOUT) : await task.promise;
+    } catch (e) {
+      if (!range) throw e;
+      range.abort();
+      range = null;
+      task.destroy().catch(() => {});
+      if (import.meta.env.DEV) console.warn("[pdf] range 打开失败，回退整份读入：", e);
+      const buf = await api.readBookBytes(bookId);
+      task = getDocument({
+        cMapUrl: "/pdfjs/cmaps/",
+        cMapPacked: true,
+        standardFontDataUrl: "/pdfjs/standard_fonts/",
+        isEvalSupported: false,
+        data: new Uint8Array(buf),
+      } as Parameters<typeof getDocument>[0]);
+      doc = await task.promise;
+    }
     // 等待期间换了书：这份文档直接销毁，别留下无人引用的 worker。
     if (gen !== generation) {
       await doc.destroy().catch(() => {});
