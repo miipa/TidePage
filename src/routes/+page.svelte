@@ -17,6 +17,7 @@
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
   import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
+  import { api } from "../lib/api";
   import { outDissolve, outFade, outSlideR } from "../lib/motion";
   import { checkForUpdates } from "../lib/update.svelte";
 
@@ -32,6 +33,12 @@
     const bg = config.reader.bgColor || t.bg;
     const fg = config.reader.fgColor || t.fg;
     return `--rdr-bg:${bg};--rdr-fg:${fg};--panel:${bg};--fg:${fg};background:${bg};color:${fg}`;
+  });
+
+  // 封面扫描开关同步给后端：启动时一次 + 每次设置变更一次（后端默认 true，手动模式必须尽早告知）。
+  // 独立窗口（AI / 面板 / 独立阅读）读同一份配置，值相同；多调一次无副作用。
+  $effect(() => {
+    void api.setCoverScan(config.library.coverScan !== "manual").catch(() => {});
   });
 
   // 自定义字体 @font-face：所有窗口（主窗口 / 独立阅读 / 独立 AI 窗口）统一注入，

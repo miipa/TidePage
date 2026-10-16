@@ -2957,6 +2957,15 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       <p class="tip">{t("settings.prefs.hideCoverProgressTip")}</p>
     </div>
 
+    <div class="field">
+      <label for="set-cover-scan">{t("settings.prefs.coverScan")}</label>
+      <select id="set-cover-scan" data-testid="pref-cover-scan" bind:value={config.library.coverScan} onchange={saveConfig}>
+        <option value="auto">{t("settings.prefs.coverScanAuto")}</option>
+        <option value="manual">{t("settings.prefs.coverScanManual")}</option>
+      </select>
+      <p class="tip">{t("settings.prefs.coverScanHint")}</p>
+    </div>
+
     <p class="sec-title" style="margin-top:18px">{t("settings.storage.title")}</p>
     {#if storage}
       <div class="storage-card">

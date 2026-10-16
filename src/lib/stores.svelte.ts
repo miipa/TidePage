@@ -737,6 +737,8 @@ export interface LibraryConfig {
   topbarOrder: string[];
   /** 是否在封面上显示阅读进度环角标（默认开启，可在「首选项」关闭） */
   showCoverProgress: boolean;
+  /** 封面扫描：auto = 后台为全部书籍生成封面；manual = 打开书籍时生成该本封面。 */
+  coverScan: "auto" | "manual";
 }
 
 /** 应用外壳界面配色（仅影响书库/设置/面板等外壳，与阅读正文完全独立）。 */
@@ -1109,6 +1111,7 @@ p {
   library: {
     topbarOrder: [...LIBRARY_TOPBAR_IDS],
     showCoverProgress: true,
+    coverScan: "auto",
   },
   webdav: {
     enabled: false,

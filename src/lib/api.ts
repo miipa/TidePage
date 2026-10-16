@@ -188,6 +188,8 @@ export const api = {
   randomBookFiltered: (query: string, sort: string, formats: string[], states: string[], folder?: string) =>
     invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states, folder: folder ?? null }),
   reextractCover: (bookId: number) => invoke<string>("reextract_cover", { bookId }),
+  setCoverScan: (enabled: boolean) => invoke<void>("set_cover_scan", { enabled }),
+  pdfBooksMissingCover: () => invoke<number[]>("pdf_books_missing_cover"),
   startSession: (bookId: number) => invoke<number>("start_reading_session", { bookId }),
   updateSession: (sessionId: number, seconds: number, chars: number) =>
     invoke<void>("update_reading_session", { sessionId, seconds, chars }),

@@ -1374,6 +1374,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         api.setSetting("pdf.outline." + book.book.id, JSON.stringify(outline)).catch(() => {});
         // 首次打开且尚无封面：后端无法栅格化 PDF，只能由这里渲染第 1 页作封面。
         if (!book.book.cover_path) void generatePdfCover(book.book.id);
+      } else if (!book.book.cover_path && config.library.coverScan === "manual") {
+        // 手动模式：其它格式也改成「打开时生成」——后端扫描不再提取封面，这里补一次。
+        // 自动模式不用做：书库后台补封面与扫描 worker 已经覆盖，重复提取纯属白读文件。
+        void generateNonPdfCover(book.book.id);
       }
       // 全书总字数只在这里算一次（见 tocCharsTotal 处的说明）
       tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
@@ -1476,6 +1480,16 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       loadingChapter = false;
       loadingIdx = -1;
       toast(friendly, "error");
+    }
+  }
+
+  /** 手动模式下打开书时补其它格式的封面：交给后端 reextract_cover（会读容器内嵌封面）。
+   *  失败静默 —— 封面是锦上添花，不能打断打开流程。 */
+  async function generateNonPdfCover(bookId: number) {
+    try {
+      await api.reextractCover(bookId);
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn("[cover] reextract failed", e);
     }
   }
 

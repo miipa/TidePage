@@ -914,6 +914,21 @@ pub fn next_meta_batch(conn: &Connection, limit: i64) -> Vec<(i64, String, Strin
         .unwrap_or_default()
 }
 
+/// 缺封面的 PDF（仅 id，升序）：书架「后台补封面」用。
+/// 为什么单独一条：复用 list_books 会整表物化（含 path/title 字符串），16 万本时每次书库刷新
+/// 拉一遍太重；这里只取 id，代价是一次列扫描。format 落库时已由 ext_of 归一为小写。
+pub fn list_pdf_ids_missing_cover(conn: &Connection) -> Vec<i64> {
+    let mut stmt = match conn.prepare(
+        "SELECT id FROM books WHERE format = 'pdf' AND (cover_path IS NULL OR cover_path = '') ORDER BY id",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| r.get::<_, i64>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
 /// 待处理书籍数（`meta_done=0`）。用于进度分母与每批「是否在推进」的判定（A6）。
 pub fn count_meta_pending(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM books WHERE meta_done = 0", [], |r| r.get(0))
@@ -2079,6 +2094,22 @@ mod cover_scan_tests {
         // 启动只捞 meta_done=0 → 三本都不再被自动重扫
         assert_eq!(count_meta_pending(&conn), 0, "扫完的书不应再入队");
         assert!(next_meta_batch(&conn, 200).is_empty());
+    }
+
+    /// 后台补封面只挑「pdf 且没有封面」：其它格式由扫描 worker 负责，空串等价于没有。
+    #[test]
+    fn list_pdf_ids_missing_cover_filters_format_and_empty() {
+        let conn = tmpdb("pdm");
+        let with = upsert_book(&conn, "/x/a.pdf", "有封面 pdf", "pdf", 1, 1).unwrap();
+        let none = upsert_book(&conn, "/x/b.pdf", "无封面 pdf", "pdf", 1, 1).unwrap();
+        let empty = upsert_book(&conn, "/x/c.pdf", "空串封面 pdf", "pdf", 1, 1).unwrap();
+        let epub = upsert_book(&conn, "/x/d.epub", "无封面 epub", "epub", 1, 1).unwrap();
+        set_book_meta_ex(&conn, with, "有封面 pdf", "", Some("a.png"), 1, 1, 1, true).unwrap();
+        set_book_meta_ex(&conn, none, "无封面 pdf", "", None, 1, 1, 1, false).unwrap();
+        // 空串：某些历史数据写的是空串而不是 NULL，同样算「没有封面」
+        conn.execute("UPDATE books SET cover_path='' WHERE id=?1", params![empty]).unwrap();
+        set_book_meta_ex(&conn, epub, "无封面 epub", "", None, 1, 1, 1, false).unwrap();
+        assert_eq!(list_pdf_ids_missing_cover(&conn), vec![none, empty]);
     }
 
     /// 再次提取到新封面：cover_ver 递增（per-book URL 缓存失效）。
