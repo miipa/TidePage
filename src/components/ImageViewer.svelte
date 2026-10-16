@@ -119,6 +119,8 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
     const el = stageEl;
     if (!el) return;
     if (el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight) return;
+    // 每次按下都复位：否则「拖拽后点空白（click 落在 stage，不消费标记）」会把下一次点图片吞掉
+    suppressClick = false;
     dragPid = e.pointerId;
     dragX = e.clientX;
     dragY = e.clientY;

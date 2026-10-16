@@ -5,7 +5,7 @@
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
-  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
+  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, releaseFullPage, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
   import {
     PDF_SLICE_MAX_SCREENS,
     buildPageToc,
@@ -613,7 +613,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const pageEl = hit.closest(".pdf-page") as HTMLElement | null;
     const page = Number(pageEl?.dataset.pdfPage ?? chapterNum);
     try {
-      const url = await renderPageImageFull(id, page, 2000);
+      releaseFullPage(); // 先把上一张整页图还掉，别让它们随长按次数线性堆积
+      const url = await renderPageImageFull(id, page);
       bookImages = [{ url, chapter_index: page, chapter_title: pdfPageTitle(page) }];
       viewerIndex = 0;
     } catch {
@@ -4397,6 +4398,11 @@ ${effCssExtra() || ""}
 
   // PDF 切片按需加载：窗口内容变化（换页/裁剪/续章/重建）后按视口补位图与文本层，
   // 并把离开视口的切片位图交还 pdf.ts 回收（切片级内存上限，rAF 合并避免滚动中抖）。
+  // 图库关闭（viewerIndex 回 null）时把整页图还掉：它不在切片 LRU 的常规节奏里。
+  $effect(() => {
+    if (viewerIndex === null) releaseFullPage();
+  });
+
   $effect(() => {
     void mangaWindow;
     if (!book || book.book.format !== "pdf") return;

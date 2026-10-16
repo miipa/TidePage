@@ -556,6 +556,8 @@ pub fn run() {
             library::set_mobi_encoding,
             library::set_custom_cover,
             library::read_book_bytes,
+            library::pdf_file_size,
+            library::pdf_read_range,
             library::set_book_cover_image,
             library::set_pdf_page_text,
             library::webdav_test,
