@@ -163,7 +163,7 @@ export type MangaLayout = "flow" | "horizontal";
 /** 漫画阅读方向：从左到右 / 从右到左（日漫）。 */
 export type MangaDirection = "ltr" | "rtl";
 
-/** 漫画模式独立设置（与普通阅读排版分开；仅漫画模式/手动漫画模式下生效）。 */
+/** 漫画模式与 PDF 共用的独立设置（与普通阅读排版分开）。 */
 export interface MangaConfig {
   /** 默认图片大小倍率（阅读界面右下角可再按单本覆盖） */
   imgScale: number;
@@ -240,7 +240,7 @@ export interface ReaderConfig {
   topbarHidden: string[];
   /** 漫画书籍图片大小倍率（旧字段，已迁移到 manga.imgScale，保留仅用于迁移） */
   mangaImageScale?: number;
-  /** 漫画模式独立设置 */
+  /** 漫画模式与 PDF 共用的独立设置（见 MangaConfig） */
   manga: MangaConfig;
   /** 是否已展示过漫画首次引导（全局，仅第一次打开漫画时提示） */
   mangaGuideDone: boolean;

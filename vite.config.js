@@ -34,7 +34,10 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      //    另外挡掉「点开头的临时目录 + *.tmp」：编辑工具会在源码目录里建临时目录再改名，
+      //    watcher 抓到刚被 rename 掉的路径会 EBUSY，整个 dev server 会因此退出
+      //    （beforeDevCommand 非零 → tauri dev 被拆）。
+      ignored: ["**/src-tauri/**", "**/.*.tmpdir", "**/.*.tmpdir/**", "**/*.tmp"],
     },
   },
 }));

@@ -3447,7 +3447,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     width: 100%;
   }
 
-  /* 漫画区块专用：窄面板下自动降为 2 列 / 1 列并换行，不溢出（仅漫画 tab 生效，不动其它 tab）。 */
+  /* 漫画区块专用：窄面板下自动降为 2 列 / 1 列并换行，不溢出（仅「漫画与 PDF」tab 生效，不动其它 tab）。 */
   .mg-grid {
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     align-items: start;
