@@ -144,7 +144,12 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
     };
     let range: PDFDataRangeTransport | null = null;
     if (len >= PDF_RANGE_MIN_BYTES) {
-      range = new PDFDataRangeTransport(len, null, false);
+      // 首块必须**在构造之前**读出来交给 initialData。手工 rt.onDataRange(0, head) 会走进
+      // pdf.js 的断言：_onReceiveData 要求存在 _begin === begin 的 range reader，而首块走的是
+      // getFullReader 那条路（不是 range reader）→ 断言抛错 → 被 catch 吞掉 → 全读流永远收不到
+      // 数据 → task.promise 永久挂起（表现就是「没报错、没日志、一直打不开」）。
+      const head = await api.pdfReadRange(bookId, 0, Math.min(PDF_RANGE_FIRST, len));
+      range = new PDFDataRangeTransport(len, new Uint8Array(head), false);
       const rt = range;
       // 失败重试一次：range 请求偶发失败会让 pdf.js 直接报损坏，重试一次能挡住抖动
       const fetchRange = async (begin: number, end: number, retry: boolean) => {
@@ -165,21 +170,15 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       };
       opts.range = rt;
       opts.length = len;
+      // 范围传输下这两个开关必须关掉 pdf.js 自己的「整份拉取」：
+      // disableStream=false 会让它顺序流式读完整个文件；disableAutoFetch 不下发则 worker 会后台预取。
+      opts.disableStream = true;
+      opts.disableAutoFetch = true;
     } else {
       const buf = await api.readBookBytes(bookId);
       opts.data = new Uint8Array(buf);
     }
     const task = getDocument(opts as Parameters<typeof getDocument>[0]);
-    if (range) {
-      // 先把头部喂进去：pdf.js 要先看到 %PDF- 头才会开始解析
-      const rt = range;
-      void api
-        .pdfReadRange(bookId, 0, Math.min(PDF_RANGE_FIRST, len))
-        .then((buf) => {
-          if (gen === generation) rt.onDataRange(0, new Uint8Array(buf));
-        })
-        .catch(() => {});
-    }
     const doc = await task.promise;
     // 等待期间换了书：这份文档直接销毁，别留下无人引用的 worker。
     if (gen !== generation) {
