@@ -9,6 +9,7 @@
   import { t } from "../lib/i18n/index.svelte";
   import { onMount, onDestroy } from "svelte";
   import { api } from "../lib/api";
+  import { mergeOutlineTitles, retitlePdfPageToc, type PdfOutlineItem } from "../lib/pdfPage";
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import type { TocEntry, HighlightRow, BookmarkRow } from "../lib/types";
   import TocPanel from "./TocPanel.svelte";
@@ -18,8 +19,10 @@
 
   const params = new URLSearchParams(window.location.search);
   const panel = params.get("panel") || "";
-  const bookId = Number(params.get("book") || "0");
 
+  // 本窗在读哪本书：URL 的 book 只是首屏初值。窗口 label 与书无关（panel-<kind>），
+  // 同一扇窗会被复用到别的书上，所以必须能被主窗的 tidepage-book-changed 改写。
+  let bookId = $state(Number(params.get("book") || "0"));
   let title = $state("");
   let toc: TocEntry[] = $state([]);
   let curChapter = $state(0);
@@ -31,6 +34,7 @@
   let unChap: UnlistenFn | null = null;
   let unBm: UnlistenFn | null = null;
   let unStats: UnlistenFn | null = null;
+  let unBook: UnlistenFn | null = null;
 
   async function loadTitle() {
     try {
@@ -39,45 +43,73 @@
     } catch { /* ignore */ }
   }
 
+  /** 按当前 bookId 载入本面板的数据：首屏与「主窗换书」都走这一条。 */
+  async function load() {
+    if (!bookId) return;
+    if (panel === "toc") {
+      try {
+        const r = await api.openBook(bookId);
+        const raw = r.toc ?? [];
+        if (r.book?.format === "pdf") {
+          // PDF：后端只给「第 N 页」；真实章节名是阅读器解析 outline 后存下的（本窗不重解析 PDF，
+          // 省一次整文件读取）。没有存过就回落本界语言的页码标题。
+          const saved = await api.getSetting("pdf.outline." + bookId).catch(() => null);
+          const outline = saved ? (JSON.parse(saved) as PdfOutlineItem[]) : [];
+          const label = (n: number) => t("reader.pdf.page", { n });
+          toc = outline.length
+            ? mergeOutlineTitles(retitlePdfPageToc(raw, label), outline, label)
+            : retitlePdfPageToc(raw, label);
+        } else {
+          toc = raw;
+        }
+        title = r.book?.title ?? "";
+        const p = await api.loadProgress(bookId);
+        curChapter = p?.chapter_index ?? 0;
+      } catch { /* ignore */ }
+    } else if (panel === "bookmarks") {
+      await loadTitle();
+      try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
+    } else if (panel === "highlights") {
+      await loadTitle();
+      hlVersion++; // HighlightsPanel 只按 version 重载：换书也必须靠它把数据切过去
+    } else if (panel === "stats") {
+      await loadTitle();
+      statsVersion++;
+    }
+  }
+
   // 本窗顶部标题栏固定 40px：写入全局变量让右上角 WindowControls 高度=40px、按钮垂直居中对齐。
   onMount(() => {
     document.documentElement.style.setProperty("--fr-titlebar-h", "40px");
   });
 
   onMount(async () => {
-    if (panel === "toc") {
-      try {
-        const r = await api.openBook(bookId);
-        toc = r.toc ?? [];
-        title = r.book?.title ?? "";
-        const p = await api.loadProgress(bookId);
-        curChapter = p?.chapter_index ?? 0;
-      } catch { /* ignore */ }
-      // 订阅主窗“当前章变化”广播：仅本窗对应 book 生效，TocPanel 会据 current 自动定位/高亮。
-      unChap = await listen<{ bookId: number; index: number }>("tidepage-chapter-changed", (e) => {
-        if (e.payload?.bookId === bookId && typeof e.payload.index === "number") {
-          curChapter = e.payload.index;
-        }
-      });
-    } else if (panel === "bookmarks") {
-      await loadTitle();
-      try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
-      // 订阅主窗书签增删：仅本窗对应 book 生效，重新拉取列表。
-      unBm = await listen<{ bookId: number }>("tidepage-bookmarks-changed", async (e) => {
-        if (e.payload?.bookId === bookId) {
-          try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
-        }
-      });
-    } else if (panel === "highlights") {
-      await loadTitle();
-      unHl = await listen("tidepage-hl-changed", () => { hlVersion++; }); // ② 订阅主窗广播
-    } else if (panel === "stats") {
-      await loadTitle();
-      // 订阅主窗阅读会话刷新：仅本窗对应 book 生效，version++ 触发 BookStatsModal 重载。
-      unStats = await listen<{ bookId: number }>("tidepage-stats-changed", (e) => {
-        if (e.payload?.bookId === bookId) statsVersion++;
-      });
-    }
+    // 订阅主窗广播。除「换书」外都只对当前书生效。
+    unChap = await listen<{ bookId: number; index: number }>("tidepage-chapter-changed", (e) => {
+      if (e.payload?.bookId === bookId && typeof e.payload.index === "number") {
+        curChapter = e.payload.index;
+      }
+    });
+    unBm = await listen<{ bookId: number }>("tidepage-bookmarks-changed", async (e) => {
+      if (e.payload?.bookId === bookId) {
+        try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
+      }
+    });
+    unHl = await listen("tidepage-hl-changed", () => { hlVersion++; }); // ② 订阅主窗广播
+    unStats = await listen<{ bookId: number }>("tidepage-stats-changed", (e) => {
+      if (e.payload?.bookId === bookId) statsVersion++;
+    });
+    unBook = await listen<{ bookId: number; title?: string }>("tidepage-book-changed", async (e) => {
+      const id = Number(e.payload?.bookId ?? 0);
+      if (!id || id === bookId) return; // 0=主窗没在读书；同书不重复加载
+      bookId = id;
+      title = e.payload?.title || "";
+      await load();
+    });
+    await load();
+    // ready 握手：本窗监听已就绪，请主窗补发一次当前书。新建窗口时 URL 只是初值，
+    // 而「换书」可能发生在监听挂上之前 —— 没有这一步新窗口就永远停在建窗时那本。
+    void emit("tidepage-panel-ready", { panel });
   });
 
   onDestroy(() => {
@@ -85,6 +117,7 @@
     unChap?.();
     unBm?.();
     unStats?.();
+    unBook?.();
   });
 
   function gotoChapter(index: number) {

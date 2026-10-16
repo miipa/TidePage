@@ -144,7 +144,9 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
         <img class="bd-cover" src={cover} alt={t("library.book.coverAlt", { title: book.title })} />
         <div class="bd-cover-acts">
           <button data-testid="bd-set-cover" onclick={setCover}>{t("library.ctx.setCover")}</button>
-          <button data-testid="bd-reextract" onclick={reextract}>{t("bookDetail.reextract")}</button>
+          {#if book.format !== "pdf"}
+            <button data-testid="bd-reextract" onclick={reextract}>{t("bookDetail.reextract")}</button>
+          {/if}
         </div>
       </div>
 

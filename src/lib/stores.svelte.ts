@@ -2809,6 +2809,9 @@ export async function openPanelWindow(panel: PanelKind, bookId: number, title: s
   try {
     const ex = await WebviewWindow.getByLabel(label);
     if (ex) {
+      // 窗口 label 与书无关（panel-<kind>），URL 里的 book 只在首次加载时生效：
+      // 复用已有窗口必须显式广播「当前是哪本书」，否则那扇窗永远停在建窗时的那本。
+      await emit("tidepage-book-changed", { bookId, title });
       await ex.unminimize().catch(() => {});
       await ex.show().catch(() => {});
       await ex.setFocus().catch(() => {});
@@ -2831,6 +2834,16 @@ export async function openPanelWindow(panel: PanelKind, bookId: number, title: s
       });
       win.once("tauri://created", () => resolve(true));
       win.once("tauri://error", () => resolve(false));
+      // 新窗口的监听要等它 onMount 之后才存在：由面板发 tidepage-panel-ready，这里回一次当前书。
+      void (async () => {
+        try {
+          const { listen } = await import("@tauri-apps/api/event");
+          const un = await listen("tidepage-panel-ready", async () => {
+            await emit("tidepage-book-changed", { bookId, title });
+            un();
+          });
+        } catch { /* ignore */ }
+      })();
     } catch {
       resolve(false);
     }

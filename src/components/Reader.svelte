@@ -5,6 +5,16 @@
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
+  import { buildTextLayer, docOutline, ensurePdf, pageGeometry, pinSlices, releaseAll, renderCoverPng, renderPageSlice } from "../lib/pdf";
+  import {
+    PDF_SLICE_MAX_SCREENS,
+    buildPageToc,
+    mergeOutlineTitles,
+    clampBitmapSize,
+    pdfDisplayBox,
+    pdfPageErrorHtml,
+    pdfSliceRanges,
+  } from "../lib/pdfPage";
   import {
     config,
     confirmBox,
@@ -112,6 +122,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     IconCloudDownload,
     IconCloudUp,
     IconHighlight,
+    IconLayoutColumns,
     IconList,
     IconPalette,
     IconPhoto,
@@ -194,6 +205,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     armChromeHide();   // 打开沉浸阅读即开始计时，不再依赖「先动一下鼠标」
   });
   onDestroy(() => clearTimeout(idleTimer));
+  // 组件销毁是另一条不经过 close() 的出口（如「打开失败后返回」直接切 ui.view）；
+  // PDF 文档与页位图必须在这里兜底释放，否则会跟着主窗口常驻。
+  onDestroy(() => releaseAll());
 
   // 顶栏实测高度写入全局 CSS 变量：供固定在右上角的 WindowControls 让自身高度=顶栏高度，
   // 按钮垂直居中即与顶栏图标中心线重合，自动对齐（Reader 顶栏比 Library 矮，靠此自适应）。
@@ -309,9 +323,16 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const o = bookOv();
     return o.overrideBookCss ?? config.reader.overrideBookCss;
   }
+  /** 本书是否为 PDF：页数、目录、正文渲染全部走前端 pdf.js 分支（后端只给页码目录）。 */
+  function isPdfBook(): boolean {
+    return book?.book.format === "pdf";
+  }
+
   /** 是否处于漫画模式（自动检测结果，或用户手动切换）。
-   *  关掉「自动识别漫画」后忽略后端判定，但按书本的手动覆盖仍然优先生效。 */
+   *  关掉「自动识别漫画」后忽略后端判定，但按书本的手动覆盖仍然优先生效。
+   *  PDF 例外：一页一张位图是它唯一正确的渲染方式，不受自动识别与手动覆盖影响，恒为 true。 */
   function isMangaMode(): boolean {
+    if (isPdfBook()) return true;
     const o = bookOv();
     return o.mangaMode ?? (config.reader.manga.autoDetect ? (book?.is_manga ?? false) : false);
   }
@@ -364,6 +385,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     icon: () => TablerIcon;
     /** 可选：激活态（按钮高亮）。 */
     on?: () => boolean;
+    /** 可选：禁用（如 PDF 无可提取文字时的朗读/划线）——不隐藏，让用户知道入口存在、为何不可用。 */
+    disabled?: () => boolean;
     visible: () => boolean;
     run: () => void;
     /** 可选：长按（约 550ms）触发（如弹出菜单）；长按已触发则不再执行短按 run。 */
@@ -377,13 +400,17 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     { id: "convert", label: () => t("reader.toolbar.convert"), title: () => t("reader.toolbar.convert"), icon: () => IconArrowsExchange, visible: () => book?.book.format === "txt", run: () => convertThis() },
     { id: "bookmarkAdd", label: () => t("reader.toolbar.bookmarkAdd"), title: () => t("reader.toolbar.bookmarkAdd"), icon: () => IconBookmarkPlus, visible: () => true, run: () => addBookmark() },
     { id: "bookmarkList", label: () => t("reader.toolbar.bookmarkList"), title: () => t("reader.toolbar.bookmarkList"), icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
-    { id: "ttsPlay", label: () => t("reader.toolbar.ttsPlay"), title: () => t("reader.toolbar.ttsPlayTitle"), icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), visible: () => true, run: () => toggleTts() },
-    { id: "ttsStop", label: () => t("reader.toolbar.ttsStop"), title: () => t("reader.toolbar.ttsStop"), icon: () => IconPlayerStop, visible: () => true, run: () => stopTts() },
-    { id: "highlight", label: () => t("reader.toolbar.highlight"), title: () => t("reader.toolbar.highlight"), icon: () => IconHighlight, visible: () => true, run: () => setRight("highlights") },
+    // 朗读/划线依赖「能取到可用文字」：PDF 取不到（扫描版 / 缺 ToUnicode 的乱码页）时保留按钮
+    // 但禁用 + 给出原因，不要静默消失（用户至少知道入口在哪、为什么点不了）。
+    { id: "ttsPlay", label: () => t("reader.toolbar.ttsPlay"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsPlayTitle")), icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => toggleTts() },
+    { id: "ttsStop", label: () => t("reader.toolbar.ttsStop"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsStop")), icon: () => IconPlayerStop, disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => stopTts() },
+    { id: "highlight", label: () => t("reader.toolbar.highlight"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.highlight")), icon: () => IconHighlight, disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => setRight("highlights") },
     { id: "ai", label: () => t("reader.toolbar.ai"), title: () => t("reader.toolbar.ai"), icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
     { id: "stats", label: () => t("reader.toolbar.bookStats"), title: () => t("reader.toolbar.bookStats"), icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
     { id: "toc", label: () => t("reader.toolbar.toc"), title: () => t("reader.toolbar.tocTitle"), icon: () => IconList, visible: () => true, run: () => toggleToc() },
-    { id: "manga", label: () => t("reader.toolbar.manga"), title: () => (isMangaMode() ? t("reader.toolbar.mangaOnTitle") : t("reader.toolbar.mangaOffTitle")), icon: () => (isMangaMode() ? IconBooks : IconBook2), on: () => isMangaMode(), visible: () => true, run: () => toggleMangaMode() },
+    // PDF 恒为「图块/页面布局」渲染，切模式没有意义：同一个按钮对 PDF 改为打开「页面布局」面板，
+    // 直接给出布局（瀑布流／横向=左右翻页）、阅读方向、图片间距、图片大小与适宽/适高。
+    { id: "manga", label: () => (isPdfBook() ? t("reader.pdfLayout.title") : t("reader.toolbar.manga")), title: () => (isPdfBook() ? t("reader.pdfLayout.hint") : isMangaMode() ? t("reader.toolbar.mangaOnTitle") : t("reader.toolbar.mangaOffTitle")), icon: () => (isPdfBook() ? IconLayoutColumns : isMangaMode() ? IconBooks : IconBook2), on: () => (isPdfBook() ? pdfLayoutOpen : isMangaMode()), visible: () => true, run: () => (isPdfBook() ? togglePdfLayout() : toggleMangaMode()) },
     { id: "manager", label: () => t("reader.toolbar.manager"), title: () => t("reader.toolbar.manager"), icon: () => IconAdjustmentsHorizontal, visible: () => true, run: () => toggleManager() },
     { id: "images", label: () => t("reader.toolbar.images"), title: () => t("reader.toolbar.imagesTitle"), icon: () => (effShowImages() ? IconPhoto : IconPhotoOff), visible: () => true, run: () => toggleImgMenu() },
     // 按钮 id 沿用历史值 "css"：topbarOrder / topbarHidden 里存的就是它，改名会让老用户的按钮
@@ -392,10 +419,21 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     { id: "settings", label: () => t("reader.toolbar.settings"), title: () => t("reader.toolbar.settings"), icon: () => IconSettings, visible: () => true, run: () => (ui.settingsOpen = true) },
   ];
   const topbarBtn = (id: string): TbBtn | undefined => TOPBAR_BTNS.find((b) => b.id === id);
+  /** PDF 下隐藏的顶栏按钮：依赖正文字符（朗读/划线）或本书图片清单（本书图片）。
+   *  「布局」按钮保留：PDF 走的本就是图块/页面布局渲染，它必须能改布局与图片大小
+   *  （见 TOPBAR_BTNS 里 manga 按钮的 PDF 分支）。AI/设置/主题/目录/书签/统计同样保留。 */
+  const PDF_HIDDEN_TOPBAR = new Set(["images"]);
+
   const visibleTopbarBtns = $derived(
     config.reader.topbarOrder
       .map((id) => topbarBtn(id))
-      .filter((b): b is TbBtn => !!b && b.visible() && (b.id === "manager" || !config.reader.topbarHidden.includes(b.id))),
+      .filter(
+        (b): b is TbBtn =>
+          !!b &&
+          b.visible() &&
+          !(isPdfBook() && PDF_HIDDEN_TOPBAR.has(b.id)) &&
+          (b.id === "manager" || !config.reader.topbarHidden.includes(b.id)),
+      ),
   );
 
   /** 拖拽排序：把 from 插入到 target 之前/之后（在完整顺序数组内重排，隐藏项位置一并保留）。 */
@@ -546,6 +584,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let blockPickMode = $state(false);
   let mangaGuideOpen = $state(false);
   let mangaGuideScale = $state(1);
+  /** PDF「页面布局」面板（与既有顶栏浮层面板同族、互斥）。 */
+  let pdfLayoutOpen = $state(false);
 
   let highlights: HighlightRow[] = $state([]);
   let highlightsOpen = $derived(rightPanel === "highlights");
@@ -569,7 +609,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     rightPanel = rightPanel === panel ? null : panel;
   }
 
-  /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / WebDAV 同步菜单 / 已屏蔽图片 / 漫画引导）。 */
+  /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / WebDAV 同步菜单 / 已屏蔽图片 / 漫画引导 / PDF 页面布局）。 */
   function closeTbPanels() {
     tbManagerOpen = false;
     imgMenuOpen = false;
@@ -577,6 +617,24 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     themeMenuOpen = false;
     blockedListOpen = false;
     mangaGuideOpen = false;
+    pdfLayoutOpen = false;
+  }
+
+  /** PDF「页面布局」开合：互斥同上。面板内的「图片大小/适宽/适高」写本书覆盖（setOv），
+   *  布局/方向/间距沿用全局 config.reader.manga（这两类设置本来就同一个渲染管线）。 */
+  function togglePdfLayout() {
+    const willOpen = !pdfLayoutOpen;
+    closeTbPanels();
+    if (willOpen) {
+      rightPanel = null;
+      tocOpen = false;
+      pdfLayoutOpen = true;
+    }
+  }
+
+  /** PDF 页面布局：把「本书图片大小/适宽/适高」清回跟随全局。 */
+  function resetPdfImageOverride() {
+    setOv({ imgScale: undefined, fitWidth: undefined, fitHeight: undefined });
   }
 
   /** 顶栏「按钮管理」开合：打开时关闭其它面板（右侧面板 / 目录 / 其它顶栏浮层），互斥。 */
@@ -814,8 +872,194 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
-  /** 取章节：命中缓存同步返回；否则发起（去重）请求并缓存结果。 */
+  /** PDF 页可用的内容宽（CSS px）：flow 取瀑布流画布宽，横向取横向视口宽。 */
+  function pdfContainerW(): number {
+    const w = mangaHorizontal() ? mangaViewport?.clientWidth ?? 0 : mangaFlowCanvas?.clientWidth ?? 0;
+    if (w > 40) return w;
+    return Math.max(200, (typeof window !== "undefined" ? window.innerWidth : 800) - 32);
+  }
+
+  /** PDF 页可用的内容高（CSS px）：flow 用「一屏高」（--rdr-img-h 的同源值），横向取视口高。 */
+  function pdfContainerH(): number {
+    const h = mangaHorizontal() ? mangaViewport?.clientHeight ?? 0 : imgMaxH;
+    if (h > 40) return h;
+    return Math.max(200, (typeof window !== "undefined" ? window.innerHeight : 800) - 48);
+  }
+
+  /** 一页在屏幕上的显示尺寸：由页尺寸 × 有效倍率（或适宽/适高）解析算出，不依赖浏览器布局
+   *  （否则会形成「位图尺寸 → 布局尺寸 → 位图尺寸」的反馈环，缩放后永远追不上）。 */
+  function pdfDisplayFor(geo: { ptW: number; ptH: number }) {
+    return pdfDisplayBox({
+      page: geo,
+      containerW: pdfContainerW(),
+      containerH: pdfContainerH(),
+      imgScale: effImgScale(),
+      fitWidth: effFitWidth(),
+      fitHeight: effFitHeight(),
+      horizontal: mangaHorizontal(),
+    });
+  }
+
+  /** PDF 的页码标题（跟随界面语言）。 */
+  function pdfPageTitle(idx: number): string {
+    return t("reader.pdf.page", { n: idx + 1 });
+  }
+
+  /** 生成一页的 DOM：显式宽高的「切片盒」序列，位图由 ensureVisibleSlices() 按视口按需填入。
+   *  为什么先给盒子再填图：盒子尺寸由显示尺寸决定、与位图分辨率无关，于是布局稳定不跳动，
+   *  且缩放/窗口变化时只要换位图，不必重建整章 DOM。位图分辨率 = 显示尺寸 × DPR（clampBitmapSize）。 */
+  function pdfPageHtmlFor(geo: { ptW: number; ptH: number }, box: { w: number; h: number }, pageIdx: number): string {
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const ranges = pdfSliceRanges(box.h, pdfContainerH(), PDF_SLICE_MAX_SCREENS);
+    const parts: string[] = [];
+    ranges.forEach(([f0, f1], i) => {
+      const top = Math.round(box.h * f0);
+      const sh = Math.max(1, Math.round(box.h * (f1 - f0)));
+      const bit = clampBitmapSize(box.w, sh, dpr);
+      // 内联 !important：必须压过漫画那套图片 CSS（max-width/max-height/zoom），否则宽高会被改。
+      parts.push(
+        `<img class="pdf-page-slice" data-slice="${i}" data-f0="${f0}" data-f1="${f1}" data-bith="${bit.bitH}"` +
+          ` style="position:absolute !important;left:0 !important;top:${top}px !important;width:${box.w}px !important;height:${sh}px !important;max-width:none !important;max-height:none !important;zoom:1 !important;margin:0 !important;display:block !important" alt="">`,
+      );
+    });
+    // 双层 DOM：位图（canvas img）在下、透明文本层在上。页容器宽高写死，文本层与位图同一坐标系，
+    // 缩放只换位图分辨率、不改布局，选区/划线偏移因此稳定。
+    return (
+      `<div class="pdf-page" data-pdf-page="${pageIdx}" data-pdf-w="${box.w}" data-pdf-h="${box.h}"` +
+      ` data-pdf-ptw="${geo.ptW}" data-pdf-pth="${geo.ptH}"` +
+      ` style="position:relative !important;width:${box.w}px !important;height:${box.h}px !important;margin:0 auto !important;zoom:1 !important">` +
+      parts.join("") +
+      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:1 !important"></div></div>`
+    );
+  }
+
+  /** PDF 单页：拿到页尺寸 → 算显示尺寸与切片 → 给出带显式宽高的切片盒（位图随后按视口补）。
+   *  取几何失败给占位 HTML 而不是抛错——抛错会让并行取页的窗口构建失败、滚到坏页时整条链卡住。 */
+  async function fetchPdfChapter(idx: number): Promise<ChapterData> {
+    const id = book?.book.id ?? 0;
+    const title = pdfPageTitle(idx);
+    try {
+      const geo = await pageGeometry(id, idx);
+      return { title, html: pdfPageHtmlFor(geo, pdfDisplayFor(geo), idx), chars: 0 };
+    } catch {
+      return { title, html: pdfPageErrorHtml(), chars: 0 };
+    }
+  }
+
+  /* ================= PDF 切片与文本层：视口驱动按需渲染/回收 ================= */
+  /** 贴着视口上下各半屏内的切片才算「要显示」，其余立刻解除 DOM 引用交还 pdf.ts 回收。 */
+  const PDF_SLICE_NEAR_SCREENS = 0.5;
+  let sliceCheckRaf = 0;
+  /** 本页文本是否可用于划词/搜索/朗读（乱码文件必须如实判否，不许假装能读）。 */
+  let pdfTextOk = $state(false);
+  /** 文本上传游标：本轮打开到第几页（换书重置）。 */
+  let pdfTextUploadToken = 0;
+
+  function scheduleSliceCheck() {
+    if (sliceCheckRaf) return;
+    sliceCheckRaf = requestAnimationFrame(() => {
+      sliceCheckRaf = 0;
+      ensureVisibleSlices();
+    });
+  }
+
+  /** 视口驱动：给可见切片补位图、给可见页补文本层，把离开视口的切片位图交还回收。
+   *  为什么必须这样：一页在 100%/200% 下的完整位图可达几十到几百 MB，只有「按显示尺寸切片 +
+   *  只在视口附近存活」才能既清晰又有界。 */
+  function ensureVisibleSlices() {
+    if (!isPdfBook() || !book) return;
+    const vp = mangaHorizontal() ? mangaViewport : mangaFlowViewport;
+    if (!vp || !mangaWindow.length) return;
+    const r = vp.getBoundingClientRect();
+    const near = r.height * PDF_SLICE_NEAR_SCREENS;
+    const lo = r.top - near;
+    const hi = r.bottom + near;
+    const tokens: string[] = [];
+    for (const blk of vp.querySelectorAll<HTMLElement>(".manga-block")) {
+      const idx = Number(blk.dataset.index);
+      if (!Number.isFinite(idx)) continue;
+      const pageEl = blk.querySelector<HTMLElement>(".pdf-page");
+      if (pageEl) {
+        const pr = pageEl.getBoundingClientRect();
+        const pageVisible = pr.bottom > lo && pr.top < hi;
+        if (pageVisible) void ensurePageTextLayer(pageEl, idx);
+      }
+      for (const im of blk.querySelectorAll<HTMLImageElement>("img.pdf-page-slice")) {
+        const ir = im.getBoundingClientRect();
+        const visible = ir.bottom > lo && ir.top < hi;
+        if (visible) {
+          const t = im.dataset.token;
+          if (t) {
+            tokens.push(t);
+            continue;
+          }
+          if (!im.dataset.loading) {
+            im.dataset.loading = "1";
+            void fillSlice(im, idx);
+          }
+        } else if (im.getAttribute("src")) {
+          // 离开视口：解除 DOM 引用，位图交给 pdf.ts 的 LRU（同页同活切片数因此有上限）
+          im.removeAttribute("src");
+          delete im.dataset.token;
+        }
+      }
+    }
+    if (tokens.length) pinSlices(book.book.id, tokens);
+  }
+
+  /** 渲染一条切片并把位图 URL 写进 <img>（失败保持空盒，不抛错阻断滚动）。 */
+  async function fillSlice(im: HTMLImageElement, pageIdx: number) {
+    const id = book?.book.id ?? 0;
+    const slice = Number(im.dataset.slice ?? 0);
+    const f0 = Number(im.dataset.f0 ?? 0);
+    const f1 = Number(im.dataset.f1 ?? 1);
+    const bitH = Number(im.dataset.bith ?? 0);
+    try {
+      const { url, token } = await renderPageSlice(id, { page: pageIdx, slice, f0, f1, bitH });
+      im.dataset.token = token;
+      im.src = url;
+    } catch {
+      /* 单条失败：留空盒（不显示错误图），滚动链不受影响 */
+    } finally {
+      delete im.dataset.loading;
+    }
+  }
+
+  /** 给一页装透明文本层（只装一次）。文本层用于选取/划线/TTS/搜索，文字本身不可见。 */
+  async function ensurePageTextLayer(pageEl: HTMLElement, pageIdx: number) {
+    if (pageEl.dataset.textDone === "1" || pageEl.dataset.textBusy === "1") return;
+    pageEl.dataset.textBusy = "1";
+    const id = book?.book.id ?? 0;
+    const w = Number(pageEl.dataset.pdfW ?? 0);
+    const ptw = Number(pageEl.dataset.pdfPtw ?? 0);
+    try {
+      const res = await buildTextLayer(id, pageIdx, pageEl, { displayW: w, ptW: ptw });
+      pageEl.dataset.textDone = "1";
+      if (!pdfTextOk && res.usable) pdfTextOk = true;
+      if (res.usable) void uploadPageText(pageIdx, res.text);
+    } catch {
+      /* 文本层失败不影响看图 */
+    } finally {
+      delete pageEl.dataset.textBusy;
+    }
+  }
+
+  /** 把某页纯文本回传后端（写入既有 chapter_text/FTS 链路，后端不解析 PDF）。
+   *  只回传「可用」文本；乱码页不回传，避免污染搜索/朗读数据。 */
+  async function uploadPageText(pageIdx: number, text: string) {
+    if (!text) return;
+    try {
+      await api.setPdfPageText(book?.book.id ?? 0, pageIdx, pdfPageTitle(pageIdx), text);
+    } catch {
+      /* 回传失败只影响搜索，不影响阅读 */
+    }
+  }
+
+  /** 取章节：命中缓存同步返回；否则发起（去重）请求并缓存结果。
+   *  PDF 不进章节缓存：它的「章节」是位图，位图的回收权归 pdf.ts 统一持有（见 pdf.ts 顶部说明），
+   *  缓存里留一份指向已回收 URL 的 html 会导致翻回去时白屏。 */
   function fetchChapter(idx: number): Promise<ChapterData> {
+    if (isPdfBook()) return fetchPdfChapter(idx);
     const hit = cacheGet(idx);
     if (hit) return Promise.resolve(hit);
     const pending = inflight.get(idx);
@@ -841,6 +1085,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function prefetchAround(center: number) {
     if (!book) return;
+    // PDF 的「章」是页位图：这里预取一次会连带渲染十几页位图（几十 MB），且漫画窗口
+    // 本身已经按需加载。故 PDF 不做章节预取。
+    if (isPdfBook()) return;
     const total = book.toc.length;
     // 大书窗口更大（来回翻页/跳读更顺），但仍设上限，避免内存/IO 过载。
     const span = total > 400 ? 12 : total > 120 ? 10 : 6;
@@ -894,6 +1141,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   export async function open(bookId: number) {
     openError = "";
     try {
+      // 原地换书也要释放上一本的 PDF（这条路径不经过 close()）：pdf.js 持有我们传进去的
+      // 整份文件字节与解析结构，扫描版大 PDF 可达数百 MB；页位图也不会自己消失。
+      // 同一本书重复 open() 不释放 —— 否则要白读一遍整份文件（session 由 ensurePdf 保留/重建）。
+      const prevId = book?.book.id ?? 0;
+      if (prevId && prevId !== bookId) releaseAll();
       chapterCache.clear();
       inflight.clear();
       prefetchQueue = [];
@@ -911,13 +1163,34 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       lastMangaLayout = null;
       bookImages = null;
       viewerIndex = null;
+      // PDF 每本书重新判定文字可用性与视图尺寸键（否则沿用上一本的判断）。
+      pdfTextOk = false;
+      lastPdfViewKey = "";
       progressUserMoved = false; // 新书打开：清空「用户已移动」标记（打开本身不释放手动状态覆盖）
       book = await api.openBook(bookId);
+      // PDF：后端不解析 PDF 内容，页数只能由前端 pdf.js 给出。拿到真实页数后重建页码目录
+      // （覆盖后端按上次上报页数给的目录），并回写设置项，让后端下次 open_book 直接给出正确目录。
+      if (book.book.format === "pdf") {
+        // 整份文件字节 IPC + pdf.js 解析要数秒（大 PDF 更久）：先立起加载态，
+        // 否则这段时间 loadingChapter 与 chapter 都不满足骨架屏条件 → 正文区纯白。
+        loadingChapter = true;
+        const pdf = await ensurePdf(book.book.id);
+        // 目录：PDF 自带 outline 优先（真实章节名 + 层级），解析不到才回落「第 N 页」。
+        // 目录数组下标恒等于页号，所以合并只换标题，不改导航语义（页码=chapter_index）。
+        const outline = await docOutline(book.book.id).catch(() => []);
+        const base = buildPageToc(pdf.doc.numPages, (n) => t("reader.pdf.page", { n }));
+        book.toc = outline.length ? mergeOutlineTitles(base, outline, (n) => t("reader.pdf.page", { n })) : base;
+        api.setSetting("pdf.pages." + book.book.id, String(pdf.doc.numPages)).catch(() => {});
+        // 目录标题存一份给「弹出目录」独立窗口：那扇窗不重新解析 PDF（省一次整文件读取）。
+        api.setSetting("pdf.outline." + book.book.id, JSON.stringify(outline)).catch(() => {});
+        // 首次打开且尚无封面：后端无法栅格化 PDF，只能由这里渲染第 1 页作封面。
+        if (!book.book.cover_path) void generatePdfCover(book.book.id);
+      }
       // 全书总字数只在这里算一次（见 tocCharsTotal 处的说明）
       tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
       // EPUB 快速解析不做全书逐章统计（toc.chars 全 0）→ 「全书总页数」估不出来，按需补算一次。
       // 只在翻页模式、且总字数确实为 0 时调用：滚动/漫画模式用不到页数，几千章的完整解析可达数秒。
-      if (tocCharsTotal === 0 && !scrollLayout() && !mangaHorizontal()) {
+      if (tocCharsTotal === 0 && !isPdfBook() && !scrollLayout() && !mangaHorizontal()) {
         const wantId = book.book.id;
         api
           .bookCharCounts(wantId)
@@ -939,6 +1212,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           });
       }
       ui.currentBookId = book.book.id;
+      // 弹出面板窗（目录/书签/划线/统计）的窗口 label 与书无关：换书后必须广播，
+      // 让面板切到当前这本书（面板自己按 tidepage-book-changed 重载）。
+      void emit("tidepage-book-changed", { bookId: book.book.id, title: book.book.title || "" });
       if (book.encoding_warning) console.log(book.encoding_warning);
       // 漫画书首次引导：全局只提示一次（写入 config.reader.mangaGuideDone），
       // 之后打开任何漫画都不再弹出；拖动时实时预览（直接改全局 manga.imgScale）。
@@ -947,7 +1223,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       tbManagerOpen = false;
       blockedListOpen = false;
       // 走 isMangaMode() 而不是裸 book.is_manga：关掉自动识别后不应再弹漫画引导。
-      if (isMangaMode() && !config.reader.mangaGuideDone) {
+      if (isMangaMode() && !isPdfBook() && !config.reader.mangaGuideDone) {
         mangaGuideScale = config.reader.manga.imgScale;
         mangaGuideOpen = true;
       } else {
@@ -957,7 +1233,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       try {
         restore = await api.loadProgress(bookId);
       } catch { /* ignore */ }
-      chapterNum = restore && restore.chapter_index < book.toc.length ? restore.chapter_index : 0;
+      let startIdx = restore && restore.chapter_index < book.toc.length ? restore.chapter_index : 0;
+      // PDF：书库「标记已读」写的是 100% 进度，重开应落到最后一页（页 = 章，目录长度即页数）。
+      if (isPdfBook() && restore && restore.pct >= 99.5) startIdx = Math.max(0, book.toc.length - 1);
+      chapterNum = Math.min(startIdx, Math.max(0, book.toc.length - 1));
       await loadChapter(chapterNum, restore ?? undefined);
       refreshHighlights();
       {
@@ -1004,7 +1283,23 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           ? t("reader.err.malformed")
           : s;
       openError = friendly;
+      // 打开失败必须收掉加载态：否则骨架屏会一直挂着（失败态另有 openError 界面）。
+      loadingChapter = false;
+      loadingIdx = -1;
       toast(friendly, "error");
+    }
+  }
+
+  /** PDF 首次打开且没有封面时，把第 1 页渲染成封面（后端无法栅格化 PDF，封面只能前端给）。
+   *  成功/失败都不打断阅读；成功后由后端 emit("book-updated") 让书库刷新封面。 */
+  async function generatePdfCover(bookId: number) {
+    try {
+      const dataUrl = await renderCoverPng(bookId, 800);
+      const b64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+      if (b64 && b64 !== dataUrl) await api.setBookCoverImage(bookId, b64);
+    } catch (e) {
+      // 封面是锦上添花：失败只留一行 DEV 痕迹，不弹错、不打断打开流程。
+      if (import.meta.env.DEV) console.warn("[pdf] cover failed", e);
     }
   }
 
@@ -1025,6 +1320,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     pendingEdge = null;
     clearTimeout(edgeFlushTimer);
     mangaWindow = [];
+    // 关书释放 PDF 文档与全部页位图（非 PDF 时是空操作）：位图是 blob，不主动回收内存不会降。
+    releaseAll();
     ui.currentBookId = 0;
   }
 
@@ -2033,6 +2330,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     } else {
       el.style.transform = xf;
     }
+    scheduleSliceCheck(); // 横向平移同样要按视口补/收切片位图与文本层
   }
 
   /* 横向拖拽跟手：pointermove 只更新 mangaPosX/Y（普通变量，非 $state，写入无副作用），
@@ -2145,6 +2443,18 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   // 对「每章很多图」的书则可能只含 1~2 章（DOM 立刻从几千降到百级）。
   const MANGA_IMG_INIT = 15; // 初始窗口累计到约这么多张图即停（至少含当前章）
   const MANGA_IMG_BUDGET = 50; // 续章后窗口累计图片预算上限，超出则从离屏远端裁掉整章
+  // PDF：一页一张位图，而位图是 MB 级（漫画里的一张图通常只有几百 KB），窗口必须比漫画小得多。
+  // 不缩小的话，「一张图一章」的书会被一次预取十几页 → 瞬间几百 MB 到 GB 级内存。
+  const PDF_MANGA_IMG_INIT = 4;
+  const PDF_MANGA_IMG_BUDGET = 6;
+  /** 初始窗口图片数：PDF 单独取值。 */
+  function mangaImgInit(): number {
+    return isPdfBook() ? PDF_MANGA_IMG_INIT : MANGA_IMG_INIT;
+  }
+  /** 窗口累计图片预算：PDF 单独取值（超出即从离屏远端裁掉整页）。 */
+  function mangaImgBudget(): number {
+    return isPdfBook() ? PDF_MANGA_IMG_BUDGET : MANGA_IMG_BUDGET;
+  }
   const MANGA_FLOW_LEAD = 1.5; // 尾块进入「视口底边 + 1.5 屏」即续章
   const MANGA_EXTEND_MIN_GAP = 70; // 续章最小间隔（ms），配 rAF 合并替代 260ms 墙上时钟
 
@@ -2170,7 +2480,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** 建一个窗口条目（懒加载注入 + 一次性图片计数，供 windowImgTotal 求和）。 */
   function mangaItem(index: number, html: string): MangaItem {
     const h = injectMangaLazy(html);
-    return { index, html: h, imgs: imgCount(h) };
+    // PDF 一页可能被切成多条位图切片：窗口/预算一律按「页」计量，否则一条 11 屏的超长页
+    // 会一次吃掉整个图片预算，把相邻页全挤出窗口（切片级内存由 pdf.ts 的存活上限单独管）。
+    const isPdfPage = html.includes("pdf-page");
+    return { index, html: h, imgs: isPdfPage ? 1 : imgCount(h) };
   }
 
   /** 窗口尾块的真实底边（纵向续章判据一律用它，不再读裁剪前的 scrollHeight）。 */
@@ -2255,8 +2568,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     loadingChapter = true;
     loadingIdx = idx;
     const total = book.toc.length;
-    // 按「图片数量」建窗：先取当前章保证至少含它；不足初值则向两侧交替扩，累计图片达 MANGA_IMG_INIT 即停。
-    // 一张图一章 → 约 MANGA_IMG_INIT 章；每章很多图 → 当前章一张就超初值 → 窗口仅 1~2 章。
+    // 初始窗口规模按书而定：PDF 一页一张位图，只开 4 页（见 PDF_MANGA_IMG_INIT 的说明）。
+    const imgInit = mangaImgInit();
+    // 按「图片数量」建窗：先取当前章保证至少含它；不足初值则向两侧交替扩，累计图片达初值即停。
+    // 一张图一章 → 约 imgInit 章；每章很多图 → 当前章一张就超初值 → 窗口仅 1~2 章。
     const items = new Map<number, MangaItem>();
     const objs = new Map<number, ChapterData | null>();
     const take = (i: number) =>
@@ -2276,23 +2591,43 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     let imgs = await take(idx);
     let lo = idx;
     let hi = idx;
-    if (imgs < MANGA_IMG_INIT) {
-      // 并行预取两侧候选（最多各 MANGA_IMG_INIT 章，够一张图一章的书），再按序累加到达初值。
-      const loMin = Math.max(0, idx - MANGA_IMG_INIT);
-      const hiMax = Math.min(total - 1, idx + MANGA_IMG_INIT);
-      const cand: number[] = [];
-      for (let i = loMin; i <= hiMax; i++) if (i !== idx) cand.push(i);
-      await Promise.all(cand.map(take));
-      let goLeft = true;
-      // 只在已预取的候选范围内扩，避免某些章无图时把整本书纳入空窗口。
-      while (imgs < MANGA_IMG_INIT && (lo > loMin || hi < hiMax)) {
-        const canL = lo > loMin;
-        const canR = hi < hiMax;
-        const left = canL && (!canR || goLeft);
-        goLeft = !goLeft;
-        if (left) lo--;
-        else hi++;
-        imgs += items.get(left ? lo : hi)?.imgs ?? 0;
+    if (imgs < imgInit) {
+      if (isPdfBook()) {
+        // PDF 每页恒 1 张位图，窗口只要 imgInit 页：先算出「左右交替」的取页顺序，再只取这些页。
+        // 不走下面漫画的「把 idx±imgInit 全部候选都取一遍」——那会多渲染近一倍的页位图
+        // （pdf.js 全局并发只有 2，多出来的渲染只会把首屏拖慢）。
+        const order: number[] = [];
+        let goLeft = true;
+        let l = idx;
+        let h = idx;
+        while (order.length < imgInit - 1 && (l > 0 || h < total - 1)) {
+          const canL = l > 0;
+          const canR = h < total - 1;
+          const useLeft = canL && (!canR || goLeft);
+          goLeft = !goLeft;
+          if (useLeft) { l--; order.push(l); } else { h++; order.push(h); }
+        }
+        if (order.length) await Promise.all(order.map(take));
+        lo = l;
+        hi = h;
+      } else {
+        // 并行预取两侧候选（最多各 imgInit 章，够一张图一章的书），再按序累加到达初值。
+        const loMin = Math.max(0, idx - imgInit);
+        const hiMax = Math.min(total - 1, idx + imgInit);
+        const cand: number[] = [];
+        for (let i = loMin; i <= hiMax; i++) if (i !== idx) cand.push(i);
+        await Promise.all(cand.map(take));
+        let goLeft = true;
+        // 只在已预取的候选范围内扩，避免某些章无图时把整本书纳入空窗口。
+        while (imgs < imgInit && (lo > loMin || hi < hiMax)) {
+          const canL = lo > loMin;
+          const canR = hi < hiMax;
+          const left = canL && (!canR || goLeft);
+          goLeft = !goLeft;
+          if (left) lo--;
+          else hi++;
+          imgs += items.get(left ? lo : hi)?.imgs ?? 0;
+        }
       }
     }
     const next: MangaItem[] = [];
@@ -2379,7 +2714,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
             await mangaBudgetTrim();
             if (gen !== loadGeneration) return;
             if (next >= total - 1) break; // 已到书尾
-            if (windowImgTotal() > MANGA_IMG_BUDGET) break;
+            if (windowImgTotal() > mangaImgBudget()) break;
             if (vp && flowWindowTailBottom() >= vp.scrollTop + h * 3.5) break;
           } else if (mangaHorizontal()) {
             measureManga();
@@ -2426,7 +2761,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         syncMangaAnchor();
         await mangaBudgetTrim();
         if (gen !== loadGeneration) return;
-        if (windowImgTotal() > MANGA_IMG_BUDGET) break;
+        if (windowImgTotal() > mangaImgBudget()) break;
         if (!flowNeedTop()) break;
         await sleepMangaGap();
       }
@@ -2439,10 +2774,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
-  /** 预算裁剪：窗口累计图片超 MANGA_IMG_BUDGET 时，从「已完全离屏」的远端裁掉整章块，带滚动/位移补偿；
+  /** 预算裁剪：窗口累计图片超 mangaImgBudget() 时，从「已完全离屏」的远端裁掉整章块，带滚动/位移补偿；
       永不裁掉视口内的章（故与瀑布流的 mangaWindowTrim 互补，横向模式则由它独自保证窗口有界）。 */
   async function mangaBudgetTrim() {
-    if (mangaWindow.length <= 1 || windowImgTotal() <= MANGA_IMG_BUDGET) return;
+    if (mangaWindow.length <= 1 || windowImgTotal() <= mangaImgBudget()) return;
     if (scrollLayout()) {
       const vp = mangaFlowViewport;
       if (!vp) return;
@@ -2453,7 +2788,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       let lo = 0;
       let hi = blocks.length;
       // 头部：完全在视口上方的整章
-      while (hi - lo > 1 && total > MANGA_IMG_BUDGET) {
+      while (hi - lo > 1 && total > mangaImgBudget()) {
         const first = blocks[lo];
         if (first.offsetTop + first.offsetHeight <= vp.scrollTop) {
           removedTop += first.offsetHeight;
@@ -2462,7 +2797,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         } else break;
       }
       // 尾部：完全在视口下方的整章（纵向唯一的尾部裁剪者）
-      while (hi - lo > 1 && total > MANGA_IMG_BUDGET) {
+      while (hi - lo > 1 && total > mangaImgBudget()) {
         const last = blocks[hi - 1];
         if (last.offsetTop >= vp.scrollTop + vp.clientHeight) {
           total -= mangaWindow[hi - 1]?.imgs ?? 0;
@@ -2490,7 +2825,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       let removedHeadW = 0;
       let tailRemoved = false;
       // 头部（阅读起点、已读过并离屏）：裁掉并把 mangaPosX 回退该章宽度（prepend 补偿的逆操作）
-      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > MANGA_IMG_BUDGET) {
+      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > mangaImgBudget()) {
         const first = blocks[0];
         const w = first.offsetWidth;
         // 该章在「去掉已裁头部」后的语义末端 = w，仍 ≤ 当前读位（同样减去已裁宽度）才算完全离屏
@@ -2501,7 +2836,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         } else break;
       }
       // 尾部（阅读终点之后、离屏）：裁掉，无需补偿
-      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > MANGA_IMG_BUDGET) {
+      while (mangaWindow.length > 1 && blocks.length > 1 && windowImgTotal() > mangaImgBudget()) {
         const last = blocks[blocks.length - 1];
         const semStart = mangaRtl()
           ? el.offsetWidth - (last.offsetLeft + last.offsetWidth)
@@ -2527,6 +2862,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
    *  scroll 事件只负责「记录最新 scrollTop + 请求一帧」：裁剪 / 续章判据 / 更新章号统一在 rAF
    *  里做（原先在 scroll 回调里同步做 2N 次强制布局读并同步改 $state，是掉帧主因）。 */
   function checkMangaWindowExtend() {
+    scheduleSliceCheck(); // PDF：滚动即按视口补/收切片位图
     const vp = mangaFlowViewport;
     if (!vp || !mangaWindow.length) return;
     pendingFlowTop = vp.scrollTop;
@@ -2578,7 +2914,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
     if (best !== chapterNum) {
       chapterNum = best;
-      chapter = chapterCache.get(best) ?? chapter;
+      // PDF 的「章节」是位图、不进 chapterCache：标题按页号算，否则底栏会一直停在旧页号。
+      chapter = isPdfBook() ? { title: pdfPageTitle(best), html: "", chars: 0 } : (chapterCache.get(best) ?? chapter);
       saveProgressDebounced();
     }
   }
@@ -2604,7 +2941,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
     if (best !== chapterNum) {
       chapterNum = best;
-      chapter = chapterCache.get(best) ?? chapter;
+      // PDF 的「章节」是位图、不进 chapterCache：标题按页号算，否则底栏会一直停在旧页号。
+      chapter = isPdfBook() ? { title: pdfPageTitle(best), html: "", chars: 0 } : (chapterCache.get(best) ?? chapter);
       saveProgressDebounced();
     }
   }
@@ -2787,11 +3125,15 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       measureManga(); // 重算 --mg-vieww / mangaMaxX / centered 居中
       mangaPosX = Math.max(0, Math.min(fx * (mangaMaxX + vw), mangaMaxX));
       applyMangaPan();
+      schedulePdfRebuildIfSizeChanged();
+      scheduleSliceCheck();
       return;
     }
     // 漫画瀑布流：重测滚动范围；窗口内容在视口上方变高时按锚点补偿 scrollTop，避免跳动。
     if (scrollLayout() && isMangaMode()) {
       remapFlowScroll(true);
+      schedulePdfRebuildIfSizeChanged();
+      scheduleSliceCheck();
       return;
     }
     // 滚动模式下先同步节流的响应式位置，保证重排后按真实位置恢复
@@ -3796,6 +4138,29 @@ ${effCssExtra() || ""}
     if (layoutChanged) loadMangaWindow(chapterNum);
   });
 
+  // PDF 切片按需加载：窗口内容变化（换页/裁剪/续章/重建）后按视口补位图与文本层，
+  // 并把离开视口的切片位图交还 pdf.ts 回收（切片级内存上限，rAF 合并避免滚动中抖）。
+  $effect(() => {
+    void mangaWindow;
+    if (!book || book.book.format !== "pdf") return;
+    scheduleSliceCheck();
+  });
+
+  /** PDF 视图尺寸键：倍率/适宽/适高/布局/容器高 任一变化 ⇒ 位图必须按新尺寸重渲染。
+   *  缓存键含位图高度，不重建窗口就等于继续用旧分辨率的图 —— 缩放后必然发虚。 */
+  function pdfViewKey(): string {
+    return [effImgScale(), effFitWidth(), effFitHeight(), config.reader.manga.layout, imgMaxH, pdfContainerH(), pdfContainerW()].join("|");
+  }
+  let lastPdfViewKey = "";
+  function schedulePdfRebuildIfSizeChanged() {
+    if (!isPdfBook() || !book) return;
+    const k = pdfViewKey();
+    if (k === lastPdfViewKey) return;
+    lastPdfViewKey = k;
+    loadGeneration++;
+    void loadMangaWindow(chapterNum);
+  }
+
   const bgImageUrl = $derived(
     (bookScheme()?.schemeBgImage ?? config.reader.bgImage)
       ? `http://tidepage.localhost/bg/${bookScheme()?.schemeBgImage ?? config.reader.bgImage}`
@@ -3849,6 +4214,12 @@ ${effCssExtra() || ""}
   });
 
   function contentRoot(): HTMLElement | null {
+    if (isPdfBook()) {
+      // PDF：根 = 当前页的 .pdf-page。页码即 chapter_index、偏移即该页文本层内的文本偏移，
+      // 于是划词/划线/TTS/选区偏移换算与既有链路（selectionOffsets/charRangeToRange）一一对应。
+      const vp = mangaHorizontal() ? mangaViewport : mangaFlowViewport;
+      return vp?.querySelector<HTMLElement>(`.pdf-page[data-pdf-page="${chapterNum}"]`) ?? null;
+    }
     return (contentEl?.querySelector("#chapter-content") as HTMLElement | null) ?? null;
   }
 
@@ -4682,6 +5053,8 @@ ${effCssExtra() || ""}
       case "chapterCount":
         return t("reader.status.chaptersTotal", { n: book.toc.length });
       case "chapterPages":
+        // PDF 的「章」就是页：显示「当前页/总页数」，比百分比更符合翻页直觉。
+        if (isPdfBook()) return t("reader.status.pageOf", { p: chapterNum + 1, n: book.toc.length });
         return !scrollLayout() && !mangaHorizontal()
           ? t("reader.status.pageOf", { p: page + 1, n: pageCount })
           : `${Math.round(currentRatio() * 100)}%`;
@@ -4815,6 +5188,7 @@ ${effCssExtra() || ""}
           class="icon tb-btn tip-left"
           class:on={b.on?.()}
           class:has-update={b.id === "settings" && !!updateState.latest}
+          disabled={b.disabled ? b.disabled() : false}
           data-drag-id={b.id}
           data-testid={"tb-" + b.id}
           aria-label={label}
@@ -4867,6 +5241,45 @@ ${effCssExtra() || ""}
         <button class="tb-menu-item" data-testid="tb-img-all" onclick={toggleAllImages}>{effShowImages() ? t("reader.menu.allImagesOff") : t("reader.menu.allImagesOn")}</button>
         <button class="tb-menu-item" data-testid="tb-img-block" onclick={startBlockPick}>{t("reader.menu.blockSelected")}</button>
         <button class="tb-menu-item" data-testid="tb-img-blocked" onclick={() => { imgMenuOpen = false; blockedListOpen = true; }}>{t("reader.menu.blockedCount", { n: blockedImages().length })}</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if pdfLayoutOpen}
+    <div class="tb-panel rdr-pop" role="menu" aria-label={t("reader.pdfLayout.title")} data-testid="pdf-layout-panel">
+      <div class="tb-panel-head"><span>{t("reader.pdfLayout.title")}</span><button class="icon" data-testid="pdf-layout-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (pdfLayoutOpen = false)}><IconX /></button></div>
+      <div class="tb-panel-body">
+        <div class="pdf-lay-field">
+          <label for="pdf-lay-layout">{t("settings.manga.display")}</label>
+          <select id="pdf-lay-layout" data-testid="pdf-lay-layout" bind:value={config.reader.manga.layout} onchange={saveConfig}>
+            <option value="flow">{t("settings.manga.displayFlow")}</option>
+            <option value="horizontal">{t("settings.manga.displayHorizontal")}</option>
+          </select>
+        </div>
+        <div class="pdf-lay-field">
+          <label for="pdf-lay-dir">{t("settings.manga.direction", { note: config.reader.manga.layout === "flow" ? t("settings.manga.horizontalOnly") : "" })}</label>
+          <select id="pdf-lay-dir" data-testid="pdf-lay-dir" bind:value={config.reader.manga.direction} onchange={saveConfig} disabled={config.reader.manga.layout === "flow"}>
+            <option value="ltr">{t("settings.manga.dirLtr")}</option>
+            <option value="rtl">{t("settings.manga.dirRtl")}</option>
+          </select>
+        </div>
+        <div class="pdf-lay-field">
+          <label for="pdf-lay-scale">{t("reader.pdfLayout.scale", { n: effImgScale().toFixed(1) })}</label>
+          <input id="pdf-lay-scale" type="range" min="0.3" max="3" step="0.1" data-testid="pdf-lay-scale" value={effImgScale()}
+            oninput={(e) => setOv({ imgScale: Number(e.currentTarget.value) })} />
+          <p class="tb-panel-hint">{t("reader.pdfLayout.scaleHint")}</p>
+        </div>
+        <div class="pdf-lay-checks">
+          <label><input type="checkbox" data-testid="pdf-lay-fitw" checked={effFitWidth()} onchange={(e) => setOv(e.currentTarget.checked ? { fitWidth: true, fitHeight: false } : { fitWidth: false })} /> {t("settings.manga.fitWidth")}</label>
+          <label><input type="checkbox" data-testid="pdf-lay-fith" checked={effFitHeight()} onchange={(e) => setOv(e.currentTarget.checked ? { fitHeight: true, fitWidth: false } : { fitHeight: false })} /> {t("settings.manga.fitHeight")}</label>
+        </div>
+        <button class="tb-menu-item" data-testid="pdf-lay-reset" onclick={resetPdfImageOverride}>{t("reader.pdfLayout.reset")}</button>
+        <div class="pdf-lay-field">
+          <label for="pdf-lay-gap">{t("settings.manga.imgGap", { n: config.reader.manga.imgGap })}</label>
+          <input id="pdf-lay-gap" type="range" min="0" max="80" data-testid="pdf-lay-gap" value={config.reader.manga.imgGap}
+            oninput={(e) => { config.reader.manga.imgGap = Number(e.currentTarget.value); saveConfig(); }} />
+        </div>
+        <p class="tb-panel-hint">{t("reader.pdfLayout.globalHint")}</p>
       </div>
     </div>
   {/if}
@@ -5541,6 +5954,11 @@ ${effCssExtra() || ""}
   .tb-theme-swatch { width: 16px; height: 16px; flex: none; border-radius: var(--radius-xs); border: 1px solid var(--rdr-line); }
   .tb-theme-item.on { color: var(--accent); }
 
+  /* PDF「页面布局」面板：与顶栏其它浮层同族，字段一列排布、标签小而淡。 */
+  .pdf-lay-field { display: flex; flex-direction: column; gap: 4px; margin: 0 6px 10px; }
+  .pdf-lay-field label { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.75; }
+  .pdf-lay-field select { width: 100%; }
+  .pdf-lay-checks { display: flex; flex-direction: column; gap: 6px; margin: 0 6px 10px; font-size: var(--fs-xs); }
   .tb-panel-hint { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); opacity: 0.6; margin: 8px 6px 2px; line-height: 1.5; }
   .tb-panel-empty { font-size: var(--fs-sm); letter-spacing: var(--ls-sm); opacity: 0.5; padding: 10px 8px; }
   .tb-block-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
@@ -5616,6 +6034,43 @@ ${effCssExtra() || ""}
   .content :global(#chapter-content *) {
     user-select: text;
     -webkit-user-select: text;
+  }
+
+  /* PDF 文本层同样可选中；扫描版没有文本层，自然不可选。 */
+  .content :global(.pdf-page .textLayer),
+  .content :global(.pdf-page .textLayer *) {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* PDF 双层 DOM 的文本层：只用于选取/划线定位，文字必须不可见（画面由位图提供）。
+     作用域限定在 .pdf-page 下 —— 绝不整文件引入 pdf_viewer.css（其 .page/.pdfViewer 会撞现有类）。 */
+  .content :global(.pdf-page .textLayer) {
+    position: absolute;
+    inset: 0;
+    overflow: clip;
+    line-height: 1;
+    -webkit-text-size-adjust: none;
+    text-size-adjust: none;
+    transform-origin: 0 0;
+    z-index: 1;
+  }
+  .content :global(.pdf-page .textLayer span),
+  .content :global(.pdf-page .textLayer br) {
+    color: transparent !important;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0 0;
+  }
+  /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
+     不得改字号/行高，也不得让文字变可见，否则会破坏文本层与位图的对齐。 */
+  .content :global(.pdf-page .textLayer mark),
+  .content :global(.pdf-page .textLayer mark *) {
+    color: transparent !important;
+    font-size: inherit !important;
+    line-height: inherit !important;
+    position: static !important;
   }
 
   /* 阅读区选区底色跟随「阅读主题」的 --rdr-sel（5 套主题 + 自由配色各自一份），

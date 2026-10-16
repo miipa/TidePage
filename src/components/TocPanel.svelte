@@ -85,7 +85,7 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
           <button
             class="toc-item"
             class:current={item.pos === current}
-            style="top:{i * ROW_H}px; height:{ROW_H}px;"
+            style="top:{i * ROW_H}px; height:{ROW_H}px; padding-left:{10 + (item.t.depth ?? 0) * 14}px;"
             onclick={() => onpick(item.pos)}
           >
             {item.t.title}

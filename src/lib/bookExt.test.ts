@@ -3,7 +3,7 @@ import { BOOK_EXTENSIONS, stripBookExt } from "./bookExt";
 
 describe("BOOK_EXTENSIONS", () => {
   it("精确等于当前集合与顺序", () => {
-    expect(BOOK_EXTENSIONS).toEqual(["txt", "epub", "mobi", "azw3", "prc"]);
+    expect(BOOK_EXTENSIONS).toEqual(["txt", "epub", "mobi", "azw3", "prc", "pdf"]);
   });
 });
 
@@ -22,7 +22,8 @@ describe("stripBookExt — 固定当前行为", () => {
     expect(stripBookExt("a.b.azw3")).toBe("a.b");
   });
   it("非书籍扩展名/无扩展名原样返回", () => {
-    expect(stripBookExt("note.pdf")).toBe("note.pdf");
+    expect(stripBookExt("note.pdf")).toBe("note");
+    expect(stripBookExt("note.docx")).toBe("note.docx");
     expect(stripBookExt("noext")).toBe("noext");
   });
 });

@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://tidepage.localhost; font-src 'self' data: http://tidepage.localhost; media-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost http://tidepage.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://tidepage.localhost; font-src 'self' data: http://tidepage.localhost; media-src 'self' blob: data:; connect-src 'self' ipc: http://ipc.localhost http://tidepage.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; worker-src 'self' blob:;"
     }
   },
   "bundle": {

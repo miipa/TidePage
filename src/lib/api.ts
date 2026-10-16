@@ -41,6 +41,15 @@ export const api = {
   bookCharCounts: (bookId: number) => invoke<number[]>("book_char_counts", { bookId }),
   getChapter: (bookId: number, chapterIndex: number, keepStyles = false) =>
     invoke<ChapterData>("get_chapter", { bookId, chapterIndex, keepStyles }),
+  /** 读取整本 PDF 的原始字节（仅 pdf）：返回 ArrayBuffer，交前端 pdf.js 解析渲染。 */
+  readBookBytes: (bookId: number) => invoke<ArrayBuffer>("read_book_bytes", { bookId }),
+  /** PDF 某页纯文本回传（前端 pdf.js 抽取）：写入 chapter_text，供划词全文搜索/FTS/朗读复用。
+   *  乱码页/扫描版不回传（见 pdfTextUsable），后端不解析 PDF。 */
+  setPdfPageText: (bookId: number, pageIndex: number, title: string, text: string) =>
+    invoke<void>("set_pdf_page_text", { bookId, pageIndex, title, text }),
+  /** PDF 首页封面：前端传已渲染好的 PNG（base64，不含 data URL 前缀），后端存缩略图并通知书库刷新。 */
+  setBookCoverImage: (bookId: number, pngBase64: string) =>
+    invoke<void>("set_book_cover_image", { bookId, pngBase64 }),
   listBookImages: (bookId: number) => invoke<BookImage[]>("list_book_images", { bookId }),
   saveProgress: (bookId: number, p: Progress) => invoke<void>("save_progress", { bookId, p }),
   loadProgress: (bookId: number) => invoke<Progress | null>("load_progress", { bookId }),
