@@ -24,10 +24,22 @@ describe("pdfDisplayBox", () => {
     expect(b.k).toBeCloseTo(1.5, 5);
   });
 
-  it("纵向滚动下不超过容器宽（否则右边被裁）", () => {
+  it("flow 下放大不夹到容器宽（超宽由横向滚动查看）", () => {
+    // 595pt × 4/3 × 3 = 2380 > 容器 800：必须按真实倍率出尺寸，否则「放大」是空操作
     const b = pdfDisplayBox({ page: a4, containerW: 800, containerH: 1198, imgScale: 3, fitWidth: false, fitHeight: false, horizontal: false });
-    expect(b.w).toBeLessThanOrEqual(800);
-    expect(b.k).toBeCloseTo(800 / (595 * PDF_PX_PER_PT), 5);
+    expect(b.w).toBe(Math.round(595 * PDF_PX_PER_PT * 3));
+    expect(b.k).toBeCloseTo(3, 5);
+  });
+
+  it("适宽优先于倍率：关掉适宽后三档倍率尺寸互不相同且 ≈ pt×4/3×倍率", () => {
+    const w = (s: number) =>
+      pdfDisplayBox({ page: a4, containerW: 1791, containerH: 1198, imgScale: s, fitWidth: false, fitHeight: false, horizontal: false }).w;
+    expect(w(1)).toBe(793);
+    expect(w(1.5)).toBe(1190);
+    expect(w(2)).toBe(1587);
+    expect(new Set([w(1), w(1.5), w(2)]).size).toBe(3);
+    const fit = pdfDisplayBox({ page: a4, containerW: 1791, containerH: 1198, imgScale: 2, fitWidth: true, fitHeight: false, horizontal: false });
+    expect(fit.w).toBe(1791);
   });
 
   it("fitWidth / fitHeight 直接按容器反推（与既有漫画语义一致）", () => {
@@ -135,6 +147,17 @@ describe("pdfTextUsable", () => {
     // 真实样本形态：HTTP → KWWS，斜杠 → 控制字符
     const garbled = "1JLQ[" + "\u001d\u0012\u0012WHQJLQH\u0011WDREDR\u0011RUJ\u0012ERRN\u0012".repeat(8);
     expect(pdfTextUsable(garbled)).toBe(false);
+  });
+
+  it("非中文外文文档必须可用（西里尔/希腊/阿拉伯）", () => {
+    expect(pdfTextUsable("Это обычный русский текст документа, извлечённый из PDF-файла.")).toBe(true);
+    expect(pdfTextUsable("Αυτό είναι ένα κανονικό ελληνικό κείμενο από αρχείο PDF.")).toBe(true);
+    expect(pdfTextUsable("هذا نص عربي عادي مستخرج من ملف PDF للقراءة.")).toBe(true);
+  });
+
+  it("纯英文/代码文本可用", () => {
+    expect(pdfTextUsable("const a = 1; // normal code and english text from a pdf page")).toBe(true);
+    expect(pdfTextUsable("0123456789 0123456789 0123456789 0123456789")).toBe(true);
   });
 
   it("替换字符 / 私用区码位过多不可用", () => {

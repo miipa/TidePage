@@ -222,6 +222,75 @@ export async function renderPageSlice(bookId: number, req: SliceRequest): Promis
   });
 }
 
+/** 一页里的可点链接：坐标已归一化到 [0,1]（PDF 原点在左下，这里换算成「从上往下」的分数），
+ *  阅读器再乘显示尺寸即可得到热点位置，缩放/切片重建时天然重算。 */
+export interface PdfLink {
+  url: string | null;
+  /** dest 解析出的目标页（0-based），-1 表示无/解析失败。 */
+  page: number;
+  nx: number;
+  ny: number;
+  nw: number;
+  nh: number;
+}
+
+/** 取一页的链接注解（subtype=Link）：url 走外链、dest 走跳页。单条解析失败只丢该条。 */
+export async function pageLinks(bookId: number, page: number): Promise<PdfLink[]> {
+  const { doc } = await ensurePdf(bookId);
+  const p = await doc.getPage(page + 1);
+  try {
+    const vp = p.getViewport({ scale: 1 });
+    const ptW = Math.max(1, vp.width);
+    const ptH = Math.max(1, vp.height);
+    let anns: unknown[] = [];
+    try {
+      anns = (await p.getAnnotations({ intent: "display" })) as unknown[];
+    } catch {
+      return [];
+    }
+    const out: PdfLink[] = [];
+    for (const a of anns) {
+      const an = a as { subtype?: string; url?: string; dest?: unknown; rect?: number[] };
+      if (an.subtype !== "Link") continue;
+      if (!Array.isArray(an.rect) || an.rect.length < 4) continue;
+      let destPage = -1;
+      if (an.dest != null) {
+        try {
+          // 用新常量接收：直接给 d 赋值会被 typeof 收窄成 string，导致 any[]|null 赋不进去
+          const rawDest = an.dest;
+          const d: unknown = typeof rawDest === "string" ? await doc.getDestination(rawDest) : rawDest;
+          if (Array.isArray(d) && d.length) {
+            const idx = await doc.getPageIndex(d[0] as Parameters<typeof doc.getPageIndex>[0]);
+            if (typeof idx === "number") destPage = idx;
+          }
+        } catch {
+          destPage = -1;
+        }
+      }
+      const [x1, y1, x2, y2] = an.rect;
+      const left = Math.min(x1, x2);
+      const right = Math.max(x1, x2);
+      const bottom = Math.min(y1, y2);
+      const top = Math.max(y1, y2);
+      // pdf.js 把非 http(s)/可疑链接放在 unsafeUrl（不放进 url）：只在确认是 http/https 时才采用，
+      // 免得 javascript:/data: 之类的链接被我们当成外链打开（实测 Nginx.pdf 有 4 条走 unsafeUrl）。
+      const rawUrl = typeof an.url === "string" && an.url ? an.url : typeof (an as { unsafeUrl?: string }).unsafeUrl === "string" ? (an as { unsafeUrl?: string }).unsafeUrl! : "";
+      const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : null;
+      out.push({
+        url: safeUrl,
+        page: destPage,
+        nx: left / ptW,
+        ny: (ptH - top) / ptH,
+        nw: (right - left) / ptW,
+        nh: (top - bottom) / ptH,
+      });
+    }
+    return out;
+  } finally {
+    p.cleanup();
+  }
+}
+
 /** 读 PDF 自带目录（outline），并把 dest（可能是数组或字符串名）解析成 0-based 页号。
  *  解析失败的单条保留标题但 page=-1（调用方跳过），绝不因此整份目录失败。 */
 export async function docOutline(bookId: number): Promise<PdfOutlineItem[]> {
@@ -297,6 +366,43 @@ export async function buildTextLayer(
   } finally {
     p.cleanup();
   }
+}
+
+/** 整页位图（图库用）：按长边 ≤ maxLong 渲染，独立于切片缓存（图库看的是整页，不是切片）。
+ *  仍登记进位图表（合成 token）→ 关书/换书时一并 revoke，不留悬挂 blob。 */
+export async function renderPageImageFull(bookId: number, page: number, maxLong = 2000): Promise<string> {
+  const { doc } = await ensurePdf(bookId);
+  const gen = generation;
+  const token = `full#${page}@${maxLong}`;
+  const hit = bitmaps.get(token);
+  if (hit) return hit.url;
+  return withSlot(async () => {
+    const p = await doc.getPage(page + 1);
+    try {
+      const base = p.getViewport({ scale: 1 });
+      const scale = Math.max(0.05, maxLong / Math.max(base.width, base.height));
+      const viewport = p.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("canvas 上下文不可用");
+      await p.render({ canvasContext: ctx, viewport }).promise;
+      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
+      if (!blob) throw new Error("整页位图生成失败");
+      const url = URL.createObjectURL(blob);
+      if (gen !== generation) {
+        revoke(url);
+        throw new Error("已切换书籍");
+      }
+      bitmaps.set(token, { url, page });
+      pinnedTokens.add(token); // 图库正在看它：不参与 LRU 淘汰
+      sweep();
+      return url;
+    } finally {
+      p.cleanup();
+    }
+  });
 }
 
 /** 渲染第 1 页为低分辨率 PNG（data URL），供「首次打开生成封面」用。

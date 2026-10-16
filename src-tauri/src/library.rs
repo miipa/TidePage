@@ -2511,6 +2511,22 @@ pub fn set_pdf_page_text(
         rusqlite::params![book_id, page_index, title, text],
     )
     .map_err(|e| e.to_string())?;
+    // 全库搜索（search_all_inner）查的是 fts 表，而 index_book_fts 只在打开后的 idle 跑一次
+    // 且以「fts 里该书 0 行」为建索引条件 —— 之后回传的页永远进不了 fts，全库搜索就搜不到 PDF。
+    // 所以这里同步补一条 FTS 行（先删同页再插，重复回传保持幂等）。
+    if db::has_fts(&conn) {
+        db::ensure_fts(&conn).ok();
+        conn.execute(
+            "DELETE FROM fts WHERE book_id=?1 AND chapter_index=?2",
+            rusqlite::params![book_id, page_index],
+        )
+        .ok();
+        conn.execute(
+            "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![book_id, page_index, title, text],
+        )
+        .ok();
+    }
     Ok(())
 }
 

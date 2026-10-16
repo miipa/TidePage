@@ -60,10 +60,9 @@ export function pdfDisplayBox(opts: {
     // 横向布局是「一屏高」定尺寸：倍率作用在容器高上
     k = (ch / baseH) * scale;
   } else {
+    // 纵向滚动：直接用倍率，**不夹到容器宽**。页面比视口宽时由 PDF 的横向滚动查看
+    // （.reader.pdf .manga-flow-viewport 放开了 overflow-x），夹取会让「放大」变成空操作。
     k = scale;
-    // 纵向滚动下不能比容器还宽：否则右边被裁掉（overflow-x: hidden）
-    const maxK = cw / baseW;
-    if (k > maxK) k = maxK;
   }
   if (!Number.isFinite(k) || k <= 0) k = 1;
   return { w: Math.max(1, Math.round(baseW * k)), h: Math.max(1, Math.round(baseH * k)), k };
@@ -142,29 +141,50 @@ export function pdfTextUsable(text: string, ctrlMax = 0.02, badMax = 0.02): bool
   if (t.length < 8) return false;
   let ctrl = 0;
   let bad = 0;
-  let nonAscii = 0;
-  let cjkish = 0;
   for (const ch of t) {
     const c = ch.codePointAt(0) ?? 0;
     if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) ctrl++;
     if (c === 0xfffd || (c >= 0xe000 && c <= 0xf8ff)) bad++;
-    if (c > 0x7f) {
-      nonAscii++;
-      const isCjk =
-        (c >= 0x4e00 && c <= 0x9fff) ||
-        (c >= 0x3400 && c <= 0x4dbf) ||
-        (c >= 0x3040 && c <= 0x30ff) ||
-        (c >= 0xac00 && c <= 0xd7af) ||
-        (c >= 0x3000 && c <= 0x303f) ||
-        (c >= 0xff00 && c <= 0xffef);
-      if (isCjk) cjkish++;
-    }
   }
   const n = t.length;
   if (ctrl / n > ctrlMax) return false;
   if (bad / n > badMax) return false;
-  if (nonAscii / n > 0.6 && cjkish / Math.max(1, nonAscii) < 0.5) return false;
+  // 主导文种判据：**不得**再用「CJK 占比」阈值 —— 那会把俄语/希腊语/阿拉伯语等所有非中文
+  // 文档误判为不可用。这里只要求「有一个（或两个字种合计）明显主导」；纯乱码通常是
+  // 码位散布在大量互不相干的文种里，主导度很低。
+  const buckets = new Map<number, number>();
+  let scripted = 0;
+  for (const ch of t) {
+    const c = ch.codePointAt(0) ?? 0;
+    const idx = scriptBucket(c);
+    if (idx < 0) continue;
+    scripted++;
+    buckets.set(idx, (buckets.get(idx) ?? 0) + 1);
+  }
+  const top = [...buckets.values()].sort((a, b) => b - a);
+  const top1 = (top[0] ?? 0) / Math.max(1, scripted);
+  const top2 = (top1 + (top[1] ?? 0) / Math.max(1, scripted));
+  if (top1 < 0.5 && top2 < 0.8) return false;
   return true;
+}
+
+/** 码位 → 文种桶（同一文种内不区分大小写/字母数字）；-1 = 不属于任何已列文种（含标点/符号）。
+ *  只用于「主导度」判断，不做任何具体语种的等价判断。 */
+function scriptBucket(c: number): number {
+  if (c >= 0x41 && c <= 0x7a) return 0; // 拉丁基本（含数字与常用标点间的字母）
+  if (c >= 0x30 && c <= 0x39) return 0; // 阿拉伯数字并入拉丁桶（纯数字代码/表格常见）
+  if (c >= 0xc0 && c <= 0x24f) return 0; // 拉丁扩展
+  if (c >= 0x370 && c <= 0x3ff) return 1; // 希腊
+  if (c >= 0x400 && c <= 0x4ff) return 2; // 西里尔
+  if (c >= 0x530 && c <= 0x58f) return 3; // 亚美尼亚
+  if (c >= 0x590 && c <= 0x5ff) return 4; // 希伯来
+  if (c >= 0x600 && c <= 0x6ff) return 5; // 阿拉伯
+  if (c >= 0x900 && c <= 0x97f) return 6; // 天城文
+  if (c >= 0xe00 && c <= 0xe7f) return 7; // 泰文
+  if (c >= 0x3040 && c <= 0x30ff) return 8; // 假名
+  if ((c >= 0x3400 && c <= 0x4dbf) || (c >= 0x4e00 && c <= 0x9fff)) return 9; // 汉字
+  if (c >= 0xac00 && c <= 0xd7af) return 10; // 谚文
+  return -1;
 }
 
 /** 用前端的页码文案重写 PDF 目录标题（保持 index/chars 不变）。
