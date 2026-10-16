@@ -24,7 +24,13 @@ const PAGE_CACHE_MAX = 6;
 export const RENDER_CONCURRENCY = 2;
 
 /** range 路径的打开超时：pdf.js 的断言被吞掉时表现为「不报错也不成功」，必须自己兜住。 */
-const PDF_RANGE_OPEN_TIMEOUT = 20_000;
+const PDF_RANGE_OPEN_TIMEOUT =
+  // DEV 专用：置 window.__pdfForceRangeTimeout1ms = true 可把超时压到 1ms，
+  // 用来验证「range 失败 → 回退整读」这条防护真的生效。生产构建里 import.meta.env.DEV 为 false，
+  // 整个表达式被摇掉（构建后 grep __pdfForceRangeTimeout1ms 应为 0 命中）。
+  import.meta.env.DEV && (globalThis as { __pdfForceRangeTimeout1ms?: boolean }).__pdfForceRangeTimeout1ms
+    ? 1
+    : 20_000;
 /** 给 Promise 加超时（range 路径最怕无限挂起，超时后要能退化整读）。 */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((res, rej) => {

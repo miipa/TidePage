@@ -2483,9 +2483,11 @@ fn pdf_book_path(state: &State<'_, Arc<AppState>>, book_id: i64) -> Result<std::
 /// 32MB 仍然是一道「单次内存上限」，只是不会误伤正常的按需读取。超限直接报错，**不截断返回**
 /// （截断一个对象流会把它损坏）。
 const PDF_RANGE_MAX: u64 = 32 * 1024 * 1024;
-/// 同时在途 range 上限：pdf.js 打开 range 后会并发拉取，无上限会在后端堆积。
-const PDF_RANGE_CONCURRENCY: usize = 4;
-static PDF_RANGE_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 在途 range **总字节**上限 64MB：只限「请求个数」挡不住极端组合（4 × 32MB = 128MB 在途缓冲）。
+/// 实测正常路径单次只有几十 KB~2.6MB（97MB 扫描件打开时最后一次只取 2.6MB），
+/// 所以 64MB 对真实使用没有任何影响，却把最坏情况钉死在可接受范围。
+const PDF_RANGE_INFLIGHT_MAX: u64 = 64 * 1024 * 1024;
+static PDF_RANGE_INFLIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// PDF 文件字节总数：前端据此决定「整份读入」还是「range 分块拉取」。
 #[tauri::command]
@@ -2515,20 +2517,20 @@ pub async fn pdf_read_range(
     if want > PDF_RANGE_MAX {
         return Err(format!("单次 range 过大：{want} 字节（上限 {PDF_RANGE_MAX}）"));
     }
-    // RAII 守卫：任何提前返回都会归还并发名额
-    struct Guard;
+    // RAII 守卫：带着本次字节数，任何提前返回都会把额度还回去
+    struct Guard(u64);
     impl Drop for Guard {
         fn drop(&mut self) {
-            PDF_RANGE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            PDF_RANGE_INFLIGHT_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    if PDF_RANGE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        >= PDF_RANGE_CONCURRENCY
+    if PDF_RANGE_INFLIGHT_BYTES.fetch_add(want, std::sync::atomic::Ordering::SeqCst) + want
+        > PDF_RANGE_INFLIGHT_MAX
     {
-        PDF_RANGE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        return Err("range 请求过于频繁（并发上限 4）".into());
+        PDF_RANGE_INFLIGHT_BYTES.fetch_sub(want, std::sync::atomic::Ordering::SeqCst);
+        return Err("在途 range 总字节超限（上限 64MB）".into());
     }
-    let _guard = Guard;
+    let _guard = Guard(want);
     let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(&path).map_err(|e| format!("打开文件失败：{e}"))?;
