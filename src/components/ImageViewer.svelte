@@ -103,8 +103,10 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
       const s = stageEl;
       if (!s) return;
       // 缩放后的留白按新尺寸重算：scroll = 新留白 + 锚点内容偏移×倍率 − 光标位置
-      const mR1 = Math.max(0, (s.clientWidth - fit.w * k1) / 2);
-      const mT1 = Math.max(0, (s.clientHeight - fit.h * k1) / 2);
+      // 留白必须与布局用同一个基准（缓存的 stageW/stageH）：live 的 clientWidth 已扣掉滚动条，
+      // 与布局值差约 7.5px，混用会让缩放那一帧的锚点偏这么多。
+      const mR1 = Math.max(0, (stageW - fit.w * k1) / 2);
+      const mT1 = Math.max(0, (stageH - fit.h * k1) / 2);
       s.scrollLeft = mR1 + cx * f - px;
       s.scrollTop = mT1 + cy * f - py;
     });
