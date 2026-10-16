@@ -5,7 +5,7 @@
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
-  import { buildTextLayer, docOutline, ensurePdf, pageGeometry, pinSlices, releaseAll, renderCoverPng, renderPageSlice } from "../lib/pdf";
+  import { buildTextLayer, docOutline, ensurePdf, pageGeometry, pageLinks, pinSlices, releaseAll, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
   import {
     PDF_SLICE_MAX_SCREENS,
     buildPageToc,
@@ -360,7 +360,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   }
   function effFitWidth(): boolean {
     const o = bookOv();
-    return o.fitWidth ?? (isMangaMode() ? config.reader.manga.fitWidth : false);
+    if (o.fitWidth != null) return o.fitWidth;
+    // PDF 默认适宽：打开即整页宽可见（配合「图＋/图−」切到手动倍率的手感）。
+    // 用户显式选了适高（本书覆盖）时不与适宽并存；漫画/普通书保持原逻辑。
+    if (isPdfBook()) return o.fitHeight === true ? false : true;
+    return isMangaMode() ? config.reader.manga.fitWidth : false;
   }
   function effFitHeight(): boolean {
     const o = bookOv();
@@ -542,6 +546,73 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function unblockImage(src: string) {
     setOv({ blockedImages: blockedImages().filter((s) => s !== src) });
+  }
+
+  /* ================= 长按进图库（B2） ================= */
+  /** 长按判定：按下后 450ms 内位移 < 8px 且未松开 → 打开图库；超阈值即取消（交给拖拽平移）。
+   *  单击图片不再打开图库（改为长按），也不吞掉点击 —— 热区翻页语义保持不变。 */
+  const LONG_PRESS_MS = 450;
+  const LONG_PRESS_MAX_DIST = 8;
+  let lpTimer: ReturnType<typeof setTimeout> | undefined;
+  let lpStartX = 0;
+  let lpStartY = 0;
+  let lpHit: HTMLImageElement | null = null;
+  let lpFired = false;
+
+  function startLongPress(target: EventTarget | null, x: number, y: number) {
+    cancelLongPress();
+    // 屏蔽图片模式仍是单击生效：长按计时不启动，避免「长按屏蔽」与单击语义打架。
+    if (blockPickMode) return;
+    const el = target as HTMLElement | null;
+    const img = (el?.closest?.("img") ?? null) as HTMLImageElement | null;
+    if (!img) return;
+    lpHit = img;
+    lpStartX = x;
+    lpStartY = y;
+    lpFired = false;
+    lpTimer = setTimeout(() => {
+      lpTimer = undefined;
+      const hit = lpHit;
+      if (!hit) return;
+      lpFired = true;
+      suppressMangaClick(); // 长按已触发：抑制随之而来的 click（沿用既有吞点击套路）
+      void openGalleryForImage(hit);
+    }, LONG_PRESS_MS);
+  }
+  function moveLongPress(x: number, y: number) {
+    if (!lpTimer) return;
+    if (Math.hypot(x - lpStartX, y - lpStartY) > LONG_PRESS_MAX_DIST) cancelLongPress();
+  }
+  function cancelLongPress() {
+    if (lpTimer) clearTimeout(lpTimer);
+    lpTimer = undefined;
+    lpHit = null;
+  }
+  /** 取走「长按已触发」标记（取走即清零），用于让 pointerup 跳过单击逻辑。 */
+  function consumeLongPress(): boolean {
+    const f = lpFired;
+    lpFired = false;
+    cancelLongPress();
+    return f;
+  }
+
+  /** 长按后的图库：PDF 用**整页位图**（切片只有一屏高，直接开图库会是空图/半页），
+   *  其它格式沿用既有图片清单定位。 */
+  async function openGalleryForImage(img: HTMLImageElement) {
+    if (!isPdfBook()) {
+      openViewerForImage(img);
+      return;
+    }
+    const id = book?.book.id ?? 0;
+    const pageEl = img.closest(".pdf-page") as HTMLElement | null;
+    const page = Number(pageEl?.dataset.pdfPage ?? chapterNum);
+    try {
+      const url = await renderPageImageFull(id, page, 2000);
+      bookImages = [{ url, chapter_index: page, chapter_title: pdfPageTitle(page) }];
+      viewerIndex = 0;
+    } catch {
+      toast(t("reader.toast.hlCreateFailed", { err: "render" }), "error");
+    }
   }
 
   /** 点击正文图片 → 打开图库并定位到该图。图片列表随 open_book 一起返回，无需再发命令。 */
@@ -908,7 +979,17 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** 生成一页的 DOM：显式宽高的「切片盒」序列，位图由 ensureVisibleSlices() 按视口按需填入。
    *  为什么先给盒子再填图：盒子尺寸由显示尺寸决定、与位图分辨率无关，于是布局稳定不跳动，
    *  且缩放/窗口变化时只要换位图，不必重建整章 DOM。位图分辨率 = 显示尺寸 × DPR（clampBitmapSize）。 */
-  function pdfPageHtmlFor(geo: { ptW: number; ptH: number }, box: { w: number; h: number }, pageIdx: number): string {
+  /** 属性值转义：URL 里可能有引号/尖括号，直接拼进 {@html} 会破坏结构。 */
+  function escAttr(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function pdfPageHtmlFor(
+    geo: { ptW: number; ptH: number },
+    box: { w: number; h: number },
+    pageIdx: number,
+    links: PdfLink[] = [],
+  ): string {
     const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     const ranges = pdfSliceRanges(box.h, pdfContainerH(), PDF_SLICE_MAX_SCREENS);
     const parts: string[] = [];
@@ -922,6 +1003,24 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           ` style="position:absolute !important;left:0 !important;top:${top}px !important;width:${box.w}px !important;height:${sh}px !important;max-width:none !important;max-height:none !important;zoom:1 !important;margin:0 !important;display:block !important" alt="">`,
       );
     });
+    // 链接热点：z-index 低于文本层（不挡划选）、高于切片位图（可点）。
+    // 坐标用 [0,1] 分数乘显示尺寸 —— 缩放/切片重建时自然重算，不会错位。
+    const hot = links
+      .map((l) => {
+        const left = Math.round(l.nx * box.w);
+        const top = Math.round(l.ny * box.h);
+        const w = Math.max(2, Math.round(l.nw * box.w));
+        const h = Math.max(2, Math.round(l.nh * box.h));
+        if (left < -4 || top < -4 || left > box.w || top > box.h) return "";
+        const attr = l.url
+          ? `data-pdf-url="${escAttr(l.url)}"`
+          : l.page >= 0
+            ? `data-pdf-jump="${l.page}"`
+            : "";
+        if (!attr) return "";
+        return `<a class="pdf-link" ${attr} style="position:absolute !important;left:${left}px !important;top:${top}px !important;width:${w}px !important;height:${h}px !important;z-index:1 !important;background:transparent !important;display:block !important;cursor:pointer !important"></a>`;
+      })
+      .join("");
     // 双层 DOM：位图（canvas img）在下、透明文本层在上。页容器宽高写死，文本层与位图同一坐标系，
     // 缩放只换位图分辨率、不改布局，选区/划线偏移因此稳定。
     return (
@@ -929,7 +1028,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       ` data-pdf-ptw="${geo.ptW}" data-pdf-pth="${geo.ptH}"` +
       ` style="position:relative !important;width:${box.w}px !important;height:${box.h}px !important;margin:0 auto !important;zoom:1 !important">` +
       parts.join("") +
-      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:1 !important"></div></div>`
+      hot +
+      `<div class="textLayer" data-pdf-text="1" style="position:absolute !important;inset:0 !important;overflow:clip !important;line-height:1 !important;text-size-adjust:none !important;transform-origin:0 0 !important;z-index:2 !important;pointer-events:none !important"></div></div>`
     );
   }
 
@@ -940,7 +1040,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const title = pdfPageTitle(idx);
     try {
       const geo = await pageGeometry(id, idx);
-      return { title, html: pdfPageHtmlFor(geo, pdfDisplayFor(geo), idx), chars: 0 };
+      // 链接注解与页尺寸一次取齐（同一页只取一次），热点随页 HTML 一起生成。
+      const links = await pageLinks(id, idx).catch(() => []);
+      return { title, html: pdfPageHtmlFor(geo, pdfDisplayFor(geo), idx, links), chars: 0 };
     } catch {
       return { title, html: pdfPageErrorHtml(), chars: 0 };
     }
@@ -2208,7 +2310,13 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
    *  漫画模式：改为调整全局漫画倍率（0.3~3，步长 0.1），并清除本书 imgScale 覆盖使其跟随全局；
    *  普通模式：保持单本覆盖行为（以有效值为基准，0.1~8，可超过默认）。 */
   function bumpImgScale(delta: number) {
-    if (isMangaMode()) {
+    if (isPdfBook()) {
+      // PDF 恒为「漫画式」渲染，走漫画分支会把**全局漫画倍率**改掉（波及所有漫画书），
+      // 而且默认适宽时画面还不变。所以 PDF 走本书覆盖，并顺手关掉适宽/适高，保证调了就能看到。
+      const cur = effImgScale();
+      const n = Math.max(0.3, Math.min(3, Math.round((cur + delta) * 10) / 10));
+      if (n !== cur) setOv({ imgScale: n, fitWidth: false, fitHeight: false });
+    } else if (isMangaMode()) {
       const g = config.reader.manga.imgScale;
       const n = Math.max(0.3, Math.min(3, Math.round((g + delta) * 10) / 10));
       if (n !== g) {
@@ -3029,8 +3137,38 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     setTimeout(() => window.removeEventListener("click", swallow, true), 400);
   }
 
+  /** PDF 页内链接：外链走既有 opener 路径，内链跳目标页。
+   *  必须 stopPropagation —— 否则点链接会同时触发内容区的热区翻页/其它点击语义。 */
+  async function onPdfLinkClick(e: MouseEvent) {
+    const el = (e.target as HTMLElement | null)?.closest?.("[data-pdf-url],[data-pdf-jump]") as HTMLElement | null;
+    if (!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const url = el.dataset.pdfUrl;
+    if (url) {
+      try {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(url);
+      } catch {
+        try { window.open(url, "_blank"); } catch { /* ignore */ }
+      }
+      return;
+    }
+    const jump = Number(el.dataset.pdfJump ?? -1);
+    if (jump >= 0) void loadChapter(jump);
+  }
+
+  /** 命中的元素是否在 PDF 透明文本层内（用于把「选文字」和「拖拽平移」分开）。 */
+  function isInPdfTextLayer(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    return !!(el && typeof el.closest === "function" && el.closest(".pdf-page .textLayer"));
+  }
+
   function onMangaPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    // PDF + 横向：文本层上的拖拽是「选文字」，不能当平移处理 —— 平移会 setPointerCapture 并
+    // 清掉选区，等于把划词彻底禁掉。落在文本层之外（页边距/空盒）仍可拖拽平移。
+    if (isPdfBook() && mangaHorizontal() && isInPdfTextLayer(e.target)) return;
     mangaPid = e.pointerId;
     mangaStartX = e.clientX;
     mangaStartY = e.clientY;
@@ -3038,6 +3176,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     mangaOriginY = mangaPosY;
     mangaPanning = false;
     mangaDownTarget = e.target;
+    startLongPress(e.target, e.clientX, e.clientY);
     mangaViewport?.setPointerCapture?.(e.pointerId);
     window.getSelection()?.removeAllRanges();
   }
@@ -3046,6 +3185,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (e.pointerId !== mangaPid) return;
     const dx = e.clientX - mangaStartX;
     const dy = e.clientY - mangaStartY;
+    moveLongPress(e.clientX, e.clientY);
     if (!mangaPanning) {
       if (Math.hypot(dx, dy) < 6) return;
       mangaPanning = true;
@@ -3071,21 +3211,79 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     const el = mangaViewport;
     if (!el) return;
     const t = mangaDownTarget as HTMLElement | null;
-    const img = t?.closest?.("img") as HTMLImageElement | null;
-    if (img && el.contains(img)) {
-      openViewerForImage(img);
-      return;
-    }
+    // PDF 链接热点：点击由 onPdfLinkClick 处理，这里不再按「左/右三分区」翻页。
+    if (t?.closest?.("[data-pdf-url],[data-pdf-jump]")) return;
+    // 单击图片不再打开图库（改长按）；长按已触发时也不再走区域翻页。
+    if (consumeLongPress()) return;
     const r = el.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width;
     if (x < 0.3) prevManga();
     else if (x > 0.7) nextManga();
   }
 
+  /* ================= 阅读区拖拽平移（B3，仅图块/PDF 布局） ================= */
+  // 纵向瀑布流用的是原生滚动：内容超出视口时用拖拽改 scrollLeft/scrollTop 平移；
+  // 横向布局沿用既有 transform 平移（onMangaPointer*）。PDF 文本层上的拖拽仍是选字。
+  let flowPid = -1;
+  let flowStartX = 0;
+  let flowStartY = 0;
+  let flowPanning = false;
+  let flowOriginLeft = 0;
+  let flowOriginTop = 0;
+
+  function onFlowPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    startLongPress(e.target, e.clientX, e.clientY);
+    if (isPdfBook() && isInPdfTextLayer(e.target)) return; // 文本层：交给浏览器选字
+    const vp = mangaFlowViewport;
+    if (!vp) return;
+    // 内容没有超出视口 → 不拦截拖拽（保留原生滚动/选区行为）
+    if (vp.scrollWidth <= vp.clientWidth && vp.scrollHeight <= vp.clientHeight) return;
+    flowPid = e.pointerId;
+    flowStartX = e.clientX;
+    flowStartY = e.clientY;
+    flowOriginLeft = vp.scrollLeft;
+    flowOriginTop = vp.scrollTop;
+    flowPanning = false;
+  }
+
+  function onFlowPointerMove(e: PointerEvent) {
+    moveLongPress(e.clientX, e.clientY);
+    if (e.pointerId !== flowPid) return;
+    const dx = e.clientX - flowStartX;
+    const dy = e.clientY - flowStartY;
+    if (!flowPanning) {
+      if (Math.hypot(dx, dy) < 8) return;
+      flowPanning = true;
+      mangaFlowViewport?.setPointerCapture?.(e.pointerId);
+      if (mangaFlowViewport) mangaFlowViewport.style.cursor = "grabbing";
+    }
+    const vp = mangaFlowViewport;
+    if (!vp) return;
+    vp.scrollLeft = flowOriginLeft - dx;
+    vp.scrollTop = flowOriginTop - dy;
+  }
+
+  function onFlowPointerUp(e: PointerEvent) {
+    if (e.pointerId !== flowPid) {
+      cancelLongPress();
+      return;
+    }
+    flowPid = -1;
+    if (mangaFlowViewport) mangaFlowViewport.style.cursor = "";
+    if (flowPanning) {
+      flowPanning = false;
+      suppressMangaClick(); // 拖拽过：松手不触发点击（链接/区域动作）
+      saveProgressDebounced();
+    }
+    cancelLongPress();
+  }
+
   function onMangaPointerCancel(e: PointerEvent) {
     if (e.pointerId !== mangaPid) return;
     mangaPid = -1;
     mangaPanning = false;
+    cancelLongPress();
     if (mangaViewport) mangaViewport.style.cursor = "";
   }
 
@@ -3393,6 +3591,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** 最近一次点击命中的阅读热区（DEV reader() 取证用）。只记录，不参与 zones 判定与执行。 */
   let lastZone: ZoneKey | null = null;
 
+  /** 内容区指针移动：长按期间位移超阈值即取消（否则「拖选文字超过 450ms」会误弹图库）。 */
+  function onContentPointerMove(e: PointerEvent) {
+    moveLongPress(e.clientX, e.clientY);
+  }
+
   function onContentPointerDown(e: PointerEvent) {
     if (mangaHorizontal()) return; // 漫画双页：手势由横向视口单独处理
     if (e.button !== 0) {
@@ -3401,6 +3604,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       return;
     }
     ptr = { x: e.clientX, y: e.clientY, id: e.pointerId };
+    startLongPress(e.target, e.clientX, e.clientY);
     // 新手势开始前清掉旧选区：避免「点空白处既保留上次选区、又把它扩成一大段」。
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) sel.removeAllRanges();
@@ -3408,6 +3612,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function onContentPointerUp(e: PointerEvent) {
     if (mangaHorizontal()) return; // 漫画双页：手势由横向视口单独处理
+    // 长按已触发（图库已开）：不再走点击/选区判定，避免同一次手势触发两件事。
+    if (consumeLongPress()) return;
     if (!ptr || ptr.id !== e.pointerId) {
       ptr = null;
       return;
@@ -3465,7 +3671,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         blockPickMode = false;
         return;
       }
-      openViewerForImage(imgEl);
+      // 单击图片不再打开图库（改长按触发，见 startLongPress）；这里什么也不做，也不吞掉点击。
       return;
     }
     // 可交互元素分流：链接交给 onBodyClick（跳章/复制），button/input 等交给各自处理器；
@@ -4150,6 +4356,9 @@ ${effCssExtra() || ""}
   $effect(() => {
     void mangaWindow;
     if (!book || book.book.format !== "pdf") return;
+    // 顺带核对「视图尺寸键」：首屏取章节时瀑布流画布可能还没挂载（容器宽只能用回退值），
+    // 挂载后这里会发现键变了并重建一次窗口，页面宽才精确等于画布宽（否则差几像素就冒出横向滚动条）。
+    schedulePdfRebuildIfSizeChanged();
     scheduleSliceCheck();
   });
 
@@ -5142,6 +5351,7 @@ ${effCssExtra() || ""}
   class:fitw={effFitWidth()}
   class:fith={effFitHeight()}
   class:manga={isMangaMode()}
+  class:pdf={isPdfBook()}
   class:manga-h={mangaHorizontal()}
   class:hide-text={isMangaMode() && config.reader.manga.hideText}
   class:no-images={!effShowImages()}
@@ -5379,6 +5589,7 @@ ${effCssExtra() || ""}
           bind:this={contentEl}
           onclick={onBodyClick}
           onpointerdown={onContentPointerDown}
+          onpointermove={onContentPointerMove}
           onpointerup={onContentPointerUp}
           onmousedown={onContentMouseDown}
           onmouseup={onContentMouseUp}
@@ -5389,6 +5600,7 @@ ${effCssExtra() || ""}
             <div
               class="manga-h-viewport"
               bind:this={mangaViewport}
+              onclick={onPdfLinkClick}
               onpointerdown={onMangaPointerDown}
               onpointermove={onMangaPointerMove}
               onpointerup={onMangaPointerUp}
@@ -5407,6 +5619,11 @@ ${effCssExtra() || ""}
               class="scroll-area manga-flow-viewport"
               bind:this={mangaFlowViewport}
               bind:this={scrollArea}
+              onclick={onPdfLinkClick}
+              onpointerdown={onFlowPointerDown}
+              onpointermove={onFlowPointerMove}
+              onpointerup={onFlowPointerUp}
+              onpointercancel={onFlowPointerUp}
               onscroll={checkMangaWindowExtend}
             >
               <div class="manga-flow-canvas" bind:this={mangaFlowCanvas}>
@@ -6069,6 +6286,8 @@ ${effCssExtra() || ""}
     white-space: pre;
     cursor: text;
     transform-origin: 0 0;
+    /* 容器 pointer-events:none（让下层链接热点可点），只有真正有文字的位置接收指针 → 仍可选字 */
+    pointer-events: auto;
   }
   /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
      不得改字号/行高，也不得让文字变可见，否则会破坏文本层与位图的对齐。 */
@@ -6304,6 +6523,12 @@ ${effCssExtra() || ""}
 
   /* 漫画瀑布流（纵向连续窗口）：固定视口层承载左右边距，内容块纵向顺排，原生竖向滚动。
      canvas 占满宽度 + 每个 .manga-block 内部水平居中（漫画窗口里无 #chapter-content 包裹层）。 */
+  /* PDF 纵向滚动允许横向滚动：页面比视口宽时（超宽页 / 关掉适宽后放大）能滚到右侧。
+     漫画保持 hidden —— 横向布局有自己的 transform 平移，不该冒出原生滚动条。 */
+  .reader.pdf .manga-flow-viewport {
+    overflow-x: auto !important;
+  }
+
   .manga-flow-viewport {
     padding: 0 var(--rdr-mh, 8px);
     box-sizing: border-box;
