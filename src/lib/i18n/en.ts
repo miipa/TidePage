@@ -65,6 +65,7 @@ export const en: Record<MessageKey, string> = {
   "common.imgViewer.prev": "Previous (←)",
   "common.imgViewer.next": "Next (→)",
   "common.imgViewer.empty": "No images found in this book",
+  "common.imgViewer.loading": "Rendering page…",
     "common.imgViewer.zoomIn": "Zoom in",
   "common.imgViewer.zoomOut": "Zoom out",
   "common.imgViewer.fit": "Fit",

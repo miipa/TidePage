@@ -11,6 +11,7 @@ import {
   pdfPageErrorHtml,
   pdfSliceRanges,
   retitlePdfPageToc,
+  fullPageLruStep,
 } from "./pdfPage";
 
 describe("pdfDisplayBox", () => {
@@ -213,5 +214,33 @@ describe("PDF 页占位 HTML", () => {
     const html = pdfPageErrorHtml();
     expect(html).toContain("height:60vh");
     expect(html).not.toContain("<img");
+  });
+});
+
+describe("fullPageLruStep（整页图小 LRU）", () => {
+  it("新增：追加到最新端，不产生淘汰", () => {
+    const r = fullPageLruStep(["a", "b"], "c", 3);
+    expect(r.order).toEqual(["a", "b", "c"]);
+    expect(r.evicted).toEqual([]);
+  });
+
+  it("命中：刷新为最新，其余元素相对顺序不变，不产生淘汰", () => {
+    const r = fullPageLruStep(["a", "b", "c"], "a", 3);
+    expect(r.order).toEqual(["b", "c", "a"]);
+    expect(r.evicted).toEqual([]);
+  });
+
+  it("超限：淘汰最旧的那个", () => {
+    expect(fullPageLruStep(["a", "b", "c"], "d", 3)).toEqual({ order: ["b", "c", "d"], evicted: ["a"] });
+  });
+
+  it("返回被淘汰项：一次可能多个，顺序为旧→新", () => {
+    const r = fullPageLruStep(["a", "b", "c", "d"], "e", 2);
+    expect(r.evicted).toEqual(["a", "b", "c"]);
+    expect(r.order).toEqual(["d", "e"]);
+  });
+
+  it("容量 0：留下来的全部被淘汰（含新 token），调用方必须逐个 revoke", () => {
+    expect(fullPageLruStep(["a"], "b", 0)).toEqual({ order: [], evicted: ["a", "b"] });
   });
 });

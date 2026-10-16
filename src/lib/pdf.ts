@@ -1,7 +1,7 @@
 import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport, TextLayer, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import workerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { api } from "./api";
-import { pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
+import { fullPageLruStep, pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
 
 // worker 指向 Vite 打出来的同源 URL：只设一次，不能每本书重设。
 GlobalWorkerOptions.workerSrc = workerSrc;
@@ -19,6 +19,9 @@ interface PdfSession {
 
 /** 未被钉住的位图上限（张）：一张普通页位图约 4~16MB，6 张 ≈ 上限百 MB 级。 */
 const PAGE_CACHE_MAX = 6;
+/** 整页图（图库）缓存上限（张）：图库一次最多看「当前页 ±1」，3 张正好；
+ *  整页图比切片大得多（单张可达 ~48MB），绝不能像切片那样按 6 张常驻。 */
+const FULL_PAGE_CACHE_MAX = 3;
 /** 渲染并发上限：pdf.js 单条切片很贵（数百毫秒 + 数 MB 位图），并发会瞬间吃满内存与主线程。 */
 /** 渲染并发（同时最多 2 条切片在渲染）。导出给 Reader 做「每帧最多新发 2 条」的限流同一口径。 */
 export const RENDER_CONCURRENCY = 2;
@@ -59,6 +62,9 @@ interface BitmapEntry {
 }
 /** 位图缓存：token → 位图。Map 的插入顺序即 LRU 顺序。 */
 const bitmaps = new Map<string, BitmapEntry>();
+/** 整页图（full# 前缀）token 的 LRU 顺序（旧 → 新）。与 bitmaps 分开存：同一张表里还混着切片，
+ *  Map 的插入顺序没法同时表达两套淘汰策略。 */
+let fullOrder: string[] = [];
 /** 仍贴着视口的切片 token：绝不回收。 */
 const pinnedTokens = new Set<string>();
 /** 页尺寸（pt）缓存：算显示尺寸要用，换书清空。 */
@@ -132,8 +138,8 @@ export function pinSlices(bookId: number, tokens: string[]): void {
   sweep();
 }
 
-/** 释放整页图（图库关闭 / 换图前调用）：revoke 并从缓存删除。
- *  尺寸修正后单张可达 ~48MB，不能像切片那样等 LRU 慢慢淘汰，否则每长按一页就常驻一张。 */
+/** 回收**全部**整页图（图库关闭时调用）：revoke 并从缓存删除，同时清空 LRU 顺序。
+ *  尺寸修正后单张可达 ~48MB，不能像切片那样等 LRU 慢慢淘汰，否则每关一次图库都常驻几张。 */
 export function releaseFullPage(): void {
   for (const [token, b] of [...bitmaps]) {
     if (!token.startsWith("full#")) continue;
@@ -141,6 +147,32 @@ export function releaseFullPage(): void {
     bitmaps.delete(token);
     pinnedTokens.delete(token);
   }
+  fullOrder = [];
+}
+
+/** 精确遗弃一张整页图（按 URL）：图库关闭后「迟到」的渲染结果用它清理。
+ *  为什么不用 releaseFullPage：那会把用户可能已经重新打开的那几页一起 revoke 掉（白屏）。 */
+export function releaseFullPageUrl(url: string): void {
+  for (const [token, b] of [...bitmaps]) {
+    if (b.url !== url) continue;
+    revoke(b.url);
+    bitmaps.delete(token);
+    pinnedTokens.delete(token);
+    fullOrder = fullOrder.filter((t) => t !== token);
+  }
+}
+
+/** 该整页图 URL 是否仍在缓存里（没被小 LRU 淘汰、也没被关闭回收）。
+ *  图库清单只能信它：只看「URL 非空」会把已被 revoke 的 URL 当成可用图，切回去就是破图。 */
+export function isFullPageCached(url: string): boolean {
+  for (const b of bitmaps.values()) if (b.url === url) return true;
+  return false;
+}
+
+/** 整页图缓存现状（token，旧→新）。供图库诊断/自动验证读取「整页图存活数」——
+ *  光看 createObjectURL/revokeObjectURL 计数分不出切片与整页图，而容量约束只管整页图。 */
+export function fullPageCacheTokens(): string[] {
+  return fullOrder.filter((t) => bitmaps.has(t));
 }
 
 /** 取当前这本书的 PDF 文档（换书时先释放上一本的文档与全部位图）。 */
@@ -467,7 +499,8 @@ export async function buildTextLayer(
   }
 }
 
-/** 整页位图（图库用）：按长边 ≤ maxLong 渲染，独立于切片缓存（图库看的是整页，不是切片）。
+/** 整页位图（图库用）：按长边 ≤ maxLong 渲染，与切片分开管理（图库看的是整页，不是切片）：
+ *  切片按 PAGE_CACHE_MAX 张扫描淘汰，整页图按 fullOrder 的小 LRU（FULL_PAGE_CACHE_MAX 张）淘汰。
  *  仍登记进位图表（合成 token）→ 关书/换书时一并 revoke，不留悬挂 blob。 */
 export async function renderPageImageFull(bookId: number, page: number, maxW = 1400, maxPx = 12_000_000): Promise<string> {
   const { doc } = await ensurePdf(bookId);
@@ -495,7 +528,11 @@ export async function renderPageImageFull(bookId: number, page: number, maxW = 1
   }
   const token = `full#${page}@${w}x${h}`;
   const hit = bitmaps.get(token);
-  if (hit) return hit.url;
+  if (hit) {
+    // 命中：只刷新它在整页图 LRU 里的新鲜度，不产生淘汰（槽容量是常量，永远够放这一张）
+    fullOrder = fullPageLruStep(fullOrder, token, FULL_PAGE_CACHE_MAX).order;
+    return hit.url;
+  }
   return withSlot(async () => {
     const p = await doc.getPage(page + 1);
     try {
@@ -514,7 +551,18 @@ export async function renderPageImageFull(bookId: number, page: number, maxW = 1
         throw new Error("已切换书籍");
       }
       bitmaps.set(token, { url, page });
-      pinnedTokens.add(token); // 图库正在看它：不参与 LRU 淘汰
+      // 整页图加钉子：切片的 sweep() 不动它 —— 它的生死只由这张容量 3 的小 LRU 决定，
+      // 否则会被 PAGE_CACHE_MAX 那套按张数扫走（图库看着看着就白屏）。
+      pinnedTokens.add(token);
+      const step = fullPageLruStep(fullOrder, token, FULL_PAGE_CACHE_MAX);
+      fullOrder = step.order;
+      for (const t of step.evicted) {
+        const e = bitmaps.get(t);
+        if (!e) continue;
+        revoke(e.url);
+        bitmaps.delete(t);
+        pinnedTokens.delete(t);
+      }
       sweep();
       return url;
     } finally {
@@ -556,6 +604,7 @@ export function releaseAll(): void {
   for (const e of bitmaps.values()) revoke(e.url);
   bitmaps.clear();
   pinnedTokens.clear();
+  fullOrder = [];
   geometry.clear();
   const s = session;
   session = null;
