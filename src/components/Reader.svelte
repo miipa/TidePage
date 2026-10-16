@@ -1179,6 +1179,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       pageEl.dataset.textDone = "1";
       if (!pdfTextOk && res.usable) pdfTextOk = true;
       if (res.usable) void uploadPageText(pageIdx, res.text);
+      // 文本层是后建的，而页面 DOM 会因视图键变化被整块重建（实测点击划线的当下就会重建一次）：
+      // 旧 mark 随旧 .pdf-page 一起消失，且重建本身不触发重绘（hlVersion 没变、文本层那时还没装好），
+      // 表现就是「点一下划线，划线不见了」而数据仍在。这里在文本层装好后补一次重绘把它画回去。
+      if (res.usable && pageIdx === chapterNum) paintNow();
     } catch {
       /* 文本层失败不影响看图 */
     } finally {
@@ -2715,6 +2719,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   /** 按当前章重建窗口（换章/跳转/恢复进度/退出进入漫画模式时调用；同步首屏，保证定位准确）。 */
   async function loadMangaWindow(idx: number, restore?: Progress) {
     if (!book) return;
+    if (import.meta.env.DEV) pdfHlTracePush("loadMangaWindow(" + idx + ")");
     const gen = ++loadGeneration;
     loadingChapter = true;
     loadingIdx = idx;
@@ -3368,6 +3373,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   function relayout() {
     if (!chapter) return;
+    if (import.meta.env.DEV) pdfHlTracePush("relayout");
     // 漫画横向：重测窗口尺寸。内容窗口宽度可能因图片加载/缩放/边距变化而改变，
     // 以横向绝对位置占内容总宽的比例恢复，避免重排后跳到别处。
     if (mangaHorizontal()) {
@@ -3638,6 +3644,18 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   /** 最近一次点击命中的阅读热区（DEV reader() 取证用）。只记录，不参与 zones 判定与执行。 */
   let lastZone: ZoneKey | null = null;
+
+  /** DEV 取证：PDF 划线的根元素身份。记到 dataset 上而不是只存引用 —— 页面被整块重建时
+   *  新元素没有这个号，序号一跳就说明 contentRoot() 换了元素（文本层随之被清空、mark 消失）。 */
+  let pdfHlProbeRoot: HTMLElement | null = null;
+  let pdfHlProbeSeq = 0;
+  /** DEV 取证：谁在重建 PDF 窗口（重建=页面 DOM 换元素，mark 随之消失）。
+   *  调用点全部用 import.meta.env.DEV 包住 —— 生产构建里 esbuild 折成 if(false) 后整段删除。 */
+  let pdfHlTrace: { at: number; what: string; stack: string }[] = [];
+  function pdfHlTracePush(what: string, skip = 2): void {
+    if (!import.meta.env.DEV || pdfHlTrace.length >= 60) return;
+    pdfHlTrace.push({ at: Date.now(), what, stack: (new Error().stack || "").split("\n").slice(skip, skip + 4).join(" <- ") });
+  }
 
   /** 内容区指针移动：长按期间位移超阈值即取消（否则「拖选文字超过 450ms」会误弹图库）。 */
   function onContentPointerMove(e: PointerEvent) {
@@ -4005,6 +4023,77 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         }),
         /** 排版几何快照（任务一）：clipW 与 pageWrapW / effAvail 是否同源一眼可见。 */
         layout: () => layoutSnapshot(),
+        /** 一次性取证（PDF 划线点击后消失）：种一条划线 / 点击前后各打一组快照。
+         *  rootProbeId 是关键：它只在 contentRoot() 换成另一个元素时才跳号，
+         *  一跳就说明页面 DOM（含 .textLayer）被整块重建过 —— mark 随旧元素一起消失。 */
+        pdfHl: {
+          seed: async (style = "background", color = "#c0392b") => {
+            const root = contentRoot();
+            if (!root) return { ok: false, why: "no-root" };
+            const layer = root.querySelector<HTMLElement>(".textLayer");
+            const walker = document.createTreeWalker(layer ?? root, NodeFilter.SHOW_TEXT);
+            const n = walker.nextNode() as Text | null;
+            const len = n?.nodeValue?.length ?? 0;
+            if (!n || len < 2) return { ok: false, why: "no-text" };
+            const end = Math.min(8, len);
+            const text = (n.nodeValue ?? "").slice(0, end);
+            selMenu = { text, start: 0, end, anchor: { top: 100, bottom: 101, cx: 100 } };
+            await onHighlight(style, color);
+            await tick();
+            paintNow();
+            const mark = root.querySelector<HTMLElement>("mark.fr-hl");
+            return { ok: !!mark, text, hlId: mark ? Number(mark.dataset.hlid) : null, hlTotal: highlights.length };
+          },
+          snap: () => {
+            const root = contentRoot();
+            if (root && root !== pdfHlProbeRoot) {
+              pdfHlProbeRoot = root;
+              pdfHlProbeSeq++;
+              root.dataset.hlProbeId = String(pdfHlProbeSeq);
+            }
+            // PDF 的 mark 在 .textLayer 里；其它格式直接在 contentRoot（#chapter-content）下，
+            // 回落到 root 才能用同一支探针给 EPUB 做回归。
+            const layer = root?.querySelector<HTMLElement>(".textLayer") ?? root ?? null;
+            const list = layer ? Array.from(layer.querySelectorAll<HTMLElement>("mark.fr-hl")) : [];
+            const first = list[0] ?? null;
+            const h = first ? highlights.find((x) => x.id === Number(first.dataset.hlid)) ?? null : null;
+            const cs = first ? getComputedStyle(first) : null;
+            const r = first?.getBoundingClientRect() ?? null;
+            return {
+              hasRoot: !!root,
+              rootProbeId: root?.dataset.hlProbeId ?? null,
+              textDone: root?.dataset.textDone ?? null,
+              textBusy: root?.dataset.textBusy ?? null,
+              layerChildNodes: layer ? layer.childNodes.length : -1,
+              markCount: list.length,
+              markFound: !!first,
+              markClass: first?.className ?? null,
+              markInlineStyle: first?.getAttribute("style") ?? null,
+              hlRowStyle: h?.style ?? null,
+              hlRowColor: h?.color ?? null,
+              hlRowChapter: h?.chapter_index ?? null,
+              computed: cs
+                ? {
+                    color: cs.color,
+                    bg: cs.backgroundColor,
+                    blend: cs.mixBlendMode,
+                    opacity: cs.opacity,
+                    display: cs.display,
+                    visibility: cs.visibility,
+                    pointerEvents: cs.pointerEvents,
+                  }
+                : null,
+              markRect: r ? { w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top) } : null,
+              hlVersion,
+              chapterNum,
+              hlTotal: highlights.length,
+              hlThisChapter: chapterHighlights.length,
+              hlMenuOpen: !!hlMenu,
+            };
+          },
+          trace: () => pdfHlTrace.slice(0),
+          clearTrace: () => { pdfHlTrace = []; },
+        },
       };
     }
     ttsSetCallbacks({
@@ -4434,6 +4523,8 @@ ${effCssExtra() || ""}
   const pdfRebuildAt = new Map<string, number>();
   function schedulePdfRebuildIfSizeChanged() {
     if (!isPdfBook() || !book) return;
+    const k0 = pdfViewKey();
+    if (import.meta.env.DEV) pdfHlTracePush("keyCheck k=" + k0 + " last=" + lastPdfViewKey + " debounced=" + ((pdfRebuildAt.get(k0) ?? 0) > Date.now() - 150));
     const k = pdfViewKey();
     if (k === lastPdfViewKey) return;
     const now = Date.now();
@@ -6617,6 +6708,11 @@ ${effCssExtra() || ""}
     overflow-y: auto !important;
     overflow-x: hidden !important;
     overflow-anchor: none;
+    /* 常驻竖直滚动条槽。重建窗口时 mangaWindow 会先换成「空占位块」（高 0），
+       .manga-flow-canvas 是 width:100%：没有槽时视口内容宽会瞬间 +11px（滚动条宽度），
+       而 pdfViewKey() 含这个宽度 ⇒ 键变 ⇒ 再重建 ⇒ 内容又变高 ⇒ 槽又出现……自激成重建循环。
+       槽常驻后内容宽恒定，视图键不再被「重建自身」扰动。 */
+    scrollbar-gutter: stable;
   }
 
   .manga-flow-canvas {
