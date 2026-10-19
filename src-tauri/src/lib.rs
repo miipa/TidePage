@@ -10,6 +10,7 @@ mod fonts;
 mod library;
 mod memlog;
 mod pdfnative;
+mod pdfscan;
 mod mobi;
 mod models;
 mod sanitize;
@@ -630,6 +631,11 @@ pub fn run() {
             pdfnative::pdf_native_page_geometry,
             pdfnative::pdf_native_render_page,
             pdfnative::pdf_native_close,
+    pdfscan::pdf_scan_open,
+    pdfscan::pdf_scan_page,
+    pdfscan::pdf_scan_page_bytes,
+    pdfscan::pdf_scan_outline,
+    pdfscan::pdf_scan_close,
             library::pdf_read_range,
             library::set_book_cover_image,
             library::set_cover_scan,

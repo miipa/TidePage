@@ -2,6 +2,7 @@ import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport, TextLayer, typ
 import workerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { api } from "./api";
 import { fullPageLruStep, pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
+import { decodeRawPage, inflatePdfStream } from "./pdfFlate";
 
 // worker 指向 Vite 打出来的同源 URL：只设一次，不能每本书重设。
 GlobalWorkerOptions.workerSrc = workerSrc;
@@ -15,8 +16,11 @@ interface PdfSession {
   doc: PDFDocumentProxy;
   /** 走 range 分块时保留传输对象：换书/关书要 abort 掉在途请求。 */
   range?: PDFDataRangeTransport;
-  /** true = 这本书走系统原生渲染（pdf.js 打不开这种体积，见 PDF_NATIVE_MIN_BYTES）。
-   *  此时 doc 只是「页数占位」，不能拿它调 pdf.js 的任何方法。 */
+  /** 打开通道：`js` = pdf.js；`native` = 系统原生渲染；`direct` = 直读页面图（纯图扫描件）。
+   *  `direct` 与 `native` 一样「没有 pdf.js 文档」，所以 `native` 保留为派生值：
+   *  `native = mode !== "js"` —— 阅读器里所有「无文字层/无文档」的判断都继续用它。 */
+  mode: "js" | "native" | "direct";
+  /** true = 无 pdf.js 文档（`mode !== "js"`）。**派生值，不要单独赋 true**。 */
   native: boolean;
 }
 
@@ -227,6 +231,33 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
     const len = await api.pdfFileSize(bookId);
     // 超大文件：pdf.js 在本运行时无法表示，改走系统原生渲染（按页出图，整份不物化）。
     if (len > PDF_NATIVE_MIN_BYTES) {
+      // ① 先探测「直读页面图」通道：纯图扫描件（每页一张整页图、DCT/Flate 编码）不需要
+      //    任何渲染引擎，按页读那张图就能显示 —— 3.5 GiB 这类字典/扫描件正属此类。
+      //    探测失败（损坏/加密/混合 xref/不支持）⇒ **静默回落原生**，行为与改动前一致。
+      // DEV 专用：置 window.__pdfForceNoDirect = true 可强制跳过直读探测，用来验证
+      // 「探测失败 ⇒ 回落原生 ⇒ 原生不可用 ⇒ 错误态出口按钮」这条完整链路。生产构建整段被摇掉。
+      const forceNoDirect = import.meta.env.DEV && (globalThis as { __pdfForceNoDirect?: boolean }).__pdfForceNoDirect;
+      const probe = forceNoDirect
+        ? null
+        : await api.pdfScanOpen(bookId).catch((e) => {
+        if (import.meta.env.DEV) console.warn("[pdf] 直读探测失败，回落原生：", e);
+        return null;
+      });
+      if (gen !== generation) {
+        void api.pdfScanClose(bookId).catch(() => {});
+        throw new Error("已切换书籍");
+      }
+      if (probe && probe.image_only && probe.pages > 0) {
+        const ds: PdfSession = {
+          bookId,
+          doc: { numPages: probe.pages } as unknown as PDFDocumentProxy,
+          mode: "direct",
+          native: true,
+        };
+        session = ds;
+        return ds;
+      }
+      if (probe) void api.pdfScanClose(bookId).catch(() => {});
       let pages: number;
       try {
         pages = await api.pdfNativeOpen(bookId);
@@ -235,8 +266,11 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
         if (import.meta.env.DEV) console.warn("[pdf] 原生渲染打开失败：", e);
         // 32 位构建/非 Windows 平台：与「文件太大」区分开，文案见 ERR_CODES。
         if (String(e).includes("pdf_native_unsupported")) throw pdfError("pdf_native_unsupported");
-        // 废弃线程到上限（连续超时）：与「平台不支持」分开说明，文案里给出下一步。
-        if (String(e).includes("pdf_native_abandoned")) throw pdfError("pdf_native_abandoned");
+        // 引擎级放弃（废弃线程到上限 / 本书原生已超时）：与「平台不支持」分开说明。
+        // 超时也走这里：文案必须指向错误态的「用系统程序打开」出口（见 reader.open.withSystemApp）。
+        if (String(e).includes("pdf_native_abandoned") || String(e).includes("超时")) {
+          throw pdfError("pdf_native_abandoned");
+        }
         throw pdfError("pdf_native_failed");
       }
       if (gen !== generation) {
@@ -248,6 +282,7 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
         bookId,
         // 调用方只读 numPages（见 Reader 的目录构建），给一个最小形状即可。
         doc: { numPages: pages } as unknown as PDFDocumentProxy,
+        mode: "native",
         native: true,
       };
       session = ns;
@@ -331,7 +366,7 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       await doc.destroy().catch(() => {});
       throw new Error("已切换书籍");
     }
-      session = { bookId, doc, range: range ?? undefined, native: false };
+      session = { bookId, doc, range: range ?? undefined, mode: "js", native: false };
     return session;
   })();
   sessionPromise = p;
@@ -346,6 +381,12 @@ export async function pageGeometry(bookId: number, page: number): Promise<PageSi
   const hit = geometry.get(page);
   if (hit) return hit;
   const s = await ensurePdf(bookId);
+  if (s.mode === "direct") {
+    const m = await directMeta(bookId, page);
+    const size: PageSize = { ptW: Math.max(1, m.pt_w), ptH: Math.max(1, m.pt_h) };
+    geometry.set(page, size);
+    return size;
+  }
   if (s.native) {
     const [w, h] = await api.pdfNativePageGeometry(bookId, page);
     const size: PageSize = { ptW: Math.max(1, w), ptH: Math.max(1, h) };
@@ -406,7 +447,7 @@ export async function renderPageSlice(bookId: number, req: SliceRequest): Promis
     }
     if (s.native) {
       const pt = await pageGeometry(bookId, req.page);
-      const url = await nativeSliceUrl(bookId, req, pt);
+      const url = s.mode === "direct" ? await directSliceUrl(bookId, req, pt) : await nativeSliceUrl(bookId, req, pt);
       if (gen !== generation) {
         revoke(url);
         throw new Error("已切换书籍");
@@ -524,6 +565,17 @@ export async function pageLinks(bookId: number, page: number): Promise<PdfLink[]
  *  解析失败的单条保留标题但 page=-1（调用方跳过），绝不因此整份目录失败。 */
 export async function docOutline(bookId: number): Promise<PdfOutlineItem[]> {
   const s = await ensurePdf(bookId);
+  // 直读通道：目录由后端直接解析 PDF 书签树（/Outlines），页码用 Kids 映射。
+  if (s.mode === "direct") {
+    try {
+      const items = await api.pdfScanOutline(bookId);
+      return items
+        .filter((it) => it && typeof it.title === "string")
+        .map((it) => ({ title: it.title, page: typeof it.page === "number" ? it.page : -1 })) as PdfOutlineItem[];
+    } catch {
+      return [];
+    }
+  }
   // 原生通道不解析自带目录：页码目录由页数生成（见 Reader 的 buildPageToc）。
   if (s.native) return [];
   const doc = s.doc;
@@ -646,9 +698,12 @@ export async function renderPageImageFull(bookId: number, page: number, maxW = 1
     return hit.url;
   }
   return withSlot(async () => {
-    const url = s.native
-      ? await nativeFullUrl(bookId, page, baseW, baseH, w, h)
-      : await pdfjsFullUrl(doc, page, baseW, w);
+    const url =
+      s.mode === "direct"
+        ? await directFullUrl(bookId, page, w, h)
+        : s.native
+          ? await nativeFullUrl(bookId, page, baseW, baseH, w, h)
+          : await pdfjsFullUrl(doc, page, baseW, w);
     if (gen !== generation) {
       revoke(url);
       throw new Error("已切换书籍");
@@ -697,7 +752,37 @@ export async function renderCoverImage(bookId: number, longEdge = 320): Promise<
   const gen = generation;
   // 原生通道一律不补封面：走原生的是 >1.9GiB 的文件，系统渲染器要把整份文件映射进进程
   // （实测 3.31GiB 那册打开后宿主工作集 3.5GB），为一张缩略图付这个代价不值得，书库继续用默认封面。
-  if (s.native) throw pdfError("pdf_no_cover");
+  // 原生通道不补封面：系统渲染器要把整份文件映射进进程（3.31GiB 那册打开后宿主工作集 3.5GB），
+  // 为一张缩略图付这个代价不值得。**直读通道不同**：它只读第 1 页那张图（本册约 220KB），
+  // 没有「整份映射」的代价，所以允许出封面。
+  if (s.mode === "native") throw pdfError("pdf_no_cover");
+  if (s.mode === "direct") {
+    return withSlot(async () => {
+      const m = await directMeta(bookId, 0);
+      const target = Math.max(1, longEdge);
+      const scale = Math.max(0.02, target / Math.max(1, Math.max(m.pt_w, m.pt_h)));
+      const w = Math.max(1, Math.round(m.pt_w * scale));
+      const h = Math.max(1, Math.round(m.pt_h * scale));
+      const url = await directFullUrl(bookId, 0, w, h);
+      const img = new Image();
+      img.src = url;
+      try {
+        await img.decode();
+      } finally {
+        revoke(url);
+      }
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) throw new Error("canvas 上下文不可用");
+      ctx.drawImage(img, 0, 0, w, h);
+      const data = c.toDataURL("image/webp", 0.9);
+      c.width = 0;
+      c.height = 0;
+      return data;
+    });
+  }
   return withSlot(async () => {
     const page = await s.doc.getPage(1);
     // 画布在 try 外声明：finally 里要归还它的后备存储，块作用域里声明会取不到。
@@ -734,6 +819,152 @@ export async function regeneratePdfCover(bookId: number, longEdge = 320): Promis
   const url = await renderCoverImage(bookId, longEdge);
   const b64 = url.slice(url.indexOf(",") + 1);
   return await api.setBookCoverImage(bookId, b64);
+}
+
+/* ---------- 直读通道（纯图扫描件）：按页取整页图，不预取、不整份物化 ---------- */
+
+/** 页元数据（后端 `pdf_scan_page`）：几何用显示盒，像素尺寸用图像自身。 */
+type DirectMeta = Awaited<ReturnType<typeof api.pdfScanPage>>;
+const directMetaCache = new Map<number, DirectMeta>();
+
+async function directMeta(bookId: number, page: number): Promise<DirectMeta> {
+  const hit = directMetaCache.get(page);
+  if (hit) return hit;
+  const m = await api.pdfScanPage(bookId, page);
+  directMetaCache.set(page, m);
+  return m;
+}
+
+/** 占位图（页面不支持的可见提示，不是白屏）。 */
+function placeholderUrl(text: string, w: number, h: number): string {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.min(1200, Math.round(w)));
+  c.height = Math.max(1, Math.min(1600, Math.round(h)));
+  const ctx = c.getContext("2d");
+  if (ctx) {
+    ctx.fillStyle = "#f4efe6";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = "#8a8175";
+    ctx.font = "28px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(text, c.width / 2, c.height / 2);
+  }
+  return c.toDataURL("image/png");
+}
+
+/* 解压/预测/像素解包已抽到 pdfFlate.ts（可单测），这里只做 canvas 包装。 */
+function rawToCanvas(meta: DirectMeta, inflated: Uint8Array): HTMLCanvasElement {
+  const page = decodeRawPage(
+    {
+      width: meta.width,
+      height: meta.height,
+      bpc: meta.bpc,
+      color_space: meta.color_space,
+      predictor: meta.predictor,
+      palette: meta.palette,
+    },
+    inflated,
+  );
+  const c = document.createElement("canvas");
+  c.width = page.width;
+  c.height = page.height;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("canvas 上下文不可用");
+  const img = ctx.createImageData(page.width, page.height);
+  img.data.set(page.rgba);
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+/** 一页的整页图 URL（jpeg 直出为 image/jpeg；raw 解压后转 PNG）。
+ *  缓存纳入现有 `bitmaps` LRU（按张数扫，回收权在本文件）。 */
+async function directPageUrl(
+  bookId: number,
+  page: number,
+): Promise<{ url: string; meta: DirectMeta } | { url: string; meta: null }> {
+  const meta = await directMeta(bookId, page);
+  if (meta.kind === "unsupported") {
+    return { url: placeholderUrl(`本页暂不支持显示`, meta.pt_w * 2, meta.pt_h * 2), meta: null };
+  }
+  const token = `direct#${page}`;
+  const hit = bitmaps.get(token);
+  if (hit) return { url: hit.url, meta };
+  const bytes = await api.pdfScanPageBytes(bookId, page);
+  let url: string;
+  if (meta.kind === "jpeg") {
+    url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+  } else {
+    const inflated = await inflatePdfStream(bytes);
+    const c = rawToCanvas(meta, inflated);
+    url = URL.createObjectURL(await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/png")));
+  }
+  bitmaps.set(token, { url, page });
+  sweep();
+  return { url, meta };
+}
+
+/** 直读通道的「页内一条」：整页图按条带裁切并缩放到目标像素。 */
+async function directSliceUrl(bookId: number, req: SliceRequest, pt: PageSize): Promise<string> {
+  const { url: pageUrl, meta } = await directPageUrl(bookId, req.page);
+  const img = new Image();
+  img.src = pageUrl;
+  try {
+    await img.decode();
+  } catch {
+    return pageUrl;
+  }
+  const srcW = img.naturalWidth || Math.max(1, meta?.width || 1);
+  const srcH = img.naturalHeight || Math.max(1, meta?.height || 1);
+  const rotate = meta?.rotate ?? 0;
+  // 与 pdf.js/native 分支同口径：条带目标像素高 = req.bitH，宽度按页面宽高同比。
+  const bandPt = Math.max(0.5, pt.ptH * (req.f1 - req.f0));
+  const scale = Math.max(0.01, req.bitH / bandPt);
+  const destW = Math.max(1, Math.round(pt.ptW * scale));
+  const destH = Math.max(1, Math.round(req.bitH));
+  const c = document.createElement("canvas");
+  c.width = destW;
+  c.height = destH;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("canvas 上下文不可用");
+  // 源矩形：条带在**页面**上的比例 × 页图像素（/Rotate 90/270 时源图相对页面是转置的）
+  const bandTop = req.f0 * (rotate === 90 || rotate === 270 ? srcW : srcH);
+  const bandH = (req.f1 - req.f0) * (rotate === 90 || rotate === 270 ? srcW : srcH);
+  if (rotate === 90 || rotate === 270) {
+    // 页面坐标的纵向条带在源图里是横向的一段（90/270 时源图相对页面是转置的）
+    ctx.save();
+    ctx.translate(destW, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(img, bandTop, 0, Math.max(1, bandH), srcH, 0, 0, destW, destH);
+    ctx.restore();
+  } else if (rotate === 180) {
+    ctx.save();
+    ctx.translate(destW, destH);
+    ctx.rotate(Math.PI);
+    ctx.drawImage(img, 0, srcH - (bandTop + bandH), srcW, bandH, 0, 0, destW, destH);
+    ctx.restore();
+  } else {
+    ctx.drawImage(img, 0, bandTop, srcW, Math.max(1, bandH), 0, 0, destW, destH);
+  }
+  return URL.createObjectURL(await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/png")));
+}
+
+/** 直读通道的整页图（图库/封面）：缩放到 w×h。 */
+async function directFullUrl(bookId: number, page: number, w: number, h: number): Promise<string> {
+  const { url: pageUrl } = await directPageUrl(bookId, page);
+  const img = new Image();
+  img.src = pageUrl;
+  try {
+    await img.decode();
+  } catch {
+    return pageUrl;
+  }
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("canvas 上下文不可用");
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  return URL.createObjectURL(await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/png")));
 }
 
 /* ---------- 原生通道渲染辅助（仅 PDF_NATIVE_MIN_BYTES 以上的文件走这条）---------- */

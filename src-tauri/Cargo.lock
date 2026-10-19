@@ -4668,13 +4668,14 @@ dependencies = [
 
 [[package]]
 name = "tidepage"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "chardetng",
  "encoding_rs",
  "fancy-regex",
+ "flate2",
  "futures-util",
  "html5ever",
  "image",

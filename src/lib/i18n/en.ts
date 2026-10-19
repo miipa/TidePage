@@ -218,6 +218,7 @@ export const en: Record<MessageKey, string> = {
   "reader.manga.large": "Large",
   "reader.manga.resetDefault": "Restore default (1.0×)",
   "reader.open.failed": "Failed to open",
+  "reader.open.withSystemApp": "Open with another app",
   "reader.open.opening": "Opening…",
   "reader.bookmarks.title": "Bookmarks",
   "reader.bookmarks.empty": "No bookmarks yet, use the bookmark button in the top bar to add",
@@ -643,7 +644,7 @@ export const en: Record<MessageKey, string> = {
   "err.pdfTooLarge": "This PDF is {mb}MB, above the openable size limit",
   "err.pdfNativeFailed": "This file cannot be displayed",
   "err.pdfNativeUnsupported": "This device cannot display this file",
-  "err.pdfNativeAbandoned": "Cannot continue displaying; restart the app and try again",
+  "err.pdfNativeAbandoned": "This file cannot be shown in the app. Use “Open with another app” below.",
   "err.pdfNoCover": "A cover cannot be generated for this file",
   "err.mobiParse": "Failed to parse the MOBI file; it may be damaged",
   "err.palmDoc": "PalmDOC format error; the file may be damaged",
@@ -1269,4 +1270,6 @@ export const en: Record<MessageKey, string> = {
   "common.hours": "{n} h",
   "settings.tts.auto": "Auto",
 };
+
+
 

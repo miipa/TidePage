@@ -364,6 +364,14 @@ import {
   function mangaFlow(): boolean {
     return isMangaMode() && config.reader.manga.layout === "flow";
   }
+  /**
+   * 窗口化布局：滚动容器里只有「已物化的窗口」，不是全书。
+   * PDF 与漫画瀑布流都属此类（按章/页建块，触底追加、超图片预算裁剪）。
+   * 这类布局的滚动条必须代表**整本书**，而不是当前窗口的滚动范围。
+   */
+  function windowedLayout(): boolean {
+    return scrollLayout() && (isPdfBook() || isMangaMode());
+  }
   /** 当前是否采用纵向滚动（瀑布流）渲染：漫画模式由漫画显示方式决定，普通书跟随全局翻页模式。 */
   function scrollLayout(): boolean {
     if (isMangaMode()) return config.reader.manga.layout === "flow";
@@ -1394,7 +1402,9 @@ import {
         const pdf = await ensurePdf(book.book.id);
         pdfNative = pdf.native;
         // 这类文件只能整页出图：打开时说明一次，免得用户找文字层/划线找半天。
-        if (pdf.native) toast(t("reader.pdf.nativeHint"));
+        // 只在原生通道弹：直读通道（纯图扫描件）的打开反馈已由进度条与首屏体现，
+        // 再弹一条只是噪音；两者都无文字层，`nativeNoText` 的禁用说明对直读同样成立。
+        if (pdf.mode === "native") toast(t("reader.pdf.nativeHint"));
         // 目录：PDF 自带 outline 优先（真实章节名 + 层级），解析不到才回落「第 N 页」。
         // 目录数组下标恒等于页号，所以合并只换标题，不改导航语义（页码=chapter_index）。
         const outline = await docOutline(book.book.id).catch(() => []);
@@ -2147,11 +2157,9 @@ import {
         area.style.transform = tf;
       }
     }
-    if (thumbEl) {
-      const trackH = (scrollArea?.clientHeight || 0) - 28;
-      const ratio = maxScroll > 0 ? Math.max(0, Math.min(1, p / maxScroll)) : 0;
-      if (trackH > 0) thumbEl.style.transform = `translate3d(0,${(ratio * trackH * 0.92).toFixed(1)}px,0)`;
-    }
+    // 拇指比例由 thumbRatio() 统一给出：非窗口化 = 章内比例（与改动前一致）；
+    // 窗口化（PDF / 漫画瀑布流）= 全书量程，且拖动/跳转期间用 sbDragRatio。
+    if (thumbEl) updateThumb(thumbRatio(p));
     // 响应式 UI 节流更新；滚动 settle 时会精确同步一次。
     const now = performance.now();
     if (now - lastUiSync > 150) {
@@ -2163,9 +2171,57 @@ import {
   /* ===== 自定义滚动条拖动 ===== */
   let sbDragPid = -1;
   let sbDragging = $state(false);
+  /** 窗口化布局拖动中的拇指比例（0..1，全书量程）；松手后到目标章落地前继续用它画拇指。 */
+  let sbDragRatio = 0;
+  /** 已发起跳转、目标章还没落地：期间拇指保持 sbDragRatio，避免先弹回旧位置再跳到目标。 */
+  let jumpPending = $state(false);
+  /** 拖动气泡（第 N 页 / 章节名）。 */
+  let sbBubble = $state<{ top: number; text: string } | null>(null);
+  /**
+   * 止损开关：窗口化布局（PDF / 漫画瀑布流）滚动条的口径。
+   * "book" = 全书量程 + 松手跳转；"hidden" = 隐藏滚动条（保留底部进度条、目录、页码跳转、滚轮/键盘）。
+   * 文本滚动（.scroll-area）永远走原来的章内量程，不受此开关影响。
+   */
+  const WINDOWED_SCROLLBAR: "book" | "hidden" = "book";
   // 拖动期间缓存的轨道几何：避免每次 pointermove 都读 getBoundingClientRect（写 scrollTop 后再读会触发布局抖动）。
   let sbTop = 0;
   let sbH = 0;
+
+  /**
+   * 拇指比例：**唯一来源**（正常绘制与拖动两处都调它，避免出现两套刻度）。
+   * - 非窗口化（EPUB/TXT 文本滚动）：与改动前完全一致 —— 章内比例 `p / maxScroll`；
+   * - 窗口化（PDF / 漫画瀑布流）：全书量程 `(chapterNum + 章内比例) / 章数`，与底部进度条同源；
+   *   拖动中与「跳转未落地」期间用 sbDragRatio，保证拇指不回弹。
+   */
+  function thumbRatio(p: number): number {
+    if (!windowedLayout()) return maxScroll > 0 ? Math.max(0, Math.min(1, p / maxScroll)) : 0;
+    if (sbDragging || jumpPending) return Math.max(0, Math.min(1, sbDragRatio));
+    const n = book?.toc.length || 1;
+    const within = maxScroll > 0 ? Math.max(0, Math.min(1, p / maxScroll)) : 0;
+    return Math.max(0, Math.min(1, (chapterNum + within) / n));
+  }
+
+  /** 只写拇指位移（不碰 scrollTop 与滚动位置）。行程公式与旧路径共用 `trackH * 0.92`。 */
+  function updateThumb(ratio: number) {
+    if (!thumbEl) return;
+    // 瀑布流分支下 mangaFlowViewport 与 scrollArea 绑定的是同一个元素，故这里只用 scrollArea。
+    const trackH = (scrollArea?.clientHeight || 0) - 28;
+    if (trackH > 0) {
+      thumbEl.style.transform = `translate3d(0,${(Math.max(0, Math.min(1, ratio)) * trackH * 0.92).toFixed(1)}px,0)`;
+    }
+  }
+
+  /** 指针位置 → 轨道内比例（0..1）。 */
+  function sbRatioAt(clientY: number): number {
+    if (sbH <= 0) return 0;
+    return Math.max(0, Math.min(1, (clientY - sbTop) / sbH));
+  }
+
+  /** 窗口化布局的拖动气泡：PDF 给页码，其余给章节名（沿用现有 i18n 键）。 */
+  function sbBubbleText(target: number): string {
+    if (isPdfBook()) return t("reader.pdf.page", { n: target + 1 });
+    return book?.toc[target]?.title || t("reader.pdf.page", { n: target + 1 });
+  }
 
   /** 按轨道内 Y 比例即时跳到目标位置（点击轨道 / 拖动 thumb 共用）。 */
   function sbSeek(clientY: number) {
@@ -2180,7 +2236,11 @@ import {
     // 先阻止冒泡：否则滚动条上的按下会冒泡到 .content 触发翻章/区域动作（内容不满屏、maxScroll=0 时也不能例外）。
     e.stopPropagation();
     e.preventDefault();
-    if (e.button !== 0 || maxScroll <= 0) return;
+    if (e.button !== 0) return;
+    // 守卫分流：窗口化布局按「章数 > 1」判定即可拖 —— 单页章或首屏未撑满时 maxScroll 可能为 0，
+    // 但这类书恰恰最需要全书量程；文本滚动沿用原来的 maxScroll 守卫，一行不改。
+    const win = windowedLayout();
+    if (win ? (book?.toc.length ?? 0) <= 1 : maxScroll <= 0) return;
     const el = scrollbarEl;
     const r = el?.getBoundingClientRect();
     if (!el || !r || r.height <= 0) return;
@@ -2189,12 +2249,34 @@ import {
     el.setPointerCapture?.(e.pointerId);
     sbDragPid = e.pointerId;
     sbDragging = true;
+    if (win) {
+      sbDragRatio = sbRatioAt(e.clientY);
+      const target = sbTargetChapter(sbDragRatio);
+      sbBubble = { top: (sbDragRatio * sbH) | 0, text: sbBubbleText(target) };
+      updateThumb(sbDragRatio);
+      return;
+    }
     sbSeek(e.clientY);
+  }
+
+  /** 拖动比例 → 目标章：`round(比例 × (章数−1))`，拖到底即末章、拖到顶即首章。 */
+  function sbTargetChapter(ratio: number): number {
+    const n = Math.max(1, book?.toc.length ?? 1);
+    return Math.max(0, Math.min(n - 1, Math.round(Math.max(0, Math.min(1, ratio)) * (n - 1))));
   }
 
   function onSbPointerMove(e: PointerEvent) {
     if (e.pointerId !== sbDragPid) return;
     e.stopPropagation();
+    // 窗口化：只更新拇指与气泡（纯 transform + 文本），**绝不**写 scrollTop、不调 sbSeek，
+    // 因此拖动期间不会触发续章/裁剪，也不会发 pdf_scan_page(_bytes)。
+    if (windowedLayout()) {
+      sbDragRatio = sbRatioAt(e.clientY);
+      const target = sbTargetChapter(sbDragRatio);
+      sbBubble = { top: (sbDragRatio * sbH) | 0, text: sbBubbleText(target) };
+      updateThumb(sbDragRatio);
+      return;
+    }
     sbSeek(e.clientY);
   }
 
@@ -2202,16 +2284,62 @@ import {
     if (e.pointerId !== sbDragPid) return;
     e.stopPropagation();
     sbDragPid = -1;
-    sbDragging = false;
+    const wasWin = windowedLayout();
     if (scrollbarEl?.hasPointerCapture?.(e.pointerId)) scrollbarEl.releasePointerCapture(e.pointerId);
-    saveProgressDebounced();
+    if (!wasWin) {
+      sbDragging = false;
+      saveProgressDebounced();
+      return;
+    }
+    // 窗口化：松手才跳一次。拇指在目标章落地前继续用 sbDragRatio（jumpPending）。
+    const ratio = sbDragRatio;
+    const n = Math.max(1, book?.toc.length ?? 1);
+    const target = sbTargetChapter(ratio);
+    const within = Math.max(0, Math.min(1, ratio * n - target));
+    sbBubble = null;
+    sbDragging = false;
+    jumpPending = true;
+    void jumpToChapter(target, within);
+  }
+
+  /** 窗口化布局松手跳转：换章走 loadMangaWindow，同章按比例就地定位一次。 */
+  async function jumpToChapter(target: number, within: number) {
+    try {
+      if (!book) return;
+      if (target === chapterNum) {
+        const vp = mangaFlowViewport;
+        const block = vp?.querySelector<HTMLElement>(`.manga-block[data-index="${target}"]`);
+        if (vp && block && block.offsetHeight > 0) {
+          const pos = Math.max(0, Math.min(maxScroll, block.offsetTop + within * block.offsetHeight));
+          scroller?.jumpTo(pos, true);
+          applyScroll(pos);
+        }
+        jumpPending = false;
+        saveProgressDebounced();
+        return;
+      }
+      // restore 只需章内比例：其余字段在 loadMangaWindow 里兜底（见其注释）。
+      await loadMangaWindow(target, { chapter_ratio: within });
+      jumpPending = false;
+      saveProgressDebounced();
+    } finally {
+      // 失败也比卡在 pending 好：至少让拇指回到真实位置。
+      if (jumpPending && !sbDragging) jumpPending = false;
+    }
   }
 
   function onSbPointerCancel(e: PointerEvent) {
     if (e.pointerId !== sbDragPid) return;
     sbDragPid = -1;
+    const wasWin = windowedLayout();
     sbDragging = false;
+    sbBubble = null;
     if (scrollbarEl?.hasPointerCapture?.(e.pointerId)) scrollbarEl.releasePointerCapture(e.pointerId);
+    // 移动端/取消不跳：丢弃本次拖动，拇指回到真实位置。
+    if (wasWin) {
+      jumpPending = false;
+      updateThumb(thumbRatio(maxScroll));
+    }
   }
 
   /** 章节切换时把滚动容器复位到顶部并清除回弹位移。 */
@@ -2355,6 +2483,8 @@ import {
     }
     sbDragPid = -1;
     sbDragging = false;
+    sbBubble = null;
+    if (jumpPending) jumpPending = false;
   }
 
   /** 取消在跑的过渡动画（cancel 让元素还原成基准样式 = 无 transform）。 */
@@ -3468,7 +3598,12 @@ import {
   }
 
   /** 按当前章重建窗口（换章/跳转/恢复进度/退出进入漫画模式时调用；同步首屏，保证定位准确）。 */
-  async function loadMangaWindow(idx: number, restore?: Progress) {
+  /**
+   * `restore` 允许只给部分字段（拖动跳章只关心 `chapter_ratio`）。兜底规则：
+   * `chapter_ratio ?? 0`（从章首开始）、`pct ?? totalPct()`、`updated_at ?? Date.now()`、
+   * `device ?? "pc"`（与 doSaveProgress 的写法一致）。
+   */
+  async function loadMangaWindow(idx: number, restore?: Partial<Progress>) {
     if (!book) return;
     if (import.meta.env.DEV) pdfHlTracePush("loadMangaWindow(" + idx + ")");
     const gen = ++loadGeneration;
@@ -3493,6 +3628,8 @@ import {
     // 先占位当前章，首屏即出结构。
     mangaWindow = [mangaItem(idx, "")];
     chapterNum = idx;
+    // 目标章已落地：窗口化布局的拇指从「拖动比例」切回真实位置。
+    if (jumpPending) jumpPending = false;
     chapter = cacheGet(idx) ?? null;
     await tick();
     let imgs = await take(idx);
@@ -3554,7 +3691,8 @@ import {
       const block = vp?.querySelector<HTMLElement>(`.manga-block[data-index="${idx}"]`);
       let pos = block ? block.offsetTop : 0;
       if (restore && block && block.offsetHeight > 0) {
-        pos += Math.max(0, Math.min(1, restore.chapter_ratio)) * block.offsetHeight;
+        // 兜底：未给章内比例就按章首定位（见 loadMangaWindow 注释）。
+        pos += Math.max(0, Math.min(1, restore.chapter_ratio ?? 0)) * block.offsetHeight;
       }
       pos = Math.max(0, Math.min(pos, maxScroll));
       scroller?.jumpTo(pos, true);
@@ -3572,7 +3710,7 @@ import {
         const W = el.offsetWidth;
         semX = mangaRtl() ? W - (block.offsetLeft + block.offsetWidth) : block.offsetLeft;
         if (restore && block.offsetWidth > 0) {
-          semX += Math.max(0, Math.min(1, restore.chapter_ratio)) * block.offsetWidth;
+          semX += Math.max(0, Math.min(1, restore.chapter_ratio ?? 0)) * block.offsetWidth;
         }
       }
       mangaPosX = Math.max(0, Math.min(semX, mangaMaxX));
@@ -3684,6 +3822,7 @@ import {
   /** 预算裁剪：窗口累计图片超 mangaImgBudget() 时，从「已完全离屏」的远端裁掉整章块，带滚动/位移补偿；
       永不裁掉视口内的章（故与瀑布流的 mangaWindowTrim 互补，横向模式则由它独自保证窗口有界）。 */
   async function mangaBudgetTrim() {
+    if (sbDragging) return;
     if (mangaWindow.length <= 1 || windowImgTotal() <= mangaImgBudget()) return;
     if (scrollLayout()) {
       const vp = mangaFlowViewport;
@@ -3769,6 +3908,8 @@ import {
    *  scroll 事件只负责「记录最新 scrollTop + 请求一帧」：裁剪 / 续章判据 / 更新章号统一在 rAF
    *  里做（原先在 scroll 回调里同步做 2N 次强制布局读并同步改 $state，是掉帧主因）。 */
   function checkMangaWindowExtend() {
+    // 拖动滚动条期间不续章/不裁剪：边拖边塌会改 maxScroll，让拇指乱跳。
+    if (sbDragging) return;
     scheduleSliceCheck(); // PDF：滚动即按视口补/收切片位图
     const vp = mangaFlowViewport;
     if (!vp || !mangaWindow.length) return;
@@ -3790,6 +3931,8 @@ import {
     flowScrollRaf = 0;
     const vp = mangaFlowViewport;
     if (!vp || !mangaWindow.length) return;
+    // 窗口化布局的拇指跟随原生滚动：本帧的 scrollTop 已知，直接按全书量程刷一次（不读 scrollTop $state）。
+    if (windowedLayout() && !sbDragging && !jumpPending) updateThumb(thumbRatio(pendingFlowTop));
     // 裁剪导致的 scrollTop 写回也放在这里，不在 scroll 事件回调里。
     await mangaWindowTrim({ top: pendingFlowTop, height: vp.clientHeight });
     updateChapterFromWindow();
@@ -4716,6 +4859,12 @@ import {
       };
 
       (window as any).__tpDebug = {
+        /** 跳到某页（0-based）。DEV 验证用：PDF 直读通道的翻页与占位检查都靠它。 */
+        goPage: (n: number) => {
+          gotoPage(Math.max(0, Math.min(n, Math.max(0, pageCount - 1))), true);
+        },
+        /** 当前页号（0-based）。 */
+        curPage: () => page,
         // i18n-allow:用户内容：全文搜索输入框的默认关键词，是用户输入的初值而非界面文案。
         openSearch: (q = "的") => {
           searchPopup = { query: q, anchor: { top: 120, bottom: 121, cx: window.innerWidth / 2 } };
@@ -5796,6 +5945,29 @@ ${effCssExtra() || ""}
     }
   }
 
+  /**
+   * 打开失败时的出口：用系统程序打开原文件。
+   * 应用内打不开（超大/损坏/引擎放弃）并不等于文件坏了 —— 交给系统里已关联的阅读器，
+   * 用户至少还能看到内容。失败（无关联程序、权限）再降级为「在文件夹中显示」。
+   */
+  async function openExternally() {
+    const p = book?.book.path;
+    if (!p) return;
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(p);
+      return;
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn("[reader] openPath 失败，降级为显示所在文件夹：", e);
+    }
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(p);
+    } catch (e) {
+      toast(errText(e), "error");
+    }
+  }
+
   function onSearchSelection() {
     const s = selMenu;
     selMenu = null;
@@ -6778,6 +6950,9 @@ ${effCssExtra() || ""}
         <div>
           <p data-testid="reader-open-failed">{t("reader.open.failed")}</p>
           <p class="err-detail">{openError}</p>
+          <!-- 出口（P0）：任何"打不开"都必须留一条出路 —— 交给系统程序打开原文件。
+               失败（无关联程序/权限）时降级为"在文件夹中显示"，用户至少能找到文件。 -->
+          <button data-testid="reader-open-external" onclick={openExternally}>{t("reader.open.withSystemApp")}</button>
           <button data-testid="reader-open-back" onclick={() => (ui.view = "library")}>{labelOfId("bind", "close")}</button>
         </div>
       </div>
@@ -6833,8 +7008,33 @@ ${effCssExtra() || ""}
                 {/each}
               </div>
             </div>
-            <!-- 漫画瀑布流只用原生滚动条（.manga-flow-viewport overflow-y:auto），
-                 不渲染为 transform 滚动设计的自绘 .scrollbar，避免右侧出现两条滚动条。 -->
+            <!-- 窗口化布局（PDF / 漫画瀑布流）：自绘滚动条代表**整本书**。
+                 原生滚动条在 CSS 里隐藏（scrollbar-color: transparent，保留槽宽以免 PDF 视图键抖动），
+                 拇指位置由 thumbRatio() 统一给出，松手才按比例跳一次章。 -->
+            {#if WINDOWED_SCROLLBAR === "book"}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="scrollbar windowed"
+                class:dragging={sbDragging}
+                bind:this={scrollbarEl}
+                onpointerdown={onSbPointerDown}
+                onpointermove={onSbPointerMove}
+                onpointerup={onSbPointerUp}
+                onpointercancel={onSbPointerCancel}
+                onclick={(e) => e.stopPropagation()}
+                role="slider"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={Math.round(thumbRatio(maxScroll) * 100)}
+                aria-label={t("reader.progress.aria")}
+                tabindex="-1"
+              >
+                <div class="thumb" bind:this={thumbEl} style="height:8%"></div>
+                {#if sbBubble}
+                  <div class="sb-bubble" style="top:{sbBubble.top}px">{sbBubble.text}</div>
+                {/if}
+              </div>
+            {/if}
           {:else if scrollLayout()}
             <!-- 普通（非漫画）滚动模式：维持原有单章渲染 + SmoothScroller（overflow:hidden）。不改动。 -->
             <div class="scroll-area" bind:this={scrollArea}>
@@ -8057,6 +8257,8 @@ ${effCssExtra() || ""}
     overflow-y: auto !important;
     overflow-x: hidden !important;
     overflow-anchor: none;
+    /* 窗口化布局用自绘滚动条代表整本书：隐藏原生竖条的外观（保留槽宽，避免 PDF 视图键抖动）。 */
+    scrollbar-color: transparent transparent;
   }
 
   .manga-flow-canvas {
@@ -8364,6 +8566,29 @@ ${effCssExtra() || ""}
      只给 X 轴值（1.6 1）：.thumb 高度是模板内联的 height:8%，两轴缩放会让它从中心向上下
      额外扩出 0.3 倍高度，探出轨道 top，且缩放发生在滚动位置计算之后，hover 期间 thumb 的
      视觉中心会与它代表的滚动位置错位，拖拽时手感对不上。 */
+  /* 窗口化布局的自绘滚动条：与文本滚动条同一套轨道/拇指样式，只隐藏原生竖条的外观。 */
+  .scrollbar.windowed {
+    top: calc(14px + var(--rdr-inset-v, 0px));
+    bottom: calc(14px + var(--rdr-inset-v, 0px));
+    z-index: 3;
+  }
+
+  .sb-bubble {
+    position: absolute;
+    right: calc(100% + 6px);
+    transform: translateY(-50%);
+    padding: 2px 8px;
+    max-width: 220px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 12px;
+    color: var(--bg-elev);
+    background: var(--fg);
+    border-radius: var(--radius-pill);
+    pointer-events: none;
+  }
+
   .thumb {
     position: absolute;
     top: 0;

@@ -233,6 +233,8 @@ export const zhCN = {
   "reader.manga.large": "大",
   "reader.manga.resetDefault": "恢复默认（1.0×）",
   "reader.open.failed": "打开失败",
+  // 打不开时的出口：把原文件交给系统里已关联的程序
+  "reader.open.withSystemApp": "用系统程序打开",
   "reader.open.opening": "正在打开…",
   "reader.bookmarks.title": "书签",
   "reader.bookmarks.empty": "暂无书签，点顶栏的书签按钮添加",
@@ -718,7 +720,7 @@ export const zhCN = {
   "err.pdfTooLarge": "这个 PDF 有 {mb}MB，超出可打开的大小上限",
   "err.pdfNativeFailed": "此文件无法显示",
   "err.pdfNativeUnsupported": "此设备无法显示该文件",
-  "err.pdfNativeAbandoned": "无法继续显示，重启应用后再试",
+  "err.pdfNativeAbandoned": "此文件在本应用内无法显示，可用下方「用系统程序打开」",
   "err.pdfNoCover": "此文件无法生成封面",
   "err.mobiParse": "MOBI 文件解析失败，文件可能已损坏",
   "err.palmDoc": "PalmDOC 格式错误，文件可能已损坏",
@@ -1344,4 +1346,6 @@ export const zhCN = {
   "common.hours": "{n} 小时",
   "settings.tts.auto": "自动",
 } as const;
+
+
 

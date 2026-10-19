@@ -7,6 +7,7 @@
     "core:default",
     "opener:allow-reveal-item-in-dir",
     "opener:allow-open-url",
+    "opener:allow-open-path",
     "opener:allow-default-urls",
     "core:webview:allow-create-webview-window",
     "core:window:allow-close",

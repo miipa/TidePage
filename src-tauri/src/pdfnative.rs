@@ -109,6 +109,25 @@ const CLOSE_TIMEOUT_MS: u64 = 2_000;
 /// 超时错误的内部标记：命令层据此判定「这条线程必须废弃」，返回前会把标记去掉。
 const TIMEOUT_PREFIX: &str = "native_timeout:";
 
+/// 本次运行内"原生已判死"的书（book_id）。一旦某本书原生超时，就不再为它起新线程：
+/// 废弃线程会永久占住该文件与地址空间，重复尝试只是叠加代价，且很可能再次超时。
+/// 与 `ABANDON_LIMIT`（全局上限）互补：那是"一共允许废几条线程"，这是"这本书别再试了"。
+static NATIVE_DEAD: Mutex<Option<std::collections::HashMap<i64, &'static str>>> = Mutex::new(None);
+
+/// 记录一本书"原生已判死"（重复调用幂等），返回当前累计本数（用于日志）。
+fn mark_native_dead(book_id: i64, reason: &'static str) -> usize {
+    let mut g = NATIVE_DEAD.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    m.insert(book_id, reason);
+    m.len()
+}
+
+/// 这本书本次运行内是否已被判死。
+fn native_dead(book_id: i64) -> bool {
+    let g = NATIVE_DEAD.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().map(|m| m.contains_key(&book_id)).unwrap_or(false)
+}
+
 /// 平台不支持时的稳定错误码：文案由前端 i18n 的错误码表给出（errText）。
 /// 只在 32 位 / 非 Windows 构建里被引用，64 位构建下允许未使用。
 #[allow(dead_code)]
@@ -535,6 +554,26 @@ use crate::library::{self, AppState};
 use std::sync::Arc;
 use tauri::State;
 
+/// 线程废弃时把"这本书"记进本次运行的判死表：同一本不再重复起线程（`pdf_native_open` 会拦住）。
+async fn call_for_book<T, F>(book_id: i64, build: F) -> Result<T, String>
+where
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> Job,
+{
+    let r = call(build).await;
+    if let Err(e) = &r {
+        // 只有"超时/线程已退出"这类**引擎级**失败才判死；文件损坏之类的普通错误不判死
+        // （那是确定性失败，前端会照常展示错误，不需要记忆）。
+        if e.contains("超时") || e.contains("原生渲染线程已退出") || e == ABANDONED_LIMIT {
+            let n = mark_native_dead(book_id, "engine");
+            memlog::stage_note(
+                "native:book_dead",
+                &format!("book={book_id} dead_total={n} err={e} ws={}MB", memlog::ws_mb()),
+            );
+        }
+    }
+    r
+}
+
 async fn call<T, F>(build: F) -> Result<T, String>
 where
     F: FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> Job,
@@ -567,8 +606,18 @@ where
 /// 打开（或复用）原生文档，返回页数。
 #[tauri::command]
 pub async fn pdf_native_open(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<u32, String> {
+    // 本次运行内已经判定"这本书原生超时"：**不再起新线程**。
+    // 每条废弃线程都会一直占住该文件与地址空间（见 trim_process_ws 的说明），
+    // 重复打开同一本只会叠加代价；直接返回废弃码，前端据此转向"用系统程序打开"。
+    if native_dead(book_id) {
+        memlog::stage_note(
+            "native:already_dead",
+            &format!("book={book_id} hit=1 ws={}MB", memlog::ws_mb()),
+        );
+        return Err(ABANDONED_LIMIT.to_string());
+    }
     let path = library::pdf_book_path(&state, book_id)?;
-    let n = call(|reply| Job::Open {
+    let n = call_for_book(book_id, |reply| Job::Open {
         book_id,
         path,
         reply,
@@ -589,7 +638,7 @@ pub async fn pdf_native_page_geometry(
     page: u32,
 ) -> Result<(f32, f32), String> {
     let path = library::pdf_book_path(&state, book_id)?;
-    let s = call(|reply| Job::Geometry {
+    let s = call_for_book(book_id, |reply| Job::Geometry {
         book_id,
         path,
         page,
@@ -625,7 +674,7 @@ pub async fn pdf_native_render_page(
             ),
         );
     }
-    let bytes = call(|reply| Job::Render {
+    let bytes = call_for_book(book_id, |reply| Job::Render {
         book_id,
         path,
         page,

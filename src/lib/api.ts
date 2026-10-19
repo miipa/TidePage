@@ -96,6 +96,36 @@ export const api = {
   /** 关闭当前原生文档（关书/换书时调用）。 */
   pdfNativeClose: () => invoke<void>("pdf_native_close"),
 
+  /* ---- 纯图扫描版 PDF 的「直读页面图」通道（见 Rust pdfscan.rs）---- */
+  /** 探测：返回页数与是否纯图扫描件；解析失败即抛错（调用方回落到原生通道）。 */
+  pdfScanOpen: (bookId: number) =>
+    invoke<{ pages: number; image_only: boolean; reason: string }>("pdf_scan_open", { bookId }),
+  /** 单页元数据（几何/编码/颜色空间/调色板），不含图像字节。 */
+  pdfScanPage: (bookId: number, page: number) =>
+    invoke<{
+      kind: "jpeg" | "raw" | "unsupported";
+      pt_w: number;
+      pt_h: number;
+      rotate: number;
+      width: number;
+      height: number;
+      bpc: number;
+      color_space: string;
+      predictor: number;
+      bytes_len: number;
+      reason: string;
+      palette: number[];
+      hival: number;
+    }>("pdf_scan_page", { bookId, page }),
+  /** 单页图像原始字节：`jpeg` 为完整 JPEG；`raw` 为未解压 zlib（前端用 DecompressionStream 解）。 */
+  pdfScanPageBytes: (bookId: number, page: number) =>
+    invoke<ArrayBuffer>("pdf_scan_page_bytes", { bookId, page }),
+  /** 自带目录（页号为 0-based；解析不出页号的条目 page=-1）。 */
+  pdfScanOutline: (bookId: number) =>
+    invoke<{ title: string; page: number }[]>("pdf_scan_outline", { bookId }),
+  /** 关闭该书的直读通道（只清这一份缓存）。 */
+  pdfScanClose: (bookId: number) => invoke<void>("pdf_scan_close", { bookId }),
+
   /** PDF 某页纯文本回传（前端 pdf.js 抽取）：写入 chapter_text，供划词全文搜索/FTS/朗读复用。
    *  乱码页/扫描版不回传（见 pdfTextUsable），后端不解析 PDF。 */
   setPdfPageText: (bookId: number, pageIndex: number, title: string, text: string) =>
