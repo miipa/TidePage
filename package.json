@@ -1,6 +1,6 @@
 {
   "name": "tidepage",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "check:name": "node scripts/check-legacy-name.mjs",
     "tauri": "tauri",
     "release": "tauri build",
     "release:exe": "tauri build --no-bundle",

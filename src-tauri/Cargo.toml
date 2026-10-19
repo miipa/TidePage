@@ -1,6 +1,6 @@
 [package]
 name = "tidepage"
-version = "0.1.27"
+version = "0.1.28"
 description = "TidePage - a fast local reading app"
 authors = ["you"]
 edition = "2021"
@@ -49,7 +49,18 @@ rand = "0.8"
 # 凭据加密：调用 Windows DPAPI（CryptProtectData/CryptUnprotectData）以当前用户
 # 密钥加密敏感配置。仅 Windows 目标编译该依赖（本应用仅发布 Windows）。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    # 超大 PDF 的原生渲染通道（Windows.Data.Pdf）：pdf.js 对 >2GiB 的文件无解，见 pdfnative.rs
+    "Foundation",
+    "Data_Pdf",
+    "Storage",
+    "Storage_Streams",
+    "Graphics_Imaging",
+    "Win32_System_WinRT",
+] }
 
 [profile.release]
 opt-level = 3
