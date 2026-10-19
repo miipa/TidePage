@@ -1,6 +1,6 @@
 [package]
 name = "tidepage"
-version = "0.1.28"
+version = "0.1.29"
 description = "TidePage - a fast local reading app"
 authors = ["you"]
 edition = "2021"
@@ -45,6 +45,10 @@ tendril = "0.5"
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 rand = "0.8"
+# PDF 的 FlateDecode 解压：**它本来就在 Cargo.lock 的依赖图里**（zip/其它 crate 传递引入），
+# 这里只是提升为直接依赖，不新增编译代码。当前运行时路径仍由前端 DecompressionStream 解压
+# （见 pdf.ts 直读通道），此依赖供后续在 Rust 侧做校验/校验和回退时使用。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # 凭据加密：调用 Windows DPAPI（CryptProtectData/CryptUnprotectData）以当前用户
 # 密钥加密敏感配置。仅 Windows 目标编译该依赖（本应用仅发布 Windows）。
