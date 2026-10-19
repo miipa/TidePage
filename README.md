@@ -6,7 +6,7 @@
 
 **面向十万级本地书库的桌面电子书阅读器**
 
-TXT · EPUB · MOBI · AZW3 · PRC　｜　舒适排版 · 漫画模式 · AI 助手 · 语音朗读
+TXT · EPUB · MOBI · AZW3 · PDF ·PRC　｜　舒适排版 · 漫画模式 · AI 助手 · 语音朗读
 
 [English](README.en.md) · **简体中文**
 
