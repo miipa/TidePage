@@ -16,6 +16,12 @@ export const api = {
   addFolder: (path: string) => invoke<void>("add_folder", { path }),
   removeFolder: (path: string) => invoke<void>("remove_folder", { path }),
   listBooks: () => invoke<BookRow[]>("list_books"),
+  /** 只取 id 的分批入口（每批 ≤500）。整库重建 FTS 之类「按 id 遍历全库」的操作用它，
+   *  不要用 listBooks：后者把 17 万条整行物化并序列化，一次 IPC 就是几十 MB。 */
+  listBookIdsPage: (offset: number, limit: number) => invoke<number[]>("list_book_ids_page", { offset, limit }),
+  /** 书库挂载并取到首屏行后调用一次：启动日志据此判断「上次是否走到书库」，
+   *  连续失败时下一次启动自动跳过封面重建（见 Rust memlog 模块）。 */
+  libraryReady: () => invoke<void>("library_ready"),
   listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean, folder?: string) =>
     invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
@@ -33,8 +39,31 @@ export const api = {
   /** 秩可寻址分页命令 2：按 ids 批量取行，返回长度/顺序恒等于 ids，缺行为 null。ids.len()>4096 抛错。 */
   listBooksByIds: (ids: number[]) => invoke<(BookRow | null)[]>("list_books_by_ids", { ids }),
   rescan: () => invoke<void>("rescan"),
-  refreshLibrary: () => invoke<{ removed: number; added: number }>("refresh_library"),
-  fileExists: (path: string) => invoke<boolean>("file_exists", { path }),
+  /**
+   * 对账刷新。后端在"待删行超阈值"时**一条都不删**，返回 `needs_confirm=true` + 摘要；
+   * 前端拿摘要问用户，用户确认后再以 `confirm=true` 调一次。
+   */
+  refreshLibrary: (confirm = false) =>
+    invoke<{
+      removed: number;
+      added: number;
+      /** 被挂起等待确认的待删条数（>0 表示需要二次确认）。 */
+      pending: number;
+      /** 因父目录不可列举被跳过的条数（>0 且 removed=0 表示本次什么也没删）。 */
+      skipped: number;
+      needs_confirm: boolean;
+      /** 待删行的主要父目录（最多 5 条，降序）。 */
+      dirs: { dir: string; count: number }[];
+      /** 快照总行数。 */
+      total: number;
+    }>("refresh_library", { confirm }),
+  /**
+   * 上次扫描的异常态（`last_scan_stale`，后端每次扫描结束重算）：书库页首屏提示条的唯一来源。
+   * 返回原始 JSON 字符串（`state` / `refused` / `pending` / `skipped` / `unfinishedDirs` / `dirs` / `at`）。
+   */
+  getLastScanStale: () => invoke<string | null>("get_last_scan_stale"),
+  /** 三态：ok（存在）/ missing（文件不在，目录可列举）/ unreachable（目录当时不可访问）。 */
+  fileExists: (path: string) => invoke<"ok" | "missing" | "unreachable">("file_exists", { path }),
   pathIsDir: (path: string) => invoke<boolean>("path_is_dir", { path }),
   openBook: (id: number) => invoke<OpenResult>("open_book", { id }),
   /** 全书每章字数（EPUB；非 EPUB 返回空数组）：「全书总页数」的估算来源。 */
@@ -47,13 +76,34 @@ export const api = {
   pdfFileSize: (bookId: number) => invoke<number>("pdf_file_size", { bookId }),
   pdfReadRange: (bookId: number, begin: number, end: number) =>
     invoke<ArrayBuffer>("pdf_read_range", { bookId, begin, end }),
+  /* ---- 超大 PDF 的 Windows 原生渲染通道（pdf.js 对 >2GiB 的文件无解，见 Rust pdfnative.rs）---- */
+  /** 打开原生文档，返回页数（同一本书复用已在内存里的文档句柄）。 */
+  pdfNativeOpen: (bookId: number) => invoke<number>("pdf_native_open", { bookId }),
+  /** 单页尺寸（页面坐标系，左上原点）：只用于比例与切片换算。 */
+  pdfNativePageGeometry: (bookId: number, page: number) =>
+    invoke<[number, number]>("pdf_native_page_geometry", { bookId, page }),
+  /** 渲染页面的一块区域为 PNG 字节：x/y/w/h 为页面坐标，destW/destH 为目标像素尺寸。 */
+  pdfNativeRenderPage: (
+    bookId: number,
+    page: number,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    destW: number,
+    destH: number,
+  ) => invoke<ArrayBuffer>("pdf_native_render_page", { bookId, page, x, y, w, h, destW, destH }),
+  /** 关闭当前原生文档（关书/换书时调用）。 */
+  pdfNativeClose: () => invoke<void>("pdf_native_close"),
+
   /** PDF 某页纯文本回传（前端 pdf.js 抽取）：写入 chapter_text，供划词全文搜索/FTS/朗读复用。
    *  乱码页/扫描版不回传（见 pdfTextUsable），后端不解析 PDF。 */
   setPdfPageText: (bookId: number, pageIndex: number, title: string, text: string) =>
     invoke<void>("set_pdf_page_text", { bookId, pageIndex, title, text }),
-  /** PDF 首页封面：前端传已渲染好的 PNG（base64，不含 data URL 前缀），后端存缩略图并通知书库刷新。 */
-  setBookCoverImage: (bookId: number, pngBase64: string) =>
-    invoke<void>("set_book_cover_image", { bookId, pngBase64 }),
+  /** PDF 首页封面：前端传按目标缩略图尺寸渲染好的 WebP（base64，不含 data URL 前缀），
+   *  后端只落盘并通知书库刷新；返回落盘文件名（重新提取封面要用它更新 cover_path）。 */
+  setBookCoverImage: (bookId: number, webpBase64: string) =>
+    invoke<string>("set_book_cover_image", { bookId, webpBase64 }),
   listBookImages: (bookId: number) => invoke<BookImage[]>("list_book_images", { bookId }),
   saveProgress: (bookId: number, p: Progress) => invoke<void>("save_progress", { bookId, p }),
   loadProgress: (bookId: number) => invoke<Progress | null>("load_progress", { bookId }),
@@ -181,8 +231,9 @@ export const api = {
   deleteBookmark: (id: number) => invoke<void>("delete_bookmark", { id }),
   addStats: (bookId: number, seconds: number) => invoke<void>("add_stats", { bookId, seconds }),
   getStats: () => invoke<[string, number][]>("get_stats"),
-  setBgImage: (imagePath: string) => invoke<string>("set_background_image", { imagePath }),
-  clearBgImage: () => invoke<void>("clear_background_image"),
+  // keep：仍被引用的背景图文件名（全局 bgImage 与各方案的 schemeBgImage）；其余旧图按时间窗回收。
+  setBgImage: (imagePath: string, keep: string[] = []) => invoke<string>("set_background_image", { imagePath, keep }),
+  clearBgImage: (keep: string[] = []) => invoke<void>("clear_background_image", { keep }),
   randomBook: () => invoke<BookRow | null>("random_book"),
   /** 从当前筛选结果随机一书（query/sort/formats/states/folder 与列表同源）。 */
   randomBookFiltered: (query: string, sort: string, formats: string[], states: string[], folder?: string) =>

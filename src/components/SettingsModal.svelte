@@ -21,7 +21,6 @@
     appConfirm,
     defaultReaderConfig,
     resetReaderConfig,
-    SCROLL_BOUNCE_PRESETS,
     HIGHLIGHT_STYLES,
     applyUiTheme,
     UI_SKINS,
@@ -89,11 +88,12 @@ IconPlus,
   } from "@tabler/icons-svelte";
   import type { MessageKey } from "../lib/i18n/types";
   import { tick, untrack } from "svelte";
-  import { getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
+  import { bookOverrides, getBookOverride, setBookOverride } from "../lib/bookcfg.svelte";
   import { refreshOnlineVoices, refreshVoices, ttsState } from "../lib/tts.svelte";
   import type { OnlineVoice } from "../lib/tts.svelte";
   import type { AiTestResult, TocEntry } from "../lib/types";
   import { outDissolve, outFade } from "../lib/motion";
+  import { onReducedMotionChange, prefersReducedMotion } from "../lib/reducedMotion";
   import { checkForUpdates, updateState } from "../lib/update.svelte";
 
   type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
@@ -131,6 +131,11 @@ IconPlus,
 
   /** 「检查更新」进行中：禁用按钮并切换文案。 */
   let checkingUpdate = $state(false);
+
+  /** 系统「减少动效」：决定「章节过渡」下那行说明的文案（常显，两种状态两句话）。
+   *  判定与订阅都走 lib/reducedMotion 的唯一来源，不自建 MediaQueryList —— 两份判定会漂移。 */
+  let reducedMotion = $state(prefersReducedMotion());
+  $effect(() => onReducedMotionChange((v) => { reducedMotion = v; }));
 
   /** 手动检查更新：按结果提示；有新版本时侧栏按钮会变为「有新版本 vX」。 */
   async function runCheckUpdate() {
@@ -270,7 +275,7 @@ IconPlus,
    *  两种形态分别处理：
    *   A) label 紧邻**单个**可标注控件，或中间只隔一层壳且壳里恰好一个
    *      —— 直接 for/id（颜色行 .color-row 就是这种：input + 取色器按钮）；
-   *   B) 紧邻的是「一组按钮」（分段控件 .fr-seg、方案卡片网格 .scheme-grid 等）
+   *   B) 紧邻的是「一组按钮」（分段控件 .tp-seg、方案卡片网格 .scheme-grid 等）
    *      —— label 无法用 for 指向一整组，改用 role=group + aria-labelledby，
    *      把 label 自身当作组名的来源。
    *
@@ -333,7 +338,7 @@ IconPlus,
     locale();
     tab;
     // 索引与 label 关联都是「这一刻的 DOM 快照」，而字段随配置条件与 AI 折叠增减。
-    // 旧写法逐个列举依赖键（mode / scrollBounce / bgImage / ai.enabled …），条件分支
+    // 旧写法逐个列举依赖键（mode / chapterTransition / bgImage / ai.enabled …），条件分支
     // 有二十多处，列不全就会索引陈旧（改完配置搜不到、新字段 label 没关联上）。
     // config 与 aiOpen 都是可 JSON 化的普通状态对象：各取一次深快照当依赖，
     // 代价是每次改配置多跑一遍建索引（~150 条目的 DOM 遍历，微秒级），换来永不失效。
@@ -372,8 +377,8 @@ IconPlus,
     }
     if (!el) return;
     el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.classList.add("fr-locate");
-    setTimeout(() => el?.classList.remove("fr-locate"), 1000);
+    el.classList.add("tp-locate");
+    setTimeout(() => el?.classList.remove("tp-locate"), 1000);
   }
 
   /** 分区导航的键盘行为：←/→/↑/↓ 在分区间移动，Home/End 跳首尾。
@@ -1601,13 +1606,20 @@ let aiTestState = $state<"" | "ok" | "bad">("");
   let previewToc: TocEntry[] | null = $state(null);
   let previewing = $state(false);
 
+  /** 仍在引用的背景图文件名：全局 bgImage + 各单本方案覆盖里的 schemeBgImage。
+   *  换图/移除时交给后端做引用检查，避免删掉单本方案里还指着的图。 */
+  function bgKeepList(): string[] {
+    const names = [config.reader.bgImage, ...Object.values(bookOverrides.map).map((o) => o.schemeBgImage ?? "")];
+    return [...new Set(names.filter((n) => !!n))];
+  }
+
   async function pickBgImage() {
     const p = await api.pickFile(t("settings.bgImage.pickDlg"), [
       { name: t("settings.fileDlg.image"), exts: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] },
     ]);
     if (!p) return;
     try {
-      const name = await api.setBgImage(p);
+      const name = await api.setBgImage(p, bgKeepList());
       config.reader.bgImage = name;
       saveConfig();
     } catch (e) {
@@ -1617,7 +1629,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
 
   async function removeBgImage() {
     try {
-      await api.clearBgImage();
+      await api.clearBgImage(bgKeepList().filter((n) => n !== config.reader.bgImage));
       config.reader.bgImage = "";
       saveConfig();
     } catch { /* ignore */ }
@@ -1714,7 +1726,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
 
     <div class="field">
       <label>{t("settings.uiTheme")}</label>
-      <div class="fr-seg">
+      <div class="tp-seg">
         <button data-testid="ui-theme-light" class:active={config.uiTheme === "light"} onclick={() => setUiTheme("light")}>{t("settings.uiTheme.light")}</button>
         <button data-testid="ui-theme-dark" class:active={config.uiTheme === "dark"} onclick={() => setUiTheme("dark")}>{t("settings.uiTheme.dark")}</button>
         <button data-testid="ui-theme-system" class:active={config.uiTheme === "system"} onclick={() => setUiTheme("system")}>{t("settings.uiTheme.system")}</button>
@@ -1891,27 +1903,31 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       </select>
       <p class="tip">{t("settings.reader.pageModeTip")}</p>
     </div>
-    {#if config.reader.mode === "scroll"}
-      <div class="field">
-        <label>{t("settings.reader.chapterTransition")}</label>
-        <select bind:value={config.reader.scrollBounce} onchange={saveConfig}>
-          <option value={false}>{t("settings.reader.transSeamless")}</option>
-          <option value={true}>{t("settings.reader.transBuffered")}</option>
+    <!-- 「特效」两种模式都显示：下拉按当前模式绑定各自的键（两模式各自记忆）。
+         说明行常显，随系统「减少动效」切换文案。
+         搜索索引只读 label 文本与字段内 .tip，不另加关键词（改名后搜旧词「章节过渡」不再命中属预期）。 -->
+    <div class="field">
+      <label>{t("settings.reader.chapterTransition")}</label>
+      {#if config.reader.mode === "scroll"}
+        <select bind:value={config.reader.chapterTransition} onchange={saveConfig}>
+          <option value="cover">{t("settings.reader.transCover")}</option>
+          <option value="spring">{t("settings.reader.transSpring")}</option>
+          <option value="none">{t("settings.reader.transNone")}</option>
         </select>
-        <p class="tip">{t("settings.reader.transTip")}</p>
-      </div>
-      {#if config.reader.scrollBounce}
-        <div class="field">
-          <label>{t("settings.reader.bufferStrength")}</label>
-          <select bind:value={config.reader.scrollBounceLevel} onchange={saveConfig}>
-            {#each Object.entries(SCROLL_BOUNCE_PRESETS) as [k] (k)}
-              <option value={k}>{labelOfId("bounce", k)}</option>
-            {/each}
-          </select>
-          <p class="tip">{t("settings.reader.bufferTip")}</p>
-        </div>
+      {:else}
+        <select bind:value={config.reader.pageTransition} onchange={saveConfig}>
+          <option value="h-spring">{t("settings.reader.transHSpring")}</option>
+          <option value="h-slide">{t("settings.reader.transHSlide")}</option>
+          <option value="none">{t("settings.reader.transNone")}</option>
+        </select>
       {/if}
-    {:else}
+      {#if reducedMotion}
+        <p class="tip">{t("settings.reader.transReduced")}</p>
+      {:else}
+        <p class="tip">{t("settings.reader.transNeedsSystem")}</p>
+      {/if}
+    </div>
+    {#if config.reader.mode !== "scroll"}
       <div class="grid2">
         <div class="field">
           <label>{t("settings.reader.columns")}</label>
@@ -3271,7 +3287,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
   /* 定位高亮：类名由 JS 运行时添加，必须用 :global，否则会被 Svelte 当作未用选择器删除。
      box-shadow 用于画强调色光环（.field 未设 box-shadow，不冲突）；
      transition 用 !important 覆盖 .field 自带的 transition，使光环淡入淡出。 */
-  :global(.fr-locate) {
+  :global(.tp-locate) {
     border-radius: var(--radius-md);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 65%, transparent) !important;
     transition: box-shadow var(--dur) var(--ease) !important;
@@ -3291,10 +3307,10 @@ let aiTestState = $state<"" | "ok" | "bad">("");
   .set-pane[hidden] { display: none; }
 
   /* 分区切换入场：只在「非 hidden」态挂动画，故每次切到该分区重放一次淡入。
-     纯 opacity（见 app.css 的 fr-set-pane-in），避免 transform 破坏分区内
+     纯 opacity（见 app.css 的 tp-set-pane-in），避免 transform 破坏分区内
      position:fixed 子元素（如 .scheme-save-backdrop）的包含块。 */
   .set-pane:not([hidden]) {
-    animation: fr-set-pane-in var(--dur-page) var(--ease-premium) both;
+    animation: tp-set-pane-in var(--dur-page) var(--ease-premium) both;
   }
 
   /* ============================================================
@@ -3312,7 +3328,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     .set-pane > .field:has(> input:not([type="checkbox"]):not([type="range"])),
     .ai-group-body > .field:has(> input:not([type="checkbox"]):not([type="range"])),
     .set-pane > .field:has(> .color-row),
-    .set-pane > .field:has(> .fr-seg),
+    .set-pane > .field:has(> .tp-seg),
     .set-pane > .field:has(> .row-inline):not(:has(> .font-list)),
     .ai-group-body > .field:has(> .row-inline):not(:has(> .font-list)) {
       display: grid;
@@ -3336,7 +3352,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     }
 
     /* 分段控件随内容收拢：贴在 320px 控件列里会留出一段空轨道。 */
-    .set-pane > .field:has(> .fr-seg) > .fr-seg {
+    .set-pane > .field:has(> .tp-seg) > .tp-seg {
       justify-self: start;
     }
 
@@ -3891,7 +3907,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     padding: var(--sp-4);
-    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
+    animation: tp-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .ss-head {

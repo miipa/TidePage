@@ -8,6 +8,8 @@ mod db;
 mod epub;
 mod fonts;
 mod library;
+mod memlog;
+mod pdfnative;
 mod mobi;
 mod models;
 mod sanitize;
@@ -22,6 +24,9 @@ use tauri_plugin_window_state::{StateFlags, WindowExt};
 
 /// window-state 统一标志：排除 DECORATIONS（历史保存值 decorated=true 会把原生标题栏带回来）。
 /// 仅去掉 DECORATIONS，位置/大小/最大化等其余状态仍正常持久化。
+/// 本地协议请求计数（启动打点用，限流输出）。
+static PROTO_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const WINDOW_STATE_FLAGS: StateFlags = StateFlags::all().difference(StateFlags::DECORATIONS);
 /// 主窗口手动恢复用：去掉 VISIBLE，保持既有「建窗后 140ms 再 show」的启动观感。
 const MAIN_RESTORE_FLAGS: StateFlags = WINDOW_STATE_FLAGS.difference(StateFlags::VISIBLE);
@@ -104,7 +109,8 @@ fn sniff_mime(b: &[u8]) -> &'static str {
 ///   （book_id + zip 内路径 / 提取文件名 / 封面文件名，封面端点还带 `v=cover_ver`、`db=`），
 ///   换图必换 URL，故可长期 immutable。漫画窗口重建 `.manga-block` 时能直接命中缓存，
 ///   不必反复重新解压 zip 条目、重新下载与重新解码同一张几百 KB 的图。
-/// - `bg/`：阅读器背景图 URL 不含任何版本分量（用户换背景不换 URL），只能给短缓存。
+/// - `bg/`：保存时按时间戳+序号唯一命名（每次选图都是新 URL），
+///   但历史遗留的 `background.img` 仍可能在使用中，故整体继续给短缓存。
 /// - 其余（`fonts/` 等）不设：字体/未知资源保持原行为。
 fn cache_control_for(path: &str) -> Option<&'static str> {
     const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -190,14 +196,29 @@ pub fn run() {
                 .map(|p| !p.trim().is_empty())
                 .unwrap_or(false);
             std::fs::create_dir_all(&data_dir).ok();
-            let conn = db::init(&data_dir.join("tidepage.db"))?;
+            // 启动打点/内存观察点：先 init 才能把「上一次启动是否走到书库」写进日志与状态文件。
+            // 连续启动失败时本轮自动跳过封面重建（见 memlog::skip_cover_rebuild）。
+            memlog::init(&data_dir);
+            memlog::stage("setup:data_dir");
+            let conn = match db::init(&data_dir.join("tidepage.db")) {
+                Ok(c) => c,
+                Err(e) => {
+                    // 不静默退出：写日志 + 弹窗（见 memlog::fatal 的说明）。
+                    memlog::fatal("db_init", &e);
+                    return Err(e.into());
+                }
+            };
+            memlog::stage("setup:db_init");
             if db::has_fts(&conn) {
                 let _ = db::ensure_fts(&conn);
             }
+            memlog::stage("setup:fts");
             db::migrate_book_ids(&conn);
+            memlog::stage("setup:migrate_book_ids");
             // 切分算法升级（txt.rs 引入章节上限细分）：作废按旧 toc 写入的搜索缓存/FTS，
             // 避免划词全文搜索定位到错误章节；下次搜索按新 toc 懒重建。
             db::migrate_chapter_split(&conn);
+            memlog::stage("setup:migrate_chapter_split");
 
             // 创建主窗口：注入 WebView2 字体渲染参数（需重启生效）。
             // 设置页现已简化为单个「灰度抗锯齿」复选框，只写入
@@ -240,7 +261,7 @@ pub fn run() {
                 // ② 再 parse::<u16>（超范围拒绝）③ 拒绝 0 与 9222
                 // 注入串只由解析后的数字重建；固定仅监听 127.0.0.1。
                 #[cfg(debug_assertions)]
-                let cdp_extra = match std::env::var("FR_TEST_CDP_PORT") {
+                let cdp_extra = match std::env::var("TP_TEST_CDP_PORT") {
                     Ok(raw) => {
                         let ascii_digits =
                             !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
@@ -263,17 +284,48 @@ pub fn run() {
                 // 环境会静默失败，产生无法加载页面的"幽灵窗口"
                 let main_window_args = full.clone();
                 wb = wb.additional_browser_args(&full);
-                let main_window = wb.build()?;
+                let main_window = match wb.build() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        memlog::fatal("window_build", &e.to_string());
+                        return Err(Box::new(e));
+                    }
+                };
                 // 建窗后立刻重算非客户区并手动恢复几何（防「每启动一次窗口长高一点」），
                 // 仍早于其余 setup 工作，且不改变「140ms 后才 show」的启动观感。
                 #[cfg(windows)]
                 restore_main_window_state(&main_window);
                 db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);
+                memlog::stage("setup:window");
             }
 
             let covers_dir = data_dir.join("covers");
             std::fs::create_dir_all(&covers_dir).ok();
             db::reset_epub_covers(&conn, &covers_dir);
+            // 封面自愈（每个进程最多一次）：cover_path 指向的文件已不存在时复位，交给扫描重建。
+            // 必须落在 create_dir_all 之后、ensure_scan_worker（下一步）之前：worker 一旦开始认领，
+            // 复位就会与在途的 meta_done=1 记录交叉（那本书会被当成"已完成"跳过，封面永远是空的）。
+            // manual 模式下整段跳过：不复位、也不写任何标记。
+            match db::get_setting(&conn, library::COVER_SCAN_MODE_KEY).as_deref() {
+                Some("manual") => {
+                    memlog::stage("setup:cover_heal_skipped_manual");
+                }
+                Some(_) => {
+                    let rep = db::heal_missing_covers(&conn, &covers_dir);
+                    library::mark_cover_heal_done();
+                    library::log_cover_heal(&rep);
+                    memlog::stage(&format!(
+                        "setup:cover_heal scanned={} reset={} custom={}",
+                        rep.scanned, rep.reset, rep.reset_custom
+                    ));
+                }
+                // 键还不存在（升级后第一次启动）：此时无法判断手动/自动，先不动；
+                // 前端启动时必定推一次 set_cover_scan，由那里补做（模式未知时不猜）。
+                None => {
+                    memlog::stage("setup:cover_heal_deferred");
+                }
+            }
+            memlog::stage("setup:covers_dir");
             // 共享 client 不再全局放宽 TLS：公网目标严格校验证书。按目标本机/私有
             // 选择 client 的逻辑集中在 ai::build_client（带缓存），此字段仅作通用兜底。
             let http = reqwest::Client::builder()
@@ -298,12 +350,14 @@ pub fn run() {
                 cover_scan_done: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_total: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_enabled: std::sync::atomic::AtomicBool::new(true),
+                cover_scan_ws_base: std::sync::atomic::AtomicU64::new(0),
                 cover_style_ver: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
 
             // 冷启动增量扫描：处理全部 `meta_done=0`（含存量与新增），逐本提交、扫完即静默。
             // 不再一次性把全部未处理 id 载入内存；worker 内部分批查询 + 限流（见 library::on_startup）。
+            memlog::stage("setup:state_ready");
             library::ensure_scan_worker(&app.handle().clone());
 
             {
@@ -315,7 +369,7 @@ pub fn run() {
                 if !folders.is_empty() {
                     let st2 = st.clone();
                     tauri::async_runtime::spawn(async move {
-                        library::scan_folders(&st2, None).await;
+                        library::scan_folders(&st2, None, library::ScanOrigin::Startup).await;
                     });
                     library::install_watcher(&st);
                 }
@@ -343,6 +397,11 @@ pub fn run() {
         .register_uri_scheme_protocol("tidepage", |ctx, request| {
             use tauri::Manager;
             let path = request.uri().path().trim_start_matches('/');
+            memlog::watch("proto");
+            let proto_requests = PROTO_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if proto_requests == 1 || proto_requests % 2000 == 0 {
+                memlog::stage_note("proto:count", &format!("requests={proto_requests} path={path}"));
+            }
             let dir = covers::covers_dir(ctx.app_handle());
             let dc_theme = parse_dc_theme(request.uri().query());
 
@@ -509,6 +568,13 @@ pub fn run() {
                     covers::placeholder_svg("", "").into_bytes(),
                 )
             };
+            if bytes.len() > 1024 * 1024 {
+                memlog::stage_note(
+                    "proto:big",
+                    &format!("path={path} bytes={} mime={mime}", bytes.len()),
+                );
+            }
+            memlog::watch("proto:body");
             // 仅跨域加载字体需要 CORS（@font-face 受 CORS 限制）；图片/封面由
             // <img>/CSS 直接显示，无需也不应回显 `*`，收紧为仅字体响应放行。
             let mut builder = tauri::http::Response::builder()
@@ -540,6 +606,7 @@ pub fn run() {
             library::rescan,
             library::refresh_library,
             library::file_exists,
+            library::get_last_scan_stale,
             library::path_is_dir,
             library::open_book,
             library::get_chapter,
@@ -558,9 +625,16 @@ pub fn run() {
             library::set_custom_cover,
             library::read_book_bytes,
             library::pdf_file_size,
+            // 超大 PDF 的原生渲染通道（见 pdfnative.rs）
+            pdfnative::pdf_native_open,
+            pdfnative::pdf_native_page_geometry,
+            pdfnative::pdf_native_render_page,
+            pdfnative::pdf_native_close,
             library::pdf_read_range,
             library::set_book_cover_image,
             library::set_cover_scan,
+            library::library_ready,
+            library::list_book_ids_page,
             library::pdf_books_missing_cover,
             library::set_pdf_page_text,
             library::webdav_test,
@@ -662,8 +736,9 @@ mod tests {
                 "{p} 应长期缓存"
             );
         }
-        // 背景图 URL 无版本分量，只能短缓存
+        // 背景图：新图按时间戳+序号唯一命名（换图即换 URL），但端点仍要照顾历史遗留的同名文件
         assert_eq!(cache_control_for("bg/a.png"), Some("public, max-age=60"));
+        assert_eq!(cache_control_for("bg/bg-1-0.png"), Some("public, max-age=60"));
         // 字体等保持原行为
         assert_eq!(cache_control_for("fonts/a.ttf"), None);
         assert_eq!(cache_control_for("other"), None);

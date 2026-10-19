@@ -112,7 +112,7 @@
     flex-direction: column;
     gap: 7px;
     max-width: 340px;
-    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .hm-text {

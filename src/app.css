@@ -521,7 +521,7 @@ input[type="range"] {
 }
 
 /* 分段控件（如 浅色/深色/系统） */
-.fr-seg {
+.tp-seg {
   display: inline-flex;
   padding: 2px;
   gap: 2px;
@@ -530,7 +530,7 @@ input[type="range"] {
   border: 1px solid var(--line);
 }
 
-.fr-seg button {
+.tp-seg button {
   border: none;
   background: transparent;
   box-shadow: none;
@@ -544,17 +544,17 @@ input[type="range"] {
     box-shadow var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
 
-.fr-seg button:hover:not(:disabled) {
+.tp-seg button:hover:not(:disabled) {
   background: transparent;
   color: var(--fg);
   box-shadow: none;
 }
 
-.fr-seg button:active:not(:disabled) {
+.tp-seg button:active:not(:disabled) {
   transform: none;
 }
 
-.fr-seg button.active {
+.tp-seg button.active {
   background: var(--bg-elev);
   color: var(--fg);
   font-weight: 600;
@@ -608,11 +608,11 @@ dialog[open] {
   height: fit-content;
   max-height: 88vh;
   z-index: var(--z-modal);
-  animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
+  animation: tp-dialog-in var(--dur-modal) var(--ease-premium) both;
 }
 
 /* 弹窗入场：轻微放大 + 上浮 + 去模糊落位，模拟从景深里浮现（skill: heavy fade-up） */
-@keyframes fr-dialog-in {
+@keyframes tp-dialog-in {
   from {
     opacity: 0;
     transform: translateY(10px) scale(0.97);
@@ -819,7 +819,7 @@ p,
   display: flex;
   flex-direction: column;
   box-shadow: var(--rdr-shadow-panel);
-  animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
+  animation: tp-drawer-in-right var(--dur-lift) var(--ease-premium) both;
 }
 
 .sidepanel--left {
@@ -827,12 +827,12 @@ p,
   left: 0;
   border-left: none;
   border-right: 1px solid var(--rdr-line);
-  animation-name: fr-drawer-in-left;
+  animation-name: tp-drawer-in-left;
 }
 
 /* 侧面板滑入：右侧抽屉用（.sidepanel），左侧抽屉用 --left 修饰。
    方向不同的两套各写一份，因为纯 translateX 无法用一枚变量表达正负。 */
-@keyframes fr-drawer-in-right {
+@keyframes tp-drawer-in-right {
   from {
     transform: translateX(24px);
     opacity: 0;
@@ -843,7 +843,7 @@ p,
   }
 }
 
-@keyframes fr-drawer-in-left {
+@keyframes tp-drawer-in-left {
   from {
     transform: translateX(-24px);
     opacity: 0;
@@ -929,10 +929,10 @@ p,
   padding: var(--sp-1);
   min-width: 208px;
   transform-origin: top left;
-  animation: fr-menu-in var(--dur) var(--ease-premium) both;
+  animation: tp-menu-in var(--dur) var(--ease-premium) both;
 }
 
-@keyframes fr-menu-in {
+@keyframes tp-menu-in {
   from {
     opacity: 0;
     transform: translateY(-6px) scale(0.96);
@@ -945,7 +945,7 @@ p,
 
 /* 遮罩淡入：全应用唯一的「纯不透明度」入场。原先有 4 份同名同体的副本
    （overlay-in / bd-overlay-in / nd-backdrop-in / iv-in），全部收敛到这里。 */
-@keyframes fr-fade-in {
+@keyframes tp-fade-in {
   from {
     opacity: 0;
   }
@@ -957,7 +957,7 @@ p,
 /* 轻量浮层入场（划线菜单、选区菜单、取色框、TTS 起播菜单、AI 快速弹窗…）：
    原先有 5 份副本，仅位移差 1px（4/5/6px），肉眼无法分辨，统一取 5px。
    刻意不带 blur —— blur 会与浮层内正在渲染的内容抢合成层。 */
-@keyframes fr-pop-in {
+@keyframes tp-pop-in {
   from {
     opacity: 0;
     transform: translateY(5px) scale(0.97);
@@ -972,7 +972,7 @@ p,
    ⚠️ 用的是独立的 translate 属性而不是 transform —— transform 会被动画整个覆盖，
       而 TTS 播放条这类元素靠 transform: translateX(-50%) 居中，用 transform 做动画
       会让它在动画期间失去居中然后突然跳回。translate 与 transform 是叠加关系。 */
-@keyframes fr-rise-in {
+@keyframes tp-rise-in {
   from {
     opacity: 0;
     translate: 0 6px;
@@ -985,7 +985,7 @@ p,
 
 /* 循环旋转（加载中）。循环动画不属于交互反馈，故时长自声明（1s），
    与 --dur-* 无关；reduce-motion 下会被全局块静止。 */
-@keyframes fr-spin {
+@keyframes tp-spin {
   to {
     transform: rotate(360deg);
   }
@@ -1025,7 +1025,7 @@ p,
    卡片内容分层揭示（书库/阅读器封面卡）
    封面在位后，标题与作者依次上浮。纯 transform/opacity。
    ============================================================ */
-@keyframes fr-meta-rise {
+@keyframes tp-meta-rise {
   from {
     opacity: 0;
     transform: translateY(6px);
@@ -1218,13 +1218,13 @@ details.adv[open] > summary .fold,
 
 /* ===================== 顶栏按钮真实拖拽排序 ===================== */
 /* 被拖起的原件留一个淡影占位，避免整条工具栏抖动。 */
-.fr-drag-src {
+.tp-drag-src {
   opacity: 0.28;
   transition: opacity var(--dur-fast) var(--ease);
 }
 
 /* 跟随指针的「拿起」浮层：只动 transform，不触发布局。 */
-.fr-drag-ghost {
+.tp-drag-ghost {
   position: fixed;
   left: 0;
   top: 0;
@@ -1243,7 +1243,7 @@ details.adv[open] > summary .fold,
 }
 
 /* 落点指示：一根跟随目标位置的竖线（横向组）/ 横线（纵向组），比硬阴影线更轻。 */
-.fr-drag-caret {
+.tp-drag-caret {
   position: absolute;
   border-radius: var(--radius-xs);
   background: var(--accent);
@@ -1253,14 +1253,14 @@ details.adv[open] > summary .fold,
   will-change: transform;
 }
 
-.fr-drag-caret[data-axis="x"] {
+.tp-drag-caret[data-axis="x"] {
   top: 3px;
   bottom: 3px;
   left: 0;
   width: 2px;
 }
 
-.fr-drag-caret[data-axis="y"] {
+.tp-drag-caret[data-axis="y"] {
   left: 3px;
   right: 3px;
   top: 0;
@@ -1293,7 +1293,7 @@ details.adv[open] > summary .fold,
   white-space: nowrap;
   pointer-events: none;
   box-shadow: var(--shadow-md);
-  animation: fr-tip-in var(--dur-fast) var(--ease-in) both;
+  animation: tp-tip-in var(--dur-fast) var(--ease-in) both;
 }
 
 /* 靠近窗口左右边缘的按钮：让提示向内侧对齐，避免溢出被裁掉 */
@@ -1309,7 +1309,7 @@ details.adv[open] > summary .fold,
   transform: none;
 }
 
-@keyframes fr-tip-in {
+@keyframes tp-tip-in {
   from {
     opacity: 0;
     transform: translate(-50%, -3px);
@@ -1322,10 +1322,10 @@ details.adv[open] > summary .fold,
 
 [data-tip].tip-left::after,
 [data-tip].tip-right::after {
-  animation-name: fr-tip-in-side;
+  animation-name: tp-tip-in-side;
 }
 
-@keyframes fr-tip-in-side {
+@keyframes tp-tip-in-side {
   from {
     opacity: 0;
   }
@@ -1357,7 +1357,7 @@ details.adv[open] > summary .fold,
    流式更新只改最后一条的文本内容、元素不重挂，故不会重播。
    必须定义在全局：Svelte 会重命名组件内 @keyframes，reduce-motion 覆盖引用不到。
    ============================================================ */
-@keyframes fr-bubble-in {
+@keyframes tp-bubble-in {
   from {
     opacity: 0;
     transform: translateY(8px) scale(0.98);
@@ -1376,7 +1376,7 @@ details.adv[open] > summary .fold,
    position:fixed 子元素，任何残留/进行中的 transform 都会改变其包含块、
    使固定定位失效。纯透明度过渡既无此风险，也与弹窗自身的入场动效不打架。
    ============================================================ */
-@keyframes fr-set-pane-in {
+@keyframes tp-set-pane-in {
   from {
     opacity: 0;
   }

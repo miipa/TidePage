@@ -101,8 +101,13 @@ export function bindKeyMatches(stored: string, combo: string): boolean {
   return normBindKey(stored) === normBindKey(combo);
 }
 
+import type { ChapterTransition, PageTransition } from "./chapterTx";
+
 export type TextAlign = "justify" | "left";
-export type ScrollBounceLevel = "weak" | "medium" | "strong";
+/** 滚动模式的章节过渡档位（定义在 lib/chapterTx.ts，与过渡几何/解锁判据同源）。 */
+export type { ChapterTransition };
+/** 翻页模式（单栏/双栏）的章节过渡档位。 */
+export type { PageTransition };
 
 /** 顶栏/底栏可显示的状态项。 */
 export type StatusItemId =
@@ -141,16 +146,6 @@ export const STATUS_ITEM_DEFS: { id: StatusItemId; name: string }[] = [
 ];
 
 export const STATUS_ITEM_IDS: Set<string> = new Set(STATUS_ITEM_DEFS.map((d) => d.id));
-
-/// 滚动模式「章节过渡」三档预设：数值越大，切换章节所需滚动量越大。
-export const SCROLL_BOUNCE_PRESETS: Record<
-  ScrollBounceLevel,
-  { strength: number; threshold: number; label: string }
-> = {
-  weak: { strength: 0.25, threshold: 180, label: "弱（少量滚动即切换）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
-  medium: { strength: 0.5, threshold: 340, label: "中（推荐）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
-  strong: { strength: 1.2, threshold: 800, label: "强（需滚更多才切换）" }, // i18n-allow:标识符：SCROLL_BOUNCE_PRESETS 里 id 的中文别名（源码可读性用）。落盘只存 ASCII id，界面渲染走 labelOfId("bounce", id)，中文不上屏。
-};
 
 /** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
 export const READER_TOPBAR_IDS = [
@@ -228,8 +223,10 @@ export interface ReaderConfig {
   immersive: boolean;
   customFonts: { family: string; file: string }[];
   aiPanelWidth: number;
-  scrollBounce: boolean;
-  scrollBounceLevel: ScrollBounceLevel;
+  /** 滚动模式的章节过渡档位（cover/spring/none）。 */
+  chapterTransition: ChapterTransition;
+  /** 翻页模式（单栏/双栏）的章节过渡档位（h-spring/h-slide/none）。 */
+  pageTransition: PageTransition;
   multiWindow: boolean;
   statusPos: "left" | "center" | "right" | "none";
   statusColor: string;
@@ -1044,15 +1041,15 @@ const DEFAULTS: AppConfig = {
       { family: "lxgwwenkai-regular", file: "lxgwwenkai-regular.ttf" },
     ],
     aiPanelWidth: 360,
-    scrollBounce: true,
-    scrollBounceLevel: "weak",
+    chapterTransition: "cover",
+    pageTransition: "h-slide",
     multiWindow: false,
     statusPos: "center",
     statusColor: "",
     topbarColor: "",
     topbarOrder: [...READER_TOPBAR_IDS],
     topbarHidden: [],
-    manga: { imgScale: 1.5, fitWidth: false, fitHeight: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "", autoDetect: true },
+    manga: { imgScale: 1.5, fitWidth: true, fitHeight: false, marginH: 8, marginV: 8, imgGap: 6, layout: "flow", direction: "ltr", hideText: false, bgColor: "", autoDetect: true },
     mangaGuideDone: false,
     statusItems: [
       { id: "chapterName", enabled: true },
@@ -1356,6 +1353,10 @@ const DEPRECATED_READER_KEYS = [
   "fauxItalic",
   "letterSpacing",
   "punctuationCompression",
+  // 「章节过渡」旧三键已由 chapterTransition 取代（层叠覆盖/阻尼弹簧/关闭）：物理清掉，
+  // 否则 spread(saved.reader) 会让这两个死字段永远写回 localStorage。
+  "scrollBounce",
+  "scrollBounceLevel",
   "scrollBounceStrength",
   "scrollBounceThreshold",
   // 边距由标量 marginH/marginV 改为三作用域 margins（任务 3）：旧键要在被清掉前读出来播种，
@@ -1446,21 +1447,17 @@ function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
   if (r.fontSize !== fsz) { r.fontSize = fsz; dirty = true; }
   const ta = r.textAlign === "left" ? "left" : "justify";
   if (r.textAlign !== ta) { r.textAlign = ta; dirty = true; }
-  // 旧 strength/threshold → 三档 level（仅当旧字段存在且未有 level 时换算）
-  if (
-    savedRaw &&
-    savedRaw.scrollBounceLevel == null &&
-    (savedRaw.scrollBounceStrength != null || savedRaw.scrollBounceThreshold != null)
-  ) {
-    const s = Number(savedRaw.scrollBounceStrength);
-    const t = Number(savedRaw.scrollBounceThreshold);
-    const score = (Number.isFinite(s) ? s : 0.5) * 1000 + (Number.isFinite(t) ? t : 340);
-    r.scrollBounceLevel = score < 1000 ? "weak" : score > 2500 ? "strong" : "medium";
+  // 「章节过渡」档位：非法/缺失一律取 cover（旧配置只有 scrollBounce* 三键，已被上面物理清掉）。
+  const ct = r.chapterTransition;
+  if (ct !== "cover" && ct !== "spring" && ct !== "none") {
+    r.chapterTransition = "cover";
     dirty = true;
   }
-  const lvl = r.scrollBounceLevel;
-  if (lvl !== "weak" && lvl !== "medium" && lvl !== "strong") {
-    r.scrollBounceLevel = "medium";
+  // 翻页模式的「章节过渡」档位：非法/缺失一律取 h-slide（与普通翻页观感一致的缺省档）；
+  // 已删除的视差侧滑档也走这里 → 可预期地回落 h-slide（显式枚举，不靠默认分支吞旧值）。
+  const pt = r.pageTransition;
+  if (pt !== "h-spring" && pt !== "h-slide" && pt !== "none") {
+    r.pageTransition = "h-slide";
     dirty = true;
   }
   // 旧默认 cssExtra（写死字色/标题色）→ 新默认，仅逐字匹配时替换
@@ -2694,6 +2691,7 @@ export async function copyText(text: string) {  try {
 
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
+import { AI_MODE_KEY, AI_OPEN_KEY, AI_WIN_H_KEY, AI_WIN_W_KEY } from "./aiPanelKeys";
 
 // 版本号单一数据源：构建期由 vite.config.js 从 package.json 注入 __APP_VERSION__
 // （与 src-tauri/tauri.conf.json 的 version 保持一致），避免运行时读版本所需的权限问题。
@@ -2745,14 +2743,14 @@ export const AI_WIN_LABEL = "tidepage-ai";
 
 export const aiState = $state({
   lastMode: (typeof localStorage !== "undefined"
-    ? (localStorage.getItem("fr.ai.mode") as "drawer" | "window" | null)
+    ? (localStorage.getItem(AI_MODE_KEY) as "drawer" | "window" | null)
     : null) ?? "drawer",
 });
 
 export function saveAiMode(m: "drawer" | "window") {
   aiState.lastMode = m;
   try {
-    localStorage.setItem("fr.ai.mode", m);
+    localStorage.setItem(AI_MODE_KEY, m);
   } catch { /* ignore */ }
 }
 
@@ -2760,8 +2758,8 @@ export function saveAiMode(m: "drawer" | "window") {
  *  不再读写 ui.aiOpen：抽屉显隐一律由使用方（Reader.rightPanel）掌控。 */
 export async function openAiWindow(): Promise<boolean> {
   saveAiMode("window");
-  const w = Number(localStorage.getItem("fr.ai.winw")) || 430;
-  const h = Number(localStorage.getItem("fr.ai.winh")) || 700;
+  const w = Number(localStorage.getItem(AI_WIN_W_KEY)) || 430;
+  const h = Number(localStorage.getItem(AI_WIN_H_KEY)) || 700;
   const extra = await winExtraOptions();
   return await new Promise<boolean>((resolve) => {
     try {
@@ -2777,7 +2775,7 @@ export async function openAiWindow(): Promise<boolean> {
         ...extra,
       });
       win.once("tauri://created", () => {
-        localStorage.setItem("fr.ai.open", "1");
+        localStorage.setItem(AI_OPEN_KEY, "1");
         try {
           emit("ai-window-status", { open: true });
         } catch { /* ignore */ }
@@ -2796,7 +2794,7 @@ export async function openAiWindow(): Promise<boolean> {
 
 export function aiWindowOpenMark(): string | null {
   try {
-    return localStorage.getItem("fr.ai.open");
+    return localStorage.getItem(AI_OPEN_KEY);
   } catch {
     return null;
   }
@@ -2864,7 +2862,7 @@ export async function emit(_event: string, _payload: unknown) {
 export async function toggleAi(): Promise<boolean> {
   let mode = aiState.lastMode;
   try {
-    const m = localStorage.getItem("fr.ai.mode");
+    const m = localStorage.getItem(AI_MODE_KEY);
     if (m === "drawer" || m === "window") mode = m as "drawer" | "window";
   } catch { /* ignore */ }
   if (mode === "window") {
@@ -2874,7 +2872,7 @@ export async function toggleAi(): Promise<boolean> {
         await w.unminimize().catch(() => {});
         await w.show().catch(() => {});
         await w.setFocus().catch(() => {});
-        localStorage.setItem("fr.ai.open", "1");
+        localStorage.setItem(AI_OPEN_KEY, "1");
         return true;
       }
     } catch { /* ignore */ }
@@ -2885,11 +2883,11 @@ export async function toggleAi(): Promise<boolean> {
         existing.unminimize();
         existing.show();
         existing.setFocus();
-        localStorage.setItem("fr.ai.open", "1");
+        localStorage.setItem(AI_OPEN_KEY, "1");
         return true;
       }
     } catch { /* ignore */ }
-    localStorage.setItem("fr.ai.open", "0");
+    localStorage.setItem(AI_OPEN_KEY, "0");
     return await openAiWindow();
   }
   // drawer 模式：抽屉显隐由 Reader.rightPanel 掌控，这里不再改 ui.aiOpen；返回 false 让调用方开抽屉。

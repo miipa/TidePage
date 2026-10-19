@@ -400,16 +400,266 @@ pub fn placeholder_svg(title: &str, author: &str) -> String {
     default_cover_svg(title, author, None)
 }
 
+/// 单张封面允许的最大输入字节（解码前的压缩数据）。正常首页 PNG 是几百 KB~数 MB。
+const COVER_MAX_INPUT_BYTES: usize = 24 * 1024 * 1024;
+/// 单张封面允许的最大像素数（宽 × 高）。解码后每像素 4 字节，2400 万像素 ≈ 96MB RGBA，
+/// 对 320×480 的缩略图产品来说是三个数量级的余量。
+/// 为什么必须挡在解码前：`image::load_from_memory` 会按整幅尺寸一次申请 宽×高×4 ——
+/// 超长条页面（扫描漫画/拼版 PDF 首页）能一次要出 GB 级缓冲，正是把启动期封面重建撑爆的分配形态。
+const COVER_MAX_PIXELS: u64 = 24_000_000;
+
+/// 从魔数判断图片扩展名：封面落盘用，只认前端会产的三种（顺带挡住把任意文件写进封面目录）。
+pub fn sniff_ext(data: &[u8]) -> Option<&'static str> {
+    if data.len() > 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("png");
+    }
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpeg");
+    }
+    None
+}
+
 pub fn make_thumbnail(data: &[u8], out_png: &Path) -> Result<(), String> {
+    if data.len() > COVER_MAX_INPUT_BYTES {
+        return Err(format!(
+            "封面数据过大：{} 字节（上限 {COVER_MAX_INPUT_BYTES}）",
+            data.len()
+        ));
+    }
+    // 只读文件头拿尺寸（不解码像素），超限直接拒绝。
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())?;
+    if (w as u64).saturating_mul(h as u64) > COVER_MAX_PIXELS {
+        return Err(format!("封面尺寸过大：{w}×{h}（上限 {COVER_MAX_PIXELS} 像素）"));
+    }
     let img = image::load_from_memory(data).map_err(|e| e.to_string())?;
     let thumb = img.thumbnail(320, 480);
     thumb.save(out_png).map_err(|e| e.to_string())?;
     Ok(())
 }
 
+/* ================= 够用就直出（容器格式封面重建的提速主路径） =================
+ *
+ * 缩略图产品是 320×480 的 PNG；源图若本来就够小，解码 + 缩放 + 重编码是纯浪费。
+ * 直出三门槛（**全部**满足才走，任何一条不满足一律回落 make_thumbnail，该路径不删）：
+ *   1. 魔数命中 sniff_ext（只认 png/jpeg/webp，顺带挡住任意字节）；
+ *   2. 只读文件头得到的像素数 ≤ COVER_DIRECT_MAX_PIXELS：
+ *      WebView 解码一张封面要 宽×高×4 字节（1.5M 像素 ≈ 6MB），首屏卡片约 30 张，须留余量；
+ *   3. 原始字节 ≤ COVER_DIRECT_MAX_BYTES：epub 里的无损 PNG 常见 2–5MB，
+ *      16 万本 × 2MB ≈ 320GB —— 磁盘与解码两头都不划算。
+ */
+pub const COVER_DIRECT_MAX_PIXELS: u64 = 1_500_000;
+/// 直出字节上限：兼顾磁盘占用与 WebView 解码成本（256KB）。
+pub const COVER_DIRECT_MAX_BYTES: usize = 256 * 1024;
+
+/// 够用就直出：返回可直写的扩展名；None ⇒ 调用方必须回落 `make_thumbnail`。
+/// 只读文件头取尺寸（`into_dimensions`），不解码像素。
+pub fn direct_cover_ext(data: &[u8]) -> Option<&'static str> {
+    if data.is_empty() || data.len() > COVER_DIRECT_MAX_BYTES {
+        return None;
+    }
+    let ext = sniff_ext(data)?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if (w as u64).saturating_mul(h as u64) > COVER_DIRECT_MAX_PIXELS {
+        return None;
+    }
+    Some(ext)
+}
+
+/// 封面文件名是否属于「允许做同 stem 清理」的两类命名：`{数字}`（自动生成）与
+/// `custom-{数字}`（手动选图 / PDF 首页）。其它命名（`bg-*`、`background.img`、
+/// `default-cover.img` 等）一律不碰 —— 回收范围只能收窄，不能扩大。
+pub fn is_cover_stem(stem: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = stem.strip_prefix("custom-") {
+        return digits(rest);
+    }
+    digits(stem)
+}
+
+/// 按 **stem 完全相等** 清理同一封面的其它扩展名文件，保留 `keep`（刚写入的文件名）。
+/// 不用 `starts_with`：`123.png` 属于书 `123`，但 `starts_with("123")` 也会命中 `1234.png`。
+/// 返回删除的文件数。只处理 `is_cover_stem` 认可的命名。
+pub fn clean_same_stem(dir: &Path, stem: &str, keep: &str) -> usize {
+    if !is_cover_stem(stem) {
+        return 0;
+    }
+    let keep_lower = keep.to_lowercase();
+    let stem_lower = stem.to_lowercase();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.to_lowercase() == keep_lower {
+            continue;
+        }
+        // 只比 stem：扩展名任意。
+        let same = Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase() == stem_lower)
+            .unwrap_or(false);
+        if same && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 落盘一张封面：够用直出（原始字节 + 嗅探扩展名），否则解码缩放重编码为 PNG。
+/// 写入后清理同一 stem 的其它扩展名旧文件（保留刚写入的那个）。
+/// 返回 (文件名, 是否直出)。
+pub fn save_cover(dir: &Path, stem: &str, data: &[u8]) -> Result<(String, bool), String> {
+    if let Some(ext) = direct_cover_ext(data) {
+        let name = format!("{stem}.{ext}");
+        std::fs::write(dir.join(&name), data).map_err(|e| e.to_string())?;
+        clean_same_stem(dir, stem, &name);
+        return Ok((name, true));
+    }
+    let name = format!("{stem}.png");
+    make_thumbnail(data, &dir.join(&name))?;
+    clean_same_stem(dir, stem, &name);
+    Ok((name, false))
+}
+
 #[cfg(test)]
 mod tests {
+    /// 封面链路耗时对照（用 --nocapture 看数字）：
+    /// 旧路径 = 800px PNG 解码 + 缩放到 320×480；新路径 = 魔数判扩展名 + 直接落盘。
+    #[test]
+    fn cover_path_cost_compare() {
+        use image::RgbaImage;
+        let mut img = RgbaImage::new(800, 1100);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("tp_cover_cost_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("old.png");
+        let t0 = std::time::Instant::now();
+        make_thumbnail(&png, &out).unwrap();
+        let old = t0.elapsed();
+        let old_size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let out2 = dir.join("new.webp");
+        let t1 = std::time::Instant::now();
+        let ext = sniff_ext(&png).unwrap();
+        std::fs::write(&out2, &png).unwrap();
+        let new = t1.elapsed();
+        println!("png_in={}KB old(make_thumbnail)={:?} old_out={}KB | new(sniff+write)={:?} ext={}",
+            png.len() / 1024, old, old_size / 1024, new, ext);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
+
+    /// 小图 PNG 字节（供直出判定用）。
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        use image::RgbaImage;
+        let img = RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tp_covers_x_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn direct_cover_ext_limits() {
+        let small = png_bytes(300, 400); // 120k 像素、字节很小
+        assert_eq!(direct_cover_ext(&small), Some("png"));
+        // 超像素上限（1600×1000 = 1.6M > 1.5M）
+        let big_px = png_bytes(1600, 1000);
+        assert_eq!(direct_cover_ext(&big_px), None);
+        // 超字节上限：塞到 256KB 以上（PNG 里追加 IDAT 会破坏文件，这里直接造大数组）
+        let mut over = small.clone();
+        over.extend(std::iter::repeat(0u8).take(COVER_DIRECT_MAX_BYTES));
+        assert_eq!(direct_cover_ext(&over), None);
+        // 非图片字节：魔数不命中
+        assert_eq!(direct_cover_ext(&[0u8; 64]), None);
+        assert_eq!(direct_cover_ext(&[]), None);
+        // JPEG 魔数（只读头，尺寸解析失败也不得 panic）
+        assert_eq!(direct_cover_ext(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn is_cover_stem_only_two_shapes() {
+        assert!(is_cover_stem("123"));
+        assert!(is_cover_stem("1234"));
+        assert!(is_cover_stem("custom-123"));
+        assert!(!is_cover_stem("custom-"));
+        assert!(!is_cover_stem("custom-abc"));
+        assert!(!is_cover_stem("bg-1792370600155-10"));
+        assert!(!is_cover_stem("background"));
+        assert!(!is_cover_stem("default-cover"));
+        assert!(!is_cover_stem(""));
+    }
+
+    #[test]
+    fn clean_same_stem_exact_stem_only() {
+        let d = tmpdir("stem");
+        std::fs::write(d.join("123.png"), b"a").unwrap();
+        std::fs::write(d.join("123.webp"), b"b").unwrap();
+        std::fs::write(d.join("1234.png"), b"c").unwrap(); // 前缀陷阱：不同 stem，不能删
+        std::fs::write(d.join("bg-1-2.png"), b"d").unwrap(); // 非封面命名，不能删
+        let removed = clean_same_stem(&d, "123", "123.webp");
+        assert_eq!(removed, 1, "只删同 stem 的另一扩展名");
+        assert!(d.join("123.webp").exists(), "保留刚写入的那份");
+        assert!(!d.join("123.png").exists());
+        assert!(d.join("1234.png").exists(), "不得用 starts_with 误删 1234.png");
+        assert!(d.join("bg-1-2.png").exists(), "不得触碰 bg-*");
+        // custom- 形态
+        std::fs::write(d.join("custom-7.png"), b"e").unwrap();
+        std::fs::write(d.join("custom-7.webp"), b"f").unwrap();
+        assert_eq!(clean_same_stem(&d, "custom-7", "custom-7.png"), 1);
+        assert!(d.join("custom-7.png").exists() && !d.join("custom-7.webp").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_cover_direct_vs_thumbnail() {
+        let d = tmpdir("save");
+        // 直出：小 PNG 原字节落盘，扩展名按魔数，并清掉旧的 .png
+        let small = png_bytes(320, 480);
+        std::fs::write(d.join("42.png"), b"old").unwrap();
+        let (name, direct) = save_cover(&d, "42", &small).unwrap();
+        assert!(direct);
+        assert_eq!(name, "42.png");
+        assert_eq!(std::fs::read(d.join(&name)).unwrap(), small, "直出必须保留原始字节");
+        // 回落到缩略图：超像素上限的图 → PNG 且被缩到 320×480 以内
+        let big = png_bytes(2000, 3000);
+        let (name2, direct2) = save_cover(&d, "43", &big).unwrap();
+        assert!(!direct2);
+        assert_eq!(name2, "43.png");
+        let img = image::open(d.join(&name2)).unwrap();
+        assert!(img.width() <= 320 && img.height() <= 480, "回落路径必须缩放");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn wrap_short_title_one_line() {

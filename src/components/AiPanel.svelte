@@ -8,6 +8,7 @@
   import { dragSort } from "../lib/dragSort";
 import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
+  import { AI_CTX_KEY } from "../lib/aiPanelKeys";
   import {
     IconArrowsSplit2,
     IconChevronLeft,
@@ -111,7 +112,7 @@ import { reorderByDrop } from "../lib/reorder";
   let saHeadH = $state(0);
   $effect(() => {
     if (standalone && saHeadH > 0) {
-      document.documentElement.style.setProperty("--fr-titlebar-h", saHeadH + 20 + "px");
+      document.documentElement.style.setProperty("--tp-titlebar-h", saHeadH + 20 + "px");
     }
   });
 
@@ -135,11 +136,11 @@ import { reorderByDrop } from "../lib/reorder";
 
   if (standalone) {
     try {
-      const raw = localStorage.getItem("fr.ai.ctx");
+      const raw = localStorage.getItem(AI_CTX_KEY);
       if (raw) ctx = JSON.parse(raw);
     } catch { /* ignore */ }
     window.addEventListener("storage", (e) => {
-      if (e.key === "fr.ai.ctx" && e.newValue) {
+      if (e.key === AI_CTX_KEY && e.newValue) {
         try {
           ctx = JSON.parse(e.newValue);
           tick().then(() => {
@@ -362,7 +363,7 @@ import { reorderByDrop } from "../lib/reorder";
     run(config.ai.system, renderPrompt(p));
   }
 
-  /** 提示词按钮真实拖拽排序（特效同主程序顶栏，走 dragSort + .fr-drag-* 样式）。
+  /** 提示词按钮真实拖拽排序（特效同主程序顶栏，走 dragSort + .tp-drag-* 样式）。
    *  直接重排 config.ai.prompts 数组并持久化：这样「自动执行第一个提示词」(prompts[0])
    *  在排序变动后天然指向新的首位，无需另存顺序表，避免出现执行到旧首位的漂移。 */
   function promptDrop(from: string, target: string, place: "before" | "after") {
@@ -1212,7 +1213,7 @@ ${readerStyle.extra}
     display: flex;
     flex-direction: column;
     box-shadow: var(--rdr-shadow-panel);
-    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
+    animation: tp-drawer-in-right var(--dur-lift) var(--ease-premium) both;
   }
 
   .ai-panel.standalone {
@@ -1321,7 +1322,7 @@ ${readerStyle.extra}
     /* 新消息入场：从下方轻微上浮落位。msgs 以 index 为 key，追加新消息才挂载该元素，
        故动画只在「新气泡出现」时跑一次；流式更新只改最后一条文本、元素不重挂，不重播。
        keyframes 定义在 app.css（Svelte 会重命名组件内 @keyframes，reduce-motion 覆盖引用不到）。 */
-    animation: fr-bubble-in var(--dur-page) var(--ease-premium) both;
+    animation: tp-bubble-in var(--dur-page) var(--ease-premium) both;
   }
 
   .ai-msg.user {

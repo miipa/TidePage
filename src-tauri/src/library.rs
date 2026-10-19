@@ -1,5 +1,6 @@
 use crate::covers;
 use crate::db::{self, Db};
+use crate::memlog;
 use crate::models::*;
 use crate::txt;
 use futures_util::StreamExt;
@@ -59,7 +60,8 @@ pub struct AppState {
     #[allow(dead_code)]
     pub http: reqwest::Client,
     /// 封面增量扫描 worker 是否在跑（进程内标记，天然不会跨崩溃残留）。
-    /// 单遍串行：处理完全部 `meta_done=0` 即退出（扫完即停、不驻留、不轮询）。
+    /// 单遍：处理完全部 `meta_done=0` 即退出（扫完即停、不驻留、不轮询）。
+    /// 批内并发（COVER_EXTRACT_CONCURRENCY，默认 2），批间仍按 path 字典序串行推进。
     pub scan_running: std::sync::atomic::AtomicBool,
     /// 请求 worker 尽快退出（清缓存前避免删封面目录与写封面并发；或应用退出）。
     pub scan_stop: std::sync::atomic::AtomicBool,
@@ -72,6 +74,8 @@ pub struct AppState {
     /// 元数据/字数照旧写入、meta_done 照旧置 1 —— 否则整轮扫描会卡在缺封面的书上，
     /// 后面所有书的字数/元数据也跟着停。
     pub cover_scan_enabled: std::sync::atomic::AtomicBool,
+    /// 本轮扫描启动时的 WS 基线（MB）：批开始前比较，超过基线 +50MB 就把并发降回 1。
+    pub cover_scan_ws_base: AtomicU64,
     /// 封面默认底图 id 与解析规则版本，参与缓存失效（F5）。
     pub cover_style_ver: AtomicU64,
 }
@@ -295,25 +299,151 @@ pub fn get_rules(state: &AppState) -> String {
     db::get_setting(&conn, "txt_rules").unwrap_or_else(|| crate::default_pattern().into())
 }
 
-pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>) {
+/// 单次扫描自动删除的比例阈值：超过「登记数的 5%」或「200 条」即拒绝自动删除。
+const STALE_AUTO_DELETE_MIN: usize = 200;
+const STALE_AUTO_DELETE_PCT: usize = 5;
+
+/// 失效文件删除的决策结果（纯数据，便于单测）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StalePlan {
+    /// 连续两次都判缺失 → 本轮真删
+    pub delete: Vec<String>,
+    /// 首次判缺失 → 记进待确认
+    pub pending: Vec<String>,
+    /// 因所在目录本轮没走完而不参与判定的失效路径
+    pub skipped: Vec<String>,
+    /// 待确认里本轮重新出现的（文件回来了，要清掉登记）
+    pub revived: Vec<String>,
+    /// 规模超阈值：拒绝自动删除（全部转为待确认）
+    pub refused: bool,
+    pub limit: usize,
+}
+
+/// 失效文件判定的纯逻辑：两段确认 + 目录未走完跳过 + 规模阈值。
+/// 为什么三件事必须一起做：目录被临时改名/不可读时，一次判定就会把整目录的书行删光。
+pub(crate) fn plan_stale(
+    stale_all: Vec<String>,
+    pending: &std::collections::HashSet<String>,
+    skip_folders: &[String],
+    registered_in_scope: usize,
+) -> StalePlan {
+    let mut skipped = Vec::new();
+    let mut stale = Vec::new();
+    for path in stale_all {
+        if skip_folders
+            .iter()
+            .any(|f| std::path::Path::new(&path).starts_with(std::path::Path::new(f)))
+        {
+            skipped.push(path);
+        } else {
+            stale.push(path);
+        }
+    }
+    let limit = std::cmp::max(
+        STALE_AUTO_DELETE_MIN,
+        registered_in_scope * STALE_AUTO_DELETE_PCT / 100,
+    );
+    let refused = stale.len() > limit;
+    let mut delete = Vec::new();
+    let mut pending_now = Vec::new();
+    for path in stale.iter() {
+        if pending.contains(path) {
+            delete.push(path.clone());
+        } else {
+            pending_now.push(path.clone());
+        }
+    }
+    if refused {
+        pending_now.append(&mut delete);
+    }
+    let stale_set: std::collections::HashSet<&String> = stale.iter().collect();
+    let revived: Vec<String> = pending
+        .iter()
+        .filter(|p| !stale_set.contains(p))
+        .cloned()
+        .collect();
+    StalePlan {
+        delete,
+        pending: pending_now,
+        skipped,
+        revived,
+        refused,
+        limit,
+    }
+}
+
+/// 扫描来源：**只有 `user` 才允许弹提示**；`startup` / `timer` 一律静默，
+/// 异常态改由书库页首屏常驻提示条呈现（数据安全信号不能因为静默而消失）。
+/// 必须由调用方显式传入，不能从 `progress_scope` 推导：`rescan`（用户动作）传的也是 None。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScanOrigin {
+    Startup,
+    Timer,
+    User,
+}
+
+impl ScanOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScanOrigin::Startup => "startup",
+            ScanOrigin::Timer => "timer",
+            ScanOrigin::User => "user",
+        }
+    }
+}
+
+/// `last_scan_stale` 的 DB 键：**提示条的唯一来源**。
+/// 与 `stale_pending_*` 的分工（不得互相推导）：
+/// - `stale_pending`（db.rs）只存"待确认删除"的 path，供清理逻辑判定哪些书可删；
+///   `plan_stale` 已把 `skip_folders` 下的路径剔进 `plan.skipped`、不进 `plan.pending`，
+///   所以「目录没走完」在它里面一条都看不到。
+/// - 本键每次扫描**结束时重算并写入**完整判定（refused / unfinishedDirs / pending / skipped /
+///   主要未完成目录 / 时间），是提示条读的唯一状态；从 `stale_pending` 读会得到
+///   「目录改名时提示条显示一切正常」的错误结论。
+pub const LAST_SCAN_STALE_KEY: &str = "last_scan_stale";
+
+/// 扫描入口写"扫描中"（清掉上一次的结论，异常中断不会残留旧状态），结束写最终态。
+fn write_scan_state(conn: &rusqlite::Connection, v: serde_json::Value) {
+    db::set_setting(conn, LAST_SCAN_STALE_KEY, &v.to_string());
+}
+
+pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>, origin: ScanOrigin) {
+    let origin_str = origin.as_str().to_string();
+    // 两段式第一段：进入扫描即写入"扫描中"（清掉上一轮结论）。
+    {
+        let conn = state.db.0.lock().unwrap();
+        write_scan_state(
+            &conn,
+            serde_json::json!({ "state": "scanning", "origin": origin_str, "at": db::now_ms() }),
+        );
+    }
     let folders = {
         let conn = state.db.0.lock().unwrap();
         db::list_folders(&conn)
     };
     let progress_on = progress_scope.is_some();
+    memlog::stage("scan_folders:start");
     // ---- 阶段一：无锁遍历目录，收集 (path → size, mtime, title, ext) ----
     let folders_walk = folders.clone();
     let prog_app = state.app.clone();
-    let (found, scanned): (HashMap<String, (i64, i64, String, String)>, usize) =
-        tauri::async_runtime::spawn_blocking(move || {
+    let origin_inner = origin_str.clone();
+    // 返回四元组：found / scanned / 每目录命中文件数 / 遍历出错的目录与原因
+    let (found, scanned, per_folder, walk_bad): (
+        HashMap<String, (i64, i64, String, String)>,
+        usize,
+        HashMap<String, usize>,
+        Vec<(String, String)>,
+    ) = tauri::async_runtime::spawn_blocking(move || {
             let mut found: HashMap<String, (i64, i64, String, String)> = HashMap::new();
+            let mut per_folder: HashMap<String, usize> = HashMap::new();
+            let mut walk_bad: Vec<(String, String)> = Vec::new();
             // scanned 只统计「本次进度范围内」的条目：不把其它已登记目录的条目算进去。
             let mut scanned: usize = 0;
             let emit = |scanned: usize, added: usize, running: bool| {
                 prog_app
                     .emit(
                         "folder-scan-progress",
-                        serde_json::json!({ "running": running, "scanned": scanned, "added": added }),
+                        serde_json::json!({ "running": running, "scanned": scanned, "added": added, "origin": origin_inner }),
                     )
                     .ok();
             };
@@ -322,11 +452,17 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
             }
             let mut last_emit = std::time::Instant::now();
             for folder in &folders_walk {
-                for entry in walkdir::WalkDir::new(folder)
-                    .follow_links(false)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
+                let mut folder_files: usize = 0;
+                let mut walk_err: Option<String> = None;
+                for entry in walkdir::WalkDir::new(folder).follow_links(false).into_iter() {
+                    // 遍历出错（权限/目录被改名/IO）→ 记下来：该目录本轮不参与 stale 判定
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            walk_err.get_or_insert_with(|| e.to_string());
+                            continue;
+                        }
+                    };
                     let path = entry.path().to_string_lossy().into_owned();
                     let scoped = progress_on
                         && progress_scope
@@ -342,8 +478,10 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
                             let mtime = file_mtime(entry.path());
                             let title = quick_title(&path);
                             found.insert(path, (size, mtime, title, ext));
+                            folder_files += 1;
                         }
                     }
+
                     // 心跳：范围内每 200 条或至少每 ~300ms 发一帧（即使条目数没到 200）。
                     if progress_on
                         && (last_emit.elapsed().as_millis() >= 300 || (scoped && scanned % 200 == 0))
@@ -352,12 +490,17 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
                         emit(scanned, 0, true);
                     }
                 }
+                per_folder.insert(folder.clone(), folder_files);
+                if let Some(msg) = walk_err {
+                    walk_bad.push((folder.clone(), msg));
+                }
             }
-            (found, scanned)
+            (found, scanned, per_folder, walk_bad)
         })
         .await
         .unwrap_or_default();
 
+    memlog::stage_note("scan_folders:walked", &format!("found={}", found.len()));
     // ---- 阶段二：一次性取锁读 `SELECT path FROM books` 入 HashSet，立即释放锁 ----
     let existing: std::collections::HashSet<String> = {
         let conn = state.db.0.lock().unwrap();
@@ -373,7 +516,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
         .map(|(p, (s, m, t, e))| (p.clone(), *s, *m, t.clone(), e.clone()))
         .collect();
     // 失效文件 = existing 中位于已登记目录、但磁盘上已不存在（不在 found）的。
-    let stale: Vec<String> = existing
+    let stale_all: Vec<String> = existing
         .iter()
         .filter(|p| {
             !found.contains_key(p.as_str())
@@ -384,9 +527,97 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
         .cloned()
         .collect();
 
+    // 每目录登记数：既用于「本轮该目录结果为空」的判定，也用于规模阈值的基数。
+    let mut registered_per_folder: HashMap<String, usize> = HashMap::new();
+    for path in existing.iter() {
+        if let Some(f) = folders
+            .iter()
+            .find(|f| std::path::Path::new(path).starts_with(std::path::Path::new(f)))
+        {
+            *registered_per_folder.entry(f.clone()).or_insert(0) += 1;
+        }
+    }
+    let registered_in_scope: usize = registered_per_folder.values().sum();
+    // 未走完的目录：遍历出错，或本轮 0 个文件而库里登记着 —— 目录被改名/暂时不可读都长这样。
+    // 这类目录本轮**不参与 stale 判定**，否则一次读不到就把整目录的书行删光。
+    let mut skip_folders: Vec<String> = Vec::new();
+    for (f, why) in walk_bad.iter() {
+        memlog::stage_note(
+            "scan_folders:unfinished",
+            &format!("dir={f} why=walk-error: {why} 未走完，跳过 stale 判定"),
+        );
+        skip_folders.push(f.clone());
+    }
+    for f in folders.iter() {
+        let hit = per_folder.get(f).copied().unwrap_or(0);
+        let reg = registered_per_folder.get(f).copied().unwrap_or(0);
+        if hit == 0 && reg > 0 && !skip_folders.contains(f) {
+            memlog::stage_note(
+                "scan_folders:unfinished",
+                &format!("dir={f} why=walked-empty registered={reg} 未走完，跳过 stale 判定"),
+            );
+            skip_folders.push(f.clone());
+        }
+    }
+    let (pending_prev, books_before) = {
+        let conn = state.db.0.lock().unwrap();
+        (db::stale_pending_all(&conn), db::count_books(&conn))
+    };
+    let plan = plan_stale(stale_all, &pending_prev, &skip_folders, registered_in_scope);
+    let stale_total = plan.pending.len() + plan.delete.len() + plan.skipped.len();
+    // 目录分布：只看本轮将删/待确认，便于事后追
+    let mut by_folder: HashMap<String, usize> = HashMap::new();
+    for path in plan.pending.iter().chain(plan.delete.iter()) {
+        if let Some(f) = folders
+            .iter()
+            .find(|f| std::path::Path::new(path).starts_with(std::path::Path::new(f)))
+        {
+            *by_folder.entry(f.clone()).or_insert(0) += 1;
+        }
+    }
+    memlog::stage_note(
+        "scan_folders:diff",
+        &format!(
+            "existing={} new={} stale={} pending={} delete={} skipped={} refused={} limit={} books_before={}",
+            existing.len(),
+            new_files.len(),
+            stale_total,
+            plan.pending.len(),
+            plan.delete.len(),
+            plan.skipped.len(),
+            plan.refused,
+            plan.limit,
+            books_before
+        ),
+    );
+    for (f, n) in by_folder.iter() {
+        memlog::stage_note("scan_folders:stale_by_dir", &format!("dir={f} n={n}"));
+    }
+    for path in plan.delete.iter().take(20) {
+        memlog::stage_note("scan_folders:stale_del_sample", path);
+    }
+    if plan.refused {
+        memlog::stage_note(
+            "scan_folders:STALE_REFUSED",
+            &format!(
+                "count={} limit={} 只登记不删除（可能是目录被改名/暂时不可读）",
+                plan.pending.len(),
+                plan.limit
+            ),
+        );
+    }
+    {
+        let conn = state.db.0.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = db::stale_pending_put(&conn, &plan.pending, now);
+        let _ = db::stale_pending_drop(&conn, &plan.revived);
+    }
     // ---- 阶段四：分批写入，每 2000 条一个事务，批间释放锁并 yield_now() ----
     let mut changed = false;
-    for chunk in stale.chunks(2000) {
+    for chunk in plan.delete.chunks(2000) {
         let r: Result<(), String> = (|| {
             let mut guard = state.db.0.lock().unwrap();
             let tx = guard.transaction().map_err(|e| e.to_string())?;
@@ -400,6 +631,50 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
             eprintln!("[scan] delete_books tx failed: {e}");
         }
         tokio::task::yield_now().await;
+    }
+    if !plan.delete.is_empty() {
+        let conn = state.db.0.lock().unwrap();
+        let _ = db::stale_pending_drop(&conn, &plan.delete);
+    }
+
+    // 两段式第二段：把本轮最终判定写进 `last_scan_stale`（提示条的唯一来源），
+    // 并在同一份数据上决定要不要发 `folder-scan-stale`（事件里带 origin）。
+    let stale = plan.refused || !skip_folders.is_empty();
+    let top_dirs: Vec<String> = skip_folders.iter().take(3).map(|d| d.to_string()).collect();
+    {
+        let conn = state.db.0.lock().unwrap();
+        let payload = serde_json::json!({
+            "state": if stale { "stale" } else { "ok" },
+            "origin": origin_str,
+            "at": db::now_ms(),
+            "refused": plan.refused,
+            "pending": plan.pending.len(),
+            "skipped": plan.skipped.len(),
+            "limit": plan.limit,
+            "unfinishedDirs": skip_folders.len(),
+            "dirs": top_dirs,
+        });
+        write_scan_state(&conn, payload.clone());
+        // 无论正常还是异常、无论谁触发，都把最终态广播一次：提示条据此出现/消失。
+        // （`folder-scan-stale` 只在异常时发，恢复时没有事件 ⇒ 提示条会一直挂着。）
+        state.app.emit("scan-stale-state", payload).ok();
+    }
+    if stale {
+        state
+            .app
+            .emit(
+                "folder-scan-stale",
+                serde_json::json!({
+                    "refused": plan.refused,
+                    "pending": plan.pending.len(),
+                    "skipped": plan.skipped.len(),
+                    "limit": plan.limit,
+                    "unfinishedDirs": skip_folders.len(),
+                    "dirs": top_dirs,
+                    "origin": origin_str,
+                }),
+            )
+            .ok();
     }
 
     let mut new_ids: Vec<i64> = Vec::with_capacity(new_files.len());
@@ -426,6 +701,19 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
         tokio::task::yield_now().await;
     }
 
+    // 留痕：新增插入完成后再数一次 books（原位置在插入前，after 不含本轮新书）。
+    {
+        let conn = state.db.0.lock().unwrap();
+        let after = db::count_books(&conn);
+        memlog::stage_note(
+            "scan_folders:books",
+            &format!(
+                "before={books_before} after={after} added={} deleted={}",
+                (after - books_before).max(0),
+                (books_before - after).max(0)
+            ),
+        );
+    }
     if changed {
         state.app.emit("library-changed", ()).ok();
     }
@@ -439,7 +727,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>)
             .app
             .emit(
                 "folder-scan-progress",
-                serde_json::json!({ "running": false, "scanned": scanned, "added": new_files.len() }),
+                serde_json::json!({ "running": false, "scanned": scanned, "added": new_files.len(), "origin": origin_str }),
             )
             .ok();
     }
@@ -478,7 +766,7 @@ pub fn spawn_watcher_loop(app: AppHandle) {
             let last = state.last_fs_event.load(Ordering::Relaxed);
             if last > last_handled && (db::now_ms() as u64) - last > 2500 {
                 last_handled = last;
-                tauri::async_runtime::block_on(scan_folders(&state, None));
+                tauri::async_runtime::block_on(scan_folders(&state, None, ScanOrigin::Timer));
             }
         }
     });
@@ -534,19 +822,33 @@ pub fn ensure_scan_worker(app: &AppHandle) {
     });
 }
 
-/// 增量扫描主循环（单遍、串行、DB 驱动）。设计见实现提示词 A/B 节：
+/// 增量扫描主循环（单遍、DB 驱动；批内并发 2、批间按 path 字典序顺序推进）。设计见实现提示词 A/B 节：
 /// - 开头回收崩溃残留（meta_done=3 → 0）（B4）；
 /// - 每一本处理前先查优先表，命中优先处理（B3）；
-/// - 否则分批 `SELECT ... WHERE meta_done=0 ORDER BY id LIMIT 200`（A2）；
+/// - 否则分批 `SELECT ... WHERE meta_done=0 ORDER BY path, id LIMIT 200`（A2；走 idx_books_meta_done_path，
+///   同一目录的书在批内相邻 —— 机械盘/外置盘上减少目录跳跃）；
 /// - 每本：重读状态(B6) → CAS 认领(0→3, B5) → 解析(不持 DB 锁) → 独立事务写 1/2 + 删优先表(A3/B5)；
 /// - 批间 sleep 80ms；每 1000 次提交 wal_checkpoint(PASSIVE)；整轮结束 TRUNCATE（A7）；
 /// - 每批比较前后 `COUNT(meta_done=0)`，未下降则打印并终止（A6）；
 /// - 每本发 `cover-updated`{id}（B7），进度节流发 `meta-progress`。
 fn on_startup(state: Arc<AppState>) {
+    // 连续启动失败保护：上一次启动没走到书库 → 本轮不做封面重建（只记日志）。
+    // 为什么整轮跳过而不是缩小批量：封面重建本身没错，错的是「在启动路径上做全库封面」——
+    // 崩溃恢复优先，让用户先能进书库，下一轮（成功一次后）再继续补。
+    if memlog::skip_cover_rebuild() {
+        memlog::stage_note("cover:skipped", "previous start crashed before library");
+        eprintln!("[scan] skipped this run: previous start did not reach library");
+        return;
+    }
+    memlog::stage("cover:start");
     let covers_dir = covers::covers_dir(&state.app);
     const BATCH: i64 = 200;
     const EMIT_EVERY: u64 = 16;
     const CKPT_EVERY: u64 = 1000;
+    // 本轮的 WS 基线：并发闸门用它判断「是否已超出 基线+50MB」。
+    state
+        .cover_scan_ws_base
+        .store(memlog::ws_mb().max(1), Ordering::SeqCst);
 
     // B4：回收上次中断残留的「处理中」。
     let recovered = {
@@ -566,8 +868,8 @@ fn on_startup(state: Arc<AppState>) {
         eprintln!("[scan] recovered {recovered} rows from meta_done=3 -> 0");
     }
 
-    let mut commits: u64 = 0;
-    let mut since_emit: u64 = 0;
+    let commits = std::sync::atomic::AtomicU64::new(0);
+    let since_emit = std::sync::atomic::AtomicU64::new(0);
     // A6：用「连续两批的待办 id 集合」比较进展，取代批次前后的全量 count_meta_pending。
     let mut last_batch_ids: Vec<i64> = Vec::new();
 
@@ -715,7 +1017,9 @@ fn on_startup(state: Arc<AppState>) {
     // 命中同样计入进度分子（优先项也是 meta_done=0，已包含在启动时的 total0 内）并按节流
     // 发 meta-progress —— 否则「只服务优先表」期间 `cover_scan_done` 不动、事件不发，
     // 底栏进度条会长时间不出现/不推进（封面却仍在插队生成）。
-    let drain_one_priority = |commits: &mut u64, since_emit: &mut u64| -> bool {
+    let drain_one_priority = |commits: &std::sync::atomic::AtomicU64,
+                              since_emit: &std::sync::atomic::AtomicU64|
+     -> bool {
         let hit = {
             let conn = state.db.0.lock().unwrap();
             db::next_priority(&conn)
@@ -723,12 +1027,12 @@ fn on_startup(state: Arc<AppState>) {
         match hit {
             Some((id, path, format)) => {
                 if process_one(id, &path, &format, &[0, 2]).is_some() {
-                    *commits += 1;
+                    commits.fetch_add(1, Ordering::SeqCst);
                     let done = state.cover_scan_done.fetch_add(1, Ordering::SeqCst) + 1;
-                    *since_emit += 1;
-                    let total = state.cover_scan_total.load(Ordering::SeqCst);
-                    if *since_emit >= EMIT_EVERY {
-                        *since_emit = 0;
+                    let n = since_emit.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= EMIT_EVERY {
+                        since_emit.store(0, Ordering::SeqCst);
+                        let total = state.cover_scan_total.load(Ordering::SeqCst);
                         emit_scan_progress(&state.app, done, total);
                         state.app.emit("library-meta", ()).ok();
                     }
@@ -744,11 +1048,11 @@ fn on_startup(state: Arc<AppState>) {
             break;
         }
         // B3：每一本处理前先查优先表；命中则先把优先项清空。
-        while drain_one_priority(&mut commits, &mut since_emit) {
+        while drain_one_priority(&commits, &since_emit) {
             if state.scan_stop.load(Ordering::SeqCst) {
                 break 'outer;
             }
-            if commits % CKPT_EVERY == 0 && commits > 0 {
+            if commits.load(Ordering::Relaxed) % CKPT_EVERY == 0 && commits.load(Ordering::Relaxed) > 0 {
                 let conn = state.db.0.lock().unwrap();
                 let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
             }
@@ -762,7 +1066,7 @@ fn on_startup(state: Arc<AppState>) {
         if batch.is_empty() {
             // 要求6：普通待办为 0 时，必须先确认优先表也空（drain 返回 None）才允许退出，
             // 避免恰好此刻有「列表插队 / 打开书」写入而漏处理。
-            if drain_one_priority(&mut commits, &mut since_emit) {
+            if drain_one_priority(&commits, &since_emit) {
                 continue;
             }
             break; // 普通待办与优先表都空 → 退出。
@@ -779,32 +1083,71 @@ fn on_startup(state: Arc<AppState>) {
         }
         last_batch_ids = cur_batch_ids;
 
-        for (id, path, format) in &batch {
-            if state.scan_stop.load(Ordering::SeqCst) {
-                break 'outer;
+        // 顺序批流 + 并发：批内用 `conc` 个线程分摊（默认 2）。顺序仍由 `path` 决定，
+        // 并发只是让 I/O 等待重叠；插队流在**每本之前**照样优先（线程内各自查优先表）。
+        // 内存闸门：批开始前若 WS 已超过「基线 + 50MB」，本批退回并发 1。
+        let conc = {
+            let want = COVER_EXTRACT_CONCURRENCY;
+            let base = state.cover_scan_ws_base.load(Ordering::SeqCst);
+            let ws = memlog::ws_mb();
+            if base > 0 && ws > base + 50 {
+                memlog::stage_note("cover:concurrency", &format!("degraded=1 ws={ws} base={base}"));
+                1
+            } else {
+                want
             }
-            // B3：每本之前再查优先表（打开书籍可随时插队）。
-            while drain_one_priority(&mut commits, &mut since_emit) {}
-            if process_one(*id, path, format, &[0]).is_some() {
-                commits += 1;
-                let done = state.cover_scan_done.fetch_add(1, Ordering::SeqCst) + 1;
-                since_emit += 1;
-                let total = state.cover_scan_total.load(Ordering::SeqCst);
-                if since_emit >= EMIT_EVERY {
-                    since_emit = 0;
-                    emit_scan_progress(&state.app, done, total);
-                    state.app.emit("library-meta", ()).ok();
+        };
+        memlog::stage_note("cover:concurrency", &format!("conc={conc} batch={}", batch.len()));
+        {
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let batch_ref = &batch;
+            std::thread::scope(|s| {
+                for _ in 0..conc.min(batch_ref.len().max(1)) {
+                    s.spawn(|| loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        if i >= batch_ref.len() || state.scan_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let (id, path, format) = &batch_ref[i];
+                        // B3：每本之前再查优先表（打开书籍可随时插队）。
+                        while drain_one_priority(&commits, &since_emit) {}
+                        if process_one(*id, path, format, &[0]).is_some() {
+                            let c = commits.fetch_add(1, Ordering::SeqCst) + 1;
+                            let done = state.cover_scan_done.fetch_add(1, Ordering::SeqCst) + 1;
+                            let emit_n = since_emit.fetch_add(1, Ordering::SeqCst) + 1;
+                            if emit_n >= EMIT_EVERY {
+                                since_emit.store(0, Ordering::SeqCst);
+                                let total = state.cover_scan_total.load(Ordering::SeqCst);
+                                emit_scan_progress(&state.app, done, total);
+                                state.app.emit("library-meta", ()).ok();
+                            }
+                            if c % CKPT_EVERY == 0 {
+                                let conn = state.db.0.lock().unwrap();
+                                let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
+                            }
+                        }
+                    });
                 }
-                if commits % CKPT_EVERY == 0 {
-                    let conn = state.db.0.lock().unwrap();
-                    let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
-                }
-            }
+            });
         }
+        // 批结束后再处理一轮优先表：线程退出前可能刚好有新插队项（避免它等下批）。
+        while drain_one_priority(&commits, &since_emit) {}
 
+        // 每批结束时释放批内中间对象（batch / cur_batch_ids 出作用域即 drop），
+        // 并打一条「批次 + 工作集」日志：封面重建的内存必须停在「一本位图」量级。
+        drop(batch);
+        memlog::stage_note(
+            "cover:batch",
+            &format!(
+                "commits={} last_batch={} ",
+                commits.load(Ordering::Relaxed),
+                last_batch_ids.len()
+            ),
+        );
         // A7：批间限流，避免满速占盘。
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
+    memlog::stage("cover:done");
 
     // 整轮结束：TRUNCATE 收缩 WAL；发最终进度 + scan-finished。
     {
@@ -855,6 +1198,80 @@ pub fn on_book_opened(state: &Arc<AppState>, book_id: i64) {
     }
     ensure_scan_worker(&state.app);
 }
+
+/// 扫描模式的持久化键：`auto` / `manual`。前端每次启动都会推一次 `set_cover_scan`，
+/// 所以启动自愈能据此判断当前模式（`cover_scan_enabled` 的默认值是 true，推送前无法区分）。
+/// 它只记录**模式**，不是「自愈已完成」标记 —— 自愈本身每进程只跑一次、且不写任何持久标记。
+pub const COVER_SCAN_MODE_KEY: &str = "cover_scan_mode";
+
+/// 本进程是否已执行过封面自愈（不落盘：每次启动都重新核对）。
+static COVER_HEAL_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 标记「本进程已处理过封面自愈」（启动路径已跑过时调用，避免前端随后再推一次时重复执行）。
+pub fn mark_cover_heal_done() {
+    COVER_HEAL_DONE.store(true, Ordering::SeqCst);
+}
+
+/// 封面自愈的日志口径：读目录失败 / 目录为空 / 正常复位 三种情形都要可追溯；
+/// 1B 的同 stem 清扫结果单独一行（保留了多少组必须可见，否则「为什么没清干净」无从判断）。
+pub fn log_cover_heal(rep: &db::CoverHeal) {
+    if rep.stem_groups > 0 {
+        let dist = rep
+            .stem_ref_ext
+            .iter()
+            .map(|(e, n)| format!("{e}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "[covers] 同 stem 冗余 {} 组：已删 {} 个文件；无引用保守保留 {} 组；被引用扩展名 [{dist}]",
+            rep.stem_groups, rep.stem_removed, rep.stem_kept
+        );
+    }
+    if let Some(e) = &rep.dir_err {
+        eprintln!("[covers] 读取封面目录失败，本轮跳过自愈（未复位任何行）：{e}");
+        return;
+    }
+    if rep.reset == 0 {
+        return;
+    }
+    if rep.scanned == 0 {
+        // 目录存在但为空 = 外部删除后又被 create_dir_all 重建的形态，全量复位是正确行为。
+        eprintln!(
+            "[covers] 封面目录为空，已复位 {} 行（其中自选封面 {} 行），将按扫描顺序重建",
+            rep.reset, rep.reset_custom
+        );
+    } else {
+        eprintln!(
+            "[covers] 封面文件缺失，已复位 {} 行（其中自选封面 {} 行；目录内 {} 个文件）",
+            rep.reset, rep.reset_custom, rep.scanned
+        );
+    }
+}
+
+/// 停 worker → 自愈 → 重新拉起扫描。运行时入口（前端推 set_cover_scan）用这一条，
+/// 避免与在途认领交叉（同 clear_cache 的停/起约定）。
+fn heal_covers_now(state: &Arc<AppState>) {
+    stop_cover_worker_and_wait(state);
+    let rep = {
+        let conn = state.db.0.lock().unwrap();
+        let dir = covers::covers_dir(&state.app);
+        db::heal_missing_covers(&conn, &dir)
+    };
+    log_cover_heal(&rep);
+    ensure_scan_worker(&state.app);
+}
+
+/// 封面提取的并发度常量：**默认 2**。
+///
+/// 为什么默认只有 2：多数用户的书库在机械盘或外置盘上，封面重建的瓶颈是随机 I/O
+/// （实测：单本 CPU（解码+缩放+重编码）≈11ms，而端到端 ≈473ms/本）；并发提高的是
+/// "把等待重叠起来"的能力，在寻道受限的介质上开太大只会加剧抖动。
+/// 自适应提升需要判断介质是否 SSD（DeviceIoControl 的 IncursSeekPenalty），
+/// 那要新增 `Win32_System_IO` / `Win32_System_Ioctl` feature（= Cargo.toml 改动），
+/// 本轮不做 —— 因此固定 2，不按核数自动放大。
+///
+/// 度量钩子已删除：调用点直接用本常量（不再读 DB 键）。
+pub const COVER_EXTRACT_CONCURRENCY: usize = 2;
 
 /// 停止封面扫描 worker 并等待其退出（最多约 3 秒），用于清缓存前避免删/写并发。
 fn stop_cover_worker_and_wait(state: &Arc<AppState>) {
@@ -1050,9 +1467,18 @@ fn extract_cover_only(
                     MAX_COVER_BYTES
                 ));
             }
-            let name = format!("{}.png", db::path_id(path));
-            let out = covers_dir.join(&name);
-            covers::make_thumbnail(&b, &out)?;
+            // 够用就直出（原始字节 + 嗅探扩展名），否则回落解码/缩放/重编码；
+            // 落盘后清理同一 stem 的其它扩展名旧文件（{path_id}.png ↔ {path_id}.webp）。
+            let stem = db::path_id(path).to_string();
+            let (name, direct) = covers::save_cover(covers_dir, &stem, &b)?;
+            // 直出命中统计：每 20 张记一行（含字节数与是否直出），供验收口径复算命中率。
+            let n = COVER_DIRECT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 20 == 0 {
+                memlog::stage_note(
+                    "cover:direct",
+                    &format!("seen={n} direct={} bytes={} name={name}", u8::from(direct), b.len()),
+                );
+            }
             Ok(Some(name))
         }
         None => Ok(None),
@@ -1305,7 +1731,7 @@ pub async fn add_folder(state: State<'_, Arc<AppState>>, path: String) -> Result
     }
     let st = state.inner().clone();
     tokio::spawn(async move {
-        scan_folders(&st, Some(vec![path])).await;
+        scan_folders(&st, Some(vec![path]), ScanOrigin::User).await;
     });
     Ok(())
 }
@@ -1315,9 +1741,18 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
     let st = state.inner().clone();
     let diag = std::env::var("TIDEPAGE_OP_DIAG").is_ok();
     let t0 = std::time::Instant::now();
+    // 入口第一行：必须在任何 `?` 之前 —— 否则"目录登记被删掉"这一步失败时，
+    // 日志里连"用户点过移除目录"都看不到（这条链路历史上完全没有日志）。
+    log_op("remove_folder", &format!("folder={path} start"));
     {
         let conn = st.db.0.lock().unwrap();
-        db::remove_folder(&conn, &path)?;
+        if let Err(e) = db::remove_folder(&conn, &path) {
+            log_op(
+                "remove_folder",
+                &format!("folder={path} failed err={e} elapsed_ms={}", t0.elapsed().as_millis()),
+            );
+            return Err(e);
+        }
     }
     let base = path.trim_end_matches(['/', '\\']).to_string();
     let folder = Path::new(&base).to_path_buf();
@@ -1350,6 +1785,8 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
     // 分批删除，每批一个事务；批间释放 db 锁并 yield，避免长持锁阻塞窗口取行等 DB 读取。
     // 与 scan_folders 阶段四同款：异步命令体直接跑（非同步命令/主线程），批间让出。
     let t_del = std::time::Instant::now();
+    let mut deleted_ok = 0usize;
+    let mut first_err: Option<String> = None;
     for chunk in doomed.chunks(2000) {
         let r: Result<(), String> = (|| {
             let mut guard = st.db.0.lock().unwrap();
@@ -1358,8 +1795,14 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
             tx.commit().map_err(|e| e.to_string())?;
             Ok(())
         })();
-        if let Err(e) = r {
-            eprintln!("[remove_folder] delete tx failed: {e}");
+        match r {
+            Ok(()) => deleted_ok += chunk.len(),
+            Err(e) => {
+                eprintln!("[remove_folder] delete tx failed: {e}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
         tokio::task::yield_now().await;
     }
@@ -1369,6 +1812,22 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
             t_del.elapsed(),
             t0.elapsed()
         );
+    }
+    match first_err {
+        Some(e) => log_op(
+            "remove_folder",
+            &format!(
+                "folder={path} failed err={e} prefix_rows={row_count} deleted_ok={deleted_ok} elapsed_ms={}",
+                t0.elapsed().as_millis()
+            ),
+        ),
+        None => log_op(
+            "remove_folder",
+            &format!(
+                "folder={path} done prefix_rows={row_count} deleted_ok={deleted_ok} elapsed_ms={}",
+                t0.elapsed().as_millis()
+            ),
+        ),
     }
     state.app.emit("library-changed", ()).ok();
     Ok(())
@@ -1399,6 +1858,7 @@ pub async fn list_books_page(
     desc: Option<bool>,
     folder: Option<String>,
 ) -> Result<BookPage, String> {
+    memlog::watch("cmd:list_books_page");
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
@@ -1410,6 +1870,15 @@ pub async fn list_books_page(
 
 /// 秩可寻址分页有序索引上限：超过则前端必须切 keyset 档（禁止静默截断）。
 const MAX_ORDER_INDEX_ROWS: i64 = 300_000;
+
+/// 「缺封面 PDF」命令的调用计数：只用于启动日志的限流打点（诊断 O(N²) 形态）。
+static PDF_MISSING_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 封面写入计数（同样只服务于限流打点）。
+static COVER_IMG_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 容器格式封面提取计数：直出命中率的采样打点（每 20 张记一行）。
+static COVER_DIRECT_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// range 请求计数：前 20 条逐条记区间，之后只记大块（见 pdf_read_range）。
+static PDF_RANGE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 命令 1（秩可寻址分页）：返回当前 `sort` + 可选 `query` 下**有序 books.id 序列**，
 /// 编码为小端 i64 原始字节流（每 8 字节一个 id）；前端得到 ArrayBuffer 后建 BigInt64Array。
@@ -1426,6 +1895,7 @@ pub async fn list_order_index(
     desc: Option<bool>,
     folder: Option<String>,
 ) -> Result<tauri::ipc::Response, String> {
+    memlog::watch("cmd:list_order_index");
     // 白名单归一（未知回落 added），避免把任意字符串带入下游。
     let sort = match sort.as_str() {
         "added" | "recent" | "title" | "lastread" | "size" => sort,
@@ -1491,6 +1961,7 @@ pub async fn list_books_by_ids(
     state: State<'_, Arc<AppState>>,
     ids: Vec<i64>,
 ) -> Result<Vec<Option<BookRow>>, String> {
+    memlog::watch("cmd:list_books_by_ids");
     if ids.len() > 4096 {
         return Err(format!("too_many_ids:{}", ids.len()));
     }
@@ -1507,7 +1978,8 @@ pub async fn list_books_by_ids(
 pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let st = state.inner().clone();
     tokio::spawn(async move {
-        scan_folders(&st, None).await;
+        // rescan 命令：转换完成后由前端调用，属用户动作触发的扫描。
+        scan_folders(&st, None, ScanOrigin::User).await;
     });
     Ok(())
 }
@@ -1516,6 +1988,137 @@ pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 pub struct RefreshResult {
     pub removed: usize,
     pub added: usize,
+    /// 因"比例分级"被挂起、等待用户二次确认的待删条数（0 = 已直接处理）。
+    pub pending: usize,
+    /// 因父目录不可列举而跳过的条数（0 = 没有不可达目录）。
+    pub skipped: usize,
+    /// true = 本次只做了判定，**一条都没删**，需要前端确认后带 confirm=true 再调一次。
+    pub needs_confirm: bool,
+    /// 待删行的父目录聚合（降序，最多 5 条）：让确认框能说出"主要在哪"。
+    pub dirs: Vec<DirCount>,
+    /// 快照总行数（确认框与日志的口径）。
+    pub total: usize,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct DirCount {
+    pub dir: String,
+    pub count: usize,
+}
+
+/// 单条路径的探测结果（纯数据，不依赖文件系统；便于纯函数决策与单测）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Probe {
+    /// 文件存在。
+    Exists,
+    /// 文件不存在，且**父目录可以 read_dir**（目录在、只是文件不在）⇒ 允许删除。
+    Missing,
+    /// 文件不存在，且父目录 read_dir 失败（权限/脱机/共享冲突）⇒ 一律跳过、只记数。
+    ParentUnreachable(String),
+}
+
+/// 待删行在某个父目录下的聚合：`missing` = 判为不存在、`present` = 仍存在。
+/// 比例分级的分母用 `missing + present`（= 该父目录在库行数）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirStat {
+    pub dir: String,
+    pub missing: usize,
+    pub present: usize,
+}
+
+/// 对账计划（纯决策结果，不含任何 IO）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReconcilePlan {
+    /// 将被删除的行（needs_confirm=true 时**为空**）。
+    pub to_delete: Vec<(i64, String)>,
+    /// 父目录不可列举而被跳过的行。
+    pub skipped: Vec<(i64, String)>,
+    /// 不可列举的父目录：(目录, 错误文本, 跳过条数)。
+    pub unreachable: Vec<(String, String, usize)>,
+    /// 父目录聚合（按 missing 降序）。
+    pub dirs: Vec<DirStat>,
+    pub needs_confirm: bool,
+    pub total: usize,
+    pub missing: usize,
+}
+
+/// 比例分级的绝对下限：待删 > 200 行就需要确认（普通刷新通常删个位数）。
+pub const RECONCILE_MIN_ROWS: usize = 200;
+/// 比例分级的总量阈值：待删 > 总行数 × 1% 需要确认（17 万本约 1,738 行）。
+pub const RECONCILE_TOTAL_PCT: usize = 1;
+/// 比例分级的单目录阈值：某父目录待删 ≥ 该目录在库行数 × 30% 需要确认。
+/// 依据：整目录被移走/改名时，该目录的缺失比例接近 100%，与"零星删几本"能清晰区分。
+pub const RECONCILE_DIR_PCT: usize = 30;
+
+/// 纯决策层：给定快照与探测结果，决定"删哪些 / 跳过哪些 / 是否需要用户确认"。
+///
+/// 规则（两条独立，**不是"都要满足"**）：
+/// 1. **必要条件**：父目录可列举才允许删；不可列举 ⇒ 该目录下全部缺失项跳过（只记数）。
+/// 2. **比例分级**：待删 > max(200, 总数×1%) 或 某父目录待删 ≥ 该目录×30% ⇒ `needs_confirm`，
+///    此时 `to_delete` 为空（绝不删），由调用方拿摘要去问用户；用户确认后以 `confirmed=true`
+///    再调一次即可正常删除。**分级只要求确认，不是拒绝**。
+pub fn plan_reconcile(
+    records: &[(i64, String)],
+    mut probe: impl FnMut(&str) -> Probe,
+    confirmed: bool,
+) -> ReconcilePlan {
+    let mut plan = ReconcilePlan {
+        total: records.len(),
+        ..Default::default()
+    };
+    let mut stats: std::collections::HashMap<String, DirStat> = std::collections::HashMap::new();
+    let mut unreachable: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
+    let mut candidates: Vec<(i64, String)> = Vec::new();
+    for (id, path) in records {
+        match probe(path) {
+            Probe::Exists => {
+                let dir = parent_dir(path);
+                stats.entry(dir.clone()).or_insert(DirStat { dir, missing: 0, present: 0 }).present += 1;
+            }
+            Probe::Missing => {
+                plan.missing += 1;
+                let dir = parent_dir(path);
+                stats.entry(dir.clone()).or_insert(DirStat { dir, missing: 0, present: 0 }).missing += 1;
+                candidates.push((*id, path.clone()));
+            }
+            Probe::ParentUnreachable(err) => {
+                plan.missing += 1;
+                let dir = parent_dir(path);
+                let e = unreachable.entry(dir).or_insert((err, 0));
+                e.1 += 1;
+                plan.skipped.push((*id, path.clone()));
+            }
+        }
+    }
+    let mut dirs: Vec<DirStat> = stats.into_values().filter(|d| d.missing > 0).collect();
+    dirs.sort_by(|a, b| b.missing.cmp(&a.missing).then(a.dir.cmp(&b.dir)));
+    // 分级判定
+    let threshold_rows = RECONCILE_MIN_ROWS.max(plan.total * RECONCILE_TOTAL_PCT / 100);
+    let over_total = plan.missing > threshold_rows;
+    let over_dir = dirs.iter().any(|d| {
+        let lib = d.missing + d.present;
+        lib > 0 && d.missing * 100 >= lib * RECONCILE_DIR_PCT
+    });
+    plan.dirs = dirs;
+    for (dir, (err, n)) in unreachable {
+        plan.unreachable.push((dir, err, n));
+    }
+    plan.unreachable.sort_by(|a, b| b.2.cmp(&a.2));
+    // 没有任何可删行时不需要确认（全部被跳过 = 只是暂时不可达，问用户没有意义）。
+    plan.needs_confirm = !confirmed && !candidates.is_empty() && (over_total || over_dir);
+    if !plan.needs_confirm {
+        plan.to_delete = candidates;
+    }
+    plan
+}
+
+/// 父目录（与 scan_dirs 同口径：`D:\Pdf\a\b.epub` → `D:\Pdf\a`）；无父目录时用空串。
+fn parent_dir(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 任务2 核心：一次性对账（纯目录遍历，不新增任何文件系统监听）。
@@ -1526,19 +2129,25 @@ pub struct RefreshResult {
 // staged: 对账算法的唯一有测试的实现（命令 refresh_library 目前内联重写同逻辑且无测试；最干净的做法是让命令委托至此以复用其 5 项测试，属行为相邻重构，另行评审）。
 #[allow(dead_code)]
 pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
+    let t0 = std::time::Instant::now();
     let records = db::all_book_paths(conn);
-    let mut missing: Vec<String> = Vec::new();
-    let mut survivors: Vec<String> = Vec::new();
-    for (_, p) in &records {
-        if Path::new(p).exists() {
-            survivors.push(p.clone());
-        } else {
-            missing.push(p.clone());
-        }
-    }
-    if !missing.is_empty() {
-        let _ = db::delete_books(conn, &missing);
-    }
+    let mut cache: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    // 测试用的这条路：confirmed=true（沿用旧语义：直接删），但同样受"父目录可列举"约束。
+    let plan = plan_reconcile(&records, |p| probe_path_fs(p, &mut cache), true);
+    log_reconcile_plan("refresh_core", &plan, t0.elapsed().as_millis(), true);
+    let (ok, failed, first_err) = delete_rows(conn, &plan.to_delete);
+    log_delete_result("refresh_core", ok, failed, first_err.as_deref(), t0.elapsed().as_millis());
+    let gone: std::collections::HashSet<&str> = plan
+        .to_delete
+        .iter()
+        .chain(plan.skipped.iter())
+        .map(|(_, p)| p.as_str())
+        .collect();
+    let survivors: Vec<String> = records
+        .iter()
+        .filter(|(_, p)| !gone.contains(p.as_str()))
+        .map(|(_, p)| p.clone())
+        .collect();
 
     let mut scan_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for p in &survivors {
@@ -1590,7 +2199,135 @@ pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
             }
         }
     }
-    RefreshResult { removed: missing.len(), added }
+    RefreshResult {
+        removed: ok,
+        added,
+        pending: 0,
+        skipped: plan.skipped.len(),
+        needs_confirm: false,
+        dirs: plan
+            .dirs
+            .iter()
+            .take(5)
+            .map(|d| DirCount { dir: d.dir.clone(), count: d.missing })
+            .collect(),
+        total: plan.total,
+    }
+}
+
+/// 真实文件系统探测：文件存在 ⇒ Exists；不存在则看**父目录能否 read_dir**
+/// （目录在、只是文件不在 ⇒ Missing；列举失败 ⇒ ParentUnreachable）。
+/// 父目录结果按目录缓存：17 万本下同一目录会被探测上万次，重复 read_dir 不可接受。
+/// 注意 `Path::exists()` ≈ `fs::metadata(..).is_ok()`：权限/共享冲突/占用都会是 false，
+/// 所以"不存在"必须再由父目录可列举性做一次区分 —— 这是唯一的直接证据。
+fn probe_path_fs(
+    path: &str,
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+) -> Probe {
+    if Path::new(path).exists() {
+        return Probe::Exists;
+    }
+    let dir = parent_dir(path);
+    let entry = cache.entry(dir.clone()).or_insert_with(|| {
+        match std::fs::read_dir(&dir) {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        }
+    });
+    match entry {
+        None => Probe::Missing,
+        Some(err) => Probe::ParentUnreachable(err.clone()),
+    }
+}
+
+/// 取证日志（删除**之前**）：一条主行 + 目录聚合 + 不可达父目录 + 前 5 条样例路径。
+/// 之所以这么细：上一轮少了 9,402 行却没有任何删除日志，事后无法判断
+/// "文件真没了"还是"目录当时不可达"，只能靠这四类读数区分。
+fn log_reconcile_plan(site: &str, plan: &ReconcilePlan, elapsed_ms: u128, confirmed: bool) {
+    let snap_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!(
+        "site={site} snapshot_at={snap_at} total={} missing={} delete={} confirm_required={} confirmed={} skipped={} unreachable_dirs={} elapsed_ms={elapsed_ms}",
+        plan.total,
+        plan.missing,
+        plan.to_delete.len(),
+        u8::from(plan.needs_confirm),
+        u8::from(confirmed),
+        plan.skipped.len(),
+        plan.unreachable.len(),
+    );
+    eprintln!("[refresh] plan {line}");
+    memlog::stage_note("refresh:plan", &line);
+    if !plan.dirs.is_empty() {
+        let dirs = plan
+            .dirs
+            .iter()
+            .take(5)
+            .map(|d| format!("{}={}/{}", d.dir, d.missing, d.missing + d.present))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        eprintln!("[refresh] dirs(missing/lib) {dirs}");
+        memlog::stage_note("refresh:dirs", &dirs);
+    }
+    for (dir, err, n) in &plan.unreachable {
+        let s = format!("dir={dir} skipped={n} err={err}");
+        eprintln!("[refresh] parent_unreachable {s}");
+        memlog::stage_note("refresh:parent_err", &s);
+    }
+    if !plan.to_delete.is_empty() {
+        let sample = plan
+            .to_delete
+            .iter()
+            .take(5)
+            .map(|(_, p)| p.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!("[refresh] sample {sample}");
+        memlog::stage_note("refresh:sample", &sample);
+    }
+}
+
+/// 删除（**错误必须被记录**，但仍不因失败中断）：返回 (成功行数, 失败行数, 首个错误文本)。
+/// 每 500 行一个事务块，避免 17 万行级别的一次性大事务。
+fn delete_rows(
+    conn: &rusqlite::Connection,
+    rows: &[(i64, String)],
+) -> (usize, usize, Option<String>) {
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut first_err: Option<String> = None;
+    for chunk in rows.chunks(500) {
+        let paths: Vec<String> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        match db::delete_books(conn, &paths) {
+            Ok(()) => ok += chunk.len(),
+            Err(e) => {
+                failed += chunk.len();
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+                eprintln!("[refresh] delete chunk failed n={} err={e}", chunk.len());
+            }
+        }
+    }
+    (ok, failed, first_err)
+}
+
+/// 删除链路的统一结构化日志（不依赖 `TIDEPAGE_OP_DIAG`：那条链路历史上完全没有日志，
+/// 事后无法判断"用户点过什么、删到哪一步失败"）。
+fn log_op(site: &str, msg: &str) {
+    eprintln!("[{site}] {msg}");
+    memlog::stage_note(&format!("{site}"), msg);
+}
+
+fn log_delete_result(site: &str, ok: usize, failed: usize, first_err: Option<&str>, elapsed_ms: u128) {
+    let line = format!(
+        "site={site} deleted_ok={ok} failed={failed} first_err={} elapsed_ms={elapsed_ms}",
+        first_err.unwrap_or("-")
+    );
+    eprintln!("[refresh] delete {line}");
+    memlog::stage_note("refresh:delete", &line);
 }
 
 /// 扫描进度事件负载（phase: check=对账缺失 / scan=扫描新增 / done=完成）。
@@ -1604,7 +2341,11 @@ pub struct RefreshProgress {
 /// 刷新（带进度）：分步执行，**不长时间持有 DB 锁**，因此扫描期间阅读/翻页/打开书等其它 IPC 不受阻。
 /// 与 `refresh_library_core` 对账规则一致：缺失记录移除、存活记录所在目录 ∪ 书库根及其一级子目录只扫一层。
 #[tauri::command]
-pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshResult, String> {
+pub async fn refresh_library(
+    state: State<'_, Arc<AppState>>,
+    confirm: Option<bool>,
+) -> Result<RefreshResult, String> {
+    let confirm = confirm.unwrap_or(false);
     let st = state.inner().clone();
     let emit = |phase: &str, done: usize, total: usize| {
         st.app
@@ -1621,22 +2362,67 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
         (db::all_book_paths(&conn), db::list_folders(&conn))
     };
     emit("check", 0, records.len());
-    let mut missing: Vec<String> = Vec::new();
-    let mut survivors: Vec<String> = Vec::new();
-    for (i, (_, p)) in records.iter().enumerate() {
-        if Path::new(p).exists() {
-            survivors.push(p.clone());
-        } else {
-            missing.push(p.clone());
-        }
-        if i % 200 == 0 || i + 1 == records.len() {
-            emit("check", i + 1, records.len());
-        }
+    let t0 = std::time::Instant::now();
+    let mut cache: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    let mut probed = 0usize;
+    let plan = plan_reconcile(
+        &records,
+        |p| {
+            probed += 1;
+            if probed % 200 == 0 {
+                emit("check", probed, records.len());
+            }
+            probe_path_fs(p, &mut cache)
+        },
+        confirm,
+    );
+    emit("check", records.len(), records.len());
+    // 取证：删除之前把"缺多少、缺在哪、哪些父目录不可达、样例路径、耗时"全部落日志。
+    log_reconcile_plan("refresh_cmd", &plan, t0.elapsed().as_millis(), confirm);
+    if plan.needs_confirm {
+        // 分级：只回摘要、一条都不删（前端拿摘要问用户，确认后带 confirm=true 再来一次）。
+        // 只报「确认后真会删」的数量：不可达目录下被跳过的不算。
+        let pending = plan.missing.saturating_sub(plan.skipped.len());
+        eprintln!(
+            "[refresh] pending_confirm missing={pending} dirs={} unreachable={}",
+            plan.dirs.len(),
+            plan.unreachable.len()
+        );
+        return Ok(RefreshResult {
+            removed: 0,
+            added: 0,
+            pending,
+            skipped: plan.skipped.len(),
+            needs_confirm: true,
+            dirs: plan
+                .dirs
+                .iter()
+                .take(5)
+                .map(|d| DirCount { dir: d.dir.clone(), count: d.missing })
+                .collect(),
+            total: plan.total,
+        });
     }
-    if !missing.is_empty() {
+    let survivors: Vec<String> = records
+        .iter()
+        .filter(|(_, p)| {
+            !plan.to_delete.iter().any(|(_, d)| d == p) && !plan.skipped.iter().any(|(_, s)| s == p)
+        })
+        .map(|(_, p)| p.clone())
+        .collect();
+    let (removed_ok, removed_failed, first_err) = if plan.to_delete.is_empty() {
+        (0usize, 0usize, None)
+    } else {
         let conn = st.db.0.lock().unwrap();
-        let _ = db::delete_books(&conn, &missing);
-    }
+        delete_rows(&conn, &plan.to_delete)
+    };
+    log_delete_result(
+        "refresh_cmd",
+        removed_ok,
+        removed_failed,
+        first_err.as_deref(),
+        t0.elapsed().as_millis(),
+    );
 
     // 扫描目录：存活记录所在目录 ∪ 书库根及其一级子目录。
     let mut scan_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1702,7 +2488,7 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
             }
         }
     }
-    if !missing.is_empty() || added > 0 {
+    if removed_ok > 0 || added > 0 {
         st.app.emit("library-changed", ()).ok();
     }
     emit("done", 1, 1);
@@ -1710,13 +2496,48 @@ pub async fn refresh_library(state: State<'_, Arc<AppState>>) -> Result<RefreshR
     if !new_ids.is_empty() {
         ensure_scan_worker(&st.app);
     }
-    Ok(RefreshResult { removed: missing.len(), added })
+    Ok(RefreshResult {
+        removed: removed_ok,
+        added,
+        pending: 0,
+        skipped: plan.skipped.len(),
+        needs_confirm: false,
+        dirs: plan
+            .dirs
+            .iter()
+            .take(5)
+            .map(|d| DirCount { dir: d.dir.clone(), count: d.missing })
+            .collect(),
+        total: plan.total,
+    })
+}
+
+/// 读取 `last_scan_stale`（书库页首屏提示条的唯一来源）。
+/// 返回原始 JSON 字符串：前端只需判 `state == "stale"` 与展示计数；
+/// 多窗口读同一份（DB），重启后仍在（若最近一次确实异常）。
+#[tauri::command]
+pub fn get_last_scan_stale(state: State<'_, Arc<AppState>>) -> Option<String> {
+    let conn = state.db.0.lock().unwrap();
+    db::get_setting(&conn, LAST_SCAN_STALE_KEY)
 }
 
 /// 任务3：打开入口先查文件是否存在（不存在则由前端弹询问，绝不进入空白阅读）。
+/// **三态**（必修 3）：`ok` / `missing` / `unreachable`。
+/// 为什么必须分开：`Path::exists()` 对权限、共享冲突、脱机盘一律返回 false，
+/// 若把它当"文件缺失"就会引导用户去刷新目录 —— 而刷新会删行（连带进度/书签/笔记）。
+/// `unreachable` 时前端只提示"暂时无法访问"，绝不进删除确认。
 #[tauri::command]
-pub fn file_exists(path: String) -> bool {
-    !path.is_empty() && Path::new(&path).exists()
+pub fn file_exists(path: String) -> String {
+    if path.is_empty() {
+        return "missing".into();
+    }
+    if Path::new(&path).exists() {
+        return "ok".into();
+    }
+    match std::fs::read_dir(parent_dir(&path)) {
+        Ok(_) => "missing".into(),
+        Err(_) => "unreachable".into(),
+    }
 }
 
 /// 拖拽入书库时判定路径是否为目录（目录直接登记为书库根，文件走单本导入）。
@@ -2136,16 +2957,95 @@ pub async fn delete_books(
         // 与 remove_folder 对齐：分批(2000/批) + 每批独立事务，消除「每本 7~8 条 DELETE
         // 各自自动提交 = 8N 次 fsync」的大批量删除慢。批间释放 db 锁，避免长持锁冻结其它读。
         // 本闭包已在 spawn_blocking 的阻塞线程池内（非主线程），分批即可，无需 async yield。
-        for chunk in paths.chunks(2000) {
-            let mut guard = st.db.0.lock().unwrap();
-            let tx = guard.transaction().map_err(|e| e.to_string())?;
-            db::delete_books_policy(&tx, chunk, keep)?;
-            tx.commit().map_err(|e| e.to_string())?;
+        let t0 = std::time::Instant::now();
+        let total_batches = paths.len().div_ceil(2000).max(1);
+        let mut deleted_ok = 0usize;
+        for (i, chunk) in paths.chunks(2000).enumerate() {
+            log_op(
+                "delete_books",
+                &format!(
+                    "batch={}/{} rows={} from_disk={} keep_notes={} start",
+                    i + 1,
+                    total_batches,
+                    chunk.len(),
+                    from_disk,
+                    keep
+                ),
+            );
+            let r: Result<(), String> = (|| {
+                let mut guard = st.db.0.lock().unwrap();
+                let tx = guard.transaction().map_err(|e| e.to_string())?;
+                db::delete_books_policy(&tx, chunk, keep)?;
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                // 失败语义保持不变：任一批失败立即中止返回（后面的批次不再执行）。
+                log_op(
+                    "delete_books",
+                    &format!(
+                        "failed_at_batch={}/{} rows_in_failed_batch={} committed_batches={} err={e} elapsed_ms={}",
+                        i + 1,
+                        total_batches,
+                        chunk.len(),
+                        i,
+                        t0.elapsed().as_millis()
+                    ),
+                );
+                return Err(e);
+            }
+            deleted_ok += chunk.len();
+            log_op(
+                "delete_books",
+                &format!(
+                    "batch={}/{} ok deleted_ok={} elapsed_ms={}",
+                    i + 1,
+                    total_batches,
+                    deleted_ok,
+                    t0.elapsed().as_millis()
+                ),
+            );
         }
         if from_disk {
-            for p in &paths {
-                trash::delete(p).map_err(|e| format!("删除失败: {e:?}"))?;
+            // 逐条落日志：从不进回收站到失败在哪一条，都要能事后追。失败语义仍是
+            // 遇到第一个失败立即返回（后面的文件既不删也不再尝试）。
+            let mut trashed_ok = 0usize;
+            let attempted = paths.len();
+            for (i, p) in paths.iter().enumerate() {
+                match trash::delete(p) {
+                    Ok(()) => {
+                        trashed_ok += 1;
+                        log_op(
+                            "delete_books",
+                            &format!("trash {}/{} path={p} ok", i + 1, attempted),
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("删除失败: {e:?}");
+                        log_op(
+                            "delete_books",
+                            &format!("trash {}/{} path={p} err={msg}", i + 1, attempted),
+                        );
+                        log_op(
+                            "delete_books",
+                            &format!(
+                                "trashed_ok={trashed_ok} attempted={attempted} remaining={} elapsed_ms={}",
+                                attempted - trashed_ok,
+                                t0.elapsed().as_millis()
+                            ),
+                        );
+                        return Err(msg);
+                    }
+                }
             }
+            log_op(
+                "delete_books",
+                &format!(
+                    "trashed_ok={trashed_ok} attempted={attempted} remaining={} elapsed_ms={}",
+                    attempted - trashed_ok,
+                    t0.elapsed().as_millis()
+                ),
+            );
         }
         Ok(())
     })
@@ -2450,6 +3350,10 @@ pub fn set_custom_cover(
     let name = format!("custom-{book_id}.png");
     let out = dir.join(&name);
     covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
+    // 同 stem 清理：手动换封面时旧扩展名（如 PDF 首页生成的 .webp）必须删掉，
+    // 否则同一本书会留下多份不同扩展名的封面（白占磁盘、孤儿永不回收）。
+    // 保留刚写入的这一份（精确文件名，不按 mtime 猜）。
+    covers::clean_same_stem(&dir, &format!("custom-{book_id}"), &name);
     let rel = name;
     {
         let conn = state.db.0.lock().unwrap();
@@ -2480,17 +3384,38 @@ pub async fn read_book_bytes(
     if ext_of(&path).as_deref() != Some("pdf") {
         return Err("仅 PDF 支持按原始字节读取".into());
     }
+    // 单次整读的硬上限（内存上限保护）：这条命令按「整份读入」设计，只能服务中小文件。
+    // 真实库里存在 3.75GB 的扫描 PDF；一旦前端走到「range 打开失败 → 回退整读」，
+    // std::fs::read 会一次性要出同样大的 Vec（实测把工作集推到 6.8GB 后崩溃）。
+    // 与其 OOM，不如在这里如实报错：range 路径对超大文件才是正解。
+    const READ_BYTES_MAX: u64 = 256 * 1024 * 1024;
+    let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if sz > READ_BYTES_MAX {
+        memlog::stage_note(
+            "cmd:read_book_bytes:reject",
+            &format!("book={book_id} size={}MB limit={}MB", sz / 1048576, READ_BYTES_MAX / 1048576),
+        );
+        return Err(format!(
+            "PDF 文件过大（{}MB），不支持整份读入；请改用区间读取",
+            sz / 1048576
+        ));
+    }
+    if sz > 8 * 1024 * 1024 {
+        memlog::stage_note("cmd:read_book_bytes", &format!("book={book_id} size={}MB", sz / 1048576));
+    }
+    memlog::watch("cmd:read_book_bytes");
     // 几十 MB 的整读放阻塞线程池，避免占用 async 运行时拖住其它 IPC。
     let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+    memlog::watch("cmd:read_book_bytes:after");
     Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// 解析书籍路径并确认是 PDF（两个 range 命令共用前置校验）。
 /// 非 pdf 一律拒绝：否则这两个命令就成了任意文件读取口。
-fn pdf_book_path(state: &State<'_, Arc<AppState>>, book_id: i64) -> Result<std::path::PathBuf, String> {
+pub(crate) fn pdf_book_path(state: &State<'_, Arc<AppState>>, book_id: i64) -> Result<std::path::PathBuf, String> {
     let path = {
         let conn = state.db.0.lock().unwrap();
         db::get_book(&conn, book_id).ok_or("书籍不存在")?.path
@@ -2514,6 +3439,7 @@ static PDF_RANGE_INFLIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// PDF 文件字节总数：前端据此决定「整份读入」还是「range 分块拉取」。
 #[tauri::command]
 pub async fn pdf_file_size(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<u64, String> {
+    memlog::watch("cmd:pdf_file_size");
     let path = pdf_book_path(&state, book_id)?;
     tauri::async_runtime::spawn_blocking(move || std::fs::metadata(&path))
         .await
@@ -2536,8 +3462,26 @@ pub async fn pdf_read_range(
         return Err("range 非法：end 必须大于 begin".into());
     }
     let want = end - begin;
+    // 请求区间打点：前 20 条逐条记（验收要看「按需小块」的分布），之后只记 >4MB 的大块。
+    let n = PDF_RANGE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 20 || want > 4 * 1024 * 1024 {
+        memlog::stage_note(
+            "cmd:pdf_read_range",
+            &format!(
+                "n={n} book={book_id} begin={begin} end={end} want={}KB",
+                want / 1024
+            ),
+        );
+    }
     if want > PDF_RANGE_MAX {
-        return Err(format!("单次 range 过大：{want} 字节（上限 {PDF_RANGE_MAX}）"));
+        // 错误里带上区间与文件大小：日志里能直接看出是「谁要了多大一块」，便于定位。
+        let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return Err(format!(
+            "单次 range 过大：book={book_id} begin={begin} end={end} want={}MB 上限={}MB 文件={}MB",
+            want / 1048576,
+            PDF_RANGE_MAX / 1048576,
+            total / 1048576
+        ));
     }
     // RAII 守卫：带着本次字节数，任何提前返回都会把额度还回去
     struct Guard(u64);
@@ -2552,6 +3496,7 @@ pub async fn pdf_read_range(
         PDF_RANGE_INFLIGHT_BYTES.fetch_sub(want, std::sync::atomic::Ordering::SeqCst);
         return Err("在途 range 总字节超限（上限 64MB）".into());
     }
+    memlog::watch("cmd:pdf_read_range");
     let _guard = Guard(want);
     let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         use std::io::{Read, Seek, SeekFrom};
@@ -2572,23 +3517,40 @@ pub async fn pdf_read_range(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// PDF 首页封面：前端把 pdf.js 渲染出的 PNG（base64，去掉 data URL 前缀）传上来。
-/// 后端无法栅格化 PDF，所以封面图必须由前端给；落盘与落库流程与 `set_custom_cover` 一致
-/// （缩略图 + cover_path/cover_ver + book-updated），保证书库封面即时刷新且 URL 失效重取。
+/// PDF 首页封面：前端**按目标缩略图尺寸**渲染好 WebP（base64，去掉 data URL 前缀）传上来，
+/// 后端只落盘、不再解码缩放（前端已是最终像素；原实现让后端把 800px 整幅解码再缩到 320×480，
+/// 白白多吃一次整幅位图的内存）。落库流程与 `set_custom_cover` 一致：cover_path/cover_ver
+/// + book-updated，保证书库封面即时刷新且 URL 失效重取。
 #[tauri::command]
 pub fn set_book_cover_image(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
-    png_base64: String,
-) -> Result<(), String> {
+    webp_base64: String,
+) -> Result<String, String> {
+    // 诊断打点：单次封面写入的 base64 有多大（PDF 首页整幅 PNG 可能数 MB，是内存峰值主要来源之一）。
+    // 限流：>4MB 一律记（需要人工看一眼的异常值），其余每 200 次记一行 ——
+    // 否则全库补封面会给 startup.log 写几万行。
+    let ci = COVER_IMG_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if webp_base64.len() > 4 * 1024 * 1024 || ci == 1 || ci % 200 == 0 {
+        memlog::stage_note(
+            "cmd:setBookCoverImage",
+            &format!("calls={ci} book={book_id} b64={}KB", webp_base64.len() / 1024),
+        );
+    }
+    memlog::watch("cmd:set_book_cover_image");
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD
-        .decode(png_base64.trim())
+        .decode(webp_base64.trim())
         .map_err(|e| format!("封面数据解码失败: {e}"))?;
+    // 只认图片魔数：既决定扩展名，也挡住把任意字节写进封面目录。
+    let ext = covers::sniff_ext(&data).ok_or("封面数据格式不支持")?;
     let dir = covers::covers_dir(&state.app);
-    let name = format!("custom-{book_id}.png");
+    let name = format!("custom-{book_id}.{ext}");
     let out = dir.join(&name);
-    covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
+    std::fs::write(&out, &data).map_err(|e| format!("封面写入失败: {e}"))?;
+    // 同 stem 清理：PDF 首页封面按魔数落 .webp/.png 时，把同一本书的其它扩展名旧文件删掉
+    // （例如先前手动选图生成的 custom-{id}.png）。保留刚写入的这一份。
+    covers::clean_same_stem(&dir, &format!("custom-{book_id}"), &name);
     {
         let conn = state.db.0.lock().unwrap();
         conn.execute(
@@ -2598,7 +3560,8 @@ pub fn set_book_cover_image(
         .map_err(|e| e.to_string())?;
     }
     state.app.emit("book-updated", ()).ok();
-    Ok(())
+    // 返回落盘文件名：调用方（重新提取封面）要用它更新 cover_path。
+    Ok(name)
 }
 
 /// 前端回传的「某页纯文本」：写入既有 chapter_text（划词全文搜索 / FTS 的数据源）。
@@ -2902,7 +3865,7 @@ pub async fn webdav_download_books(
         }
     }
     if !imported.is_empty() {
-        scan_folders(&state, None).await;
+        scan_folders(&state, None, ScanOrigin::Timer).await;
     }
     Ok(imported)
 }
@@ -3250,6 +4213,10 @@ pub fn scan_progress(state: State<'_, Arc<AppState>>) -> serde_json::Value {
 /// - 结束后 `ensure_scan_worker`（worker 空闲则拉起，`next_priority` 按 queued_at DESC 取最近关注项）。
 #[tauri::command]
 pub fn prioritize_covers(state: State<'_, Arc<AppState>>, ids: Vec<i64>) -> Result<u64, String> {
+    // 连续启动失败保护：本轮跳过封面重建时不再入队（否则 worker 又会把全库封面重扫一遍）。
+    if memlog::skip_cover_rebuild() {
+        return Ok(0);
+    }
     let ids: Vec<i64> = ids.into_iter().take(1000).collect();
     if ids.is_empty() {
         return Ok(0);
@@ -4402,15 +5369,71 @@ pub fn reveal_in_explorer(app: AppHandle, path: String) -> Result<(), String> {
 /// 拉一遍太重；这里只取 id，代价是一次列扫描。format 落库时已是小写（ext_of 归一）。
 #[tauri::command]
 pub fn pdf_books_missing_cover(state: State<'_, Arc<AppState>>) -> Result<Vec<i64>, String> {
+    // 连续启动失败保护：本轮跳过封面重建时返回空清单 —— 前端「补 PDF 封面」循环据此立即收工，
+    // 不再让有崩溃风险的封面链路在启动期继续跑。下一轮成功启动会自动恢复。
+    if memlog::skip_cover_rebuild() {
+        memlog::stage_note("cmd:pdfBooksMissingCover", "skipped (previous start crashed)");
+        return Ok(Vec::new());
+    }
     let conn = state.db.0.lock().unwrap();
-    Ok(db::list_pdf_ids_missing_cover(&conn))
+    let ids = db::list_pdf_ids_missing_cover(&conn);
+    drop(conn);
+    memlog::watch("cmd:pdf_books_missing_cover");
+    // 调用次数本身是诊断信息（O(N²) 的形态就长这样），但逐调用落盘会刷屏：每 200 次记一行。
+    let calls = PDF_MISSING_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls == 1 || calls % 200 == 0 {
+        memlog::stage_note("cmd:pdfBooksMissingCover", &format!("calls={calls} ids={}", ids.len()));
+    }
+    Ok(ids)
 }
 
 /// 设置封面扫描开关（首选项「封面扫描」）。语义见 AppState::cover_scan_enabled 的说明。
 #[tauri::command]
 pub fn set_cover_scan(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
+    // 「连续启动失败」保护优先：本轮跳过封面重建时，前端启动期的 setCoverScan(true) 不得把它打开。
+    if memlog::skip_cover_rebuild() {
+        state.cover_scan_enabled.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
     state.cover_scan_enabled.store(enabled, Ordering::SeqCst);
+    // 持久化模式：启动自愈在 worker 起来之前就要判断 auto/manual（atomic 的默认值恒为 true）。
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::set_setting(&conn, COVER_SCAN_MODE_KEY, if enabled { "auto" } else { "manual" });
+    }
+    // 模式键此前不存在（升级后第一次启动）时，启动路径没敢复位；这里在 auto 下补做一次。
+    // 每进程最多一次，且整段带 worker 停/起，避免与在途认领交叉。
+    if enabled && !COVER_HEAL_DONE.swap(true, Ordering::SeqCst) {
+        heal_covers_now(state.inner());
+    }
     Ok(())
+}
+
+/// 只取 id 的分页入口（每批上限 500）：给「按 id 遍历全库」的操作（如重建 FTS）用。
+/// 为什么不让前端用 list_books：那是整表物化 + 整表序列化，17 万本一次 IPC 就是几十 MB 的
+/// 行对象与 JSON 文本；这里每批只有 limit 个 i64，内存与书数无关。
+#[tauri::command]
+pub async fn list_book_ids_page(
+    state: State<'_, Arc<AppState>>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<i64>, String> {
+    memlog::watch("cmd:list_book_ids_page");
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_book_ids_page(&conn, offset.max(0), limit.clamp(1, 500))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 前端书库挂载并取到首屏行后调用：把本轮启动标记为「已走到书库」。
+/// 下一次启动据此判断上一轮是否崩溃 —— 崩溃则自动跳过封面重建并记一条日志。
+#[tauri::command]
+pub fn library_ready() {
+    memlog::stage("frontend:library_ready");
+    memlog::ready();
 }
 
 #[tauri::command]
@@ -4461,19 +5484,95 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
     }
 }
 
+/// 保存阅读器背景图。
+///
+/// 文件名必须**每次都不一样**：背景图 URL 只由文件名决定，同名文件会让 WebView 命中
+/// 同一 URL 的缓存（`bg/` 是短缓存）、也不会重新解码，用户看到的一直是上一张图。
+/// 因此按 `<时间戳>-<序号>` 唯一命名并保留原扩展名（`bg/` 端点读文件时按内容嗅探 MIME）。
+///
+/// `keep`：调用方仍然引用的背景图文件名（全局 `bgImage` 与各书籍方案的 `schemeBgImage`）。
+/// 不在此列、且写入时间超过 `RECLAIM_AGE` 的旧图才回收 —— 留出这段窗口，
+/// 避免删掉别的窗口或在途请求正在加载的文件。
 #[tauri::command]
-pub fn set_background_image(state: State<'_, Arc<AppState>>, image_path: String) -> Result<String, String> {
+pub fn set_background_image(
+    state: State<'_, Arc<AppState>>,
+    image_path: String,
+    keep: Option<Vec<String>>,
+) -> Result<String, String> {
     let data = std::fs::read(&image_path).map_err(|e| e.to_string())?;
     let dir = covers::covers_dir(&state.app);
-    std::fs::write(dir.join("background.img"), &data).map_err(|e| e.to_string())?;
-    Ok("background.img".into())
+    let ext = bg_ext_of(&image_path);
+    let name = format!("bg-{}-{}.{}", now_millis(), BG_SEQ.fetch_add(1, Ordering::Relaxed), ext);
+    std::fs::write(dir.join(&name), &data).map_err(|e| e.to_string())?;
+    reclaim_bg_images(&dir, &name, keep.as_deref().unwrap_or(&[]));
+    Ok(name)
 }
 
 #[tauri::command]
-pub fn clear_background_image(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub fn clear_background_image(
+    state: State<'_, Arc<AppState>>,
+    keep: Option<Vec<String>>,
+) -> Result<(), String> {
     let dir = covers::covers_dir(&state.app);
-    std::fs::remove_file(dir.join("background.img")).ok();
+    // 当前这张随后就不再被引用，交给回收逻辑统一处理（同样受 keep 与时间窗保护）。
+    reclaim_bg_images(&dir, "", keep.as_deref().unwrap_or(&[]));
     Ok(())
+}
+
+/// 背景图序号：同一毫秒内连续选图也不会撞名。
+static BG_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 回收窗口：比这更新的文件可能仍在别的窗口或在途请求里，先留着。
+const RECLAIM_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// 源图扩展名（白名单；未知一律 png）。`bg/` 端点按内容嗅探真实 MIME，名字只用于区分 URL。
+fn bg_ext_of(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "jpg",
+        Some("webp") => "webp",
+        Some("bmp") => "bmp",
+        Some("gif") => "gif",
+        _ => "png",
+    }
+}
+
+/// 回收 `covers/bg-*` 与历史遗留的 `background.img`：跳过 `keep` 与刚写入的那张，
+/// 回收本命令自己写出的 `covers/bg-*`：跳过 `keep` 与刚写入的那张，
+/// 且只删写入时间超过 RECLAIM_AGE 的文件。
+/// 历史遗留的 `background.img` **不回收**：它可能是用户选过、但配置里没落上的那张图，
+/// 删掉就是丢用户数据；它不占 URL 空间（放着不影响换图生效）。
+fn reclaim_bg_images(dir: &Path, current: &str, keep: &[String]) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_bg = name.starts_with("bg-");
+        if !is_bg || name == current || keep.iter().any(|k| k == &name) {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|d| d < RECLAIM_AGE).unwrap_or(false))
+            .unwrap_or(true);
+        if fresh {
+            continue;
+        }
+        std::fs::remove_file(entry.path()).ok();
+    }
 }
 
 /// 全库随机一本书（轻量：COUNT + 随机 offset；放阻塞线程池，避免同步持锁 O(N)）。
@@ -4723,7 +5822,7 @@ mod default_cover_tests {
     use std::path::PathBuf;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fr_dcover_{}_{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!("tp_dcover_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -4862,15 +5961,175 @@ mod filename_tests {
 }
 
 #[cfg(test)]
+mod stale_tests {
+    use super::*;
+
+    fn set(v: &[&str]) -> std::collections::HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn 首次判缺失只登记不删除() {
+        let plan = plan_stale(vec!["D:/a/1.pdf".into()], &set(&[]), &[], 10);
+        assert!(plan.delete.is_empty(), "首次不得删除");
+        assert_eq!(plan.pending, vec!["D:/a/1.pdf".to_string()]);
+        assert!(!plan.refused);
+    }
+
+    #[test]
+    fn 连续两次判缺失才删除() {
+        let plan = plan_stale(vec!["D:/a/1.pdf".into()], &set(&["D:/a/1.pdf"]), &[], 10);
+        assert_eq!(plan.delete, vec!["D:/a/1.pdf".to_string()]);
+        assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn 目录未走完时整目录跳过() {
+        let plan = plan_stale(
+            vec!["D:/a/1.pdf".into(), "D:/b/2.pdf".into()],
+            &set(&["D:/a/1.pdf"]),
+            &["D:/a".to_string()],
+            10,
+        );
+        assert!(plan.delete.is_empty(), "跳过的目录不得删除");
+        assert!(!plan.pending.contains(&"D:/a/1.pdf".to_string()), "跳过的目录不得进待确认");
+        assert_eq!(plan.pending, vec!["D:/b/2.pdf".to_string()], "未跳过的目录照常登记");
+        assert_eq!(plan.skipped, vec!["D:/a/1.pdf".to_string()]);
+        assert_eq!(plan.delete.len() + plan.pending.len() + plan.skipped.len(), 2);
+    }
+
+    #[test]
+    fn 规模超阈值一律不删只登记() {
+        let many: Vec<String> = (0..300).map(|i| format!("D:/a/{i}.pdf")).collect();
+        let pending: std::collections::HashSet<String> = many.iter().cloned().collect();
+        let plan = plan_stale(many, &pending, &[], 100);
+        assert!(plan.refused, "300 > max(200, 5) 必须拒绝");
+        assert!(plan.delete.is_empty(), "拒绝时不得删除");
+        assert_eq!(plan.pending.len(), 300, "全部转为待确认");
+        assert_eq!(plan.limit, STALE_AUTO_DELETE_MIN);
+    }
+
+    #[test]
+    fn 阈值随登记数增长() {
+        // 登记 20000 条 → 阈值取 5% = 1000
+        let plan = plan_stale((0..900).map(|i| format!("D:/a/{i}.pdf")).collect(), &set(&[]), &[], 20_000);
+        assert_eq!(plan.limit, 1000);
+        assert!(!plan.refused);
+    }
+
+    #[test]
+    fn 文件回来时清掉待确认() {
+        let plan = plan_stale(vec![], &set(&["D:/a/1.pdf"]), &[], 10);
+        assert_eq!(plan.revived, vec!["D:/a/1.pdf".to_string()]);
+        assert!(plan.pending.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod refresh_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_root(tag: &str) -> PathBuf {
         let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let d = std::env::temp_dir().join(format!("fr_refresh_{}_{}_{}", tag, std::process::id(), n));
+        let d = std::env::temp_dir().join(format!("tp_refresh_{}_{}_{}", tag, std::process::id(), n));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ---------- 纯决策层 plan_reconcile（必修 4.2）----------
+    fn recs(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+        rows.iter().map(|(i, p)| (*i, p.to_string())).collect()
+    }
+
+    /// 父目录可列举 ⇒ 正常列入删除（同目录存活行多，比例远低于阈值）。
+    #[test]
+    fn plan_deletes_when_parent_listable() {
+        let mut rows: Vec<(i64, String)> = (0..100).map(|i| (i, format!("D:/a/keep{i}.txt"))).collect();
+        rows.push((900, "D:/a/gone1.txt".into()));
+        rows.push((901, "D:/a/gone2.txt".into()));
+        let plan = plan_reconcile(&rows, |p| if p.contains("gone") { Probe::Missing } else { Probe::Exists }, false);
+        assert_eq!(plan.to_delete.len(), 2);
+        assert!(plan.skipped.is_empty());
+        assert!(!plan.needs_confirm, "2/102 ≈ 2% 低于阈值，不该要求确认");
+        assert_eq!(plan.dirs[0].dir, "D:/a");
+        assert_eq!(plan.dirs[0].missing, 2);
+    }
+
+    /// 父目录不可列举 ⇒ 该目录全部跳过（必要条件）；confirmed=true 也不会删它们。
+    #[test]
+    fn plan_skips_whole_dir_when_parent_unreachable() {
+        let r = recs(&[(1, "D:/pdf/1.pdf"), (2, "D:/pdf/2.pdf"), (3, "D:/ok/3.txt")]);
+        let plan = plan_reconcile(
+            &r,
+            |p| {
+                if p.starts_with("D:/pdf/") {
+                    Probe::ParentUnreachable("拒绝访问".into())
+                } else {
+                    Probe::Missing
+                }
+            },
+            true,
+        );
+        assert_eq!(plan.skipped.len(), 2, "不可达目录下全部跳过");
+        assert_eq!(plan.to_delete.len(), 1, "其它目录照常（确认后）");
+        assert_eq!(plan.missing, 3);
+        assert_eq!(plan.unreachable, vec![("D:/pdf".to_string(), "拒绝访问".to_string(), 2)]);
+        assert!(plan.to_delete.iter().all(|(_, p)| !p.starts_with("D:/pdf/")), "不可达目录的行绝不能进删除列表");
+    }
+
+    /// 比例超阈值 ⇒ 返回待确认且**不删除**；confirmed=true ⇒ 正常列入删除。
+    #[test]
+    fn plan_needs_confirm_over_threshold() {
+        // 1,000 行里删 300 行 = 30% > 1%（且 300 > 200 绝对值下限）
+        let mut rows: Vec<(i64, String)> = (0..700).map(|i| (i, format!("D:/a/{i}.txt"))).collect();
+        rows.extend((700..1000).map(|i| (i, format!("D:/a/gone{i}.txt"))));
+        let plan = plan_reconcile(&rows, |p| if p.contains("gone") { Probe::Missing } else { Probe::Exists }, false);
+        assert!(plan.needs_confirm);
+        assert!(plan.to_delete.is_empty(), "需要确认时一条都不能删");
+        assert_eq!(plan.missing, 300);
+        let plan2 = plan_reconcile(&rows, |p| if p.contains("gone") { Probe::Missing } else { Probe::Exists }, true);
+        assert!(!plan2.needs_confirm);
+        assert_eq!(plan2.to_delete.len(), 300);
+    }
+
+    /// 单目录 30% 阈值：总量很小但某目录整仓缺失 ⇒ 也要确认。
+    #[test]
+    fn plan_needs_confirm_by_dir_ratio() {
+        let mut rows: Vec<(i64, String)> = (0..3).map(|i| (i, format!("D:/pdf/keep{i}.pdf"))).collect();
+        rows.push((10, "D:/pdf/gone1.pdf".into()));
+        rows.push((11, "D:/pdf/gone2.pdf".into()));
+        // D:/pdf: missing=2, present=3 ⇒ 40% ≥ 30%
+        let plan = plan_reconcile(&rows, |p| if p.contains("gone") { Probe::Missing } else { Probe::Exists }, false);
+        assert!(plan.needs_confirm);
+        assert!(plan.to_delete.is_empty());
+        // 同规模但缺失比例低于 30% ⇒ 不要求确认
+        let mut rows2: Vec<(i64, String)> = (0..10).map(|i| (i, format!("D:/pdf/keep{i}.pdf"))).collect();
+        rows2.push((10, "D:/pdf/gone1.pdf".into()));
+        let plan2 = plan_reconcile(&rows2, |p| if p.contains("gone") { Probe::Missing } else { Probe::Exists }, false);
+        assert!(!plan2.needs_confirm, "1/11 ≈ 9% < 30%");
+        assert_eq!(plan2.to_delete.len(), 1);
+    }
+
+    /// 删除失败必须被计数并回传错误文本（不中断）。
+    #[test]
+    fn delete_rows_reports_failure() {
+        let root = tmp_root("del_fail");
+        let p = root.join("t.db");
+        let conn = db::init(&p).unwrap();
+        db::upsert_book(&conn, "D:/x/1.txt", "1", "txt", 1, 0).unwrap();
+        // 只读连接：DELETE 必然失败
+        let ro = rusqlite::Connection::open_with_flags(
+            &p,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (ok, failed, err) = delete_rows(&ro, &[(1, "D:/x/1.txt".to_string())]);
+        assert_eq!((ok, failed), (0, 1));
+        assert!(err.is_some(), "失败必须带上错误文本");
+        // 正常连接：成功
+        let (ok2, failed2, _) = delete_rows(&conn, &[(1, "D:/x/1.txt".to_string())]);
+        assert_eq!((ok2, failed2), (1, 0));
     }
 
     /// 必验 A/B：删文件 → removed 计数正确；目录新增文件 → added 计数正确；二次刷新幂等 0/0。
@@ -5409,10 +6668,10 @@ mod refresh_tests {
     }
 
     /// 端到端：用 _test/make_manga_false_fixture.py 生成的真实 EPUB 校验探针（按需运行）。
-    ///   $env:FR_MANGA_FALSE_FIXTURE="<path.epub>"; cargo test manga_probe_against_python_fixture -- --nocapture
+    ///   $env:TP_MANGA_FALSE_FIXTURE="<path.epub>"; cargo test manga_probe_against_python_fixture -- --nocapture
     #[test]
     fn manga_probe_against_python_fixture() {
-        let Ok(path) = std::env::var("FR_MANGA_FALSE_FIXTURE") else {
+        let Ok(path) = std::env::var("TP_MANGA_FALSE_FIXTURE") else {
             return;
         };
         let data = std::fs::read(&path).expect("读取夹具失败");
@@ -5455,7 +6714,7 @@ mod epub_meta_tests {
 
     #[test]
     fn write_meta_overwrites_title_and_author() {
-        let dir = std::env::temp_dir().join(format!("fr_epub_meta_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tp_epub_meta_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("b.epub");
         write_min_epub(&p);
@@ -5498,7 +6757,7 @@ mod cache_stamp_tests {
 
     #[test]
     fn file_stamp_reflects_size_and_missing_path() {
-        let dir = std::env::temp_dir().join(format!("fr_stamp_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tp_stamp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("a.txt");

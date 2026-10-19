@@ -55,7 +55,7 @@
     flex-direction: column;
     gap: var(--sp-1);
     min-width: 150px;
-    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .ts-title {

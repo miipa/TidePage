@@ -745,7 +745,7 @@ pub const MAX_PARSE_CALLS: u64 = 200_000;
 
 /// worker 与看门狗共享的读取预算/取消令牌。
 pub struct CoverReadBudget {
-    // staged: 解析预算计量基准；仅 FR_EPUB_COVER cargo test cover_budget_bench 读取（校准 MAX_PARSE_CALLS）。
+    // staged: 解析预算计量基准；仅 TP_EPUB_COVER cargo test cover_budget_bench 读取（校准 MAX_PARSE_CALLS）。
     #[allow(dead_code)]
     bytes_limit: u64,
     #[allow(dead_code)]
@@ -1201,7 +1201,7 @@ fn render_doc_html<R: Read + std::io::Seek>(
     if keep_styles && !book_css.trim().is_empty() {
         let scoped = scope_book_css(&book_css);
         if !scoped.trim().is_empty() {
-            style_tag = format!("<style class=\"fr-book-css\">{scoped}</style>");
+            style_tag = format!("<style class=\"tp-book-css\">{scoped}</style>");
         }
     }
 
@@ -1950,13 +1950,13 @@ mod tests {
 
     /// 计量：对给定文件，(1) 从尾部 EOCD 读出中央目录大小；(2) 用共享计数 reader 执行一次
     /// `ZipArchive::new`，报告读取字节总数（用看门狗防止畸形 CD 卡死）。
-    /// 用法：FR_ZIP_BENCH=<epub> cargo test zipnew_bytes_bench -- --nocapture
+    /// 用法：TP_ZIP_BENCH=<epub> cargo test zipnew_bytes_bench -- --nocapture
     #[test]
     fn zipnew_bytes_bench() {
         use std::io::{Read, Seek, SeekFrom};
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        let Ok(spec) = std::env::var("FR_ZIP_BENCH") else { return };
+        let Ok(spec) = std::env::var("TP_ZIP_BENCH") else { return };
         // 支持 "@文件" 形式（文件首行是 UTF-8 路径），避免命令行传非 ASCII 路径被转码。
         let path = if let Some(f) = spec.strip_prefix('@') {
             std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
@@ -2041,18 +2041,18 @@ mod tests {
 
     /// 计量：对给定文件执行**带预算**的封面提取，输出解析阶段消耗的 read 调用次数/字节数、
     /// 是否命中预算（病态）、耗时与结果。用于为 `MAX_PARSE_CALLS` 取值提供依据，并对失败文件归类。
-    /// 用法：FR_EPUB_COVER=<epub|@pathfile> cargo test cover_budget_bench -- --nocapture
+    /// 用法：TP_EPUB_COVER=<epub|@pathfile> cargo test cover_budget_bench -- --nocapture
     #[test]
     fn cover_budget_bench() {
-        let Ok(spec) = std::env::var("FR_EPUB_COVER") else { return };
+        let Ok(spec) = std::env::var("TP_EPUB_COVER") else { return };
         let path = if let Some(f) = spec.strip_prefix('@') {
             std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
         } else {
             spec
         };
         let t = std::time::Instant::now();
-        let bytes = std::env::var("FR_EPUB_COVER_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_BYTES);
-        let calls = std::env::var("FR_EPUB_COVER_CALLS").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_CALLS);
+        let bytes = std::env::var("TP_EPUB_COVER_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_BYTES);
+        let calls = std::env::var("TP_EPUB_COVER_CALLS").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_PARSE_CALLS);
         let budget = Arc::new(CoverReadBudget::new(bytes, calls));
         let r = extract_cover_file(&path, &budget);
         let desc = match &r {
@@ -2074,10 +2074,10 @@ mod tests {
     }
 
     /// 计量：对病态文件执行带预算的封面提取，并在 500ms 后 cancel（模拟看门狗取消），
-    /// 验证 worker 线程随即结束（不再泄漏）。用法：FR_EPUB_CANCEL=<epub> cargo test cover_cancel_bench -- --nocapture
+    /// 验证 worker 线程随即结束（不再泄漏）。用法：TP_EPUB_CANCEL=<epub> cargo test cover_cancel_bench -- --nocapture
     #[test]
     fn cover_cancel_bench() {
-        let Ok(spec) = std::env::var("FR_EPUB_CANCEL") else { return };
+        let Ok(spec) = std::env::var("TP_EPUB_CANCEL") else { return };
         let path = if let Some(f) = spec.strip_prefix('@') {
             std::fs::read_to_string(f).unwrap().lines().next().unwrap().trim().to_string()
         } else {
@@ -2099,12 +2099,12 @@ mod tests {
     }
 
     /// 计量：用共享计数的 reader 统计 extract_cover 各阶段实际从磁盘拉取的字节数。
-    /// 用法：FR_COVER_BENCH=<epub 路径> cargo test cover_bytes_bench -- --nocapture
+    /// 用法：TP_COVER_BENCH=<epub 路径> cargo test cover_bytes_bench -- --nocapture
     #[test]
     fn cover_bytes_bench() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        let Ok(path) = std::env::var("FR_COVER_BENCH") else { return };
+        let Ok(path) = std::env::var("TP_COVER_BENCH") else { return };
         struct Counting<R> { inner: R, read: Arc<AtomicU64> }
         impl<R: std::io::Read> std::io::Read for Counting<R> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {

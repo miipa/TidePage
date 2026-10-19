@@ -80,7 +80,7 @@
 
   // 本窗顶部标题栏固定 40px：写入全局变量让右上角 WindowControls 高度=40px、按钮垂直居中对齐。
   onMount(() => {
-    document.documentElement.style.setProperty("--fr-titlebar-h", "40px");
+    document.documentElement.style.setProperty("--tp-titlebar-h", "40px");
   });
 
   onMount(async () => {

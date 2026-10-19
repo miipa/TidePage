@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { renderCoverPng } from "../lib/pdf";
+  import { regeneratePdfCover, renderCoverImage } from "../lib/pdf";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
@@ -109,6 +109,33 @@ import { reorderByDrop } from "../lib/reorder";
   let folderScan = $state<{ running: boolean; scanned: number; added: number } | null>(null);
   /** 封面/元数据后台生成进度（由后端 meta-progress 事件驱动；不阻塞其它操作）。 */
   let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
+  /**
+   * 上次扫描的异常态（`last_scan_stale`，后端每次扫描结束重算）：首屏常驻提示条的唯一来源。
+   * 为什么不复用 `stale_pending_*`：那张表只存"待确认删除"的 path，目录没走完的路径
+   * 根本不进它（被 plan_stale 剔进 skipped），从它读会得到"目录改名时一切正常"的错误结论。
+   */
+  let scanStale = $state<{
+    refused: boolean;
+    pending: number;
+    skipped: number;
+    unfinishedDirs: number;
+    dirs: string[];
+    at: number;
+  } | null>(null);
+
+  async function loadScanStale() {
+    try {
+      const raw = await api.getLastScanStale();
+      if (!raw) {
+        scanStale = null;
+        return;
+      }
+      const v = JSON.parse(raw);
+      scanStale = v && v.state === "stale" ? { refused: !!v.refused, pending: v.pending ?? 0, skipped: v.skipped ?? 0, unfinishedDirs: v.unfinishedDirs ?? 0, dirs: Array.isArray(v.dirs) ? v.dirs : [], at: v.at ?? 0 } : null;
+    } catch {
+      scanStale = null;
+    }
+  }
   /** 让最后一帧进度（N/N）短暂可见后再隐藏，避免一闪而过看不到。 */
   let metaHideTimer: ReturnType<typeof setTimeout> | undefined;
   /** library-changed 防抖：移除大目录等场景可能短时多次触发，合并为一次全量刷新，
@@ -341,7 +368,7 @@ import { reorderByDrop } from "../lib/reorder";
   let tbH = $state(0);
   $effect(() => {
     if (tbH > 0) {
-      document.documentElement.style.setProperty("--fr-titlebar-h", tbH + "px");
+      document.documentElement.style.setProperty("--tp-titlebar-h", tbH + "px");
     }
   });
 
@@ -927,6 +954,8 @@ import { reorderByDrop } from "../lib/reorder";
     windowRetry = 0;
     pruneRowMap(s, e);
     winVersion++;
+    // 首屏行已进 rowMap：向后端报一次「本轮启动走到了书库」（连续启动失败 → 下轮跳过封面重建）。
+    signalLibraryReady();
     // ❌ 死 id 收敛：idIndex 是快照，删书后其 rank 会长期留 null（空行 + 滚动高度偏大 +
     // 为死 id 白请求封面 IO）。窗口内 null 过多或连续多窗出现 → 防抖重建（按锚点重定位）。
     if (nulls > 0) {
@@ -1120,40 +1149,70 @@ import { reorderByDrop } from "../lib/reorder";
    *  tried 记本轮已试过的书：单本失败不能让它被反复选中（死循环）。 */
   let pdfCoverToken = 0;
   let pdfCoverRunning = false;
+  let pdfCoverTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 一轮最多补多少本：上限让「一轮」的内存与主线程占用都可预期；还有剩余就排下一轮。 */
+  const PDF_COVER_ROUND_MAX = 120;
+  /** 每补几本让出一次事件循环：给画布 / data URL / base64 字符串与 GC 回收的机会。 */
+  const PDF_COVER_YIELD_EVERY = 10;
+  /** 本次会话里已试过的书：失败的不再重挑。
+   *  为什么必须有：补封面失败的 PDF（例如 132 字节的空壳文件）不会从「缺封面」列表里消失，
+   *  没有这个集合就会「每轮重新挑同一批 → 永远失败 → 无限重试」。 */
+  const pdfCoverTried = new Set<number>();
   async function backfillPdfCovers() {
     if (pdfCoverRunning) return;
     const token = ++pdfCoverToken;
     pdfCoverRunning = true;
-    const tried = new Set<number>();
+    let more = false;
     try {
-      for (;;) {
+      // 一轮只取一次待补清单。旧实现把这次查询放在循环体里：每补一本就重取一遍全量 id，
+      // 1.1 万本 = 1.3 亿个 id 反复过 IPC + 每轮一个 N 长数组，是启动期内存暴涨的主因之一。
+      const ids = await api.pdfBooksMissingCover().catch(() => null);
+      if (!ids) return;
+      const queue = ids.filter((id) => !pdfCoverTried.has(id));
+      more = queue.length > PDF_COVER_ROUND_MAX;
+      let n = 0;
+      for (const id of queue.slice(0, PDF_COVER_ROUND_MAX)) {
         if (token !== pdfCoverToken || config.library.coverScan !== "auto" || ui.view !== "library") return;
-        const ids = await api.pdfBooksMissingCover().catch(() => null);
-        if (!ids) return;
-        const id = ids.find((n) => !tried.has(n));
-        if (id == null) return; // 没有待补的：收工（新导入会再由 library-changed 触发）
-        // 渲染前再查一次：用户可能刚好在这一刻点开了书
-        if (token !== pdfCoverToken || config.library.coverScan !== "auto" || ui.view !== "library") return;
-        tried.add(id);
+        let dataUrl = "";
         try {
-          const dataUrl = await renderCoverPng(id, 800);
-          const b64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-          if (b64 && b64 !== dataUrl) await api.setBookCoverImage(id, b64);
+          dataUrl = await renderCoverImage(id, 320);
+          const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+          dataUrl = ""; // 立刻放掉整幅 data URL（可能数 MB），只把 base64 段交给后端
+          if (b64) await api.setBookCoverImage(id, b64);
         } catch {
           /* 单本失败静默：封面是锦上添花，不弹错、也不拖住后面的书 */
+          dataUrl = "";
         }
+        pdfCoverTried.add(id); // 无论成败都记账：失败的本轮不再重挑（见 pdfCoverTried 的说明）
+        // 让出事件循环：渲染用的 canvas、PNG 字符串在这一拍之后就能被回收。
+        if (++n % PDF_COVER_YIELD_EVERY === 0) await new Promise((r) => setTimeout(r, 0));
       }
     } finally {
       if (token === pdfCoverToken) pdfCoverRunning = false;
+    }
+    // 还有剩余：隔一下排下一轮（每轮仍有上限），用户无需干预，也不会出现一次冲刺。
+    if (more && token === pdfCoverToken && config.library.coverScan === "auto" && ui.view === "library") {
+      clearTimeout(pdfCoverTimer);
+      pdfCoverTimer = setTimeout(() => void backfillPdfCovers(), 1500);
     }
   }
   /** 起一轮补封面（重复调用安全）；关闭/切手动后令牌失效，循环自行退出。 */
   function kickPdfCovers() {
     if (config.library.coverScan !== "auto") return;
+    if (pdfCoverRunning) return;
     void backfillPdfCovers();
   }
   // 离开书架（组件卸载）即停止：令牌 +1 让在跑的循环在下一次检查点退出。
-  onDestroy(() => { pdfCoverToken++; });
+  onDestroy(() => { pdfCoverToken++; clearTimeout(pdfCoverTimer); });
+
+  /** 首屏取到行后向后端报一次「已进入书库」：启动日志据此判定上一轮是否崩溃，
+   *  连续启动失败时下一次启动自动跳过封面重建。只报一次。 */
+  let readySignaled = false;
+  function signalLibraryReady() {
+    if (readySignaled) return;
+    readySignaled = true;
+    api.libraryReady().catch(() => {});
+  }
 
   // C1：路由重新进入本组件时 onMount 会重跑 reload()（本应用书库/阅读是 {#if} 切换，非 keep-alive）。
   // 另外响应全局 cover-updated 信号（ui.coverTick，来自 +page 根组件监听）重拉当前窗口，
@@ -1305,26 +1364,55 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
+  // 对账刷新的执行器（两个入口共用）：先跑一次不带确认的对账。
+  // - 后端返回 needs_confirm ⇒ 一条都没删，这里用多行确认框把「数量 + 主要目录」告诉用户，
+  //   确认后再以 confirm=true 调一次（此时才真正删除）。
+  // - 返回 null 表示用户取消或发生错误（错误已 toast）。
+  async function runReconcile(): Promise<{ removed: number; added: number; pending: number; skipped: number } | null> {
+    try {
+      const r = await api.refreshLibrary();
+      if (!r.needs_confirm) return { removed: r.removed, added: r.added, pending: r.pending, skipped: r.skipped };
+      // 确认框：第一行放数量（`word-break: break-all` 会断路径，关键数字必须在第一行）
+      const lines = [t("library.refresh.confirmCount", { count: r.pending })];
+      const dirs = r.dirs.slice(0, 3);
+      if (dirs.length) {
+        lines.push(t("library.refresh.confirmDirs", { dirs: dirs.map((d) => `${d.dir}（${d.count}）`).join("、") }));
+      }
+      lines.push(t("library.refresh.confirmAsk"));
+      const ok = await appConfirm(lines.join("\n"));
+      if (!ok) return null;
+      const r2 = await api.refreshLibrary(true);
+      return { removed: r2.removed, added: r2.added, pending: r2.pending, skipped: r2.skipped };
+    } catch (e) {
+      toast(errText(e), "error");
+      return null;
+    }
+  }
+
   // 任务3：打开入口先查文件是否存在；不存在则弹确认刷新，绝不进入空白阅读。
   // 确认 → 刷新目录后停下（不继续打开、不触碰旧 reader 状态）；取消 → 直接返回。
+  // 三态：ok=打开；missing=弹"文件缺失"确认；unreachable=只提示"暂时无法访问"，不进删除确认。
   async function tryOpenBook(b: BookRow) {
-    let exists = true;
+    let state: "ok" | "missing" | "unreachable" = "ok";
     try {
-      exists = await api.fileExists(b.path);
+      state = await api.fileExists(b.path);
     } catch {
-      exists = true; // 检查失败时不阻断（交由打开流程自行报错）
+      state = "ok"; // 检查调用本身失败时不阻断（交由打开流程自行报错）
     }
-    if (exists) {
+    if (state === "ok") {
       openBook(b);
+      return;
+    }
+    if (state === "unreachable") {
+      toast(t("toast.library.unreachable"));
       return;
     }
     const ok = await appConfirm(t("library.book.missingConfirm", { path: b.path }));
     if (!ok) return;
-    try {
-      const r = await api.refreshLibrary();
-      toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
-    } catch (e) {
-      toast(errText(e), "error");
+    const r = await runReconcile();
+    if (r) {
+      if (r.skipped > 0 && r.removed === 0) toast(t("toast.library.unreachable"));
+      else toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
     }
     // 无论该书是否仍在索引，都停在这里（不进入空白阅读）
   }
@@ -1337,11 +1425,12 @@ import { reorderByDrop } from "../lib/reorder";
     refreshing = true;
     refreshProgress = { phase: "check", done: 0, total: 0 };
     try {
-      const r = await api.refreshLibrary();
-      toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
-      await reloadWindow();
-    } catch (e) {
-      toast(errText(e), "error");
+      const r = await runReconcile();
+      if (r) {
+        if (r.skipped > 0 && r.removed === 0) toast(t("toast.library.unreachable"));
+        else toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
+        await reloadWindow();
+      }
     } finally {
       refreshing = false;
       refreshProgress = null;
@@ -1456,7 +1545,7 @@ import { reorderByDrop } from "../lib/reorder";
 
   async function reextract(b: BookRow) {
     try {
-      const name = await api.reextractCover(b.id);
+      const name = b.format === "pdf" ? await regeneratePdfCover(b.id, 320) : await api.reextractCover(b.id);
       // 换新对象身份（不就地改属性），令封面 <img> 重挂即时刷新。
       replaceBook(b.id, { cover_path: name, cover_ver: (b.cover_ver ?? 0) + 1 });
       toast(t("toast.library.coverReextracted"));
@@ -1584,9 +1673,11 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   onMount(() => {
+    // 首屏提示条：读上次扫描的最终判定（多窗口同一份；重启后仍在）。
+    void loadScanStale();
     // DEV 调试钩子：便于自动化验证删书弹窗（release 剥离）。
     if (import.meta.env.DEV) {
-      (window as any).__frLibDebug = {
+      (window as any).__tpLibDebug = {
         deleteByPath: async (p: string, fromDisk = false) => {
           let b = booksWindow.find((x) => x.path === p);
           if (!b) {
@@ -1643,18 +1734,57 @@ import { reorderByDrop } from "../lib/reorder";
       if (e.payload) refreshProgress = e.payload;
     });
     // 添加目录扫描进度（专用事件）：只统计本次目录的条目；结束时提示新增书籍数。
-    const u8 = listen<{ running: boolean; scanned: number; added: number }>("folder-scan-progress", (e) => {
+    // `origin` 分流：只有用户动作触发的扫描才提示；`startup` / `timer` 只更新进度条，不弹提示。
+    const u8 = listen<{ running: boolean; scanned: number; added: number; origin?: string }>("folder-scan-progress", (e) => {
       const p = e.payload;
       if (!p) return;
+      const userScan = p.origin === "user";
       if (p.running) {
-        folderScan = p;
-      } else {
-        folderScan = null;
-        toast(p.added > 0 ? t("toast.library.folderScanAdded", { count: p.added }) : t("toast.library.folderScanNone"));
-        // 扫描完成后按当前排序全量刷新：resetScroll() + 按 sortKey/query/desc 重建 id 索引，
-        // 确保新书出现在其排序位置并回到顶部（reloadWindow 会锚定原顶部 id，新书可能不在可视区）。
-        if (p.added > 0) reload();
+        if (userScan) folderScan = p;
+        return;
       }
+      if (userScan) folderScan = null;
+      if (!userScan) return;
+      toast(p.added > 0 ? t("toast.library.folderScanAdded", { count: p.added }) : t("toast.library.folderScanNone"));
+      // 扫描完成后按当前排序全量刷新：resetScroll() + 按 sortKey/query/desc 重建 id 索引，
+      // 确保新书出现在其排序位置并回到顶部（reloadWindow 会锚定原顶部 id，新书可能不在可视区）。
+      if (p.added > 0) reload();
+    });
+    // 扫描删行护栏（后端 folder-scan-stale）：目录没走完或失效数超阈值时后端拒绝自动删除，只登记不清理。
+    // `origin="user"` 才弹提示（用户动作，弹了才知道结果）；`startup` / `timer` 一律静默，
+    // 异常态改由首屏常驻提示条呈现（`last_scan_stale`），数据安全信号不会因为静默而消失。
+    const u9 = listen<{
+      refused: boolean;
+      pending: number;
+      skipped: number;
+      unfinishedDirs: number;
+      origin?: string;
+    }>("folder-scan-stale", (e) => {
+      const p = e.payload;
+      if (!p) return;
+      if (p.origin === "user") {
+        if (p.refused) toast(t("toast.library.scanStaleRefused", { count: p.pending }));
+        else if (p.unfinishedDirs > 0) toast(t("toast.library.scanUnfinished"));
+      }
+      void loadScanStale();
+    });
+    // 扫描最终态（每次扫描结束都发，含恢复为正常）：首屏提示条据此出现/消失。
+    // 与 `folder-scan-stale` 的区别：那个只在异常时发，恢复时没有事件。
+    const u10 = listen<{
+      state: string;
+      refused: boolean;
+      pending: number;
+      skipped: number;
+      unfinishedDirs: number;
+      dirs?: string[];
+      at?: number;
+    }>("scan-stale-state", (e) => {
+      const p = e.payload;
+      if (!p) return;
+      scanStale =
+        p.state === "stale"
+          ? { refused: !!p.refused, pending: p.pending ?? 0, skipped: p.skipped ?? 0, unfinishedDirs: p.unfinishedDirs ?? 0, dirs: Array.isArray(p.dirs) ? p.dirs : [], at: p.at ?? 0 }
+          : null;
     });
     // 封面增量扫描进度（入队时发一帧 / 每 16 本发一帧 / done==total 必发）。
     const u5 = listen<{ phase: string; done: number; total: number }>("meta-progress", (e) => {
@@ -1696,6 +1826,8 @@ import { reorderByDrop } from "../lib/reorder";
       u6.then((f) => f());
       u7.then((f) => f());
       u8.then((f) => f());
+      u9.then((f) => f());
+      u10.then((f) => f());
       u3?.then((f) => f());
     };
   });
@@ -1809,6 +1941,21 @@ import { reorderByDrop } from "../lib/reorder";
       </div>
       {#if hasFilter}
         <button class="fp-clear" data-testid="lib-filter-clear" onclick={clearFilter}>{t("library.filter.clear")}</button>
+      {/if}
+    </div>
+  {/if}
+
+  {#if scanStale}
+    <!-- 上次扫描未走完/已跳过清理：首屏常驻提示条（不可折叠进设置）。
+         数据安全信号不能因为"后台扫描不弹提示"而消失；措辞与刷新确认框同一套口径。 -->
+    <div class="scan-stale" data-testid="lib-scan-stale">
+      <div class="ss-line1">
+        {scanStale.refused
+          ? t("toast.library.scanStaleRefused", { count: scanStale.pending })
+          : t("toast.library.scanUnfinished")}
+      </div>
+      {#if scanStale.dirs.length}
+        <div class="ss-line2">{t("library.refresh.confirmDirs", { dirs: scanStale.dirs.join("、") })}</div>
       {/if}
     </div>
   {/if}
@@ -2164,7 +2311,7 @@ import { reorderByDrop } from "../lib/reorder";
     background: var(--panel);
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
-    animation: fr-menu-in var(--dur-fast) var(--ease-in) both;
+    animation: tp-menu-in var(--dur-fast) var(--ease-in) both;
   }
 
   .fp-group {
@@ -2225,6 +2372,24 @@ import { reorderByDrop } from "../lib/reorder";
     gap: var(--sp-2);
     padding: var(--sp-3) var(--sp-4) 0;
     flex-wrap: wrap;
+  }
+
+  /* 上次扫描异常态常驻提示条：不折叠、不进设置，只陈述数量与目录。 */
+  .scan-stale {
+    margin: var(--sp-3) var(--sp-4) 0;
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel2);
+    color: var(--fg);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-line;
+  }
+  .scan-stale .ss-line2 {
+    color: var(--fg-dim, var(--fg));
+    opacity: 0.75;
+    word-break: break-all;
   }
 
   .folder-chip {
@@ -2470,7 +2635,7 @@ import { reorderByDrop } from "../lib/reorder";
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    animation: fr-meta-rise var(--dur-lift) var(--ease-premium) both;
+    animation: tp-meta-rise var(--dur-lift) var(--ease-premium) both;
   }
 
   .meta .a {
@@ -2481,7 +2646,7 @@ import { reorderByDrop } from "../lib/reorder";
     overflow: hidden;
     text-overflow: ellipsis;
     margin-top: 1px;
-    animation: fr-meta-rise var(--dur-lift) var(--ease-premium) 60ms both;
+    animation: tp-meta-rise var(--dur-lift) var(--ease-premium) 60ms both;
   }
 
   /* ---------- 列表 ---------- */
@@ -2503,10 +2668,10 @@ import { reorderByDrop } from "../lib/reorder";
      卡住；虚拟窗口逐行增删，若给每张卡挂动画则滚动中会不断重播（像闪烁）。 */
   .grid-inner,
   .list-inner {
-    animation: fr-content-in var(--dur-lift) var(--ease-premium) both;
+    animation: tp-content-in var(--dur-lift) var(--ease-premium) both;
   }
 
-  @keyframes fr-content-in {
+  @keyframes tp-content-in {
     from {
       opacity: 0;
       transform: translateY(10px);
@@ -2643,7 +2808,7 @@ import { reorderByDrop } from "../lib/reorder";
     border-radius: 50%;
     border: 1.5px solid color-mix(in srgb, var(--fg2) 28%, transparent);
     border-top-color: var(--accent);
-    animation: fr-spin 0.9s linear infinite;
+    animation: tp-spin 0.9s linear infinite;
   }
 
   /* 书库为空 / 无匹配结果：文案里的 \n 需要真实换行才能分行显示。
@@ -2742,11 +2907,11 @@ import { reorderByDrop } from "../lib/reorder";
 
   /* 空态逐项错峰落位：标记 → 标题/说明 → 按钮 → 格式。
      这个状态一次挂载只出现一次（不在虚拟滚动里），所以逐项入场不会像书库卡片那样
-     在滚动中重播 —— 那正是 app.css 里 fr-meta-rise 注释警告过的场景。
+     在滚动中重播 —— 那正是 app.css 里 tp-meta-rise 注释警告过的场景。
      填充模式用 backwards 而**不是** both：both 会在动画结束后继续把 transform 钉在
      none 上，压过按钮自己的 :active 按下反馈（动画填充优先于普通声明）。 */
   .lib-start > * {
-    animation: fr-meta-rise var(--dur-lift) var(--ease-premium) backwards;
+    animation: tp-meta-rise var(--dur-lift) var(--ease-premium) backwards;
   }
   .lib-start > *:nth-child(2) { animation-delay: 60ms; }
   .lib-start > *:nth-child(3) { animation-delay: 120ms; }
@@ -2823,7 +2988,7 @@ import { reorderByDrop } from "../lib/reorder";
     border: 1px solid var(--line);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
-    animation: fr-menu-in var(--dur-fast) var(--ease-in) both;
+    animation: tp-menu-in var(--dur-fast) var(--ease-in) both;
   }
 
   .refresh-menu .rm-item {
@@ -2849,7 +3014,7 @@ import { reorderByDrop } from "../lib/reorder";
     /* 进度块随事件到来凭空出现、结束又凭空消失，两端都是硬切。入场给一次
        淡入上浮（块本身是横向的横向位移读不出来，用纵向 4px），退场见模板里的
        out:outDissolve。 */
-    animation: fr-rise-in var(--dur) var(--ease-premium) both;
+    animation: tp-rise-in var(--dur) var(--ease-premium) both;
   }
 
   /* 进度条在状态栏里横向撑满（轨道的粗细/圆角/配色由 app.css 的全局进度条给） */
@@ -2888,7 +3053,7 @@ import { reorderByDrop } from "../lib/reorder";
      逐条 26ms 上浮后，菜单的「来路」（指针所在处）就有了方向感。
      12 × 26ms = 312ms，与抽屉入场同量级，不会拖成慢动作。 */
   .ctx-menu .ctx-item {
-    animation: fr-rise-in var(--dur) var(--ease-premium) both;
+    animation: tp-rise-in var(--dur) var(--ease-premium) both;
   }
   .ctx-menu .ctx-item:nth-child(1) { animation-delay: 0ms; }
   .ctx-menu .ctx-item:nth-child(2) { animation-delay: 26ms; }
@@ -2974,7 +3139,7 @@ import { reorderByDrop } from "../lib/reorder";
      这条必须写在全局（本文件的 <style> 是 scoped 的，匹配不到 IconCheck
      内部渲染的 <svg> —— app.css 里那批 .xxx .tabler-icon 规则同此理由）。 */
   :global(.sel-badge .tabler-icon) {
-    animation: fr-fade-in var(--dur-fast) var(--ease) both;
+    animation: tp-fade-in var(--dur-fast) var(--ease) both;
   }
 
 

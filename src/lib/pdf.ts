@@ -15,6 +15,9 @@ interface PdfSession {
   doc: PDFDocumentProxy;
   /** 走 range 分块时保留传输对象：换书/关书要 abort 掉在途请求。 */
   range?: PDFDataRangeTransport;
+  /** true = 这本书走系统原生渲染（pdf.js 打不开这种体积，见 PDF_NATIVE_MIN_BYTES）。
+   *  此时 doc 只是「页数占位」，不能拿它调 pdf.js 的任何方法。 */
+  native: boolean;
 }
 
 /** 未被钉住的位图上限（张）：一张普通页位图约 4~16MB，6 张 ≈ 上限百 MB 级。 */
@@ -47,8 +50,42 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /** 小于这个大小就整份读入（一次 IPC 换最少往返）；大于等于则走 range 分块。 */
 const PDF_RANGE_MIN_BYTES = 8 * 1024 * 1024;
+/** range 打开失败时允许「回退整份读入」的**文件大小上限**。
+ *  为什么必须有：range 路径的兜底逻辑会把整个文件经 IPC 读进内存，而真实书库里有
+ *  3.75GB 的扫描 PDF（书库总量 518GB，单册中位数几十 MB）。没有这道闸，一次回退就是
+ *  数 GB 的分配 —— 实测启动期补封面时把宿主工作集推到 6.8GB 后崩溃（0xE0000008）。
+ *  超限时如实报「打不开」，绝不拿内存换一次侥幸。 */
+const PDF_FULL_READ_MAX = 96 * 1024 * 1024;
+/** 带稳定错误码的报错：用户可见文案一律由 i18n 的错误码表（ERR_CODES）给出，本文件不写中文。
+ *  为什么这样：pdf.ts 不是组件，拿不到 t()；错误码 + params 是既有机制（见 i18n/index）。
+ *  params 由 errText 从错误对象上读取，用于填 {mb} 这类动态值。 */
+function pdfError(code: string, params?: Record<string, string | number>): Error {
+  const e = new Error(code) as Error & { code?: string; params?: Record<string, string | number> };
+  e.code = code;
+  e.params = params;
+  return e;
+}
+
 /** 首个分块：pdf.js 需要先拿到头部才能开始解析（64KB 足够覆盖 xref 头）。 */
 const PDF_RANGE_FIRST = 64 * 1024;
+/** 本运行时（WebView2 / Chromium 渲染进程）单次 ArrayBuffer 分配的硬上限：2GiB-1 字节。
+ *  为什么必须知道：pdf.js 走 range 路径时用的是 ChunkedStream，它在构造时就
+ *  `new Uint8Array(length)`（pdf.worker.mjs 的 ChunkedStream 构造函数）——**按整份文件长度
+ *  要一块连续缓冲**，跟 disableStream / disableAutoFetch 无关；超过上限就抛
+ *  RangeError: Array buffer allocation failed，且在抛之前一个区间请求都不会发。
+ *  实测（同一台机器、同一 WebView2）：1.75GiB 分配成功、2.00GiB 失败；
+ *  8MB/40MB/253MB/1.34GiB 的 PDF 都能正常打开，3.31GiB/3.50GiB 必失败。
+ *  所以超过这个长度的 PDF 在本运行时里无法打开，不是开关问题，提前如实说明。 */
+// PDF_SINGLE_BUFFER_MAX = 2³¹−1（2GiB−1，本运行时单次 ArrayBuffer 上限）—— 只剩注释里的说明，
+// 代码里没有对应检查：>1.9GiB 一律走原生通道，pdf.js 分支永远见不到超过它的文件。
+// 不要据此再写回「len > 2GiB−1 就报错」这类不可达检查（历史上写过一次，已删）。
+/** 超过这个体积改走系统原生渲染（Rust pdfnative.rs）：pdf.js 的 range 路径用 ChunkedStream，
+ *  构造时就按整份长度 new Uint8Array(length)，而 WebView2 单次 ArrayBuffer 上限是 2³¹−1 字节
+ *  （实测 1.75GiB 成功、2.00GiB 失败）。阈值取 1.9GiB：那块缓冲之外，pdf.js 还要给页面对象
+ *  与画布留空间。原生通道按页渲染，不需要整份物化。 */
+const PDF_NATIVE_MIN_BYTES = Math.round(1.9 * 1024 * 1024 * 1024);
+/** 原生文档句柄（页数；页尺寸走 geometry 缓存）。同一时刻只留一本，换书即关。 */
+let nativeSession: { bookId: number; pages: number } | null = null;
 
 let session: PdfSession | null = null;
 let sessionBookId = -1;
@@ -183,9 +220,39 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
   sessionBookId = bookId;
   const gen = generation;
   const p = (async (): Promise<PdfSession> => {
-    // 小文件整读（往返少），大文件走 range 分块：pdf.js 只拉它真正需要的字节，
-    // 进程内存不再随文件大小线性上涨（90MB 级扫描件尤其明显）。
+    // 小文件整读（往返少），大文件走 range 分块：pdf.js 只拉它真正需要的字节。
+    // 注意：pdf.js 的 ChunkedStream 仍会按整份长度预留一块连续缓冲（pdf.worker.mjs:6406 的
+    // new Uint8Array(length)）；看起来「内存很低」是操作系统把未触碰的页推迟提交 ——
+    // range 省的是实际驻留与读取量，不是「不再按文件大小分配」。
     const len = await api.pdfFileSize(bookId);
+    // 超大文件：pdf.js 在本运行时无法表示，改走系统原生渲染（按页出图，整份不物化）。
+    if (len > PDF_NATIVE_MIN_BYTES) {
+      let pages: number;
+      try {
+        pages = await api.pdfNativeOpen(bookId);
+      } catch (e) {
+        // 系统渲染不可用（缺组件/文件损坏）时给出准确说明，不把底层错误抛给用户。
+        if (import.meta.env.DEV) console.warn("[pdf] 原生渲染打开失败：", e);
+        // 32 位构建/非 Windows 平台：与「文件太大」区分开，文案见 ERR_CODES。
+        if (String(e).includes("pdf_native_unsupported")) throw pdfError("pdf_native_unsupported");
+        // 废弃线程到上限（连续超时）：与「平台不支持」分开说明，文案里给出下一步。
+        if (String(e).includes("pdf_native_abandoned")) throw pdfError("pdf_native_abandoned");
+        throw pdfError("pdf_native_failed");
+      }
+      if (gen !== generation) {
+        void api.pdfNativeClose().catch(() => {});
+        throw new Error("已切换书籍");
+      }
+      nativeSession = { bookId, pages };
+      const ns: PdfSession = {
+        bookId,
+        // 调用方只读 numPages（见 Reader 的目录构建），给一个最小形状即可。
+        doc: { numPages: pages } as unknown as PDFDocumentProxy,
+        native: true,
+      };
+      session = ns;
+      return ns;
+    }
     const opts: Record<string, unknown> = {
       cMapUrl: "/pdfjs/cmaps/",
       cMapPacked: true,
@@ -194,6 +261,8 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       isEvalSupported: false,
     };
     let range: PDFDataRangeTransport | null = null;
+    // 到这里必有 len <= PDF_NATIVE_MIN_BYTES(1.9GiB)；而 1.9GiB < 2³¹−1（运行时单次 ArrayBuffer 上限），
+    // 所以 pdf.js 分支永远见不到「超过单次缓冲上限」的文件 —— 原先这里那道不可达检查已删。
     if (len >= PDF_RANGE_MIN_BYTES) {
       // 首块必须**在构造之前**读出来交给 initialData。手工 rt.onDataRange(0, head) 会走进
       // pdf.js 的断言：_onReceiveData 要求存在 _begin === begin 的 range reader，而首块走的是
@@ -221,9 +290,11 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       };
       opts.range = rt;
       opts.length = len;
-      // 范围传输下这两个开关必须关掉 pdf.js 自己的「整份拉取」：
-      // disableStream=false 会让它顺序流式读完整个文件；disableAutoFetch 不下发则 worker 会后台预取。
-      opts.disableStream = true;
+      // 数据源支持按需区间读取，所以 disableStream 用 false（= 支持流式），交给 pdf.js 正常选择
+      // NetworkPdfManager；disableAutoFetch 保持 true：只关掉「后台预取剩余区块」，不影响按需取块。
+      // 注意：>2GiB 的 PDF 打不开与这两个开关无关 —— 卡点是上面那块「整份长度」的连续缓冲
+      // （2³¹−1 是运行时单次 ArrayBuffer 上限），而 >1.9GiB 的文件已被原生通道接走。
+      opts.disableStream = false;
       opts.disableAutoFetch = true;
     } else {
       const buf = await api.readBookBytes(bookId);
@@ -241,6 +312,10 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       range = null;
       task.destroy().catch(() => {});
       if (import.meta.env.DEV) console.warn("[pdf] range 打开失败，回退整份读入：", e);
+      // 超大文件不回退整读：宁可打不开，也不把几 GB 拉进内存（见 PDF_FULL_READ_MAX 注释）。
+      if (len > PDF_FULL_READ_MAX) {
+        throw pdfError("pdf_too_large", { mb: Math.round(len / 1048576) });
+      }
       const buf = await api.readBookBytes(bookId);
       task = getDocument({
         cMapUrl: "/pdfjs/cmaps/",
@@ -256,7 +331,7 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
       await doc.destroy().catch(() => {});
       throw new Error("已切换书籍");
     }
-      session = { bookId, doc, range: range ?? undefined };
+      session = { bookId, doc, range: range ?? undefined, native: false };
     return session;
   })();
   sessionPromise = p;
@@ -270,7 +345,14 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
 export async function pageGeometry(bookId: number, page: number): Promise<PageSize> {
   const hit = geometry.get(page);
   if (hit) return hit;
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  if (s.native) {
+    const [w, h] = await api.pdfNativePageGeometry(bookId, page);
+    const size: PageSize = { ptW: Math.max(1, w), ptH: Math.max(1, h) };
+    geometry.set(page, size);
+    return size;
+  }
+  const doc = s.doc;
   const p = await doc.getPage(page + 1);
   try {
     const vp = p.getViewport({ scale: 1 });
@@ -302,7 +384,8 @@ export interface SliceBitmap {
 /** 渲染「一页的一条」为位图：位图分辨率由调用方按「显示尺寸 × DPR」算好（见 pdfPage.clampBitmapSize）。
  *  超长页只渲染当前贴着视口的那几条，整页不会被一次性画出来（否则必被像素上限压掉分辨率）。 */
 export async function renderPageSlice(bookId: number, req: SliceRequest): Promise<SliceBitmap> {
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  const doc = s.doc;
   const gen = generation;
   const token = sliceToken(req.page, req.slice, req.bitH, req.f0);
   const hit = bitmaps.get(token);
@@ -320,6 +403,18 @@ export async function renderPageSlice(bookId: number, req: SliceRequest): Promis
       bitmaps.set(token, again);
       pinnedTokens.add(token);
       return { url: again.url, token };
+    }
+    if (s.native) {
+      const pt = await pageGeometry(bookId, req.page);
+      const url = await nativeSliceUrl(bookId, req, pt);
+      if (gen !== generation) {
+        revoke(url);
+        throw new Error("已切换书籍");
+      }
+      bitmaps.set(token, { url, page: req.page });
+      pinnedTokens.add(token);
+      sweep();
+      return { url, token };
     }
     const page = await doc.getPage(req.page + 1);
     try {
@@ -367,7 +462,10 @@ export interface PdfLink {
 
 /** 取一页的链接注解（subtype=Link）：url 走外链、dest 走跳页。单条解析失败只丢该条。 */
 export async function pageLinks(bookId: number, page: number): Promise<PdfLink[]> {
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  // 原生通道不做注解解析：这类文件的链接入口在阅读器里一并置灰。
+  if (s.native) return [];
+  const doc = s.doc;
   const p = await doc.getPage(page + 1);
   try {
     const vp = p.getViewport({ scale: 1 });
@@ -425,7 +523,10 @@ export async function pageLinks(bookId: number, page: number): Promise<PdfLink[]
 /** 读 PDF 自带目录（outline），并把 dest（可能是数组或字符串名）解析成 0-based 页号。
  *  解析失败的单条保留标题但 page=-1（调用方跳过），绝不因此整份目录失败。 */
 export async function docOutline(bookId: number): Promise<PdfOutlineItem[]> {
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  // 原生通道不解析自带目录：页码目录由页数生成（见 Reader 的 buildPageToc）。
+  if (s.native) return [];
+  const doc = s.doc;
   let raw: unknown = null;
   try {
     raw = await doc.getOutline();
@@ -472,7 +573,10 @@ export async function buildTextLayer(
   host: HTMLElement,
   opts: { displayW: number; ptW: number },
 ): Promise<TextLayerResult> {
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  // 原生通道没有文字层（系统渲染只出位图）：如实返回不可用，阅读器据此隐藏相关入口。
+  if (s.native) return { usable: false, text: "" };
+  const doc = s.doc;
   const gen = generation;
   const p = await doc.getPage(page + 1);
   try {
@@ -503,21 +607,29 @@ export async function buildTextLayer(
  *  切片按 PAGE_CACHE_MAX 张扫描淘汰，整页图按 fullOrder 的小 LRU（FULL_PAGE_CACHE_MAX 张）淘汰。
  *  仍登记进位图表（合成 token）→ 关书/换书时一并 revoke，不留悬挂 blob。 */
 export async function renderPageImageFull(bookId: number, page: number, maxW = 1400, maxPx = 12_000_000): Promise<string> {
-  const { doc } = await ensurePdf(bookId);
+  const s = await ensurePdf(bookId);
+  const doc = s.doc;
   const gen = generation;
   // 尺寸必须**先算出来**再当缓存键：键里含最终宽高，尺寸策略一变就不会命中旧图。
   // 为什么不能只按长边夹：15、Nginx.pdf 是 1693×11221pt，按长边 2000 只得到 302×2000，
   // 适配看着还行，一放大就是 302 源像素硬撑（必糊）。改按宽度 1400 定 scale，再用总像素
   // 1200 万收紧 → 该页约 1345×8919（≈1199 万像素），400%/800% 下文字仍清楚。
-  const probe = await doc.getPage(page + 1);
   let baseW = 1;
   let baseH = 1;
-  try {
-    const vp0 = probe.getViewport({ scale: 1 });
-    baseW = Math.max(1, vp0.width);
-    baseH = Math.max(1, vp0.height);
-  } finally {
-    probe.cleanup();
+  if (s.native) {
+    // 原生通道的页尺寸来自系统渲染器（只用于比例，与 pt 语义一致）。
+    const pt = await pageGeometry(bookId, page);
+    baseW = Math.max(1, pt.ptW);
+    baseH = Math.max(1, pt.ptH);
+  } else {
+    const probe = await doc.getPage(page + 1);
+    try {
+      const vp0 = probe.getViewport({ scale: 1 });
+      baseW = Math.max(1, vp0.width);
+      baseH = Math.max(1, vp0.height);
+    } finally {
+      probe.cleanup();
+    }
   }
   let w = Math.min(maxW, baseW); // 不放大原图
   let h = (w * baseH) / baseW;
@@ -534,66 +646,138 @@ export async function renderPageImageFull(bookId: number, page: number, maxW = 1
     return hit.url;
   }
   return withSlot(async () => {
-    const p = await doc.getPage(page + 1);
-    try {
-      const viewport = p.getViewport({ scale: w / baseW });
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(viewport.width));
-      canvas.height = Math.max(1, Math.round(viewport.height));
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("canvas 上下文不可用");
-      await p.render({ canvasContext: ctx, viewport }).promise;
-      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
-      if (!blob) throw new Error("整页位图生成失败");
-      const url = URL.createObjectURL(blob);
-      if (gen !== generation) {
-        revoke(url);
-        throw new Error("已切换书籍");
-      }
-      bitmaps.set(token, { url, page });
-      // 整页图加钉子：切片的 sweep() 不动它 —— 它的生死只由这张容量 3 的小 LRU 决定，
-      // 否则会被 PAGE_CACHE_MAX 那套按张数扫走（图库看着看着就白屏）。
-      pinnedTokens.add(token);
-      const step = fullPageLruStep(fullOrder, token, FULL_PAGE_CACHE_MAX);
-      fullOrder = step.order;
-      for (const t of step.evicted) {
-        const e = bitmaps.get(t);
-        if (!e) continue;
-        revoke(e.url);
-        bitmaps.delete(t);
-        pinnedTokens.delete(t);
-      }
-      sweep();
-      return url;
-    } finally {
-      p.cleanup();
+    const url = s.native
+      ? await nativeFullUrl(bookId, page, baseW, baseH, w, h)
+      : await pdfjsFullUrl(doc, page, baseW, w);
+    if (gen !== generation) {
+      revoke(url);
+      throw new Error("已切换书籍");
     }
+    bitmaps.set(token, { url, page });
+    // 整页图加钉子：切片的 sweep() 不动它 —— 它的生死只由这张容量 3 的小 LRU 决定，
+    // 否则会被 PAGE_CACHE_MAX 那套按张数扫走（图库看着看着就白屏）。
+    pinnedTokens.add(token);
+    const step = fullPageLruStep(fullOrder, token, FULL_PAGE_CACHE_MAX);
+    fullOrder = step.order;
+    for (const t of step.evicted) {
+      const e = bitmaps.get(t);
+      if (!e) continue;
+      revoke(e.url);
+      bitmaps.delete(t);
+      pinnedTokens.delete(t);
+    }
+    sweep();
+    return url;
   });
 }
 
-/** 渲染第 1 页为低分辨率 PNG（data URL），供「首次打开生成封面」用。
- *  独立于切片缓存（分辨率不同、只渲染一次），失败时抛错由调用方静默处理。 */
-export async function renderCoverPng(bookId: number, maxWidth = 800): Promise<string> {
-  const { doc } = await ensurePdf(bookId);
+/** pdf.js 的整页位图（图库用）。原生通道见 nativeFullUrl。 */
+async function pdfjsFullUrl(doc: PDFDocumentProxy, page: number, baseW: number, w: number): Promise<string> {
+  const p = await doc.getPage(page + 1);
+  try {
+    const viewport = p.getViewport({ scale: w / baseW });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(viewport.width));
+    canvas.height = Math.max(1, Math.round(viewport.height));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("canvas 上下文不可用");
+    await p.render({ canvasContext: ctx, viewport }).promise;
+    const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
+    if (!blob) throw new Error("整页位图生成失败");
+    return URL.createObjectURL(blob);
+  } finally {
+    p.cleanup();
+  }
+}
+/** 渲染第 1 页为封面图（WebP data URL），长边缩到 longEdge 像素。
+ *  独立于切片缓存（分辨率不同、只渲染一次），失败时抛错由调用方静默处理。
+ *  直接出最终缩略图尺寸：后端 setBookCoverImage 只落盘，不再解码缩放。 */
+export async function renderCoverImage(bookId: number, longEdge = 320): Promise<string> {
+  const s = await ensurePdf(bookId);
   const gen = generation;
+  // 原生通道一律不补封面：走原生的是 >1.9GiB 的文件，系统渲染器要把整份文件映射进进程
+  // （实测 3.31GiB 那册打开后宿主工作集 3.5GB），为一张缩略图付这个代价不值得，书库继续用默认封面。
+  if (s.native) throw pdfError("pdf_no_cover");
   return withSlot(async () => {
-    const page = await doc.getPage(1);
+    const page = await s.doc.getPage(1);
+    // 画布在 try 外声明：finally 里要归还它的后备存储，块作用域里声明会取不到。
+    const canvas = document.createElement("canvas");
+    let url: string;
     try {
       const base = page.getViewport({ scale: 1 });
-      const viewport = page.getViewport({ scale: Math.max(0.1, maxWidth / Math.max(1, base.width)) });
-      const canvas = document.createElement("canvas");
+      // 长边（竖版封面就是页高）对齐缩略图尺寸：这里出的就是最终像素。
+      const target = Math.max(1, longEdge);
+      const scale = Math.max(0.02, target / Math.max(1, Math.max(base.width, base.height)));
+      const viewport = page.getViewport({ scale });
       canvas.width = Math.max(1, Math.round(viewport.width));
       canvas.height = Math.max(1, Math.round(viewport.height));
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("canvas 上下文不可用");
       await page.render({ canvasContext: ctx, viewport }).promise;
-      const url = canvas.toDataURL("image/png");
-      if (gen !== generation) throw new Error("已切换书籍");
-      return url;
+      // 直接出 WebP：后端只落盘、不再解码缩放（见 set_book_cover_image）。
+      url = canvas.toDataURL("image/webp", 0.9);
     } finally {
       page.cleanup();
+      // 立刻归还画布后备存储：整页位图是这条链路里最大的单笔占用，
+      // 书库补封面时一本接一本，晚一拍就会被下一次分配叠上去。
+      canvas.width = 0;
+      canvas.height = 0;
     }
+    if (gen !== generation) throw new Error("已切换书籍");
+    return url;
   });
+}
+
+/** 「重新提取封面」（PDF）：按目标缩略图尺寸重渲染并落盘，返回新的封面文件名。
+ *  与后端 reextract_cover 的分工：那个只处理 epub/mobi 的内嵌封面，PDF 只能由前端栅格化。 */
+export async function regeneratePdfCover(bookId: number, longEdge = 320): Promise<string> {
+  const url = await renderCoverImage(bookId, longEdge);
+  const b64 = url.slice(url.indexOf(",") + 1);
+  return await api.setBookCoverImage(bookId, b64);
+}
+
+/* ---------- 原生通道渲染辅助（仅 PDF_NATIVE_MIN_BYTES 以上的文件走这条）---------- */
+
+/** 「页内一条」：条带换算成源矩形（页面坐标）与目标像素，交给系统渲染器出 PNG。
+ *  换算与 pdf.js 分支同源：scale = 条带目标像素高 / 条带页面高，宽度按页宽同比。 */
+async function nativeSliceUrl(bookId: number, req: SliceRequest, pt: PageSize): Promise<string> {
+  const bandPt = Math.max(0.5, pt.ptH * (req.f1 - req.f0));
+  const scale = Math.max(0.01, req.bitH / bandPt);
+  const destW = Math.max(1, Math.round(pt.ptW * scale));
+  const destH = Math.max(1, Math.round(req.bitH));
+  const bytes = await api.pdfNativeRenderPage(
+    bookId,
+    req.page,
+    0,
+    pt.ptH * req.f0,
+    pt.ptW,
+    bandPt,
+    destW,
+    destH,
+  );
+  return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+}
+
+/** 整页位图（图库用）：源矩形就是整页。 */
+async function nativeFullUrl(
+  bookId: number,
+  page: number,
+  baseW: number,
+  baseH: number,
+  w: number,
+  h: number,
+): Promise<string> {
+  const bytes = await api.pdfNativeRenderPage(
+    bookId,
+    page,
+    0,
+    0,
+    baseW,
+    baseH,
+    Math.max(1, Math.round(w)),
+    Math.max(1, Math.round(h)),
+  );
+  return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
 }
 
 /** 释放当前 PDF：回收全部位图、销毁文档（关书/换书/组件销毁时调用；非 PDF 时是空操作）。 */
@@ -610,5 +794,10 @@ export function releaseAll(): void {
   session = null;
   sessionPromise = null;
   sessionBookId = -1;
-  if (s) void s.doc.destroy().catch(() => {});
+  if (nativeSession) {
+    nativeSession = null;
+    // 原生通道没有 pdf.js 文档：显式让 Rust 侧释放文档句柄（换书/关书都要走这条）
+    void api.pdfNativeClose().catch(() => {});
+  }
+  if (s && !s.native) void s.doc.destroy().catch(() => {});
 }

@@ -188,7 +188,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    animation: fr-pop-in var(--dur) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur) var(--ease-premium) both;
   }
 
   .sb-head {

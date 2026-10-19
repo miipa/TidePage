@@ -1,11 +1,12 @@
 <script lang="ts">
   import { errText, labelOfId, t } from "../lib/i18n/index.svelte";
+  import { AI_CTX_KEY, AI_MODE_KEY } from "../lib/aiPanelKeys";
   import { updateState } from "../lib/update.svelte";
   import { onMount, onDestroy, tick } from "svelte";
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
-  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, fullPageCacheTokens, isFullPageCached, pageGeometry, pageLinks, pinSlices, releaseAll, releaseFullPage, releaseFullPageUrl, renderCoverPng, renderPageImageFull, renderPageSlice, type PdfLink } from "../lib/pdf";
+  import { RENDER_CONCURRENCY, buildTextLayer, docOutline, ensurePdf, fullPageCacheTokens, isFullPageCached, pageGeometry, pageLinks, pinSlices, releaseAll, releaseFullPage, releaseFullPageUrl, renderCoverImage, renderPageImageFull, renderPageSlice, type PdfLink , regeneratePdfCover } from "../lib/pdf";
   import {
     PDF_SLICE_MAX_SCREENS,
     buildPageToc,
@@ -35,7 +36,6 @@
     copyText,
     stripNonTextHtml,
     requestOpenBook,
-    SCROLL_BOUNCE_PRESETS,
     READER_TOPBAR_IDS,
     marginScopeOf,
     type ReaderTopbarId,
@@ -63,11 +63,28 @@ import { reorderByDrop } from "../lib/reorder";
     scrollKeyRoute,
     setVerdictSink,
     shouldDedupeLoad,
+    WHEEL_FIELD_SEL,
+    WHEEL_PANEL_SEL,
     WHEEL_TURN_IDLE,
     type WheelAxis,
     type WheelTurnState,
   } from "../lib/readerInput";
 import { prefersReducedMotion } from "../lib/reducedMotion";
+import {
+  pageTransitionGeometry,
+  pageTransitionOf,
+  pageTurnFxClass,
+  transitionGeometry,
+  transitionModeOf,
+  txKeyDir,
+  txSwallows,
+  txUnlockStep,
+  TX_HARD_MS,
+  TX_POLL_MS,
+  TX_SNAPSHOT_MAX_NODES,
+  type ChapterTransition,
+  type PageTransition,
+} from "../lib/chapterTx";
   import { outSlideL, outSlideR } from "../lib/motion";
 
   // 侧面板退场的承载层。
@@ -166,6 +183,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let scrollWrap: HTMLDivElement | undefined = $state();
   let scrollArea: HTMLDivElement | undefined = $state();
   let pageWrap: HTMLDivElement | undefined = $state();
+  /** 翻页模式的文字层滑块（过渡位移载体；`.clip` 静止）。 */
+  let pageSlideEl: HTMLDivElement | undefined = $state();
   let contentEl: HTMLDivElement | undefined = $state();
   let bodyEl: HTMLDivElement | undefined = $state();
   let thumbEl: HTMLDivElement | undefined = $state();
@@ -215,7 +234,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let tbH = $state(0);
   $effect(() => {
     if (tbH > 0) {
-      document.documentElement.style.setProperty("--fr-titlebar-h", tbH + "px");
+      document.documentElement.style.setProperty("--tp-titlebar-h", tbH + "px");
     }
   });
 
@@ -359,13 +378,14 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (o.imgScale != null) return o.imgScale;
     return isMangaMode() ? config.reader.manga.imgScale : 1;
   }
+  /** 是否适宽。PDF 与漫画共用设置里「漫画与 PDF」的三项（fitWidth / fitHeight / imgScale），
+   *  所以这里不能再给 PDF 单独兜底 —— 曾经 PDF 恒返回适宽，导致「图片大小」与
+   *  「默认适应阅读器宽度/高度」对 PDF 全部失效（用户改了没反应）。
+   *  仅保留互斥：PDF 下有效适高为真时适宽为假，否则 pdfDisplayBox 里适宽优先级更高会单方胜出。 */
   function effFitWidth(): boolean {
     const o = bookOv();
-    if (o.fitWidth != null) return o.fitWidth;
-    // PDF 默认适宽：打开即整页宽可见（配合「图＋/图−」切到手动倍率的手感）。
-    // 用户显式选了适高（本书覆盖）时不与适宽并存；漫画/普通书保持原逻辑。
-    if (isPdfBook()) return o.fitHeight === true ? false : true;
-    return isMangaMode() ? config.reader.manga.fitWidth : false;
+    const on = o.fitWidth ?? (isMangaMode() ? config.reader.manga.fitWidth : false);
+    return isPdfBook() && on && effFitHeight() ? false : on;
   }
   function effFitHeight(): boolean {
     const o = bookOv();
@@ -407,9 +427,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     { id: "bookmarkList", label: () => t("reader.toolbar.bookmarkList"), title: () => t("reader.toolbar.bookmarkList"), icon: () => IconBookmarks, visible: () => true, run: () => loadBookmarks() },
     // 朗读/划线依赖「能取到可用文字」：PDF 取不到（扫描版 / 缺 ToUnicode 的乱码页）时保留按钮
     // 但禁用 + 给出原因，不要静默消失（用户至少知道入口在哪、为什么点不了）。
-    { id: "ttsPlay", label: () => t("reader.toolbar.ttsPlay"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsPlayTitle")), icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => toggleTts() },
-    { id: "ttsStop", label: () => t("reader.toolbar.ttsStop"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsStop")), icon: () => IconPlayerStop, disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => stopTts() },
-    { id: "highlight", label: () => t("reader.toolbar.highlight"), title: () => (isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.highlight")), icon: () => IconHighlight, disabled: () => isPdfBook() && !pdfTextOk, visible: () => true, run: () => setRight("highlights") },
+    { id: "ttsPlay", label: () => t("reader.toolbar.ttsPlay"), title: () => (pdfNative ? t("reader.pdf.nativeNoText") : isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsPlayTitle")), icon: () => (ttsState.playing ? IconPlayerPause : IconPlayerPlay), disabled: () => isPdfBook() && (pdfNative || !pdfTextOk), visible: () => true, run: () => toggleTts() },
+    { id: "ttsStop", label: () => t("reader.toolbar.ttsStop"), title: () => (pdfNative ? t("reader.pdf.nativeNoText") : isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.ttsStop")), icon: () => IconPlayerStop, disabled: () => isPdfBook() && (pdfNative || !pdfTextOk), visible: () => true, run: () => stopTts() },
+    { id: "highlight", label: () => t("reader.toolbar.highlight"), title: () => (pdfNative ? t("reader.pdf.nativeNoText") : isPdfBook() && !pdfTextOk ? t("reader.pdf.noText") : t("reader.toolbar.highlight")), icon: () => IconHighlight, disabled: () => isPdfBook() && (pdfNative || !pdfTextOk), visible: () => true, run: () => setRight("highlights") },
     { id: "ai", label: () => t("reader.toolbar.ai"), title: () => t("reader.toolbar.ai"), icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
     { id: "stats", label: () => t("reader.toolbar.bookStats"), title: () => t("reader.toolbar.bookStats"), icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
     { id: "toc", label: () => t("reader.toolbar.toc"), title: () => t("reader.toolbar.tocTitle"), icon: () => IconList, visible: () => true, run: () => toggleToc() },
@@ -868,7 +888,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 互斥：打开 AI 时关闭顶栏浮层面板。
     closeTbPanels();
     let mode: string | null = null;
-    try { mode = localStorage.getItem("fr.ai.mode"); } catch { /* ignore */ }
+    try { mode = localStorage.getItem(AI_MODE_KEY); } catch { /* ignore */ }
     if (mode === "window") {
       const shownAsWindow = await toggleAi();
       if (!shownAsWindow) setRight("ai");            // 建窗失败 → 直接回退抽屉
@@ -1104,6 +1124,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let sliceCheckRaf = 0;
   /** 本页文本是否可用于划词/搜索/朗读（乱码文件必须如实判否，不许假装能读）。 */
   let pdfTextOk = $state(false);
+  /** 本书是否走系统原生渲染（超大 PDF）：这类文件没有文字层与注解，相关入口一并置灰。 */
+  let pdfNative = $state(false);
   /** 文本上传游标：本轮打开到第几页（换书重置）。 */
   let pdfTextUploadToken = 0;
 
@@ -1145,7 +1167,8 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       const pageEl = blk.querySelector<HTMLElement>(".pdf-page");
       if (pageEl) {
         const pageVisible = withinNearBand(r, pageEl.getBoundingClientRect());
-        if (pageVisible) void ensurePageTextLayer(pageEl, idx);
+        // 原生通道没有文字层（系统渲染只出位图），不必去问一次。
+        if (pageVisible && !pdfNative) void ensurePageTextLayer(pageEl, idx);
       }
       for (const im of blk.querySelectorAll<HTMLImageElement>("img.pdf-page-slice")) {
         const visible = withinNearBand(r, im.getBoundingClientRect());
@@ -1358,6 +1381,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       viewerIndex = null;
       // PDF 每本书重新判定文字可用性与视图尺寸键（否则沿用上一本的判断）。
       pdfTextOk = false;
+  pdfNative = false;
       lastPdfViewKey = "";
       progressUserMoved = false; // 新书打开：清空「用户已移动」标记（打开本身不释放手动状态覆盖）
       book = await api.openBook(bookId);
@@ -1368,6 +1392,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         // 否则这段时间 loadingChapter 与 chapter 都不满足骨架屏条件 → 正文区纯白。
         loadingChapter = true;
         const pdf = await ensurePdf(book.book.id);
+        pdfNative = pdf.native;
+        // 这类文件只能整页出图：打开时说明一次，免得用户找文字层/划线找半天。
+        if (pdf.native) toast(t("reader.pdf.nativeHint"));
         // 目录：PDF 自带 outline 优先（真实章节名 + 层级），解析不到才回落「第 N 页」。
         // 目录数组下标恒等于页号，所以合并只换标题，不改导航语义（页码=chapter_index）。
         const outline = await docOutline(book.book.id).catch(() => []);
@@ -1434,6 +1461,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       // PDF：书库「标记已读」写的是 100% 进度，重开应落到最后一页（页 = 章，目录长度即页数）。
       if (isPdfBook() && restore && restore.pct >= 99.5) startIdx = Math.max(0, book.toc.length - 1);
       chapterNum = Math.min(startIdx, Math.max(0, book.toc.length - 1));
+      navTarget = chapterNum; // 初次定位：累积导航目标与落地章号对齐
       await loadChapter(chapterNum, restore ?? undefined);
       refreshHighlights();
       {
@@ -1478,12 +1506,14 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         ? t("reader.err.drm")
         : s.includes("ParseTimeoutOrCorrupted")
           ? t("reader.err.malformed")
-          : s;
+          : // 稳定错误码（pdf_too_large / pdf_native_failed / ...）走文案表；未知原样透传。
+            // String(e) 会带 "Error: " 前缀，展示前去掉。
+            errText(e).replace(/^Error:\s*/, "");
+      // 只落在页面内的失败态上：同一句话不再弹 toast（说明性文字只给一条）。
       openError = friendly;
       // 打开失败必须收掉加载态：否则骨架屏会一直挂着（失败态另有 openError 界面）。
       loadingChapter = false;
       loadingIdx = -1;
-      toast(friendly, "error");
     }
   }
 
@@ -1501,9 +1531,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
    *  成功/失败都不打断阅读；成功后由后端 emit("book-updated") 让书库刷新封面。 */
   async function generatePdfCover(bookId: number) {
     try {
-      const dataUrl = await renderCoverPng(bookId, 800);
-      const b64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-      if (b64 && b64 !== dataUrl) await api.setBookCoverImage(bookId, b64);
+      await regeneratePdfCover(bookId, 320);
     } catch (e) {
       // 封面是锦上添花：失败只留一行 DEV 痕迹，不弹错、不打断打开流程。
       if (import.meta.env.DEV) console.warn("[pdf] cover failed", e);
@@ -1754,6 +1782,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (gen !== loadGeneration && !placeholder) return;
     chapter = ch;
     chapterNum = idx;
+    // 非事务期间（初次打开 / 换书 / 重排重载）让累积导航目标跟随落地章号；事务期间保留意图，
+    // 由 chapterTx 的收尾统一对齐（见 navBy/navTo 与 chapterTx）。
+    if (!txLocked) navTarget = idx;
     // 漫画（横向 / 瀑布流）：重建跨章连续窗口，跳过普通单章定位逻辑。
     if (isMangaMode()) {
       await loadMangaWindow(idx, restore);
@@ -1804,7 +1835,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       const ctxHtml = ch.html;
       const writeCtx = () => {
         try {
-          localStorage.setItem("fr.ai.ctx", JSON.stringify({ title: ctxTitle, html: aiCtxHtml(ctxHtml) }));
+          localStorage.setItem(AI_CTX_KEY, JSON.stringify({ title: ctxTitle, html: aiCtxHtml(ctxHtml) }));
         } catch { /* ignore */ }
       };
       if (typeof requestIdleCallback === "function") requestIdleCallback(writeCtx, { timeout: 2000 });
@@ -1834,22 +1865,26 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         const target = Math.round(pendingPageRatio * Math.max(1, pageCount - 1));
         gotoPage(Math.max(0, Math.min(target, pageCount - 1)), true);
       } else {
-        applyPage();
+        applyPage(true);
       }
     }
     pendingPageRatio = null;
   }
 
+  /** 下一章（底栏状态项 / 翻页到底 / 按键）：显式导航，落章首。 */
   function nextChapter(fromEnd = false) {
-    if (book && chapterNum < book.toc.length - 1) loadChapter(chapterNum + 1);
-    else if (fromEnd) toast(t("reader.toast.lastChapter"));
+    if (!book) return;
+    if (chapterNum >= book.toc.length - 1) {
+      if (fromEnd) toast(t("reader.toast.lastChapter"));
+      return;
+    }
+    void navBy(1, { at: "head", extra: 0 });
   }
 
+  /** 上一章：翻页首页回翻与键盘上一章落上一章末尾（toEnd），底栏上一章落章首。 */
   function prevChapter(toEnd = false) {
-    if (book && chapterNum > 0) {
-      // 回溯语义统一为"接着看上一章的结尾"（翻页与显式上一章均落章末）
-      loadChapter(chapterNum - 1, undefined, toEnd ? { at: "tail", extra: 0 } : undefined);
-    }
+    if (!book || chapterNum <= 0) return;
+    void navBy(-1, toEnd ? { at: "tail", extra: 0 } : { at: "head", extra: 0 });
   }
 
   function maybeAutoAi() {
@@ -1871,7 +1906,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         .catch(() => {});
       try {
         localStorage.setItem(
-          "fr.ai.ctx",
+          AI_CTX_KEY,
           JSON.stringify({
             title: `${book?.book.title ?? ""} · ${ch.title}`,
             html: aiCtxHtml(ch.html),
@@ -2092,16 +2127,20 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
   let lastUiSync = 0;
 
   function applyScroll(renderPos: number) {
-    scrollRender = renderPos;
+    // 事务锁定：只把「目标位置」写进 DOM —— 忽略惯性逼近的中间值与越界回弹。
+    // 换章落地走 jumpTo(落点)，目标即落点，所以落点必定精确到位；而输入侧的写入在锁定期内
+    // 已被捕获层拦下。两者合起来才能保证「落点不被推走」（实测旧实现差 1680px）。
+    const pos = txLocked && scroller ? scroller.targetPos : renderPos;
+    scrollRender = pos;
     const area = scrollArea;
     // 主体位置走原生滚动（scrollTop）：浏览器按需分块绘制超长正文，无巨型合成层、无撕裂/空白。
-    const clamped = renderPos < 0 ? 0 : renderPos > maxScroll ? maxScroll : renderPos;
+    const clamped = pos < 0 ? 0 : pos > maxScroll ? maxScroll : pos;
     const p = Math.round(clamped);
     if (area) {
       if (area.scrollTop !== p) area.scrollTop = p;
       // 越界部分（回弹）只在视口大小的 .scroll-area 上做微小 transform，图层恒为一屏，绝不超纹理上限。
       // 仅在值真正变化时写 style：避免每帧重复写 transform 触发样式失效/无谓合成。
-      const over = renderPos - clamped; // <0 顶部回弹 / >0 底部回弹
+      const over = pos - clamped; // <0 顶部回弹 / >0 底部回弹
       const tf = over === 0 ? "" : `translateY(${(-over).toFixed(2)}px)`;
       if (tf !== lastBounce) {
         lastBounce = tf;
@@ -2202,6 +2241,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       void extendMangaWindow(dir > 0 ? 1 : -1);
       return;
     }
+    // 事务锁定期：跨章意图一律按被动输入处理（同向续期吞掉，反向立即放行），不缓存 pendingEdge。
+    if (txLocked && txSwallow(dir > 0 ? 1 : -1)) {
+      pushVerdict("swallowed:txLock");
+      return;
+    }
     // 加载中丢弃的意图必须留痕（补触发用），否则「滚到底」的第一下会被无声吞掉。
     if (loadingChapter) {
       pendingEdge = { dir, carry };
@@ -2221,13 +2265,503 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
       if (chapterNum >= book.toc.length - 1) return;
       lastEdgeAt = now;
       // 第四个参数 fromEdge=true：落地后允许补触发 pendingEdge（连滚跨章的意图链）。
-      loadChapter(chapterNum + 1, undefined, { at: "head", extra: config.reader.scrollBounce ? 0 : carry }, true);
+      // extra 固定 0：进事务后落点由 entry 决定（向下续章落章首），不再把越界行程当额外偏移。
+      void chapterTx(chapterNum + 1, { at: "head", extra: 0 }, true);
     } else {
       if (chapterNum <= 0) return;
       lastEdgeAt = now;
-      loadChapter(chapterNum - 1, undefined, { at: "tail", extra: config.reader.scrollBounce ? 0 : carry }, true);
+      void chapterTx(chapterNum - 1, { at: "tail", extra: 0 }, true);
     }
   }
+
+  /* ================= 章节切换事务（过渡层 / 防穿透锁定） =================
+   * 为什么需要事务：滚动模式的换章是「异步取章 + 重建 DOM + 复位滚动 + 重新测量」四段操作，
+   * 这段窗口里 maxScroll / chapterNum / DOM 的新旧状态并存，旧实现把窗口整个暴露给输入：
+   *   · 章末续滚的惯性尾巴在 fetch 窗口里被缓存成 pendingEdge，落地后立刻补触发 —— 实测一次
+   *     连续滚轮可以连跳 5 章（帧内章号 5→7、9→11 的跳变）；
+   *   · 落点（章末/章首）刚写好就被随后到达的同向滚轮推走 —— 实测「向上滚到顶续章」落点差 1680px；
+   *   · maxScroll 还是旧章的值时滚轮被判成越界/章末（onWheel 的 maxScroll<=1 分支）。
+   * 事务把这段窗口收成一个原子段：置锁 → 旧章快照遮挡 → loadChapter（内置定位）→ 双层过渡 →
+   * 收尾解锁；锁定期内的同向被动输入一律吞掉，反向输入立即彻底放行。
+   *
+   * 事务号 activeTxId 与 loadGeneration 是两件事：后者是「章节代际」（每次 loadChapter 自增，
+   * 用于丢弃陈旧请求），不能拿它当事务号 —— 一次事务里可能发生多次 loadChapter。 */
+
+  /** 显式导航/边缘续章的落点：head=章首 / tail=章末。 */
+  type TxEntry = { at: "head" | "tail"; extra?: number };
+
+  /** 过渡档位（缺失/非法取 cover）。 */
+  function transitionMode(): ChapterTransition {
+    return transitionModeOf(config.reader.chapterTransition);
+  }
+
+  /** 翻页模式的过渡档位（缺失/非法取 h-slide）。 */
+  function pageModeTransition(): PageTransition {
+    return pageTransitionOf(config.reader.pageTransition);
+  }
+
+  /** 事务适用面：滚动模式与翻页模式都可进事务；漫画（含横向）与 PDF 豁免 ——
+   *  它们各有自己的窗口续章/页渲染逻辑，不建层、不挂监听。 */
+  function txAvailable(): boolean {
+    return !isMangaMode() && !isPdfBook();
+  }
+
+  /** 翻页模式的静止视口（真实 DOM）：`.clip` 自带 mh-eff 边距与 overflow:hidden。
+   *  用 :scope > 限定成 .content 的直接子元素，避免命中克隆出来的那个 .clip。
+   *  语义**不变**：它仍然是「版心盒 / 可见盒」，只是不再参与过渡位移。 */
+  function pageClip(): HTMLElement | null {
+    return contentEl?.querySelector<HTMLElement>(":scope > .clip") ?? null;
+  }
+
+  /** 翻页模式的**文字层滑块**：过渡位移的唯一载体（视口静止，动的是它）。
+   *  克隆滑块（`.tx-snap`）也在 `.clip` 里，故只取非克隆的那个。 */
+  function pageSlide(): HTMLElement | null {
+    return pageClip()?.querySelector<HTMLElement>(":scope > .tx-slide:not(.tx-snap)") ?? null;
+  }
+
+  /** 事务号：每次换章自增；旧事务的收尾只在 myTxId === activeTxId 时执行。 */
+  let activeTxId = 0;
+  /** 锁定期标志：写入端（applyScroll）据此不落地渲染位置。仅滚动模式使用 ——
+   *  翻页模式不吞输入、也不设静默解锁（解锁＝动画结束），故只用下面的 txActive 表示在途。 */
+  let txLocked = false;
+  /** 事务在途标志（两种模式共用）：中断/接管、幂等守卫都以它为准。 */
+  let txActive = false;
+  /** 当前事务的目标章号与方向（同一章的显式重入按向下处理）。 */
+  let txTargetIdx = -1;
+  let txDir = 1;
+  /** 锁定期内最后一次同向输入时刻：解锁判据 A 用。 */
+  let txLastInputAt = 0;
+  /** 过渡动画是否已结束：解锁除 A/B 外还要等动画收尾（动画期写 transform 会与回弹互相覆盖）。 */
+  let txAnimDone = true;
+  /** 在跑的过渡动画句柄：打断/收尾时统一 cancel。 */
+  let txAnims: Animation[] = [];
+  /** 舞台（承载旧章快照）与边距带遮挡层。 */
+  let txStageEl: HTMLDivElement | undefined = $state();
+  let txBandEl: HTMLDivElement | undefined = $state();
+  /** 快照节点（旧章克隆）。 */
+  let txSnapEl: HTMLElement | null = null;
+  /** 显式导航的累积目标章号：请求在途时连点也逐次推进（不得每次按 chapterNum + 1 重算）。 */
+  let navTarget = 0;
+
+  function nextFrame(): Promise<void> {
+    return new Promise((r) => requestAnimationFrame(() => r()));
+  }
+
+  /** ⑧ 自绘滚动条：进事务时显式取消在途拖动（否则拖动中的 pointermove 会继续写 scrollTop）。 */
+  function cancelScrollbarDrag() {
+    if (sbDragPid >= 0) {
+      const el = scrollbarEl;
+      if (el?.hasPointerCapture?.(sbDragPid)) el.releasePointerCapture(sbDragPid);
+    }
+    sbDragPid = -1;
+    sbDragging = false;
+  }
+
+  /** 取消在跑的过渡动画（cancel 让元素还原成基准样式 = 无 transform）。 */
+  function cancelTxAnims() {
+    for (const a of txAnims) {
+      try { a.cancel(); } catch { /* ignore */ }
+    }
+    txAnims = [];
+  }
+
+  /** 销毁快照。舞台上**不允许**存在第二个克隆：历史上有直调入口（目录/进度/高亮/边缘续章/自动续章）
+   *  未先收口，txSnapEl 被覆盖后旧克隆再也无人销毁，下一次过渡的 ②~③ 窗口会把它当遮挡层显示出来
+   *  （旧章内容定格在真实页之上）。这里连残留子节点一起清掉，是残留问题的最后一道兜底。 */
+  function destroySnapshot() {
+    txSnapEl?.remove();
+    txSnapEl = null;
+    const stage = txStageEl;
+    if (stage && stage.childElementCount > 0) stage.replaceChildren();
+  }
+
+  /** ② 截旧章快照：克隆必须插入文档之后才能写 scrollTop（实测插入前写入被忽略）。
+   *  按模式分叉：
+   *   · 滚动模式克隆 `.scroll-area`（清掉回弹 transform，插入后写 scrollTop）；
+   *   · 翻页模式克隆 `.clip`（自带 mh-eff 边距与 overflow:hidden），**保留**内部 `.col-page`
+   *     的页码 transform —— 快照因此停在旧章的那一页，不会回到第 1 页。
+   *  刻意保留克隆内部的 #chapter-content id：排版覆盖按 id 命中，克隆必须与真实章同字体同字号；
+   *  文档顺序上真实节点在前（舞台排在分支块之后），getElementById 仍命中真实节点。
+   *  返回 ok=false 表示节点数超阈值（调用方据此退化为关闭档路径），nodes 供 DEV 告警读出。 */
+  function buildSnapshot(oldScrollTop: number): { ok: boolean; nodes: number } {
+    const stage = txStageEl;
+    const scroll = scrollLayout();
+    if (scroll) {
+      // 滚动模式：克隆 .scroll-area 放进舞台（舞台与它同盒，视觉层序靠 on/behind）。
+      const src = scrollArea;
+      if (!stage || !src) return { ok: false, nodes: 0 };
+      if (stage.childElementCount > 0) stage.replaceChildren();
+      const nodes = src.querySelectorAll("*").length;
+      if (nodes > TX_SNAPSHOT_MAX_NODES) return { ok: false, nodes };
+      const clone = src.cloneNode(true) as HTMLElement;
+      clone.style.transform = "";
+      stage.appendChild(clone);
+      clone.scrollTop = oldScrollTop;
+      txSnapEl = clone;
+      return { ok: true, nodes };
+    }
+    // 翻页模式：克隆**文字层滑块**并 append 到 `.clip`（退役舞台）。
+    // 真实滑块在前、克隆在后 ⇒ getElementById("chapter-content") 必命中真实节点；
+    // 视觉层序用局部 z-index（真实 2、克隆 1）。克隆保留内部 .col-page 的页码位移，
+    // 因此快照停在被翻走的那一页。`tx-snap` 只用于层序与探针识别。
+    const slider = pageSlide();
+    const host = pageClip();
+    if (!slider || !host) return { ok: false, nodes: 0 };
+    for (const el of Array.from(host.querySelectorAll(":scope > .tx-slide.tx-snap"))) el.remove();
+    const nodes = slider.querySelectorAll("*").length;
+    if (nodes > TX_SNAPSHOT_MAX_NODES) return { ok: false, nodes };
+    const clone = slider.cloneNode(true) as HTMLElement;
+    clone.classList.add("tx-snap");
+    clone.style.transform = "";
+    host.appendChild(clone);
+    txSnapEl = clone;
+    return { ok: true, nodes };
+  }
+
+  /** ⑤ 销毁快照、移除临时背景、复核 maxScroll；⑥ 解锁。调用方负责 txId 守卫。 */
+  function cleanupTx() {
+    cancelTxAnims();
+    destroySnapshot();
+    txStageEl?.classList.remove("on", "behind");
+    txBandEl?.classList.remove("on");
+    const area = scrollArea;
+    if (area) {
+      area.classList.remove("tx-front", "tx-bg");
+      area.style.transform = ""; // 动画被中途打断时确保回到最终态
+    }
+    // 翻页模式：只清**滑块**上的过渡位移（`.clip` 是静止视口，从不动它）；
+    // 内部 .col-page 的页码 transform 一律不动（它由 applyPage 独家维护）。
+    const slider = pageSlide();
+    if (slider) slider.style.transform = "";
+    lastBounce = "";
+    // 复核：maxScroll 必须等于 scrollHeight - clientHeight（锁定期内不落地，故在解锁前补一次）
+    if (scrollLayout()) measureScroll();
+    txActive = false;
+    txLocked = false; // ⑥ 解锁（resetScroll() 不碰锁标记，这里也不动它的其余职责）
+    txTargetIdx = -1;
+    txPageTarget = -1;
+    txAnimDone = true;
+  }
+
+  /** 翻页模式：把在跑的过渡动画快进到终点（**不重建快照**），随后由调用方接管。
+   *  cancel() 让元素回到基准样式（= 动画终点）；`lastPageX = NaN` 作废「位置未变」判据后，
+   *  再走一次 applyPage(true)（立即跳转分支）把页码位置写死 ——
+   *  否则 applyPage(false) 会在 x === lastPageX 时短路（`:2848`），残留的动画层偏移清不掉。 */
+  function finishTxAnim() {
+    logCancelProbe("finishTxAnim:before");
+    cancelTxAnims();
+    txAnimDone = true;
+    // 翻页模式：位移在滑块上（`.clip` 是静止视口，不动它）；滚动模式清滚动容器。
+    const slider = pageSlide();
+    if (slider) slider.style.transform = "";
+    if (scrollArea) scrollArea.style.transform = "";
+    lastPageX = Number.NaN;
+    if (!scrollLayout()) applyPage(true);
+    logCancelProbe("finishTxAnim:after");
+  }
+
+  /** 打断在途事务：旧事务的收尾失效（txId 守卫），立即清理快照/层级/锁，供新目标重入。
+   *  翻页模式先把动画快进到终点再清理（同一时刻只允许一个动画）。不改 navTarget —— 调用方已写好新目标。 */
+  function interruptTx() {
+    if (!txActive && !txSnapEl) return;
+    activeTxId++;
+    if (!scrollLayout()) finishTxAnim();
+    cleanupTx();
+  }
+
+  /** 反向输入 / 提前收尾：旧事务的收尾失效，立即清理并解锁（这一拍输入不吞）。仅滚动模式使用。 */
+  function releaseTxEarly() {
+    if (!txLocked) return;
+    activeTxId++;
+    cleanupTx();
+  }
+
+  /** 翻页模式：任何新的翻页/切章输入先把手上的过渡动画快进到终点（同一时刻只允许一个动画）。 */
+  function takeOverPageAnim() {
+    if (scrollLayout() || !txActive) return;
+    activeTxId++;
+    finishTxAnim();
+    cleanupTx();
+  }
+
+  /** 锁定期内被吞掉的被动输入：目标在面板/表单里时放行（抽屉、下拉、输入框自己滚自己的）。 */
+  function txInputLocal(target: EventTarget | null): boolean {
+    const el = target as Element | null;
+    if (!el || typeof el.closest !== "function") return false;
+    return !!el.closest(`${WHEEL_PANEL_SEL}, ${WHEEL_FIELD_SEL}`);
+  }
+
+  /** 锁定期内的被动滚动源：同向吞掉（续期判据 A），反向立即彻底放行。
+   *  返回 true = 这一拍应当吞掉。 */
+  function txSwallow(dir: number): boolean {
+    if (!txSwallows(dir, txDir)) {
+      releaseTxEarly();
+      return false;
+    }
+    txLastInputAt = performance.now();
+    return true;
+  }
+
+  /** ④ 双层过渡：同一同步帧内先翻转层级（真实层在上、舞台在下）并设好入场起始态，
+   *  中间不得 await —— 否则会漏出一帧「新章已在上层却还停在起点」或「真实层仍在舞台下面」。
+   *  随后才启动动画；关闭档只做层级翻转、不启动动画。
+   *
+   *  两种模式的载体不同：
+   *   · 滚动模式：真实 `.scroll-area` 纵向滑入，克隆 `.scroll-area`（在舞台里）纵向视差移出；
+   *   · 翻页模式：**静止视口 + 文字层滑块** —— `.clip` 不动，动的是 `.clip` 内的滑块：
+   *     真实滑块横向滑入、克隆滑块（append 在 `.clip` 里的 `.tx-snap`）横向移出。
+   *     两层共用同一条缓动，因此始终首尾相接、互不重叠（透明纸质下重叠会露出双层文字）；
+   *     越出视口的部分被 `.clip` 裁掉，正文因此永不进入窗口边距区。
+   *     `.col-page` 的页码 transform 一律不碰（往它身上加偏移会把相邻栏拉进静止视口）。 */
+  async function playTransition(dir: number, mode: ChapterTransition | PageTransition, hasSnap: boolean) {
+    const stage = txStageEl;
+    const pageMode = !scrollLayout();
+    const shell = pageMode ? pageSlide() : scrollArea;
+    if (!shell) return;
+    if (pageMode) {
+      // 翻页模式不挂 tx-bg（纸质由 .bg-layer 提供，纯色会盖掉背景图）；层序靠 .tx-slide/.tx-snap 的 z-index。
+      shell.classList.add("tx-front");
+    } else {
+      if (!stage) return;
+      stage.classList.add("behind"); // 舞台退到下面（局部 z-index 1）
+      // 有背景图时不挂 tx-bg：唯一背景面是 .bg-layer，纯色纸会把背景打断（过渡帧闪底色）。
+      // 无图时保留：滚动模式的「纸」全靠它与舞台底提供，去掉了会露出窗口底色。
+      shell.classList.add("tx-front");
+      if (!bgImageUrl) shell.classList.add("tx-bg");
+    }
+    if (mode === "none" || !hasSnap || !txSnapEl) return;
+    const snap = txSnapEl;
+    const anims: Animation[] = [];
+    if (pageMode) {
+      const g = pageTransitionGeometry(mode as Exclude<PageTransition, "none">, dir, effAvail || shell.clientWidth);
+      anims.push(
+        shell.animate(
+          [{ transform: `translate3d(${g.inFrom}px,0,0)` }, { transform: "translate3d(0,0,0)" }],
+          { duration: g.durMs, easing: g.easingIn, fill: "none" },
+        ),
+        // 退场层只动位移：不加 opacity / filter / scale ——
+        // 旧实现给弹簧档退场淡到 0.45，中段帧会在底色上留下旧页的半透明虚影（必修 2）。
+        // 缓动与入场层**同一条**：两层共用进度才能保持首尾相接（弹簧过冲时整对一起过冲）。
+        snap.animate(
+          [{ transform: "translate3d(0,0,0)" }, { transform: `translate3d(${g.outTo}px,0,0)` }],
+          { duration: g.durMs, easing: g.easingIn, fill: "forwards" },
+        ),
+      );
+    } else {
+      const g = transitionGeometry(mode as Exclude<ChapterTransition, "none">, dir, shell.clientHeight, "y");
+      // 退场层的终值不透明度：无图时维持原值（观感与改动前完全一致），
+      // 有图时压到很低 —— 真实层不再铺不透明纸，两层会真正叠在一起，
+      // 旧章正文若仍停在 0.65/0.3 就会与新章正文同时清晰可读（必修 2.5 不允许）。
+      // 压低的只是**内容层**的不透明度：背景面不受影响（它不在这一层里）。
+      const outOpacity = bgImageUrl ? "0.12" : mode === "cover" ? "0.65" : "0.3";
+      anims.push(
+        snap.animate(
+          mode === "cover"
+            ? [{ transform: "translate3d(0,0,0)", opacity: "1" },
+               { transform: `translate3d(0,${g.outTo}px,0)`, opacity: outOpacity }]
+            : [{ transform: "translate3d(0,0,0) scale(1)", opacity: "1" },
+               { transform: `translate3d(0,${g.outTo}px,0) scale(0.96)`, opacity: outOpacity }],
+          { duration: g.durMs, easing: g.easing, fill: "forwards" },
+        ),
+        shell.animate(
+          mode === "cover"
+            ? [{ transform: `translate3d(0,${g.inFrom}px,0)` }, { transform: "translate3d(0,0,0)" }]
+            : [{ transform: `translate3d(0,${g.inFrom}px,0) scale(0.96)` },
+               { transform: "translate3d(0,0,0) scale(1)" }],
+          { duration: g.durMs, easing: g.easing, fill: "none" },
+        ),
+      );
+    }
+    txAnims = anims;
+    txAnimDone = false;
+    await Promise.all(anims.map((a) => a.finished.catch(() => null)));
+    txAnimDone = true;
+  }
+
+  /** 解锁判据 = A 且 B（三档共用，关闭档不设更短上限）：
+   *  A：距最后一次同向输入 ≥ TX_IDLE_MS；B：目标章已落地（chapterNum 相符且不在加载）且过一帧。
+   *  判定本体在 lib/chapterTx.ts（可单测）。 */
+  async function waitUnlock(myTxId: number) {
+    const hardDeadline = performance.now() + TX_HARD_MS; // 只防事件流异常，不参与正常路径
+    let framePassed = false;
+    while (myTxId === activeTxId) {
+      const step = txUnlockStep({
+        now: performance.now(),
+        lastInputAt: txLastInputAt,
+        animDone: txAnimDone,
+        framePassed,
+        chapterNum,
+        target: txTargetIdx,
+        loading: loadingChapter,
+      });
+      if (step === "unlock") return;
+      if (step === "frame") {
+        await tick();
+        await nextFrame();
+        framePassed = true;
+        continue;
+      }
+      if (performance.now() >= hardDeadline) return;
+      await new Promise((r) => setTimeout(r, TX_POLL_MS));
+    }
+  }
+
+  /** 章节切换事务：置锁 → 旧章快照遮挡 → loadChapter（内置定位）→ 双层过渡 → 收尾解锁。
+   *  漫画 / PDF 不进事务，直接退回 loadChapter（行为与改动前一致）。
+   *  翻页模式：复用同一套快照/舞台/txId 守卫，但**不置锁、不吞输入、不设静默解锁**
+   *  （解锁＝动画结束）；期间的任何新输入由 interruptTx 快进并接管。 */
+  async function chapterTx(target: number, entry: TxEntry | undefined, fromEdge: boolean, restore?: Progress) {
+    if (!book) return;
+    const last = Math.max(0, book.toc.length - 1);
+    const idx = Math.max(0, Math.min(last, target));
+    if (!txAvailable()) {
+      navTarget = idx;
+      await loadChapter(idx, restore, entry, fromEdge);
+      return;
+    }
+    // 收口必须由 chapterTx 自己做：入口不止 navBy/navTo（它们已先调 interruptTx），
+    // 目录跳章 / 进度恢复 / 划线跳转 / 边缘续章 / 自动续章都是直调。少收一次，
+    // 旧克隆就会永久留在舞台上（txSnapEl 被覆盖后无人销毁），复现为「旧章内容定格在真实页上」。
+    interruptTx();
+    const pageMode = !scrollLayout();
+    const myTxId = ++activeTxId;
+    const dir = idx >= chapterNum ? 1 : -1;
+    // ① 置锁（仅滚动模式）+ 丢弃已消费的跨章意图 + 清补触发定时器 + 记录旧位置（原生 scrollTop）
+    txActive = true;
+    txLocked = !pageMode;
+    txTargetIdx = idx;
+    txDir = dir;
+    txLastInputAt = performance.now();
+    txAnimDone = true;
+    navTarget = idx;
+    pendingEdge = null;
+    clearTimeout(edgeFlushTimer);
+    cancelScrollbarDrag();
+    cancelTxAnims();
+    let oldScrollTop = 0;
+    if (!pageMode) {
+      const area = scrollArea;
+      oldScrollTop = area ? area.scrollTop : 0;
+      if (area) {
+        area.style.transform = ""; // ② 清旧章内联 transform（回弹位移）
+        lastBounce = "";
+      }
+      // 冻结惯性：目标=当前位置，rAF 循环不再朝旧目标逼近（旧实现里这段逼近会把新章落点推走）。
+      scroller?.reset();
+      if (scroller) scroller.jumpTo(scroller.pos, true);
+    }
+    // 舞台盒：滚动模式与 .scroll-area 同盒（inset: var(--rdr-inset-v) 0）；
+    // 翻页模式必须与 .clip 同盒（全高），否则克隆内的 .col-page 会被舞台高度裁短 ——
+    // 第 0 步实测：舞台带 inset-v 时克隆的 .col-page top 差 80px；inset:0 时四项逐项相等。
+    txStageEl?.classList.toggle("page", pageMode);
+    try {
+      // ② 快照；滚动模式再让舞台临时取得上层，遮挡 ③ 的 async 窗口。
+      //    翻页模式已退役舞台：克隆滑块就挂在 `.clip` 里，静止视口 + 滑块本身即可遮挡，
+      //    舞台若同时 on 会盖住 `.clip`（同盒但 z-index 更高），徒增一层不透明纸。
+      const snap = buildSnapshot(oldScrollTop);
+      if (!pageMode && txStageEl) {
+        txStageEl.classList.add("on");
+        txStageEl.classList.remove("behind");
+      }
+      // 上下边距带只在滚动模式挂：翻页模式的正文竖向位置不动、永不进上下边距，
+      // 一旦背景图透出，这两条纯色横带反而会显形（必修 3.6）。
+      if (!pageMode) txBandEl?.classList.add("on");
+      // 本次过渡的降级判定：只有这两处会让 mode 落到 none（用户选「关闭」不算降级）。
+      // DEV 留痕：下次「真机无动画」直接看控制台，不用再靠推断。
+      const reduced = prefersReducedMotion();
+      if (import.meta.env.DEV && (reduced || !snap.ok)) {
+        const why = [reduced ? "prefers-reduced-motion" : "", !snap.ok ? `snapshot-nodes>${TX_SNAPSHOT_MAX_NODES}` : ""]
+          .filter(Boolean)
+          .join(" + ");
+        console.warn(`[chapterTx] 过渡降级为 none：${why}；快照节点数 ${snap.nodes}`);
+      }
+      // ③ 加载：reset / resetScroll / jumpTo / pinToEnd / gotoPage 都在 loadChapter 内部完成，这里不重复实现
+      await loadChapter(idx, restore, entry, fromEdge);
+      // ④ 双层过渡（关闭档只翻层级）。两种降级都退化为关闭档路径、但仍进事务：
+      //    克隆超阈值（snap.ok=false）与命中「减少动效」。滚动模式的关闭档不设更短的解锁上限。
+      const mode: ChapterTransition | PageTransition = !snap.ok || reduced
+        ? "none"
+        : pageMode ? pageModeTransition() : transitionMode();
+      await playTransition(dir, mode, snap.ok);
+      // ⑤⑥ 解锁：滚动模式等「动画结束 + A 且 B」；翻页模式动画结束即解锁（无输入吞噬）。
+      if (!pageMode) await waitUnlock(myTxId);
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn("[chapterTx] failed", e);
+    } finally {
+      // txId 守卫覆盖四处状态写入：释放锁、清 pendingEdge、移除临时背景、销毁快照
+      if (myTxId === activeTxId) {
+        pendingEdge = null;
+        cleanupTx();
+        navTarget = chapterNum; // 事务结束：意图与落地章号对齐（被吞/失败时不残留偏移）
+      }
+    }
+  }
+
+  /** 显式导航（±1）：按累积目标推进 —— 请求在途时连点 3 次就走 3 章。 */
+  function navBy(dir: number, entry: TxEntry): Promise<void> {
+    if (!book) return Promise.resolve();
+    const last = Math.max(0, book.toc.length - 1);
+    navTarget = Math.max(0, Math.min(last, navTarget + dir));
+    // 已在首/末章：不起事务（没有目标可去）——否则会白锁一次并重载当前章。
+    if (navTarget === chapterNum && !txLocked && !loadingChapter) return Promise.resolve();
+    interruptTx();
+    return chapterTx(navTarget, entry, false);
+  }
+
+  /** 显式导航（绝对目标）：目录 / 书签 / 跨窗跳章 / 正文内跳章链接。 */
+  function navTo(idx: number, entry: TxEntry | undefined): Promise<void> {
+    if (!book) return Promise.resolve();
+    const last = Math.max(0, book.toc.length - 1);
+    navTarget = Math.max(0, Math.min(last, idx));
+    interruptTx();
+    return chapterTx(navTarget, entry, false);
+  }
+
+  // 锁定期内的输入拦截：window 捕获阶段吞掉滚轮 / 触摸 / 滚动键。
+  // 为什么不能用 scroll 事件或 overscroll-behavior：惯性尾巴本身就是一串 wheel 事件，
+  // 只有在这一层拦才拦得住（scroll 事件是结果；overscroll-behavior 管不到程序化滚动容器）。
+  let txTouchY = -1;
+  $effect(() => {
+    const onWheelCap = (e: WheelEvent) => {
+      if (!txLocked || e.deltaY === 0) return;
+      if (txInputLocal(e.target)) return;
+      if (!txSwallow(e.deltaY > 0 ? 1 : -1)) return; // 反向：已解锁，这一拍照常走
+      pushVerdict("swallowed:txLock");
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onTouchMoveCap = (e: TouchEvent) => {
+      if (!txLocked) return;
+      if (txInputLocal(e.target)) return;
+      const y = e.touches[0]?.clientY ?? -1;
+      if (y < 0) return;
+      // 手指上移 = 内容下滚 = dir 1；首拍没有基线，按「与本次切换同向」处理（保守吞掉）。
+      const d = txTouchY < 0 ? txDir : y < txTouchY ? 1 : -1;
+      txTouchY = y;
+      if (!txSwallow(d)) return;
+      pushVerdict("swallowed:txLock");
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onKeyCap = (e: KeyboardEvent) => {
+      if (!txLocked || !scrollLayout()) return;
+      const d = txKeyDir(e.key);
+      if (d === 0) return; // 翻章键等显式命令交给 onKeyDown（会打断并重入事务）
+      if (txInputLocal(e.target) || formControlOf(e.target) === "visible") return;
+      if (!txSwallow(d)) return;
+      pushVerdict("swallowed:txLock");
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener("wheel", onWheelCap, { passive: false, capture: true });
+    window.addEventListener("touchmove", onTouchMoveCap, { passive: false, capture: true });
+    window.addEventListener("keydown", onKeyCap, { capture: true });
+    return () => {
+      window.removeEventListener("wheel", onWheelCap, { capture: true });
+      window.removeEventListener("touchmove", onTouchMoveCap, { capture: true });
+      window.removeEventListener("keydown", onKeyCap, { capture: true });
+    };
+  });
 
   /* ================= page mode ================= */
   let screenCols = 1;
@@ -2323,6 +2857,10 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 先夹取有效左右内缩：窄窗口 + 大边距时收窄边距，而不是让 .clip 比排版窄（正文被裁成竖排）。
     // JS 排版宽度与 CSS 可见盒（.clip / .col-scroll）都取这一个值，几何值只有一个来源。
     const mhUse = syncMhEff(W, config.reader.duo);
+    // 首屏同帧同源：--rdr-mh-eff 平时由响应式样式写入（未测量时回落到**未夹取**的 --rdr-mh），
+    // 那一帧 .clip 的可见盒会比本次排版宽度窄 → 正文在窗口内被左右切掉。
+    // 这里把本次测量用的值同步写进内联自定义属性，让「排版宽度 effAvail」与「可见盒 clip.clientWidth」同帧一致。
+    contentEl.style.setProperty("--rdr-mh-eff", `${mhUse}px`);
     const avail = Math.max(1, W - mhUse * 2);
     const vh = Math.max(200, H - mv * 2);
     colW = Math.max(1, Math.floor((avail - (screenCols - 1) * gap) / screenCols));
@@ -2341,11 +2879,37 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 先同步算一次页数（读取 scrollWidth 会触发一次布局），保证恢复进度时
     // gotoPage 的夹取使用的是真实页数，而不是上一章的旧值/初始值 1。
     computePageCount();
-    applyPage();
+    applyPage(true);
     measureRaf = requestAnimationFrame(() => {
       computePageCount();
-      applyPage();
+      applyPage(true);
+      // 自检放在第二遍之后：此时 CSS 变量与本次测量应已同帧，仍不达标才需要重算。
+      pageGeomCheck();
     });
+  }
+
+  /** 翻页几何自检（生产也跑）：可见盒（.clip）恒不窄于排版宽度 effAvail。
+   *  `avail − effAvail = R ≥ 0` 是构造保证，这里查的是**反面**：CSS 变量与本次测量不同源时
+   *  （首屏未测量 → 回落到未夹取的 --rdr-mh；改用例/换栏/改字号边距那一帧）可见盒会偏窄、正文被切。
+   *  不达标就重算（最多 3 次，避免死循环）；R 只作读数，不为凑 0 收窄 .clip。 */
+  let geomRetry = 0;
+  function pageGeomCheck() {
+    if (scrollLayout() || stepPx <= 0) return;
+    const clip = pageClip();
+    if (!clip) return;
+    if (clip.clientWidth - effAvail >= -0.5) {
+      geomRetry = 0;
+      return;
+    }
+    if (geomRetry >= 3) {
+      if (import.meta.env.DEV) {
+        console.warn("[layout] 可见盒窄于排版宽度，重算 3 次仍不达标", { clipW: clip.clientWidth, effAvail, mhEff, page });
+      }
+      return;
+    }
+    geomRetry++;
+    if (import.meta.env.DEV) console.warn("[layout] 可见盒窄于排版宽度，重算第 " + geomRetry + " 次", { clipW: clip.clientWidth, effAvail });
+    measurePages();
   }
 
   // DEV：几何值落定、DOM 更新之后再打 [layout]，把「排版宽度 vs 可见盒」一次看全。
@@ -2360,40 +2924,149 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     tick().then(() => logLayout());
   });
 
-  /** 页面偏移统一走 transform 合成（GPU 合成层），animate=true 时不会带动页面滚动 */
+  /** 页面偏移统一走 transform 合成（GPU 合成层）。
+   *
+   *  形参语义（唯一一套）：`instant`
+   *   · 档位只决定往 `.col-page` 挂哪个类（关闭档挂 `.tx-fx-none`，其余不挂 = 基础规则=左右滑动）；
+   *     阻尼弹簧档不在这里：它走整页双层过渡（pageTurnTx → playTransition），`.col-page` 只做无过渡定位；
+   *   · `instant` 只决定是否走「立即跳转」分支（关掉过渡 → 落位 → 强制 reflow → 恢复）。
+   *  `gotoPage(n, silent)` 传 `instant = silent`（等价旧写法 `applyPage(!silent)`）。 */
   let lastPageX = Number.NaN;
-  function applyPage(animate = false) {
-    if (!pageWrap) return;
-    // 步长非法时不要平移（否则会把内容推出可视区）；等测量完成后再定位。
+  /** 在途的翻页事务目标页（-1 = 无）。章号不变，故不复用 txTargetIdx。 */
+  let txPageTarget = -1;
+  /** 当前挂在 .col-page 上的特效类，以及挂它的那个元素（换元素/换档位时必须重挂）。 */
+  let pageFxClass: "" | "tx-fx-none" = "";
+  let pageFxHost: HTMLElement | null = null;
+
+  /** DEV 残留排查：记录「取消/快进前后」的 xRaw 与页码（随 DEV 块摇掉，不影响生产）。
+   *  为什么需要它：cancel() 之后 .col-page 会回到**内联基准值**（上一次 applyPage 写入的旧页码），
+   *  只看最终态分不清「残留」和「这一拍没写」。 */
+  let txCancelLog: Array<Record<string, unknown>> = [];
+  function logCancelProbe(where: string) {
+    if (!import.meta.env.DEV) return;
+    if (txCancelLog.length > 80) txCancelLog.shift();
+    const el = pageWrap;
+    txCancelLog.push({
+      where,
+      t: +performance.now().toFixed(1),
+      xRaw: el ? el.style.transform || "" : "",
+      page,
+      pageCount,
+      stepPx: +stepPx.toFixed(2),
+      cls: el ? Array.from(el.classList).filter((c) => c.startsWith("tx-fx-")).join(" ") : "",
+    });
+  }
+
+  /** 掐掉 `.col-page` 上的在途过渡：切到「关闭」档时只是关掉后续过渡，
+   *  计算值会停在当前插值位置（中段帧仍有位移中间值）。CSS 过渡可从 getAnimations() 拿到并 cancel。
+   *  只动 `.col-page` 自己的过渡，不碰 txAnims（那批挂在 .clip/快照上）。 */
+  function cancelPageTransition() {
+    const el = pageWrap;
+    logCancelProbe("cancel:before");
+    if (!el) return;
+    for (const a of el.getAnimations()) {
+      try { a.cancel(); } catch { /* ignore */ }
+    }
+    logCancelProbe("cancel:after");
+  }
+
+  function applyPage(instant = false) {
+    const el = pageWrap;
+    if (el) {
+      // ① 先挂类，早于判空与「位置未变」短路：首次调用（刚进翻页模式 / 刚换档位）必须无条件挂一次，
+      //    否则启动时存的是弹簧档，第一次翻页仍会走基础规则的 220ms。
+      //    跳过 classList 写入只作用于类本身，不影响下面的 lastPageX 与 transform 写入。
+      const want = scrollLayout() ? "" : pageTurnFxClass(pageModeTransition());
+      if (el !== pageFxHost) {
+        pageFxHost = el;
+        pageFxClass = ""; // 新元素：类一定还没挂
+      }
+      if (want !== pageFxClass) {
+        el.classList.remove("tx-fx-none");
+        if (want) el.classList.add(want);
+        pageFxClass = want;
+        // 切到「关闭」：掐掉在途过渡，避免中段帧留下位移中间值。
+        if (want === "tx-fx-none") cancelPageTransition();
+      }
+    }
+    if (!el) return;
+    // ② 步长非法时不要平移（否则会把内容推出可视区）；等测量完成后再定位。
     const x = stepPx > 0 ? -Math.round(page * stepPx) : 0;
-    if (!animate && x === lastPageX) return; // 位置未变：跳过，避免无谓的强制同步布局
+    if (!instant && x === lastPageX) return; // 位置未变：跳过，避免无谓的强制同步布局
     lastPageX = x;
-    if (animate && !prefersReducedMotion()) {
-      pageWrap.style.transform = `translate3d(${x}px,0,0)`;
+    if (!instant && !prefersReducedMotion()) {
+      el.style.transform = `translate3d(${x}px,0,0)`;
       return;
     }
-    // 立即跳转：临时禁用过渡 → 落位 → 强制 reflow → 恢复常驻 transition，
-    // 避免恢复进度/章节切换/relayout 复用旧动画。
-    pageWrap.style.transition = "none";
-    pageWrap.style.transform = `translate3d(${x}px,0,0)`;
-    void pageWrap.offsetWidth;
-    pageWrap.style.transition = "";
+    // 立即跳转：临时禁用过渡 → 落位 → 强制 reflow → 恢复（清空内联值后由类规则接管时长/曲线），
+    // 避免恢复进度/章节切换/relayout/关闭档复用旧动画。
+    el.style.transition = "none";
+    el.style.transform = `translate3d(${x}px,0,0)`;
+    void el.offsetWidth;
+    el.style.transition = "";
   }
 
   function gotoPage(n: number, silent = false) {
     page = Math.max(0, Math.min(n, pageCount - 1));
-    applyPage(!silent);
+    applyPage(silent); // silent = 无过渡定位（档位分流在 applyPage 内部按类切换）
     if (!silent) saveProgressDebounced();
   }
 
+  /** 阻尼弹簧档的页面翻页：**静止视口 + 文字层滑块**双层过渡（与切章共用同一套骨架与载体）。
+   *  为什么不用内容条曲线：列首尾相连，超过 48px 列间距的过冲就会把相邻页拉进视口，
+   *  把过冲压掉就只剩 ease-out —— 「弹簧」与「不露邻页」在内容条方案下不可兼得（上一版即栽在这）。
+   *  为什么滑块而不是壳：`.clip` 自身左右内缩 mh_eff，本身上屏幕边距靠它；壳一移动正文就
+   *  越过窗口边距区（截图：左缘文字带 421px）。视口静止后由 `.clip` 裁切，正文永不进边距区。
+   *  四步：① 无（舞台已退役）→ ② 快照当前页（克隆滑块）→ ③ 无过渡结算到目标页 → ④ playTransition。 */
+  async function pageTurnTx(dir: number) {
+    const target = Math.max(0, Math.min(page + dir, pageCount - 1));
+    if (target === page || !txAvailable() || !pageSlide()) {
+      if (target !== page) { page = target; applyPage(true); saveProgressDebounced(); }
+      return;
+    }
+    // 任何入口先收口：上次翻页/切章的在途层不能留（同一时刻只允许一个过渡）。
+    interruptTx();
+    const myTxId = ++activeTxId;
+    txActive = true;
+    txDir = dir;
+    txPageTarget = target;
+    txAnimDone = true;
+    navTarget = chapterNum; // 章号不变
+    try {
+      // ① 快照当前页：克隆滑块，保留内部 .col-page 的页码位移（快照因此停在旧页）
+      const snap = buildSnapshot(0);
+      // ② 无过渡结算到目标页：页码位移只由 applyPage 写，动画只动滑块
+      page = target;
+      applyPage(true);
+      saveProgressDebounced();
+      // ③ 双层过渡（真实滑块滑入、克隆滑块移出；视口静止）
+      await playTransition(dir, "h-spring", snap.ok);
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn("[pageTurnTx] failed", e);
+    } finally {
+      if (myTxId === activeTxId) cleanupTx();
+    }
+  }
+
+  /** 页面翻页是否走整页双层：仅翻页模式 + 阻尼弹簧档 + 未命中减少动效。 */
+  function pageTurnEnabled(): boolean {
+    return !scrollLayout() && pageModeTransition() === "h-spring" && !prefersReducedMotion();
+  }
+
   function nextPage() {
-    if (page < pageCount - 1) gotoPage(page + 1);
-    else nextChapter(true);
+    takeOverPageAnim(); // 翻页模式：先快进手上的过渡动画，再接管这一拍
+    if (page < pageCount - 1) {
+      if (pageTurnEnabled()) void pageTurnTx(1);
+      else gotoPage(page + 1);
+    } else nextChapter(true);
   }
 
   function prevPage() {
-    if (page > 0) gotoPage(page - 1);
-    else if (chapterNum > 0) prevChapter(true); // 首页回翻 → 上一章【末尾】，而非章首
+    takeOverPageAnim();
+    if (page > 0) {
+      if (pageTurnEnabled()) void pageTurnTx(-1);
+      else gotoPage(page - 1);
+    } else if (chapterNum > 0) prevChapter(true); // 首页回翻 → 上一章【末尾】，而非章首
   }
 
   /** 阅读页内快捷字号调整（单本生效，覆盖全局字号）。 */
@@ -2421,12 +3094,22 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         config.reader.manga.imgScale = n;
         saveConfig();
       }
+      // 「图±」自动关闭适应（与 PDF 分支同一条语义）：适应开着时 CSS 的适应规则压过倍率，
+      // 调了倍率画面也不动；新装默认适宽后这个按钮会直接变成「按了没反应」。
+      // 全局与本书覆盖一起关 —— 只关全局，带单本适宽覆盖的书仍看不到变化。
+      if (config.reader.manga.fitWidth || config.reader.manga.fitHeight) {
+        config.reader.manga.fitWidth = false;
+        config.reader.manga.fitHeight = false;
+        saveConfig();
+      }
       // 清除本书单本覆盖，使当前书即时跟随新的全局倍率。
       // 先判断覆盖是否真的存在：setBookOverride 即便 patch 全是 undefined 也会
       // map[key] = {} 建一条空覆盖并同步写一次 localStorage（bookcfg.svelte.ts:76-77），
       // 没有覆盖时这一步纯属白写，还会给这本书留一条永久空记录。
-      if (book && getBookOverride(book.book.id).imgScale !== undefined) {
-        setBookOverride(book.book.id, { imgScale: undefined });
+      const bid = book?.book.id;
+      const ov0 = bid != null ? getBookOverride(bid) : undefined;
+      if (bid != null && ov0 && (ov0.imgScale !== undefined || ov0.fitWidth !== undefined || ov0.fitHeight !== undefined)) {
+        setBookOverride(bid, { imgScale: undefined, fitWidth: undefined, fitHeight: undefined });
       }
     } else {
       const cur = effImgScale();
@@ -3531,6 +4214,9 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
     e.preventDefault();
     const d = normalizeWheelDelta(e.deltaMode, e.deltaY);
+    // 加载在途（新章尚未布局完成）：滚轮一律不当章末意图。这段窗口里 maxScroll 还是旧章的值
+    // （或短章的 0），旧实现会把滚轮判成越界/章末，表现为「切章后滚不动」与「一次意图连跳多章」。
+    if (loadingChapter) return;
     if (maxScroll <= 1 || !scroller) {
       if (d > 0) handleScrollEdge(1, 0);
       else if (d < 0) handleScrollEdge(-1, 0);
@@ -3781,7 +4467,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     window.getSelection()?.removeAllRanges();
     const tgt = e.target as HTMLElement | null;
     // 点击已有划线 → 打开划线设置（改颜色 / 改样式 / 删除）
-    const markEl = tgt?.closest?.("mark.fr-hl") as HTMLElement | null;
+    const markEl = tgt?.closest?.("mark.tp-hl") as HTMLElement | null;
     if (markEl && contentEl.contains(markEl)) {
       const id = Number(markEl.dataset.hlid);
       const h = highlights.find((x) => x.id === id);
@@ -3858,7 +4544,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     if (!base || !base.includes(".")) return;
     const idx = book?.docs?.findIndex((d) => d.toLowerCase() === base) ?? -1;
     if (idx >= 0) {
-      loadChapter(idx);
+      void navTo(idx, { at: "head", extra: 0 });
     } else {
       toast(t("reader.toast.jumpFailed", { target: base }));
     }
@@ -3877,7 +4563,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     }
   }
 
-  /** DEV 输入日志条目（__frDebug.inputLog）：取证用，release 构建随 DEV 块一起被摇掉。
+  /** DEV 输入日志条目（__tpDebug.inputLog）：取证用，release 构建随 DEV 块一起被摇掉。
    *  覆盖 pointer/mouse/click/auxclick/keydown/wheel 八类：映射设备可能只发其中一部分
    *  （例如只有 click、没有 pointer 系），少记一类就分不清「事件没进来」与「进来被吞了」。
    *  各事件类型不共有的字段用 -1/0/false 占位，避免类型断言。 */
@@ -3918,7 +4604,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 开发期调试钩子：便于自动化验证搜索框/笔记交互（仅 DEV 构建，release 不含）。
     if (import.meta.env.DEV) {
       // 输入取证：映射设备到底发 wheel 还是 keydown/click、deltaMode/deltaX 各是多少、
-      // 有没有夹带修饰键，用户自己也说不清，这里环形留最近 80 条原始事件供 __frDebug.inputLog() 读取。
+      // 有没有夹带修饰键，用户自己也说不清，这里环形留最近 80 条原始事件供 __tpDebug.inputLog() 读取。
       // 用捕获阶段挂 window：即使后面有 stopPropagation，日志也一定先记到。
       const INPUT_LOG_MAX = 80;
       const inputLog: InputLogRec[] = [];
@@ -4029,7 +4715,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         window.removeEventListener("wheel", onInWheel, true);
       };
 
-      (window as any).__frDebug = {
+      (window as any).__tpDebug = {
         // i18n-allow:用户内容：全文搜索输入框的默认关键词，是用户输入的初值而非界面文案。
         openSearch: (q = "的") => {
           searchPopup = { query: q, anchor: { top: 120, bottom: 121, cx: window.innerWidth / 2 } };
@@ -4050,7 +4736,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
           await tick();
           paintNow();
           const root = contentRoot();
-          const mark = root?.querySelector(`mark.fr-hl[data-hlid="${hlId}"]`) as HTMLElement | null;
+          const mark = root?.querySelector(`mark.tp-hl[data-hlid="${hlId}"]`) as HTMLElement | null;
           const h = highlights.find((x) => x.id === hlId);
           if (!mark || !h || !h.note.trim()) {
             hoverNote = null;
@@ -4091,6 +4777,211 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
         }),
         /** 排版几何快照（任务一）：clipW 与 pageWrapW / effAvail 是否同源一眼可见。 */
         layout: () => layoutSnapshot(),
+        /** 章节切换事务快照（DEV 取证）：锁定态、事务号、目标、快照层、滚动器位置。
+         *  验收探针靠它量「狂滚期间是否被吞」「停手后多久解锁」「落点是否被推走」。 */
+        tx: () => ({
+          locked: txLocked,
+          active: txActive,
+          txId: activeTxId,
+          targetIdx: txTargetIdx,
+          dir: txDir,
+          lastInputAgoMs: +(performance.now() - txLastInputAt).toFixed(1),
+          snapshot: !!txSnapEl,
+          snapshotNodes: txSnapEl ? txSnapEl.querySelectorAll("*").length : 0,
+          stageClass: txStageEl?.className ?? "",
+          bandOn: !!txBandEl?.classList.contains("on"),
+          navTarget,
+          scrollerPos: scroller ? +scroller.pos.toFixed(1) : -1,
+          scrollerTarget: scroller ? +scroller.targetPos.toFixed(1) : -1,
+          maxScroll,
+          // 翻页模式取证：视口/滑块/克隆三层的位移、页码定位、跨度口径（effAvail 而不是 stepPx）。
+          page,
+          pageCount,
+          effAvail: +effAvail.toFixed(2),
+          stepPx: +stepPx.toFixed(2),
+          clipTf: pageClip() ? getComputedStyle(pageClip()!).transform : "",
+          slideTf: pageSlide() ? getComputedStyle(pageSlide()!).transform : "",
+          snapTf: txSnapEl ? getComputedStyle(txSnapEl).transform : "",
+          pageWrapTf: pageWrap ? getComputedStyle(pageWrap).transform : "",
+        }),
+        /** 翻页特效取证（DEV）：挂的类、生效的 transition、当前位移与目标位移。
+         *  setPageFx 只为验收「在途动画中途切档」而存在（等价设置面板改下拉），随 DEV 块一起摇掉。 */
+        pageFx: () => ({
+          cls: pageWrap ? Array.from(pageWrap.classList).filter((c) => c.startsWith("tx-fx-")).join(" ") : "",
+          transition: pageWrap ? getComputedStyle(pageWrap).transition : "",
+          x: pageWrap && pageWrap.style.transform ? Number(/translate3d\((-?[\d.]+)px/.exec(pageWrap.style.transform)?.[1] ?? NaN) : NaN,
+          // 计算值（过渡进行中读到的是插值后的位置）：判「有没有位移中间值」只看它。
+          cx: pageWrap ? (() => {
+            const m = /matrix\(([^)]+)\)/.exec(getComputedStyle(pageWrap).transform);
+            return m ? +Number(m[1].split(",")[4]).toFixed(2) : NaN;
+          })() : NaN,
+          target: stepPx > 0 ? -Math.round(page * stepPx) : 0,
+          page,
+          stepPx: +stepPx.toFixed(2),
+          gap,
+          level: pageModeTransition(),
+          // —— 残留排查用（必修 1）：宿主归属、位置哨兵、原串 ——
+          fxHost: pageFxHost === null ? "none" : pageFxHost === pageWrap ? "pageWrap" : "other",
+          lastPageX: Number.isFinite(lastPageX) ? lastPageX : null,
+          xRaw: pageWrap ? (pageWrap.style.transform || "") : "",
+          pageFxClass,
+          txPageTarget,
+          // 双层过渡的生效时长/曲线（翻页模式下从**滑块**的第一条动画读；视口 `.clip` 不动）：
+          // 弹簧档不挂类，所以「播了没有」只能看这里。
+          clipAnim: (() => {
+            const a = pageSlide()?.getAnimations()[0];
+            if (!a) return null;
+            const t = (a.effect as KeyframeEffect | null)?.getTiming();
+            return t ? { duration: t.duration, easing: t.easing, fill: t.fill, playState: a.playState } : { playState: a.playState };
+          })(),
+          // 视口动画条数：迁移后恒为 0 才是对的（壳体不得再被位移）
+          clipViewportAnims: pageClip() ? pageClip()!.getAnimations().length : -1,
+          slideTf: pageSlide() ? pageSlide()!.style.transform || "" : "",
+          snapAnim: (() => {
+            const a = txSnapEl?.getAnimations()[0];
+            if (!a) return null;
+            const t = (a.effect as KeyframeEffect | null)?.getTiming();
+            return t ? { duration: t.duration, easing: t.easing, fill: t.fill, playState: a.playState } : { playState: a.playState };
+          })(),
+        }),
+        /** 翻页几何取证（DEV）：每一帧现取 pageClip()/txStageEl（模式切换后元素会变，不能缓存引用）。 */
+        pageGeom: () => {
+          const clip = pageClip();
+          const stage = txStageEl;
+          const wrap = pageWrap;
+          const R = (e: Element | null | undefined) => {
+            if (!e) return null;
+            const r = e.getBoundingClientRect();
+            return { left: +r.left.toFixed(2), top: +r.top.toFixed(2), right: +r.right.toFixed(2), bottom: +r.bottom.toFixed(2), w: +r.width.toFixed(2), h: +r.height.toFixed(2) };
+          };
+          const wr = R(wrap);
+          const cr = R(clip);
+          const anims = (e: Element | null | undefined) =>
+            e ? e.getAnimations().map((a) => `${a.constructor.name}:${a.playState}`) : [];
+          const cs = clip ? getComputedStyle(clip) : null;
+          const m = wrap ? /matrix\(([^)]+)\)/.exec(getComputedStyle(wrap).transform) : null;
+          return {
+            pageWrapRect: wr,
+            clipRect: cr,
+            // 带符号：>0 表示正文页相对可见盒右移（左侧露白），<0 表示左移（左缘文字带）
+            wrapMinusClipLeft: wr && cr ? +(wr.left - cr.left).toFixed(2) : null,
+            wrapOverClipLeft: wr && cr ? +(cr.left - wr.left).toFixed(2) : null,
+            wrapOverClipRight: wr && cr ? +(wr.right - cr.right).toFixed(2) : null,
+            clipLeftCss: cs ? cs.left : "",
+            clipRightCss: cs ? cs.right : "",
+            clipTransition: cs ? cs.transition : "",
+            clipTf: cs ? cs.transform : "",
+            pageWrapTf: wrap ? getComputedStyle(wrap).transform : "",
+            pageWrapCx: m ? +Number(m[1].split(",")[4]).toFixed(2) : null,
+            clipAnims: anims(clip),
+            wrapAnims: anims(wrap),
+            stageAnims: anims(stage),
+            stageClass: stage ? stage.className : "",
+            stageChildren: stage ? stage.querySelectorAll("*").length : 0,
+            clipInlineTf: clip ? (clip.style.transform || "") : "",
+            clipInlineShadow: clip ? (clip.style.boxShadow || "") : "",
+            // 首屏/几何自检读数：可见盒宽度 vs 本次排版宽度、CSS 变量的实际取值
+            clipClientW: clip ? clip.clientWidth : 0,
+            effAvail: +effAvail.toFixed(2),
+            availMinusEffAvail: clip ? +(clip.clientWidth - effAvail).toFixed(2) : null,
+            mhEffVar: contentEl ? getComputedStyle(contentEl).getPropertyValue("--rdr-mh-eff").trim() : "",
+            mhVar: contentEl ? getComputedStyle(contentEl).getPropertyValue("--rdr-mh").trim() : "",
+            // 快照层（必修 1.3：每层只显示一页 → 克隆内 .col-page 必须停在旧页、且贴住舞台左缘）
+            snap: (() => {
+              const snapEl = txSnapEl;
+              if (!snapEl) return { exists: false, colTf: "", colLeft: null, deltaLeft: null, rect: null, background: "" };
+              const col = snapEl.querySelector<HTMLElement>(".col-page");
+              const sr = snapEl.getBoundingClientRect();
+              const cr = col ? col.getBoundingClientRect() : null;
+              return {
+                exists: true,
+                colTf: col ? col.style.transform || "" : "",
+                colLeft: cr ? +cr.left.toFixed(2) : null,
+                deltaLeft: cr ? +(cr.left - sr.left).toFixed(2) : null,
+                snapLeft: +sr.left.toFixed(2),
+                rect: R(snapEl),
+                background: getComputedStyle(snapEl).backgroundColor,
+              };
+            })(),
+            // 真实入场层（翻页模式 = 文字层滑块；动画期间被位移的就是它）
+            real: (() => {
+              const slider = pageSlide();
+              if (!slider) return { exists: false, colTf: "", rect: null, background: "" };
+              const col = slider.querySelector<HTMLElement>(".col-page");
+              return {
+                exists: true,
+                colTf: col ? col.style.transform || "" : "",
+                rect: R(slider),
+                background: getComputedStyle(slider).backgroundColor,
+                opacity: getComputedStyle(slider).opacity,
+                zIndex: getComputedStyle(slider).zIndex,
+                tf: getComputedStyle(slider).transform,
+              };
+            })(),
+            // 静止视口：迁移后它的 transform 必须恒为 none、且无动画
+            viewport: (() => {
+              if (!clip) return { exists: false };
+              return { exists: true, rect: cr, tf: getComputedStyle(clip).transform, anims: anims(clip).length, leftCss: cs ? cs.left : "", rightCss: cs ? cs.right : "" };
+            })(),
+            // 边距带遮挡：左右两条竖带的实测宽度必须等于 mh_eff（必修 4.7 的真机确认项）
+            band: (() => {
+              const band = txBandEl;
+              if (!band) return { exists: false };
+              const b = getComputedStyle(band);
+              const br = band.getBoundingClientRect();
+              const inner = { left: br.left + parseFloat(b.borderLeftWidth || "0"), right: br.right - parseFloat(b.borderRightWidth || "0") };
+              return {
+                exists: true,
+                on: band.classList.contains("on"),
+                rect: R(band),
+                borderLeft: b.borderLeftWidth,
+                borderRight: b.borderRightWidth,
+                borderColor: b.borderLeftColor,
+                display: b.display,
+                innerLeft: +inner.left.toFixed(2),
+                innerRight: +inner.right.toFixed(2),
+                innerW: +(inner.right - inner.left).toFixed(2),
+              };
+            })(),
+          };
+        },
+        setPageFx: (v: string) => {
+          config.reader.pageTransition = pageTransitionOf(v);
+          saveConfig();
+          return config.reader.pageTransition;
+        },
+        /** 取消/快进前后的 xRaw 记录（DEV 残留排查），以及清空入口。 */
+        cancelLog: () => txCancelLog.slice(0),
+        clearCancelLog: () => { txCancelLog = []; return true; },
+        /** 背景图验收专用（DEV）：等价设置面板选图后的落值（面板流程 = invoke set_background_image + 这一句赋值）。 */
+        setBg: (name: string) => {
+          config.reader.bgImage = name;
+          saveConfig();
+          return config.reader.bgImage;
+        },
+        /** 背景图层读数（DEV）：实际 URL、取景盒、不透明度、阅读底色。 */
+        bg: () => {
+          const layer = document.querySelector<HTMLElement>(".bg-layer");
+          const cs = layer ? getComputedStyle(layer) : null;
+          const r = layer ? layer.getBoundingClientRect() : null;
+          return {
+            cfg: config.reader.bgImage,
+            url: bgImageUrl,
+            image: cs ? cs.backgroundImage.replace(/^url\("?/, "").replace(/"?\)$/, "") : "",
+            size: cs ? cs.backgroundSize : "",
+            repeat: cs ? cs.backgroundRepeat : "",
+            opacity: cs ? cs.opacity : "",
+            rect: r ? { left: +r.left.toFixed(1), top: +r.top.toFixed(1), w: +r.width.toFixed(1), h: +r.height.toFixed(1) } : null,
+            rdrBg: getComputedStyle(document.documentElement).getPropertyValue("--rdr-bg").trim(),
+          };
+        },
+        /** 残留验收专用（DEV）：从「未先收口」的入口再起一次事务 ——
+         *  与 TOC 跳章 / 边缘续章 / 自动续章那几处直调 chapterTx 的入口等价。
+         *  在途时调用它可验「新事务是否必然收掉旧舞台/旧克隆」。 */
+        txDirect: (idx: number) => {
+          void chapterTx(idx, { at: "head", extra: 0 }, false);
+          return true;
+        },
         /** 图库快照（DEV 取证）：清单长度 / 已回填页数 / 整页图缓存 token / 在途页号。 */
         gallery: () => ({
           viewerIndex,
@@ -4117,7 +5008,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
             await onHighlight(style, color);
             await tick();
             paintNow();
-            const mark = root.querySelector<HTMLElement>("mark.fr-hl");
+            const mark = root.querySelector<HTMLElement>("mark.tp-hl");
             return { ok: !!mark, text, hlId: mark ? Number(mark.dataset.hlid) : null, hlTotal: highlights.length };
           },
           snap: () => {
@@ -4130,7 +5021,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
             // PDF 的 mark 在 .textLayer 里；其它格式直接在 contentRoot（#chapter-content）下，
             // 回落到 root 才能用同一支探针给 EPUB 做回归。
             const layer = root?.querySelector<HTMLElement>(".textLayer") ?? root ?? null;
-            const list = layer ? Array.from(layer.querySelectorAll<HTMLElement>("mark.fr-hl")) : [];
+            const list = layer ? Array.from(layer.querySelectorAll<HTMLElement>("mark.tp-hl")) : [];
             const first = list[0] ?? null;
             const h = first ? highlights.find((x) => x.id === Number(first.dataset.hlid)) ?? null : null;
             const cs = first ? getComputedStyle(first) : null;
@@ -4198,7 +5089,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     });
     const onJump = (e: Event) => {
       const idx = (e as CustomEvent<number>).detail;
-      if (book && idx >= 0 && idx < book.toc.length) loadChapter(idx);
+      if (book && idx >= 0 && idx < book.toc.length) void navTo(idx, { at: "head", extra: 0 });
     };
     const onUnload = () => {
       doSaveProgress();
@@ -4211,7 +5102,7 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
     // 任务 5：独立面板窗口的跳转请求（跨窗 Tauri 事件）→ 主窗执行导航
     const gotoChUn = listen<{ index: number }>("tidepage-goto-chapter", (e) => {
       const i = e.payload?.index;
-      if (book && typeof i === "number" && i >= 0 && i < book.toc.length) loadChapter(i);
+      if (book && typeof i === "number" && i >= 0 && i < book.toc.length) void navTo(i, { at: "head", extra: 0 });
     });
     const gotoHlUn = listen<{ id: number }>("tidepage-goto-highlight", async (e) => {
       const id = e.payload?.id;
@@ -4243,10 +5134,11 @@ import { prefersReducedMotion } from "../lib/reducedMotion";
 
   $effect(() => {
     if (scroller) {
-      const p = SCROLL_BOUNCE_PRESETS[config.reader.scrollBounceLevel] ?? SCROLL_BOUNCE_PRESETS.medium;
-      scroller.bounce = config.reader.scrollBounce;
-      scroller.strength = p.strength;
-      scroller.threshold = p.threshold;
+      // 边缘阻尼参数三档共用、恒为常量：不随「章节过渡」档位变，避免删除旧预设后灵敏度漂移。
+      // 数值取 SmoothScroller 的默认档（strength 0.5 / threshold 140），wheelBy 的 edge 路径仍可达。
+      scroller.bounce = true;
+      scroller.strength = 0.5;
+      scroller.threshold = 140;
     }
   });
 
@@ -4407,13 +5299,17 @@ ${effCssExtra() || ""}
   $effect(() => {
     const override = effOverrideCss();
     void chapter;
+    void bgImageUrl;
     const opts = {
       fontFamily: fontStack(effFontFamily(), effLatinFont()),
       monoFont: "Consolas, \"Courier New\", monospace",
       fontSize: effFontSize(),
       lineHeight: effLineHeight(),
       color: effFgColor() || THEMES[effTheme()].fg,
-      background: effBgColor() || THEMES[effTheme()].bg,
+      // 设了背景图时正文层必须透明：这条覆盖规则带 !important，会用不透明底色把
+      // 图片挡在正文后面（实测：正文行间像素 = 底色 #f5f1e8，而左边距/角落 = 图片色）。
+      // 透明同样是「覆盖掉原书自带的背景色」，同时让图片与边距区同源（取景唯一）。
+      background: bgImageUrl ? "transparent" : effBgColor() || THEMES[effTheme()].bg,
     };
     void tick().then(() => {
       if (!override) {
@@ -4564,6 +5460,12 @@ ${effCssExtra() || ""}
     if (layoutChanged) loadMangaWindow(chapterNum);
   });
 
+  /** 有效背景图不透明度：唯一背景面（.bg-layer）与遮挡带必须同源，
+   *  否则带子区域会比周围实、静止帧与过渡帧就能看出色差（第一判据会自败）。 */
+  function bgOpacityEff(): number {
+    return bookScheme()?.schemeBgOpacity ?? config.reader.bgOpacity;
+  }
+
   // PDF 切片按需加载：窗口内容变化（换页/裁剪/续章/重建）后按视口补位图与文本层，
   // 并把离开视口的切片位图交还 pdf.ts 回收（切片级内存上限，rAF 合并避免滚动中抖）。
   // 图库开/关与翻页：
@@ -4707,8 +5609,8 @@ ${effCssExtra() || ""}
     // 先按划线（hlid）归组再算色块：一条跨 span 的划线现在会切出很多个 mark，
     // 若逐个 mark 出块，一天里的相邻块各带圆角、交界处会露发丝缝（合并逻辑在纯函数里）。
     const groups = new Map<string, { isTts: boolean; color: string; rects: DOMRect[] }>();
-    for (const m of root.querySelectorAll<HTMLElement>("mark.fr-hl-background, mark.fr-tts")) {
-      const isTts = m.classList.contains("fr-tts");
+    for (const m of root.querySelectorAll<HTMLElement>("mark.tp-hl-background, mark.tp-tts")) {
+      const isTts = m.classList.contains("tp-tts");
       const key = isTts ? "tts" : m.dataset.hlid ?? "";
       let g = groups.get(key);
       if (!g) {
@@ -4835,7 +5737,7 @@ ${effCssExtra() || ""}
   let hoverNote = $state<{ note: string; text: string; x: number; y: number } | null>(null);
 
   function onContentHover(e: MouseEvent) {
-    const markEl = (e.target as HTMLElement | null)?.closest?.("mark.fr-hl") as HTMLElement | null;
+    const markEl = (e.target as HTMLElement | null)?.closest?.("mark.tp-hl") as HTMLElement | null;
     if (!markEl) {
       if (hoverNote) hoverNote = null;
       return;
@@ -5082,7 +5984,7 @@ ${effCssExtra() || ""}
     // 记录跳转前位置，便于返回；搜索框保持打开
     searchNavStack = [...searchNavStack, { chapter_index: chapterNum, ratio: currentRatio() }];
     if (chapterIndex !== chapterNum || !chapter) {
-      await loadChapter(chapterIndex);
+      await chapterTx(chapterIndex, undefined, false);
     }
     await tick();
     paintNow();
@@ -5100,7 +6002,7 @@ ${effCssExtra() || ""}
 
   async function gotoNavPos(p: NavPos) {
     if (p.chapter_index !== chapterNum || !chapter) {
-      await loadChapter(p.chapter_index);
+      await chapterTx(p.chapter_index, undefined, false);
       await tick();
     }
     applyRatio(p.ratio);
@@ -5126,7 +6028,7 @@ ${effCssExtra() || ""}
       return;
     }
     if (h.chapter_index !== chapterNum) {
-      await loadChapter(h.chapter_index);
+      await chapterTx(h.chapter_index, undefined, false);
       await tick();
     } else {
       await tick();
@@ -5370,7 +6272,7 @@ ${effCssExtra() || ""}
       return;
     }
     // 此时 ttsState.playing 已为 false，loadChapter 不会误杀朗读
-    await loadChapter(chapterNum + 1);
+    await chapterTx(chapterNum + 1, { at: "head", extra: 0 }, false);
     await tick();
     startTts("chapter");
   }
@@ -5654,13 +6556,14 @@ ${effCssExtra() || ""}
   class:hide-text={isMangaMode() && config.reader.manga.hideText}
   class:no-images={!effShowImages()}
   class:vfade={!isMangaMode() && config.reader.mode === "scroll" && effMarginV() > 0}
+  class:has-bg={!!bgImageUrl}
   style={readerVars()}
   onwheel={onWheel}
   onmousemove={onReaderMove}
   onmouseleave={() => { fontCtlShow = false; syncChromeHover(false); }}
 >
   {#if bgImageUrl}
-    <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{bookScheme()?.schemeBgOpacity ?? config.reader.bgOpacity};"></div>
+    <div class="bg-layer" style="background-image:url('{bgImageUrl}'); opacity:{bgOpacityEff()};"></div>
   {/if}
   {#if showFsHint}
     <div class="fs-hint" transition:fade={{ duration: 220 }}>{t("reader.fullscreenExit")}</div>
@@ -5952,12 +6855,34 @@ ${effCssExtra() || ""}
               <div class="thumb" bind:this={thumbEl} style="height:8%"></div>
             </div>
           {:else}
+            <!-- 翻页模式：`.clip` 是**静止视口**（保留 overflow:hidden 与 mh_eff 左右内缩），
+                 过渡只动里面的文字层滑块 `.tx-slide`，页码位移仍写在 `.col-page` 上。
+                 克隆滑块（`.tx-snap`）由 buildSnapshot append 到 `.clip` 末尾。 -->
             <div class="clip">
-              <div class="col-page" bind:this={pageWrap}>
-                <div id="chapter-content">{@html chapter?.html ?? ""}</div>
+              <div class="tx-slide" bind:this={pageSlideEl}>
+                <div class="col-page" bind:this={pageWrap}>
+                  <div id="chapter-content">{@html chapter?.html ?? ""}</div>
+                </div>
               </div>
             </div>
           {/if}
+          <!-- 章节过渡舞台：位于整个分支块之后（同时排在真实 .scroll-area / .clip 之后），
+               readFix 的 getElementById("chapter-content") 因此必命中真实节点。
+               滚动模式与 .scroll-area 同盒（inset: var(--rdr-inset-v) 0）；
+               翻页模式由 .page 修饰成整块 .content 高，与 .clip（top/bottom:0）同盒 —— 第 0 步实测：
+               舞台带 inset-v 时克隆体内 .col-page 的 top 差 80px；inset:0 时四项逐项相等。
+               视觉层级只用 .content 内的局部 z-index（stage 2/1、band 3），不碰任何 --z-* 全局 token；
+               自绘滚动条那条仍用全局 --z-sticky(20)，始终压在舞台之上。 -->
+          <div class="tx-stage" bind:this={txStageEl}></div>
+          <!-- 边距带遮挡：过渡期间上下边距带必须干净。滚动模式实测位移会把正文带进边距带；
+               翻页模式图层横向移动、正文竖向位置不动，但舞台全高、仍挂上以防边缘露出。
+               用上下两条底色带压在两层之上、自绘 .scrollbar(--z-sticky) 之下。 -->
+          <div
+            class="tx-band"
+            bind:this={txBandEl}
+            style:--tx-band-image={bgImageUrl ? `url("${bgImageUrl}")` : "none"}
+            style:--tx-band-veil={bgImageUrl ? `color-mix(in srgb, ${readerColors().bg} ${Math.round((1 - bgOpacityEff()) * 100)}%, transparent)` : "transparent"}
+          ></div>
           {#if loadingChapter && !chapter}
             <div class="loading" aria-label={t("reader.loadingAria")} aria-busy="true">
               <span class="sk sk-title"></span>
@@ -6029,7 +6954,7 @@ ${effCssExtra() || ""}
 
     {#if tocOpen && book}
       <div class="panel-slot" out:outSlideL>
-        <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; void loadChapter(i).then(alignStatsBaseline); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
+        <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; void navTo(i, { at: "head", extra: 0 }).then(alignStatsBaseline); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
       </div>
     {/if}
 
@@ -6039,7 +6964,7 @@ ${effCssExtra() || ""}
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
-              <div class="bm-main" onclick={() => { void loadChapter(bm.chapter_index).then(alignStatsBaseline); rightPanel = null; }}>
+              <div class="bm-main" onclick={() => { void navTo(bm.chapter_index, { at: "head", extra: 0 }).then(alignStatsBaseline); rightPanel = null; }}>
                 <div class="bm-title">{bm.title || t("common.untitled")}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
@@ -6160,9 +7085,9 @@ ${effCssExtra() || ""}
 
   <!-- H2：悬停划线的感想浮层（仅 note 非空时） -->
   {#if hoverNote}
-    <div class="fr-note-tip rdr-pop" style="left:{Math.round(hoverNote.x)}px; top:{Math.round(hoverNote.y)}px;">
-      <div class="fr-note-tip-quote">{hoverNote.text.length > 40 ? hoverNote.text.slice(0, 40) + "…" : hoverNote.text}</div>
-      <div class="fr-note-tip-body">{hoverNote.note}</div>
+    <div class="tp-note-tip rdr-pop" style="left:{Math.round(hoverNote.x)}px; top:{Math.round(hoverNote.y)}px;">
+      <div class="tp-note-tip-quote">{hoverNote.text.length > 40 ? hoverNote.text.slice(0, 40) + "…" : hoverNote.text}</div>
+      <div class="tp-note-tip-body">{hoverNote.note}</div>
     </div>
   {/if}
 
@@ -6184,6 +7109,37 @@ ${effCssExtra() || ""}
 
 
 <style>
+  /* ================= 阅读面三条架构约束（改任何底色前先读这一段） =================
+   *
+   * ① 唯一背景面：全应用只有 `.bg-layer` 一处承载「阅读底」= 背景图 + 底色 + 透明度；
+   *    它铺满窗口、**永不位移、永不参与过渡**。任何过渡层都不得在它之上铺不透明底，
+   *    否则背景会在过渡期间被整块盖掉（静止帧与过渡帧出现色差）。
+   *
+   * ② 文字层纯文字：正文容器（`.content` / `.clip` / `.tx-slide` / `.col-page` /
+   *    `#chapter-content` 及其后代）不得有不透明底色。
+   *
+   * ③ 遮挡不得靠「纸」：遮旧页只能用「内容层位移 + 透明度」，或在**整窗同盒**的一层上做；
+   *    禁止在版心盒这类小盒上做不透明底。
+   *    附：`cover` ≠ 拉伸到盒子大小 —— 它按原始宽高比放大到刚好覆盖取景盒
+   *    （scale = max(W/nw, H/nh)）再居中裁切；所以「同图同取景」要求取景盒相同。
+   *
+   * ===== 允许写不透明阅读底的白名单（白名单之外，阅读链路元素一律不得写） =====
+   * 1. `Reader.svelte` `.reader { background: var(--rdr-bg) }`
+   *    理由：唯一背景面的**兜底**——无图或 bgOpacity=0 时回落纯色，不白屏。
+   * 2. `readFix.ts` `READ_FIX_BG_SELECTOR` 与 `html, body`（`buildReadFixCss` 的 BG 项）
+   *    理由：覆盖原书自带底色的排版修复；**有图时同一 BG 传 `transparent`**（见该文件注释），
+   *    此时它仍然覆盖原书底色，只是不再挡图。
+   * 3. `Reader.svelte` `.tx-bg` / `.tx-stage` / `.tx-band::before/::after`
+   *    理由：滚动模式过渡期遮挡旧页所需；**有图时逐条去纸**（`.tx-bg` 不挂、`.tx-stage`
+   *    透明、横带与背景面逐像素同源），无图时与改动前完全一致。
+   * 4. `routes/+page.svelte` 的 shell（`background:${bg}`）
+   *    理由：应用外壳底色，位于 `.reader` **之下**，不可能遮住背景面；非阅读链路。
+   * 5. `config.reader.cssExtra`（用户自定义 CSS 注入）
+   *    理由：用户自己写的样式，范围外；默认值为空。
+   * 6. `readerSurfaceVars()` / `color-mix` 派生色
+   *    理由：只产出变量与浮层底色（书内搜索等 UI 面板），不是阅读面。
+   *    注：`schemeBg*` 是**变量**（单本方案的取值），不是独立写底处，审计时不要误判。
+   * ============================================================================ */
   .reader {
     height: 100%;
     display: flex;
@@ -6230,7 +7186,12 @@ ${effCssExtra() || ""}
     /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
     padding-right: 112px;
     background: color-mix(in srgb, var(--rdr-bg) 90%, black 10%);
-    z-index: var(--z-raised);
+    /* 必须比正文层高一档，不能同为 --z-raised：顶栏按钮的悬停提示是它自己的 ::after 子元素，
+       又被这里的 transform 收进顶栏的层叠上下文，只有顶栏整层压过 .body，提示才出得到正文之上。
+       原先与 .body 同为 10 时由文档顺序决胜，DOM 在后的正文胜出 —— EPUB/TXT 正文背景透明所以
+       看不出来，PDF 页位图不透明，提示就只剩顶栏盒内那 2px 一条线。
+       层级：正文 10 < 顶栏 20 < 抽屉 100 < 弹层 200 < 门户浮层 450 < toast 500。 */
+    z-index: var(--z-sticky);
     position: relative;
     user-select: none;
     /* 顶栏下方 1px 用顶栏背景色补齐：快速滚动时滚动层与顶栏交界处不会露出背景形成亮线/接缝 */
@@ -6561,23 +7522,23 @@ ${effCssExtra() || ""}
   /* PDF 高亮的底色 / 下划线 / 框线：**与 #chapter-content 那组规则同步维护**（两份声明必须一致）。
      为什么必须镜像：PDF 的正文根是 .pdf-page，一条 #chapter-content 规则都匹配不到 ——
      不镜像的话 mark 只剩浏览器对 <mark> 的 UA 默认黄底，用户选的 --hl-color 完全不参与。
-     头一条把默认黄底清掉（与 #chapter-content mark.fr-hl 的 background:transparent 对齐），
+     头一条把默认黄底清掉（与 #chapter-content mark.tp-hl 的 background:transparent 对齐），
      后面各样式再各自上色。--hl-color 由阅读器根写入并继承，无需在这里另设。 */
-  .reader.pdf :global(mark.fr-hl) {
+  .reader.pdf :global(mark.tp-hl) {
     background: transparent;
     color: inherit;
     padding: 0;
     cursor: pointer;
   }
 
-  .reader.pdf :global(mark.fr-hl-underline) {
+  .reader.pdf :global(mark.tp-hl-underline) {
     text-decoration-line: underline;
     text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 2px;
   }
 
-  .reader.pdf :global(mark.fr-hl-wavy) {
+  .reader.pdf :global(mark.tp-hl-wavy) {
     text-decoration-line: underline;
     text-decoration-style: wavy;
     text-decoration-color: var(--hl-color);
@@ -6585,7 +7546,7 @@ ${effCssExtra() || ""}
     text-underline-offset: 3px;
   }
 
-  .reader.pdf :global(mark.fr-hl-dotted) {
+  .reader.pdf :global(mark.tp-hl-dotted) {
     text-decoration-line: underline;
     text-decoration-style: dotted;
     text-decoration-color: var(--hl-color);
@@ -6593,7 +7554,7 @@ ${effCssExtra() || ""}
     text-underline-offset: 2px;
   }
 
-  .reader.pdf :global(mark.fr-hl-double) {
+  .reader.pdf :global(mark.tp-hl-double) {
     text-decoration-line: underline;
     text-decoration-style: double;
     text-decoration-color: var(--hl-color);
@@ -6601,13 +7562,13 @@ ${effCssExtra() || ""}
     text-underline-offset: 2px;
   }
 
-  .reader.pdf :global(mark.fr-hl-strike) {
+  .reader.pdf :global(mark.tp-hl-strike) {
     text-decoration-line: line-through;
     text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
   }
 
-  .reader.pdf :global(mark.fr-hl-box) {
+  .reader.pdf :global(mark.tp-hl-box) {
     box-shadow: 0 0 0 1.5px var(--hl-color);
     border-radius: var(--radius-xs);
   }
@@ -6636,11 +7597,11 @@ ${effCssExtra() || ""}
      否则 mark 自己那层（乘不到位图的）平铺色会盖在叠层上，等于白做。
      下划线 / 波浪 / 点线 / 双线 / 删除线 / 方框仍由 mark 承担（见上面那组镜像规则）。
      选择器挂在 .reader.pdf 上 —— EPUB/TXT 的观感保持不变。 */
-  .reader.pdf :global(mark.fr-hl-background) {
+  .reader.pdf :global(mark.tp-hl-background) {
     background: transparent;
   }
 
-  .reader.pdf :global(mark.fr-tts) {
+  .reader.pdf :global(mark.tp-tts) {
     background: transparent;
     color: inherit;
     border-radius: var(--radius-xs);
@@ -6681,7 +7642,7 @@ ${effCssExtra() || ""}
     /* 容器 pointer-events:none（让下层链接热点可点），只有真正有文字的位置接收指针 → 仍可选字 */
     pointer-events: auto;
   }
-  /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.fr-hl* 提供）：
+  /* 划线 mark 只允许改装饰（背景/下划线由既有 mark.tp-hl* 提供）：
      不得改字号/行高，也不得让文字变可见，否则会破坏文本层与位图的对齐。
      mark 自身 static：文本层用绝对定位，mark 不该另立一套定位。
      **后代不再强制 static**：跨 span 的划线已改为就地包文本节点，mark 里只会有文本节点；
@@ -6763,15 +7724,50 @@ ${effCssExtra() || ""}
     left: var(--rdr-mh-eff, var(--rdr-mh, 320px));
     right: var(--rdr-mh-eff, var(--rdr-mh, 320px));
     overflow: hidden;
+    /* 静止视口：过渡期间**不动它**（位移在下面的 .tx-slide 上）。
+       一旦位移视口本身，正文就会越过窗口边距区（用户截图：左缘文字带 421px）；
+       视口静止后由这里的 overflow 裁切，正文永不进边距区、边距区始终是背景。 */
+  }
+
+  /* 翻页模式的文字层滑块：`overflow: hidden` 保证每个滑块只显示自己那一页
+     （列条会向右延续到相邻页，滑块自己的盒子就是它的取景框）。
+     层序只用 .clip 内的局部 z-index：真实滑块 2、克隆滑块 .tx-snap 为 1。 */
+  .tx-slide {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    z-index: 2;
+  }
+
+  .tx-slide.tx-snap {
+    z-index: 1;
   }
 
   .col-page {
     position: absolute;
     left: 0;
     column-fill: auto;
-    /* 翻页只走合成：常驻 transition，立即跳转时用内联 transition:none 短路 */
+    /* 翻页只走合成：常驻 transition（= 左右滑动档），立即跳转时用内联 transition:none 短路。
+       transition 只写在内联值上会被立即跳转分支清空，所以档位差异一律走下面的覆盖类。 */
     will-change: transform;
     transition: transform var(--dur-page) var(--ease-page);
+  }
+
+  /* 翻页特效覆盖类：档位只决定挂哪个类（applyPage 最前面挂），页码定位仍由 applyPage 写 transform。
+     阻尼弹簧档**不在这里**：它走整页双层过渡（playTransition），内容条只做无过渡定位。 */
+  .col-page.tx-fx-none {
+    transition: none;
+  }
+
+  /* 减少动效：必须排在覆盖类之后 —— 同特异性下后写者胜。
+     媒体查询不改变特异性，位置放错就压不住关闭档。JS 侧另有 prefersReducedMotion() 短路。 */
+  @media (prefers-reduced-motion: reduce) {
+    .col-page {
+      transition: none;
+    }
+    .col-page:is(.tx-fx-none) {
+      transition: none;
+    }
   }
 
   .scroll-area {
@@ -6791,6 +7787,118 @@ ${effCssExtra() || ""}
      且 flow 布局本就声明不支持上下边距。 */
   .scroll-area:not(.manga-flow-viewport) {
     inset: var(--rdr-inset-v) 0;
+  }
+
+  /* ===== 章节过渡舞台（与 .scroll-area 同级、同盒）=====
+     ②~③：舞台在上（局部 2）遮挡 loadChapter 的 async 窗口；④：翻成舞台在下（局部 1）、
+     真实 .scroll-area 在上（局部 2）。层级只用 .content 内的局部字面量（同层内的先例：
+     .textLayer 的 z-index: 1），不动任何 --z-* 全局 token；自绘 .scrollbar 是 --z-sticky(20)、
+     骨架屏 .loading 是 --z-sticky(20)、.zone-hints 是 --z-raised(10)，都不会被舞台压住。 */
+  .tx-stage {
+    position: absolute;
+    inset: var(--rdr-inset-v) 0;
+    overflow: hidden;
+    pointer-events: none;
+    display: none;
+    background: var(--rdr-bg);
+  }
+
+  /* 有背景图时舞台必须透明：舞台是整窗同盒的一层，但它若铺不透明纸，
+     就会在过渡期间把唯一背景面（.bg-layer）整块盖掉 —— 静止帧与过渡帧出现色差。
+     无图时保留这层底：滚动模式的「纸」由舞台底 + .tx-bg 提供。 */
+  .reader.has-bg .tx-stage {
+    background: transparent;
+  }
+
+  .tx-stage.on {
+    display: block;
+    z-index: 2;
+  }
+
+  .tx-stage.behind {
+    z-index: 1;
+  }
+
+  /* 克隆的 .scroll-area：舞台已与真实层同盒，克隆必须覆写 inset 才能让两个视口盒逐项相等
+     （实测不覆写时克隆盒比真实层上下各少一个 --rdr-inset-v）。 */
+  .tx-stage :global(.scroll-area) {
+    inset: 0;
+  }
+
+  /* 翻页模式的舞台盒：必须与 .clip 同盒（整块 .content 高）。
+     实测：舞台带 inset-v 时克隆体内 .col-page 的 top 比真实 .col-page 小一个 --rdr-inset-v（80px）；
+     改成 inset:0 后 top/left/width/height 四项与真实 .col-page 逐项相等。 */
+  .tx-stage.page {
+    inset: 0;
+  }
+
+  /* ④ 之后真实层在上，并显式给背景：.scroll-area / .clip 自身没有底色，过渡期间透明会把
+     下方正在移出的旧章快照透出来。动画结束由 cleanupTx 移除。
+     只在**滚动模式**挂：翻页模式纸质由 .bg-layer 提供，纯色会盖掉背景图（必修 3.5）。 */
+  .tx-front {
+    z-index: 2;
+  }
+
+  .tx-bg {
+    background: var(--rdr-bg);
+  }
+
+  /* 边距带遮挡（只遮上下）：整块 .content 大小，把上下两条边距带刷成阅读底色。
+     高度必须用 height（不能用 border-width）：--rdr-inset-v 里含 calc(100% - 240px)，
+     百分比在 border-width 上非法（整条声明失效），而 height/top 的百分比基准与 .scroll-area
+     的 inset 完全一致（都相对 .content 的 padding box）。
+     左右不再遮挡：翻页模式改成静止视口后，越界正文由 .clip 的 overflow 裁掉，
+     遮挡带在这里没有职责、且会在背景图上显形（必修 3.6）。
+     只在滚动模式挂 .on：翻页模式的正文竖向位置不动、永不进上下边距。
+     两条带**不得移除**：滚动模式的内容位移会把正文带进上下边界，仍需要遮挡。
+     层级 z-index: 3：高于舞台 1/2 与真实层 2，低于自绘 .scrollbar 的 --z-sticky(20)。 */
+  .tx-band {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    display: none;
+    z-index: 3;
+  }
+
+  .tx-band.on {
+    display: block;
+  }
+
+  .tx-band::before,
+  .tx-band::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: var(--rdr-inset-v);
+    background: var(--rdr-bg);
+  }
+
+  /* 有背景图时，两条带必须与唯一背景面（.bg-layer）**逐像素同源**：
+     同一张图、同一取景（cover 按视口取景 ⇒ background-attachment: fixed）、同一不透明度。
+     为什么用「纸色底 + [纸色纱(1−o) + 图]」两层复合，而不是给带子设 opacity：
+     带子浮在背景面之上，设 opacity 会与下面的背景面**二次混合**（0.35 图叠在 0.35 图上），
+     静止帧就能量出色差；这里两层复合的结果恰是 o×图 + (1−o)×纸，与背景面完全一致。
+     纱必须写成 `linear-gradient(纱, 纱)`：`background-image` 只接受 <image>，
+     直接放一个半透明颜色会让**整条声明失效**（回落到基础规则的纯色纸，正是本节要避免的）。
+     `cover` 不是拉伸到盒大小：它按原始宽高比放大到刚覆盖取景盒再居中裁切 —— 所以只要
+     取景盒同为视口、不透明度同为 --tx-band-veil 的补数，两处像素就一致。 */
+  .reader.has-bg .tx-band::before,
+  .reader.has-bg .tx-band::after {
+    background-color: var(--rdr-bg);
+    background-image: linear-gradient(var(--tx-band-veil), var(--tx-band-veil)), var(--tx-band-image);
+    background-size: auto, cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: scroll, fixed;
+  }
+
+  .tx-band::before {
+    top: 0;
+  }
+
+  .tx-band::after {
+    bottom: 0;
   }
 
   /* 边界渐隐：用 mask-image 让接近边界处的文字 alpha 自然衰减；
@@ -7099,28 +8207,28 @@ ${effCssExtra() || ""}
     padding: 4px 8px;
   }
 
-  #chapter-content :global(mark.fr-hl) {
+  #chapter-content :global(mark.tp-hl) {
     background: transparent;
     color: inherit;
     padding: 0;
     cursor: pointer;
   }
 
-  #chapter-content :global(mark.fr-tts) {
+  #chapter-content :global(mark.tp-tts) {
     background: color-mix(in srgb, var(--accent) 32%, transparent);
     color: inherit;
     border-radius: var(--radius-xs);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
   }
 
-  #chapter-content :global(mark.fr-hl-underline) {
+  #chapter-content :global(mark.tp-hl-underline) {
     text-decoration-line: underline;
     text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
     text-underline-offset: 2px;
   }
 
-  #chapter-content :global(mark.fr-hl-wavy) {
+  #chapter-content :global(mark.tp-hl-wavy) {
     text-decoration-line: underline;
     text-decoration-style: wavy;
     text-decoration-color: var(--hl-color);
@@ -7128,7 +8236,7 @@ ${effCssExtra() || ""}
     text-underline-offset: 3px;
   }
 
-  #chapter-content :global(mark.fr-hl-dotted) {
+  #chapter-content :global(mark.tp-hl-dotted) {
     text-decoration-line: underline;
     text-decoration-style: dotted;
     text-decoration-color: var(--hl-color);
@@ -7136,7 +8244,7 @@ ${effCssExtra() || ""}
     text-underline-offset: 2px;
   }
 
-  #chapter-content :global(mark.fr-hl-double) {
+  #chapter-content :global(mark.tp-hl-double) {
     text-decoration-line: underline;
     text-decoration-style: double;
     text-decoration-color: var(--hl-color);
@@ -7144,22 +8252,22 @@ ${effCssExtra() || ""}
     text-underline-offset: 2px;
   }
 
-  #chapter-content :global(mark.fr-hl-strike) {
+  #chapter-content :global(mark.tp-hl-strike) {
     text-decoration-line: line-through;
     text-decoration-color: var(--hl-color);
     text-decoration-thickness: 2px;
   }
 
-  #chapter-content :global(mark.fr-hl-background) {
+  #chapter-content :global(mark.tp-hl-background) {
     background: color-mix(in srgb, var(--hl-color) 38%, transparent);
     border-radius: var(--radius-xs);
   }
 
   /* H2：有感想(note)的划线加一个小圆点标记，提示可悬停查看 */
-  #chapter-content :global(mark.fr-hl.fr-has-note) {
+  #chapter-content :global(mark.tp-hl.tp-has-note) {
     position: relative;
   }
-  #chapter-content :global(mark.fr-hl.fr-has-note::after) {
+  #chapter-content :global(mark.tp-hl.tp-has-note::after) {
     content: "";
     display: inline-block;
     width: 3px;
@@ -7171,7 +8279,7 @@ ${effCssExtra() || ""}
   }
 
   /* H2 感想浮层：底色 / 描边 / 圆角 / 投影走全局 .rdr-pop（跟随阅读主题） */
-  .fr-note-tip {
+  .tp-note-tip {
     position: fixed;
     z-index: var(--z-popover);
     transform: translate(-50%, calc(-100% - 8px));
@@ -7180,9 +8288,9 @@ ${effCssExtra() || ""}
     pointer-events: none;
     font-size: var(--fs-sm);
     letter-spacing: var(--ls-sm);
-    animation: fr-rise-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-rise-in var(--dur-fast) var(--ease-premium) both;
   }
-  .fr-note-tip-quote {
+  .tp-note-tip-quote {
     font-size: var(--fs-xs);
     letter-spacing: var(--ls-xs);
     opacity: 0.6;
@@ -7191,9 +8299,9 @@ ${effCssExtra() || ""}
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .fr-note-tip-body { line-height: 1.6; white-space: pre-wrap; }
+  .tp-note-tip-body { line-height: 1.6; white-space: pre-wrap; }
 
-  #chapter-content :global(mark.fr-hl-box) {
+  #chapter-content :global(mark.tp-hl-box) {
     box-shadow: 0 0 0 1.5px var(--hl-color);
     border-radius: var(--radius-xs);
   }

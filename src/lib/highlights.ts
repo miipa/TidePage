@@ -146,7 +146,7 @@ function wrapRange(range: Range, makeMark: () => HTMLElement): void {
 }
 
 function unwrapMarks(root: ParentNode): void {
-  root.querySelectorAll("mark.fr-hl").forEach((m) => {
+  root.querySelectorAll("mark.tp-hl").forEach((m) => {
     const parent = m.parentNode;
     if (!parent) return;
     while (m.firstChild) parent.insertBefore(m.firstChild, m);
@@ -156,7 +156,7 @@ function unwrapMarks(root: ParentNode): void {
 
 /** 清除朗读高亮标记。 */
 export function clearTtsMark(root: ParentNode): void {
-  root.querySelectorAll("mark.fr-tts").forEach((m) => {
+  root.querySelectorAll("mark.tp-tts").forEach((m) => {
     const parent = m.parentNode;
     if (!parent) return;
     while (m.firstChild) parent.insertBefore(m.firstChild, m);
@@ -173,7 +173,7 @@ export function paintTtsMark(root: HTMLElement, start: number, end: number): voi
   if (!range) return;
   wrapRange(range, () => {
     const mark = document.createElement("mark");
-    mark.className = "fr-tts";
+    mark.className = "tp-tts";
     return mark;
   });
 }
@@ -191,7 +191,7 @@ export function paintHighlights(root: HTMLElement, highlights: HighlightRow[]): 
     if (!range) continue;
     wrapRange(range, () => {
       const mark = document.createElement("mark");
-      mark.className = `fr-hl fr-hl-${h.style || "underline"}${h.note && h.note.trim() ? " fr-has-note" : ""}`;
+      mark.className = `tp-hl tp-hl-${h.style || "underline"}${h.note && h.note.trim() ? " tp-has-note" : ""}`;
       mark.dataset.hlid = String(h.id);
       if (h.color) mark.style.setProperty("--hl-color", h.color);
       return mark;

@@ -73,14 +73,14 @@
 </div>
 
 <style>
-  /* 固定右上角覆盖层：容器高度 = 当前窗口顶栏实际高度（--fr-titlebar-h，由承载顶栏的
+  /* 固定右上角覆盖层：容器高度 = 当前窗口顶栏实际高度（--tp-titlebar-h，由承载顶栏的
      组件测高写入），按钮在容器内垂直居中，使按钮中心线与顶栏图标中心线重合、自动对齐。
      z-index 取层级表最高的 --z-window，保证任何时候（连设置弹窗打开时）都能操作窗口。 */
   .win-ctl {
     position: fixed;
     top: 0;
     right: 0;
-    height: var(--fr-titlebar-h, 44px);
+    height: var(--tp-titlebar-h, 44px);
     z-index: var(--z-window);
     display: flex;
     align-items: center;

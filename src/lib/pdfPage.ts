@@ -172,8 +172,12 @@ export function pdfTextUsable(text: string, ctrlMax = 0.02, badMax = 0.02): bool
 
 /** 码位 → 文种桶（同一文种内不区分大小写/字母数字）；-1 = 不属于任何已列文种（含标点/符号）。
  *  只用于「主导度」判断，不做任何具体语种的等价判断。 */
-function scriptBucket(c: number): number {
-  if (c >= 0x41 && c <= 0x7a) return 0; // 拉丁基本（含数字与常用标点间的字母）
+export function scriptBucket(c: number): number {
+  // 导出仅为单测（纯函数、无副作用）。
+  if (c >= 0x41 && c <= 0x5a) return 0; // 拉丁大写 A-Z
+  if (c >= 0x61 && c <= 0x7a) return 0; // 拉丁小写 a-z
+  // 0x5B-0x60（[ \ ] ^ _ `）与 0x7B-0x7F 不是字母，落到末尾的 -1；原先 0x41..=0x7a 把这段也
+  // 算进拉丁桶，纯标点/下划线的文本会被误判成「有拉丁内容」。
   if (c >= 0x30 && c <= 0x39) return 0; // 阿拉伯数字并入拉丁桶（纯数字代码/表格常见）
   if (c >= 0xc0 && c <= 0x24f) return 0; // 拉丁扩展
   if (c >= 0x370 && c <= 0x3ff) return 1; // 希腊
@@ -225,30 +229,65 @@ export function hlBlocksFromRects(
   // 同一行的相邻/重叠矩形合并成一块：跨 span 的划线会切出几十个紧挨的小矩形，
   // 每个都带圆角 —— 交界处会露出「发丝缝」（荧光笔样式下最明显）。合并后一行一块，
   // 既无缝也少 DOM。判据：竖直重叠超过较矮者的 50%（同一行）且水平相接（gap ≤ 容差）。
+  // 单趟：先按行分组，再在行内自左向右贪心合并。
+  // 为什么改：原实现是 while(merged) + 双循环 + break 重扫，矩形上千时接近立方级。
   boxes.sort((a, b) => a.top - b.top || a.left - b.left);
-  const out = boxes.map((b) => ({ ...b }));
-  let merged = true;
-  while (merged) {
-    merged = false;
-    outer: for (let i = 0; i < out.length; i++) {
-      for (let j = i + 1; j < out.length; j++) {
-        const a = out[i];
-        const b = out[j];
-        const overlapY = Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
-        if (overlapY < Math.min(a.height, b.height) * 0.5) continue;
-        const gapX = Math.max(a.left, b.left) - Math.min(a.left + a.width, b.left + b.width);
-        if (gapX > mergeGapPx) continue;
-        const left = Math.min(a.left, b.left);
-        const top = Math.min(a.top, b.top);
-        const right = Math.max(a.left + a.width, b.left + b.width);
-        const bottom = Math.max(a.top + a.height, b.top + b.height);
-        out[i] = { left, top, width: right - left, height: bottom - top };
-        out.splice(j, 1);
-        merged = true;
-        break outer;
+  /** 「同一行」三条判据全过才算：高度比 ≥ 0.5、竖直重叠 ≥ 较矮者 50%、行顶差 ≤ 较矮者高 × 0.3。
+   *  为什么必须带高度比：只按 minH 判重叠时，一个 100px 的跨行块会把同 top 的 12px 普通行并进去
+   *  （12 ≥ 6 且 0 ≤ 3.6 都成立），结果是整块高 100px 的错误色块。
+   *  另一条（行顶差）挡住双栏排版：左右两栏同一基线的碎片不该并成横跨整页的一块。
+   *  取舍：大块与小行交界处不再合并，重绘时交界留约 1px 缝 —— 与「并成错误高块」相比，
+   *  缝是观感问题、错误高块是内容遮挡，故选带高度比这一版。 */
+  const sameLine = (rTop: number, rBottom: number, b: { top: number; height: number }): boolean => {
+    const rH = rBottom - rTop;
+    const minH = Math.min(rH, b.height);
+    const maxH = Math.max(rH, b.height);
+    const overlap = Math.min(rBottom, b.top + b.height) - Math.max(rTop, b.top);
+    return (
+      minH / Math.max(1, maxH) >= 0.5 && overlap >= minH * 0.5 && Math.abs(rTop - b.top) <= minH * 0.3
+    );
+  };
+  const rows: { top: number; bottom: number; segs: typeof boxes }[] = [];
+  for (const b of boxes) {
+    let row: (typeof rows)[number] | null = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].top > b.top + b.height) continue; // 该行整体在新块下方，排序保证早于它出现
+      if (sameLine(rows[i].top, rows[i].bottom, b)) {
+        row = rows[i];
+        break;
       }
     }
+    if (!row) {
+      rows.push({ top: b.top, bottom: b.top + b.height, segs: [b] });
+      continue;
+    }
+    // 行内找可并入的段：排序是按 (top,left)，同一行里先到的未必在最左（例如行顶更小的
+    // 上标先到），所以不能只跟「最后一段」比 —— 用对称的间距公式挑 gap 最小的那段。
+    let best = -1;
+    let bestGap = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < row.segs.length; i++) {
+      const seg = row.segs[i];
+      const gapX = Math.max(b.left, seg.left) - Math.min(b.left + b.width, seg.left + seg.width);
+      if (gapX <= mergeGapPx && gapX < bestGap) {
+        best = i;
+        bestGap = gapX;
+      }
+    }
+    if (best >= 0) {
+      // 与行内某段相接/重叠：并入它（跨 span 的划线会切出几十个紧挨的小矩形）
+      const seg = row.segs[best];
+      const left = Math.min(seg.left, b.left);
+      const top = Math.min(seg.top, b.top);
+      const right = Math.max(seg.left + seg.width, b.left + b.width);
+      const bottom = Math.max(seg.top + seg.height, b.top + b.height);
+      row.segs[best] = { left, top, width: right - left, height: bottom - top };
+    } else {
+      row.segs.push(b);
+    }
+    if (b.top < row.top) row.top = b.top;
+    if (b.top + b.height > row.bottom) row.bottom = b.top + b.height;
   }
+  const out = rows.flatMap((r) => r.segs);
   out.sort((a, b) => a.top - b.top || a.left - b.left);
   return out;
 }

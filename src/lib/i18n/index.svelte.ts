@@ -226,6 +226,13 @@ const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
   ["ai.proxySourceWindows", "ai.proxySourceWindows"],
   ["ai.proxySourcePacOnly", "ai.proxySourcePacOnly"],
   ["ai.proxySourceNone", "ai.proxySourceNone"],
+  // 前端 pdf.ts 抛出的稳定 ASCII 码（原生渲染通道 / 超大 PDF）：
+  // 这些文案必须在表里，否则用户看到的是错误码本身。
+  ["pdf_too_large", "err.pdfTooLarge"],
+  ["pdf_native_failed", "err.pdfNativeFailed"],
+  ["pdf_native_unsupported", "err.pdfNativeUnsupported"],
+  ["pdf_native_abandoned", "err.pdfNativeAbandoned"],
+  ["pdf_no_cover", "err.pdfNoCover"],
 ];
 
 /** toast(String(e), "error") 的本地化替代：已知错误码给译文，未知原样透传。
@@ -234,9 +241,12 @@ const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
 export function errText(e: unknown, params?: Record<string, string | number>): string {
   // 前端 stores 抛出的错误会带稳定 ASCII `code`（见 stores.svelte.ts 备份入口）：
   // 优先按 code 查表，这样不必把中文原文塞进 Error.message。
+  // 调用方没显式给 params 时，从错误对象上取一次（pdf.ts 的 {mb} 这类动态值就走这条）。
+  const own = (e as { params?: Record<string, string | number> } | null)?.params;
+  const p = params ?? own;
   const code = (e as { code?: unknown } | null)?.code;
   if (typeof code === "string") {
-    for (const [c, key] of ERR_CODES) if (code === c || code.startsWith(c)) return t(key, params);
+    for (const [c, key] of ERR_CODES) if (code === c || code.startsWith(c)) return t(key, p);
   }
   const raw = String(e);
   for (const [c, key] of ERR_CODES) {

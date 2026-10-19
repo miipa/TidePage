@@ -13,6 +13,7 @@ import {
   retitlePdfPageToc,
   fullPageLruStep,
   hlBlocksFromRects,
+  scriptBucket,
 } from "./pdfPage";
 
 describe("pdfDisplayBox", () => {
@@ -283,6 +284,113 @@ describe("hlBlocksFromRects（PDF 高亮叠层色块）", () => {
 
   it("空输入给空数组", () => {
     expect(hlBlocksFromRects(page, [])).toEqual([]);
+  });
+});
+
+describe("scriptBucket（文种桶：0x5B-0x60 不再算拉丁）", () => {
+  it("A-Z / a-z / 数字入拉丁桶", () => {
+    for (const c of [0x41, 0x5a, 0x61, 0x7a, 0x30, 0x39]) expect(scriptBucket(c)).toBe(0);
+  });
+  it("0x5B-0x60 与 0x7B-0x7F 落到 -1（原先被并入拉丁桶）", () => {
+    for (const c of [0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f]) {
+      expect(scriptBucket(c)).toBe(-1);
+    }
+  });
+  it("汉字 / 假名 / 西里尔仍在各自桶", () => {
+    expect(scriptBucket(0x4e2d)).toBe(9);
+    expect(scriptBucket(0x3042)).toBe(8);
+    expect(scriptBucket(0x0416)).toBe(2);
+  });
+});
+
+describe("hlBlocksFromRects 单趟合并（必修6）", () => {
+  const page = { left: 0, top: 0 };
+  const run = (rects: { left: number; top: number; width: number; height: number }[]) => hlBlocksFromRects(page, rects);
+
+  it("吞并反例：高 100px 的跨行块不得吞掉同 top 的 12px 普通行", () => {
+    const out = run([
+      { left: 0, top: 0, width: 300, height: 100 },
+      { left: 320, top: 0, width: 40, height: 12 },
+    ]);
+    expect(out).toEqual([
+      { left: 0, top: 0, width: 300, height: 100 },
+      { left: 320, top: 0, width: 40, height: 12 },
+    ]);
+  });
+
+  it("等高同行：24×24 必须合并", () => {
+    const out = run([
+      { left: 0, top: 0, width: 40, height: 24 },
+      { left: 41, top: 0, width: 40, height: 24 },
+    ]);
+    expect(out).toEqual([{ left: 0, top: 0, width: 81, height: 24 }]);
+  });
+
+  it("离群块 + 行内碎片：两个 12px 合并，且都不并入 100px 块", () => {
+    const out = run([
+      { left: 0, top: 0, width: 300, height: 100 },
+      { left: 320, top: 0, width: 20, height: 12 },
+      { left: 341, top: 0, width: 20, height: 12 },
+    ]);
+    expect(out).toEqual([
+      { left: 0, top: 0, width: 300, height: 100 },
+      { left: 320, top: 0, width: 41, height: 12 },
+    ]);
+  });
+  it("行内到达顺序颠倒（先到的是更靠右的上标）也必须正确合并", () => {
+    const out = run([
+      { left: 100, top: -2, width: 20, height: 12 },
+      { left: 0, top: 0, width: 60, height: 12 },
+      { left: 61, top: 0, width: 30, height: 12 },
+    ]);
+    expect(out).toEqual([
+      { left: 100, top: -2, width: 20, height: 12 },
+      { left: 0, top: 0, width: 91, height: 12 },
+    ]);
+  });
+  it("同一行大量碎片一趟并成一块（原实现是近立方级重扫）", () => {
+    const rects = Array.from({ length: 2000 }, (_, i) => ({ left: i * 10, top: 100, width: 10, height: 20 }));
+    const t0 = Date.now();
+    const out = run(rects);
+    expect(out).toEqual([{ left: 0, top: 100, width: 20000, height: 20 }]);
+    // 原实现在这个规模上跑不完；这里给一个宽松上限，只挡住算法退化。
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it("行顶差超过较矮者高 0.3 倍不合并（双栏排版不被并成横跨整页）", () => {
+    const out = run([
+      { left: 0, top: 0, width: 200, height: 20 },
+      { left: 220, top: 8, width: 40, height: 8 },
+    ]);
+    // 竖直重叠 8-0=8 ≥ min(20,8)*0.5=4，但行顶差 8 > 8*0.3=2.4 → 两块
+    expect(out).toEqual([
+      { left: 0, top: 0, width: 200, height: 20 },
+      { left: 220, top: 8, width: 40, height: 8 },
+    ]);
+  });
+
+  it("同一行内两段之间有真实间距时仍是两块（不跨段贪心）", () => {
+    const out = run([
+      { left: 0, top: 0, width: 40, height: 20 },
+      { left: 41, top: 0, width: 40, height: 20 },
+      { left: 200, top: 0, width: 40, height: 20 },
+    ]);
+    expect(out).toEqual([
+      { left: 0, top: 0, width: 81, height: 20 },
+      { left: 200, top: 0, width: 40, height: 20 },
+    ]);
+  });
+
+  it("多行输入保持自上而下、自左向右", () => {
+    const out = run([
+      { left: 50, top: 200, width: 30, height: 20 },
+      { left: 0, top: 100, width: 30, height: 20 },
+      { left: 80, top: 200, width: 30, height: 20 },
+    ]);
+    expect(out).toEqual([
+      { left: 0, top: 100, width: 30, height: 20 },
+      { left: 50, top: 200, width: 60, height: 20 },
+    ]);
   });
 });
 

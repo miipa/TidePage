@@ -348,7 +348,7 @@ import { IconChevronLeft, IconChevronRight } from "@tabler/icons-svelte";
     align-items: center;
     justify-content: center;
     outline: none;
-    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
+    animation: tp-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
   /* 内边距改由图片 margin 表达（见 mT/mR）：内容原点 = 舞台原点，锚点缩放才不跑偏。

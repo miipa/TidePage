@@ -205,7 +205,7 @@
     border-radius: var(--radius-pill);
     flex-wrap: wrap;
     /* 固定药丸：用 opacity + translateY 的轻量入场，不带 blur（会与条内正在更新的文本抢合成层） */
-    animation: fr-rise-in var(--dur) var(--ease-premium) both;
+    animation: tp-rise-in var(--dur) var(--ease-premium) both;
   }
 
   .tb-btn {
@@ -304,7 +304,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-2);
-    animation: fr-fade-in var(--dur-fast) var(--ease-in) both;
+    animation: tp-fade-in var(--dur-fast) var(--ease-in) both;
   }
 
   .tb-row {

@@ -231,7 +231,7 @@ const VERDICT_MAX = 80;
 const devVerdicts: InputVerdict[] = [];
 
 /** 判定回填器：Reader 在 DEV 下注册，把结论写回它最近一条原始事件记录，
- *  于是 __frDebug.inputLog() 的一条事件自带「最后落到哪」。 */
+ *  于是 __tpDebug.inputLog() 的一条事件自带「最后落到哪」。 */
 let verdictSink: ((verdict: string) => void) | undefined;
 
 export function setVerdictSink(fn?: (verdict: string) => void): void {
@@ -268,7 +268,7 @@ export function pushVerdict(verdict: string, e?: InputVerdictEvent): void {
   verdictSink?.(verdict);
 }
 
-/** 最近 VERDICT_MAX 条判定结论（供 __frDebug.inputVerdicts() 取用）。 */
+/** 最近 VERDICT_MAX 条判定结论（供 __tpDebug.inputVerdicts() 取用）。 */
 export function recentVerdicts(): InputVerdict[] {
   return devVerdicts.slice();
 }

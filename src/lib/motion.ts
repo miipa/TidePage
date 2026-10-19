@@ -86,7 +86,7 @@ export function outFade(node: Element, o: MotionOpts = {}) {
 }
 
 /** 就地淡出：只降不透明度，不位移。用于遮罩、就地出现的提示条。
- *  ⚠️ 退场里绝不要给「靠 transform 居中」的元素（tts-bar / fr-note-tip）用带 transform 的退场，
+ *  ⚠️ 退场里绝不要给「靠 transform 居中」的元素（tts-bar / tp-note-tip）用带 transform 的退场，
  *     只能用本函数 —— 否则居中位移会被退场的 transform 覆盖而跳走。 */
 export function outDissolve(node: Element) {
   return {
@@ -100,7 +100,7 @@ export function outDissolve(node: Element) {
 /* 抽屉 / 侧面板                                                       */
 /* ------------------------------------------------------------------ */
 
-/** 右侧抽屉退场。与 app.css 的 fr-drawer-in-right 严格对位。
+/** 右侧抽屉退场。与 app.css 的 tp-drawer-in-right 严格对位。
  *  入场 24px、退场 20px，略短一点：出画时用户已经开始期待下一个动作，
  *  不需要跑完全程（这是 --dur-exit 取入场一半的同一个理由）。 */
 export function outSlideR(node: Element) {
@@ -114,7 +114,7 @@ export function outSlideR(node: Element) {
   };
 }
 
-/** 左侧抽屉退场（目录）。与 fr-drawer-in-left 对位。 */
+/** 左侧抽屉退场（目录）。与 tp-drawer-in-left 对位。 */
 export function outSlideL(node: Element) {
   return {
     duration: dur(EXIT_MS),

@@ -706,11 +706,11 @@
     padding: 5px 18px;
   }
 
-  /* 加载中：旋转的 IconLoader2。用全局 fr-spin（取代原先组件内的 wd-rotate），
+  /* 加载中：旋转的 IconLoader2。用全局 tp-spin（取代原先组件内的 wd-rotate），
      这样「循环动画」在本项目只有一处定义。 */
   .wd-spin {
     display: inline-flex;
-    animation: fr-spin 1s linear infinite;
+    animation: tp-spin 1s linear infinite;
   }
 
 
@@ -796,7 +796,7 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     padding: 18px;
-    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
+    animation: tp-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .wd-confirm-t {

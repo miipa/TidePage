@@ -12,6 +12,7 @@
   import NotesPanel from "../components/NotesPanel.svelte";
   import WindowControls from "../components/WindowControls.svelte";
   import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
+  import { AI_OPEN_KEY, AI_WIN_H_KEY, AI_WIN_W_KEY } from "../lib/aiPanelKeys";
   import { t } from "../lib/i18n/index.svelte";
   import { IconCopy, IconX } from "@tabler/icons-svelte";
   import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
@@ -95,7 +96,7 @@
     return () => { void stopSnap(); };
   });
 
-  // 吸附特效：卫星窗拖动进入吸附区显示预吸附虚线（fr-snap-preview），吸附命中闪一下发光（fr-snap-flash）。
+  // 吸附特效：卫星窗拖动进入吸附区显示预吸附虚线（tp-snap-preview），吸附命中闪一下发光（tp-snap-flash）。
   // 事件由 windowSnap.ts 在本窗 dispatch，故只在触发的那个卫星窗渲染。
   let snapPreview = $state(false);
   let snapFlash = $state(false);
@@ -107,12 +108,12 @@
       clearTimeout(snapFlashTimer);
       snapFlashTimer = setTimeout(() => { snapFlash = false; }, 1000);
     };
-    window.addEventListener("fr-snap-preview", onPreview);
-    window.addEventListener("fr-snap-flash", onFlash);
+    window.addEventListener("tp-snap-preview", onPreview);
+    window.addEventListener("tp-snap-flash", onFlash);
     return () => {
       clearTimeout(snapFlashTimer);
-      window.removeEventListener("fr-snap-preview", onPreview);
-      window.removeEventListener("fr-snap-flash", onFlash);
+      window.removeEventListener("tp-snap-preview", onPreview);
+      window.removeEventListener("tp-snap-flash", onFlash);
     };
   });
 
@@ -160,19 +161,19 @@
   $effect(() => {
     if (!standalone) return;
     try {
-      localStorage.setItem("fr.ai.open", "1");
+      localStorage.setItem(AI_OPEN_KEY, "1");
     } catch { /* ignore */ }
     const un = listen<{ open: boolean }>("ai-window-status", () => {});
     const save = () => {
       try {
-        localStorage.setItem("fr.ai.winw", String(window.innerWidth));
-        localStorage.setItem("fr.ai.winh", String(window.innerHeight));
+        localStorage.setItem(AI_WIN_W_KEY, String(window.innerWidth));
+        localStorage.setItem(AI_WIN_H_KEY, String(window.innerHeight));
       } catch { /* ignore */ }
     };
     const onUnload = () => {
       save();
       try {
-        localStorage.setItem("fr.ai.open", "0");
+        localStorage.setItem(AI_OPEN_KEY, "0");
       } catch { /* ignore */ }
     };
     window.addEventListener("resize", save);
@@ -291,7 +292,7 @@
   <div class="snap-fx" class:preview={snapPreview} class:flash={snapFlash}></div>
 {/if}
 
-<div class="fr-toast-wrap">
+<div class="tp-toast-wrap">
   <!-- 循环变量改名 ti：避免与 i18n 的 t() 同名遮蔽（t() 依赖 locale，必须在模板里调用） -->
   {#each toasts.items as ti (ti.id)}
     <div class="toast-card" class:error={ti.kind === "error"} out:outFade={{ from: 0.96 }}>
@@ -305,7 +306,7 @@
 </div>
 
 <style>
-  .fr-toast-wrap {
+  .tp-toast-wrap {
     position: fixed;
     left: 16px;
     bottom: 52px; /* 底栏高度约 30–34px + 间距：通知浮在书库状态栏 / 阅读页底栏之上，不遮挡 */
@@ -405,7 +406,7 @@
     backdrop-filter: blur(3px) saturate(1.08);
     -webkit-backdrop-filter: blur(3px) saturate(1.08);
     z-index: var(--z-drawer);
-    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
+    animation: tp-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
  .ai-window-root {
@@ -420,7 +421,7 @@
      不再 top:0 贴边满高——那会与右上角自绘窗口按钮同层相撞。 */
   .wd-drawer {
     position: fixed;
-    top: var(--fr-titlebar-h, 44px);
+    top: var(--tp-titlebar-h, 44px);
     right: var(--sp-2);
     bottom: var(--sp-2);
     width: min(520px, 92vw);
@@ -430,7 +431,7 @@
     border: 1px solid var(--line);
     border-radius: var(--radius-xl);
     box-shadow: var(--shadow-drawer);
-    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
+    animation: tp-drawer-in-right var(--dur-lift) var(--ease-premium) both;
     display: flex;
     flex-direction: column;
     overflow: hidden;

@@ -305,11 +305,11 @@
 
 <style>
   .nl {
-    animation: fr-fade-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-fade-in var(--dur-fast) var(--ease-premium) both;
     position: fixed;
     /* 顶栏之下：右上角只归自绘窗口按钮，笔记条自成一行；
        独立笔记窗由此露出 40px 的 .win-titlebar 拖动区 */
-    top: var(--fr-titlebar-h, 44px);
+    top: var(--tp-titlebar-h, 44px);
     left: 0;
     right: 0;
     bottom: 0;
@@ -548,12 +548,12 @@
     backdrop-filter: blur(3px) saturate(1.08);
     -webkit-backdrop-filter: blur(3px) saturate(1.08);
     z-index: var(--z-drawer);
-    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
+    animation: tp-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
   .drawer {
     position: fixed;
-    top: var(--fr-titlebar-h, 44px);
+    top: var(--tp-titlebar-h, 44px);
     right: 0;
     bottom: 0;
     width: min(460px, 92vw);
@@ -563,7 +563,7 @@
     box-shadow: -6px 0 18px rgba(0, 0, 0, 0.14), -20px 0 52px rgba(0, 0, 0, 0.22);
     display: flex;
     flex-direction: column;
-    animation: fr-drawer-in-right var(--dur-lift) var(--ease-premium) both;
+    animation: tp-drawer-in-right var(--dur-lift) var(--ease-premium) both;
   }
 
   .drawer-head {

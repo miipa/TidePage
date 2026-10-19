@@ -4,7 +4,7 @@
 // - 指针按下后移动超过阈值（默认 6px）才进入拖拽；未超阈值视为普通点击，按钮功能照常触发。
 // - 进入拖拽后，松手不再触发该按钮的 onclick（捕获阶段拦截一次 click）。
 // - 原件淡出占位，另建一个跟随指针的「拿起」浮层（只动 transform，不触发布局）。
-// - 落点用一根跟随目标位置的指示线（.fr-drag-caret）表达，比硬阴影线更轻、可动画。
+// - 落点用一根跟随目标位置的指示线（.tp-drag-caret）表达，比硬阴影线更轻、可动画。
 // - 落点按指针位置与其它项中点比较，决定插入到目标之前/之后。
 // - 只在本组内排序；拖出组（含 40px 余量）则取消，不改顺序。
 //
@@ -24,9 +24,9 @@ export interface DragSortOptions {
   disabled?: (id: string, el: HTMLElement) => boolean;
 }
 
-const SRC_CLASS = "fr-drag-src";
-const GHOST_CLASS = "fr-drag-ghost";
-const CARET_CLASS = "fr-drag-caret";
+const SRC_CLASS = "tp-drag-src";
+const GHOST_CLASS = "tp-drag-ghost";
+const CARET_CLASS = "tp-drag-caret";
 
 export function dragSort(node: HTMLElement, options: DragSortOptions) {
   let opts = options;

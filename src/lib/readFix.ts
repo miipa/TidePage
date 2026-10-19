@@ -6,7 +6,7 @@
 //      font-family / font-size / line-height / color / background；
 //      背景额外覆盖 html / body / #chapter-content / #chapter-content * 共四层。
 //      ——刻意不用标签白名单（p/div/span/li/...）：白名单漏掉任一标签就会穿透。
-//      唯一的例外是划线标记（mark.fr-hl / mark.fr-tts）**及其后代**：背景单独成一条规则并
+//      唯一的例外是划线标记（mark.tp-hl / mark.tp-tts）**及其后代**：背景单独成一条规则并
 //      排除它们（见 READ_FIX_BG_SELECTOR）。否则 "荧光笔" 样式的底色会被这条 !important
 //      涂成页面底色；且 paintHighlights() 会把原书的 <font>/<span> 搬进 mark 内部，
 //      只排除 mark 自身盖不住它们。四项覆盖不排除任何元素。
@@ -28,7 +28,8 @@ export interface ReadFixOptions {
   lineHeight: number | string;
   /** 文字颜色 */
   color: string;
-  /** 背景颜色 */
+  /** 背景颜色。设了阅读背景图时传 `transparent`：这条规则带 !important，
+   *  不透明底色会把图片挡在正文后面（边距区却能看到图 → 正文内外不同源）。 */
   background: string;
 }
 
@@ -38,16 +39,16 @@ export const READ_FIX_STYLE_ID = "__read_fix";
 export const READ_FIX_TEXT_SELECTOR = "#chapter-content, #chapter-content *";
 
 /**
- * 背景覆盖的选择器：排除划线标记（mark.fr-hl / mark.fr-tts）**及其全部后代**。
+ * 背景覆盖的选择器：排除划线标记（mark.tp-hl / mark.tp-tts）**及其全部后代**。
  *
  * 为什么必须排除后代：paintHighlights()（src/lib/highlights.ts）用 range.extractContents()
- * 把原书的 <font>/<span> 搬进 mark 内部，它们仍会命中 `:not(mark.fr-hl)` 之后的 `*` 规则，
+ * 把原书的 <font>/<span> 搬进 mark 内部，它们仍会命中 `:not(mark.tp-hl)` 之后的 `*` 规则，
  * 把荧光笔的底色整块盖回页面底色 —— 只排除 mark 自身等于没排除。
- * 也不采用「给 mark.fr-hl-background 补 !important」：盖不住内部元素的背景，
+ * 也不采用「给 mark.tp-hl-background 补 !important」：盖不住内部元素的背景，
  * 还会搅乱 box/note 圆点那几层的层叠。
  */
 export const READ_FIX_BG_SELECTOR =
-  "#chapter-content, #chapter-content *:not(mark.fr-hl):not(mark.fr-hl *):not(mark.fr-tts):not(mark.fr-tts *)";
+  "#chapter-content, #chapter-content *:not(mark.tp-hl):not(mark.tp-hl *):not(mark.tp-tts):not(mark.tp-tts *)";
 
 const DEFAULT_MONO = "Consolas, \"Courier New\", monospace";
 

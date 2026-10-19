@@ -5,7 +5,7 @@ import {
   buildReadFixCss,
 } from "./readFix";
 
-// 任务二：荧光笔（mark.fr-hl-background）的底色必须活过 __read_fix 的背景 !important。
+// 任务二：荧光笔（mark.tp-hl-background）的底色必须活过 __read_fix 的背景 !important。
 // vitest 是 node 环境（无 jsdom），因此只做字符串级断言：真正生效与否由 _test 的 CDP live 脚本
 // 用 computed style 验收。
 
@@ -29,12 +29,12 @@ const hasBackground = (r: { body: string }) => /(^|[;\s])background\s*:/.test(r.
 describe("buildReadFixCss — 背景规则必须放过划线标记及其后代", () => {
   const css = buildReadFixCss(O);
 
-  it("背景选择器排除 mark.fr-hl / mark.fr-tts 自身与全部后代（内部 <font> 会被 extractContents 搬进来）", () => {
+  it("背景选择器排除 mark.tp-hl / mark.tp-tts 自身与全部后代（内部 <font> 会被 extractContents 搬进来）", () => {
     for (const sel of [
-      ":not(mark.fr-hl)",
-      ":not(mark.fr-hl *)",
-      ":not(mark.fr-tts)",
-      ":not(mark.fr-tts *)",
+      ":not(mark.tp-hl)",
+      ":not(mark.tp-hl *)",
+      ":not(mark.tp-tts)",
+      ":not(mark.tp-tts *)",
     ]) {
       expect(READ_FIX_BG_SELECTOR).toContain(sel);
       expect(css).toContain(sel);

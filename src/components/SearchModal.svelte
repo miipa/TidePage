@@ -28,13 +28,18 @@
     try {
       await api.rebuildFts();
       toast(t("search.rebuildStarted"));
-      const books = await api.listBooks();
       let n = 0;
-      for (const b of books) {
-        try {
-          const c = await api.indexBookFts(b.id);
-          n += c;
-        } catch { /* skip */ }
+      // 分批按 id 遍历全库（每批 500）：listBooks 会把 17 万条整行物化并一次性序列化，
+      // 一次 IPC 就是几十 MB 的行对象 + JSON 文本；这里每批只有 500 个 i64，内存与书数无关。
+      const ID_BATCH = 500;
+      for (let offset = 0; ; offset += ID_BATCH) {
+        const ids = await api.listBookIdsPage(offset, ID_BATCH);
+        if (!ids.length) break;
+        for (const id of ids) {
+          try {
+            n += await api.indexBookFts(id);
+          } catch { /* skip */ }
+        }
       }
       toast(t("search.rebuildDone", { n }));
     } catch (e) {

@@ -19,7 +19,7 @@
 // 防回环：卫星自移前置 syncing + suppressUntil 时间窗 + expected 位置；onMoved 命中任一即视为回声直接 return。
 // 坐标：一律原生物理坐标(PhysicalPosition)，不做换算比较。
 // 生命周期：unlisten 句柄集中保存，stopSnap()/关闭时调用并 emit snap:leave/closed 摘组清偏移。
-// 特效：预吸附/吸附成功通过 window CustomEvent(fr-snap-preview / fr-snap-flash) 通知本窗根组件(+page)渲染。
+// 特效：预吸附/吸附成功通过 window CustomEvent(tp-snap-preview / tp-snap-flash) 通知本窗根组件(+page)渲染。
 // ============================================================================
 
 import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
@@ -95,10 +95,10 @@ function alignAxis(satEdge: number, baseEdge: number): number {
 function setPreview(on: boolean): void {
   if (on === previewOn) return;
   previewOn = on;
-  try { window.dispatchEvent(new CustomEvent("fr-snap-preview", { detail: on })); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent("tp-snap-preview", { detail: on })); } catch { /* ignore */ }
 }
 function flashSnap(): void {
-  try { window.dispatchEvent(new CustomEvent("fr-snap-flash")); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent("tp-snap-flash")); } catch { /* ignore */ }
 }
 
 /** 启动本窗吸附逻辑（主窗=基准；其余=卫星）。幂等。 */

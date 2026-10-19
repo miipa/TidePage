@@ -219,7 +219,7 @@
     width: 250px;
     padding: 10px;
     user-select: none;
-    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .cp-row {

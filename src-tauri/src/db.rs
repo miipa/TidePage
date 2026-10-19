@@ -107,6 +107,12 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         );
         -- 删除书籍且用户选择「保留笔记」时，把书名/作者快照落到此表，
         -- 保证笔记界面在 books 行已消失后仍能显示原书名（而非只有"已删除"）。
+        -- 扫描「失效文件」的两段确认表：首次判缺失只登记，连续两次都判缺失才真删。
+        -- 为什么要它：目录被临时改名/短暂不可读时，一次判定就会把整目录的书行删光。
+        CREATE TABLE IF NOT EXISTS stale_pending(
+            path TEXT PRIMARY KEY,
+            seen_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS orphan_books(
             book_id INTEGER PRIMARY KEY,
             title_snap TEXT NOT NULL DEFAULT '',
@@ -271,6 +277,10 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         -- 增量扫描的关键索引：让 `WHERE meta_done=0 ORDER BY id LIMIT 200`
         -- 与 `COUNT(*) WHERE meta_done=0` 走索引，避免 16 万行时每批从头线性扫（二次方）。
         CREATE INDEX IF NOT EXISTS idx_books_meta_done ON books(meta_done, id);
+        -- 顺序批流的索引：扫描批次改按 path 字典序取（机械盘/外置盘上尽量减少目录跳跃），
+        -- 没有它就是每批 200 行都要做一次排序（16 万行时退化成二次方）。
+        -- 排序键与查询一致（meta_done, path），带索引的全表排序无需回表。
+        CREATE INDEX IF NOT EXISTS idx_books_meta_done_path ON books(meta_done, path);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -278,17 +288,32 @@ pub fn init(path: &Path) -> Result<Connection, String> {
 }
 
 pub fn migrate_book_ids(conn: &Connection) {
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = match conn.prepare("SELECT id, path FROM books") {
-            Ok(s) => s,
-            Err(_) => return,
+    // 先判「要不要迁移」再决定要不要读库：迁移完成后（id_migrated_v2=1）这里**一次查询都不做**。
+    // 旧实现无论迁没迁过都先 `SELECT id, path FROM books` 全量 collect 一遍 ——
+    // 17 万本时那是 17 万条 (i64, String) 的常驻物化，纯白烧内存。
+    if get_setting(conn, "id_migrated_v2").is_some() {
+        return;
+    }
+    // 只迁移一次；分批（每批 2000 行）流式处理，内存与书数无关。
+    // 分页键用 path（UNIQUE 且本迁移不改它），**不能用 id**：迁移本身在改 id，按 id 翻页会漏行/重复。
+    const BATCH: usize = 2000;
+    let mut cursor = String::new();
+    loop {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = match conn.prepare(
+                "SELECT id, path FROM books WHERE path > ?1 ORDER BY path LIMIT ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map(params![cursor, BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rs| rs.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map(|rs| rs.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    };
-    let once: bool = get_setting(conn, "id_migrated_v2").is_none();
-    if once {
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(_, p)| p.clone()).unwrap_or_default();
         for (old_id, path) in &rows {
             let new_id = path_id(path);
             if new_id == *old_id {
@@ -320,8 +345,9 @@ pub fn migrate_book_ids(conn: &Connection) {
                 .ok();
             }
         }
-        set_setting(conn, "id_migrated_v2", "1");
+        drop(rows); // 本批中间对象及时释放
     }
+    set_setting(conn, "id_migrated_v2", "1");
 }
 
 /// 章节切分算法版本。改变 `txt.rs` 的切分策略（如引入 `MAX_CHAPTER_CHARS` 细分、
@@ -375,6 +401,207 @@ pub fn reset_epub_covers(conn: &Connection, covers_dir: &std::path::Path) {
     set_setting(conn, "cover_reset_v2", "1");
     set_setting(conn, "cover_reset_v3", "1");
     set_setting(conn, KEY, "1");
+}
+
+/// 封面自愈的统计（供启动日志与验收读数）。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CoverHeal {
+    /// 封面目录里读到的文件名条数。
+    pub scanned: usize,
+    /// 被复位的行数（cover_path 置空 + meta_done=0）。
+    pub reset: usize,
+    /// 其中 `custom-` 前缀（用户自选封面）的行数，让「自选封面受影响面」可追溯。
+    pub reset_custom: usize,
+    /// 读目录失败的原因；Some 表示本轮**一条都没有复位**。
+    pub dir_err: Option<String>,
+    /// 1B：发现的「同 stem 多扩展名」组数。
+    pub stem_groups: usize,
+    /// 1B：实际删除的冗余文件数。
+    pub stem_removed: usize,
+    /// 1B：因「无引用」被保守保留（一份都不删）的组数。
+    pub stem_kept: usize,
+    /// 1B：被引用那一份的扩展名分布。
+    pub stem_ref_ext: Vec<(String, usize)>,
+}
+
+/// 复位条件的唯一来源：`cover_path` 非空、且其文件名不在目录清单里（或本就不合法）。
+///
+/// 「不合法」= 含 `/`、`\`、`..`：与 `tidepage://…/covers/` 端点同一套校验（端点直接拒绝这类名字），
+/// 所以即使目录里凑巧有同名文件也不认——不 join 后探测，避免路径穿越/歧义。
+const COVER_HEAL_WHERE: &str = "cover_path IS NOT NULL AND cover_path<>'' AND (\
+     instr(cover_path,'/')>0 OR instr(cover_path,'\\')>0 OR instr(cover_path,'..')>0 \
+     OR lower(cover_path) NOT IN (SELECT name FROM cover_heal_names))";
+
+/// 每次启动的廉价核对：`cover_path` 指向的文件若已不存在，就把它复位，交给现有扫描重建。
+///
+/// 为什么需要它：`clear_cache`/`reset_epub_covers` 都会把 `cover_path` 置空，而库里出现
+/// 「`cover_path` 非空但文件不存在」只可能是**目录在应用之外被删除**；只清 `cover_path`
+/// 也不够——容器格式的入口全按 `meta_done` 认领（`claim_meta` 只认 allow=[0]、
+/// `next_priority` 要 meta_done IN (0,2,3)、`on_book_opened` 遇 meta_done=1 直接返回），
+/// 所以复位必须同时把 `meta_done` 归零。
+///
+/// **read_dir 的 Ok / Err 必须分开**（本函数的第一个硬约定）：
+/// - `Err` ⇒ 立刻返回，一条都不复位。若把失败当成空集合，`NOT IN (空集)` 对每行都为真，
+///   一次启动就会把**全部**带封面的行（含 pdf 与 `custom-` 自选封面）置空，用户的显式选择被覆盖。
+///   依据：启动时调用方已 `create_dir_all(covers_dir)`，`covers::covers_dir()` 自己也建目录，
+///   所以 `Err` 只可能是权限/IO 问题，不可能是「目录被删」。
+/// - `Ok` 且 0 条 ⇒ 目录存在但为空（外部删除后又被重建的形态）⇒ **继续**，全量复位才是正确行为。
+///
+/// 其它约定：
+/// - 大小写归一化：Windows 文件名不区分大小写、SQLite 字符串比较区分，所以临时表与比较都用小写，
+///   避免把「仅大小写不同的同一文件」误判为缺失。
+/// - 一趟 `read_dir` 灌临时表 + **一条** UPDATE：不用上万个字面量拼 `IN`（会撞表达式深度/变量数上限）。
+/// - 不设一次性标记：每次启动都核对，无缺失时是 no-op（不写任何键）。
+/// - `cover_ver` 不动；`meta_error`/`fail_count` **一并清掉**：这样这本书再被打开时
+///   `on_book_opened` 不会因旧的 `Pathological`/超限 `Timeout` 拒绝插队，实现「打开即优先重建」。
+pub fn heal_missing_covers(conn: &Connection, covers_dir: &Path) -> CoverHeal {
+    let mut rep = CoverHeal::default();
+    let entries = match std::fs::read_dir(covers_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            rep.dir_err = Some(e.to_string());
+            return rep;
+        }
+    };
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cover_heal_names; CREATE TEMP TABLE cover_heal_names(name TEXT PRIMARY KEY);")
+        .ok();
+    {
+        let mut ins = match conn.prepare("INSERT OR IGNORE INTO cover_heal_names(name) VALUES (?1)") {
+            Ok(s) => s,
+            Err(e) => {
+                rep.dir_err = Some(e.to_string());
+                return rep;
+            }
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            rep.scanned += 1;
+            ins.execute(params![name]).ok();
+        }
+    }
+    // count → count(custom) → update，三步同一条件，避免复位后无法回溯受影响面。
+    let count = |extra: &str| -> usize {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM books WHERE ({COVER_HEAL_WHERE}){extra}"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    };
+    rep.reset = count("");
+    if rep.reset > 0 {
+        rep.reset_custom = count(" AND lower(cover_path) LIKE 'custom-%'");
+        conn.execute(
+            &format!("UPDATE books SET cover_path=NULL, meta_done=0, meta_error=NULL, fail_count=0 WHERE ({COVER_HEAL_WHERE})"),
+            [],
+        )
+        .ok();
+    }
+    // 1B：历史同 stem 冗余清扫（搭在同一趟 read_dir 上，零额外 I/O）。
+    // 只处理 `{数字}` 与 `custom-{数字}` 两类命名；判定见 sweep_same_stem。
+    let sweep = sweep_same_stem(conn, covers_dir);
+    rep.stem_groups = sweep.groups;
+    rep.stem_removed = sweep.removed;
+    rep.stem_kept = sweep.kept;
+    rep.stem_ref_ext = sweep.ref_ext;
+    rep
+}
+
+/// 同 stem 冗余清扫的统计。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct StemSweep {
+    /// 发现「同 stem 多扩展名」的组数。
+    pub groups: usize,
+    /// 实际删除的文件数。
+    pub removed: usize,
+    /// 因「无引用」而被保守保留的组数（一份都不删、只记数）。
+    pub kept: usize,
+    /// 被引用那一份的扩展名分布：(ext, 组数)。
+    pub ref_ext: Vec<(String, usize)>,
+}
+
+/// 清扫封面目录里「同一 stem 有多个扩展名」的冗余文件（只动写入侧留下的垃圾）。
+///
+/// 判定规则（**不许按 mtime 猜**：最新那份未必是被服务的那份，删错就是 404）：
+/// 1. 组 = 同 stem 的文件集合（stem 完全相等；只认 `{数字}` / `custom-{数字}`）。
+/// 2. 被引用 = DB 里某行的 `cover_path` 指向**组内**的某个名字，**且该文件真实存在**。
+/// 3. 有被引用 ⇒ 保留它，删同 stem 的其余；**没有任何一份满足**（含"引用的那份已丢失"
+///    与"cover_path 为 NULL"）⇒ **全部保留、只记数**（保守规则，宁可留垃圾也不删封面）。
+/// 4. 绝不触碰 `bg-*`、`background.img`、`default-cover.img` 等其它命名。
+fn sweep_same_stem(conn: &Connection, covers_dir: &Path) -> StemSweep {
+    let mut out = StemSweep::default();
+    let entries = match std::fs::read_dir(covers_dir) {
+        Ok(e) => e,
+        // 读目录失败：一条都不删（与自愈同一条约定）。
+        Err(_) => return out,
+    };
+    // stem -> Vec<(file_name_lower, path)>
+    let mut groups: std::collections::HashMap<String, Vec<(String, std::path::PathBuf)>> =
+        std::collections::HashMap::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let p = Path::new(&name);
+        let stem = match p.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+        if !crate::covers::is_cover_stem(&stem) || p.extension().is_none() {
+            continue;
+        }
+        groups
+            .entry(stem.to_lowercase())
+            .or_default()
+            .push((name.to_lowercase(), e.path()));
+    }
+    // 被引用的文件名（小写）集合：一次查询，避免每组建查询。
+    let mut referenced = std::collections::HashSet::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT DISTINCT lower(cover_path) FROM books WHERE cover_path IS NOT NULL AND cover_path<>''",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() {
+                referenced.insert(r);
+            }
+        }
+    }
+    for (_stem, files) in groups {
+        if files.len() < 2 {
+            continue; // 没有同 stem 冗余
+        }
+        out.groups += 1;
+        // 组内被引用且真实存在的那一份（按 basename 比对；文件已在目录里，存在性天然成立）。
+        let keep = files.iter().find(|(n, _)| referenced.contains(n));
+        match keep {
+            Some((_, keep_path)) => {
+                let keep_name = keep_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let ext = Path::new(&keep_name)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match out.ref_ext.iter_mut().find(|(e, _)| *e == ext) {
+                    Some((_, c)) => *c += 1,
+                    None => out.ref_ext.push((ext, 1)),
+                }
+                for (n, p) in &files {
+                    if *n != keep_name && std::fs::remove_file(p).is_ok() {
+                        out.removed += 1;
+                    }
+                }
+            }
+            None => {
+                // 无引用（或引用的那份已丢失/为 NULL）：全部保留，只记数。
+                out.kept += 1;
+            }
+        }
+    }
+    out.ref_ext.sort_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 pub fn has_fts(conn: &Connection) -> bool {
@@ -609,6 +836,23 @@ pub fn upsert_book(
     Ok(id)
 }
 
+/// 只取 id 的一页（按 added_at DESC, id DESC 排序，与 list_books 同序）。
+/// 给「按 id 遍历全库」的批量操作分批用：单批内存 = limit × 8 字节。
+pub fn list_book_ids_page(conn: &Connection, offset: i64, limit: i64) -> Vec<i64> {
+    let mut stmt = match conn.prepare(
+        "SELECT id FROM books ORDER BY added_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![limit, offset], |r| r.get::<_, i64>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 整库全量行（含 path/title 等字符串）：**只允许小书库或明确的整库导出场景**。
+/// 17 万本时它是 17 万条 BookRow 的物化 + 整表 JSON 序列化（数十 MB 常驻），
+/// 按 id 遍历请用 list_book_ids_page；窗口取行请用 list_books_page。
 pub fn list_books(conn: &Connection) -> Vec<BookRow> {
     let sql = format!(
         "SELECT {BOOK_COLS} FROM books b ORDER BY b.added_at DESC, b.id DESC"
@@ -887,6 +1131,45 @@ pub fn all_book_paths(conn: &Connection) -> Vec<(i64, String)> {
         .unwrap_or_default()
 }
 
+/// 待确认删除的失效路径（见 scan_folders 的两段确认）。
+pub fn stale_pending_all(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut stmt = match conn.prepare("SELECT path FROM stale_pending") {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 登记/刷新待确认路径（已存在则只更新时间）。
+pub fn stale_pending_put(conn: &Connection, paths: &[String], now: i64) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("INSERT INTO stale_pending(path, seen_at) VALUES(?1, ?2) ON CONFLICT(path) DO UPDATE SET seen_at=?2")
+        .map_err(|e| e.to_string())?;
+    for p in paths {
+        stmt.execute(rusqlite::params![p, now]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 清掉待确认路径（已删除 / 重新出现）。
+pub fn stale_pending_drop(conn: &Connection, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("DELETE FROM stale_pending WHERE path=?1")
+        .map_err(|e| e.to_string())?;
+    for p in paths {
+        stmt.execute(rusqlite::params![p]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 一次性读入全部书籍路径为 `HashSet`（`SELECT path FROM books`）。
 /// 供 scan_folders 阶段二：单次短锁读取后立即释放，随后无锁求差集。
 pub fn all_paths_set(conn: &Connection) -> std::collections::HashSet<String> {
@@ -900,12 +1183,15 @@ pub fn all_paths_set(conn: &Connection) -> std::collections::HashSet<String> {
 }
 
 
-/// 增量扫描：取下一批待处理（`meta_done=0`）的 (id, path, format)，按 id 升序、上限 limit。
-/// 走 idx_books_meta_done 索引，16 万行也不会每批从头线性扫。
+/// 增量扫描：取下一批待处理（`meta_done=0`）的 (id, path, format)，按 **path 字典序**、上限 limit。
+/// 走 idx_books_meta_done_path(meta_done, path)：16 万行也不会每批从头排序/线性扫。
 pub fn next_meta_batch(conn: &Connection, limit: i64) -> Vec<(i64, String, String)> {
-    let mut stmt = match conn
-        .prepare("SELECT id, path, format FROM books WHERE meta_done = 0 ORDER BY id ASC LIMIT ?1")
-    {
+    // 顺序批流：按 `path` 字典序取批（不是 id）。同一目录的书在批次里相邻 ⇒ 目录项遍历与
+    // 相邻文件的寻道次数最少；`idx_books_meta_done_path(meta_done, path)` 让这条查询免排序。
+    // **不得**改成「启动时把全部待办 id 载入内存排序」：16 万本的内存与启动时间都不可接受。
+    let mut stmt = match conn.prepare(
+        "SELECT id, path, format FROM books WHERE meta_done = 0 ORDER BY path ASC, id ASC LIMIT ?1",
+    ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -1084,7 +1370,7 @@ mod book_chars_tests {
 
     #[test]
     fn set_book_chars_backfills_only_char_columns() {
-        let dir = std::env::temp_dir().join(format!("fr_db_bookchars_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tp_db_bookchars_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.db");
@@ -1128,7 +1414,7 @@ mod upsert_chars_tests {
 
     #[test]
     fn upsert_resets_chars_only_when_file_changed() {
-        let dir = std::env::temp_dir().join(format!("fr_db_upsert_chars_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tp_db_upsert_chars_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.db");
@@ -1804,7 +2090,7 @@ mod notes_tests {
     use rusqlite::Connection;
 
     fn tmpdb(tag: &str) -> Connection {
-        let p = std::env::temp_dir().join(format!("fr_notes_{}_{}.db", tag, std::process::id()));
+        let p = std::env::temp_dir().join(format!("tp_notes_{}_{}.db", tag, std::process::id()));
         let _ = std::fs::remove_file(&p);
         init(&p).unwrap()
     }
@@ -1822,7 +2108,7 @@ mod notes_tests {
     /// 修复后：先按 pragma_table_info 补列，再统一建索引。
     #[test]
     fn init_upgrades_old_books_table_missing_last_read() {
-        let p = std::env::temp_dir().join(format!("fr_old_{}.db", std::process::id()));
+        let p = std::env::temp_dir().join(format!("tp_old_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         {
             let old = Connection::open(&p).unwrap();
@@ -2056,9 +2342,179 @@ mod cover_scan_tests {
     use rusqlite::Connection;
 
     fn tmpdb(tag: &str) -> Connection {
-        let p = std::env::temp_dir().join(format!("fr_cscan_{}_{}.db", tag, std::process::id()));
+        let p = std::env::temp_dir().join(format!("tp_cscan_{}_{}.db", tag, std::process::id()));
         let _ = std::fs::remove_file(&p);
         init(&p).unwrap()
+    }
+
+    // ---------- 封面自愈（heal_missing_covers）----------
+    fn tmpcovers(tag: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tp_heal_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// 造一本书：cover_path 与 meta_done 可控。
+    fn book(conn: &Connection, path: &str, cover: Option<&str>, meta_done: i64) -> i64 {
+        let id = upsert_book(conn, path, "书", "epub", 10, 1).unwrap();
+        set_book_meta_ex(conn, id, "书", "作者", cover, 1, 1, meta_done, cover.is_some()).unwrap();
+        if meta_done != 1 {
+            mark_meta(conn, id, 3, Some("timeout")).ok();
+            conn.execute("UPDATE books SET fail_count=7 WHERE id=?1", rusqlite::params![id]).ok();
+        }
+        id
+    }
+
+    fn snapshot(conn: &Connection) -> (i64, i64, i64) {
+        // (cover_path 非空行数, meta_done=0 行数, meta_done=1 行数)
+        let a = conn.query_row("SELECT COUNT(*) FROM books WHERE cover_path IS NOT NULL AND cover_path<>''", [], |r| r.get(0)).unwrap();
+        let b = conn.query_row("SELECT COUNT(*) FROM books WHERE meta_done=0", [], |r| r.get(0)).unwrap();
+        let c = conn.query_row("SELECT COUNT(*) FROM books WHERE meta_done=1", [], |r| r.get(0)).unwrap();
+        (a, b, c)
+    }
+
+    /// 硬约定：read_dir 失败时**一条都不能复位**（空集合会让 NOT IN 对每行都为真）。
+    #[test]
+    fn heal_dir_error_resets_nothing() {
+        let conn = tmpdb("heal_err");
+        book(&conn, "/b/1.epub", Some("a.png"), 1);
+        book(&conn, "/b/2.epub", Some("custom-2.png"), 1);
+        book(&conn, "/b/3.pdf", Some("c.png"), 1);
+        let before = snapshot(&conn);
+        let rep = heal_missing_covers(&conn, &std::path::Path::new("Z:\\tp_definitely_missing_dir_9c1f"));
+        assert!(rep.dir_err.is_some(), "读目录失败必须回传原因");
+        assert_eq!(rep.reset, 0);
+        assert_eq!(snapshot(&conn), before, "读目录失败时不得复位任何行");
+    }
+
+    /// 目录存在但为空 = 外部删除后重建的形态 ⇒ 全量复位，并分别统计 custom- 行数。
+    #[test]
+    fn heal_empty_dir_resets_all_and_counts_custom() {
+        let conn = tmpdb("heal_empty");
+        book(&conn, "/b/1.epub", Some("a.png"), 1);
+        let id_custom = book(&conn, "/b/2.epub", Some("custom-2.png"), 1);
+        book(&conn, "/b/3.pdf", Some("c.png"), 1);
+        book(&conn, "/b/4.txt", None, 1);
+        // 造一次"上次失败过"的痕迹：复位时必须一起清掉（打开即优先重建）
+        conn.execute("UPDATE books SET meta_error='timeout', fail_count=7 WHERE id=?1", rusqlite::params![id_custom]).ok();
+        let dir = tmpcovers("empty", &[]);
+        let rep = heal_missing_covers(&conn, &dir);
+        assert!(rep.dir_err.is_none());
+        assert_eq!(rep.scanned, 0);
+        assert_eq!(rep.reset, 3);
+        assert_eq!(rep.reset_custom, 1);
+        let (nonempty, md0, md1) = snapshot(&conn);
+        assert_eq!(nonempty, 0, "全部 cover_path 置空");
+        assert_eq!(md0, 3, "三本有封面的书回到待扫描");
+        assert_eq!(md1, 1, "原本就没有封面的那本不受影响");
+        // 复位时一并清掉错误与失败计数（打开即优先重建）
+        let (cover, err, fails): (Option<String>, Option<String>, i64) = conn
+            .query_row("SELECT cover_path, meta_error, fail_count FROM books WHERE id=?1", rusqlite::params![id_custom], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(cover, None);
+        assert_eq!(err, None);
+        assert_eq!(fails, 0);
+    }
+
+    /// 只有指向缺失/非法名字的行被复位：存在文件（含仅大小写不同）的行保留。
+    #[test]
+    fn heal_keeps_existing_files_and_case_insensitive() {
+        let conn = tmpdb("heal_case");
+        let dir = tmpcovers("case", &["Keep.PNG", "b.png"]);
+        let id_keep = book(&conn, "/b/keep.epub", Some("keep.png"), 1); // 大小写不同 ⇒ 视为存在
+        let id_keep2 = book(&conn, "/b/keep2.epub", Some("b.png"), 1);
+        let id_missing = book(&conn, "/b/missing.epub", Some("gone.png"), 1);
+        let id_escape = book(&conn, "/b/esc.epub", Some("../a.png"), 1);
+        let id_slash = book(&conn, "/b/slash.epub", Some("sub/a.png"), 1);
+        let rep = heal_missing_covers(&conn, &dir);
+        assert_eq!(rep.scanned, 2);
+        assert_eq!(rep.reset, 3, "缺失 1 + 非法 2");
+        let kept = |id: i64| -> Option<String> {
+            conn.query_row("SELECT cover_path FROM books WHERE id=?1", rusqlite::params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(kept(id_keep).as_deref(), Some("keep.png"));
+        assert_eq!(kept(id_keep2).as_deref(), Some("b.png"));
+        for id in [id_missing, id_escape, id_slash] {
+            assert_eq!(kept(id), None);
+        }
+    }
+
+    /// 无缺失时是纯 no-op：不写任何行（第二次调用 reset=0）。
+    #[test]
+    fn heal_is_noop_when_nothing_missing() {
+        let conn = tmpdb("heal_noop");
+        let dir = tmpcovers("noop", &["a.png"]);
+        book(&conn, "/b/1.epub", Some("a.png"), 1);
+        let rep1 = heal_missing_covers(&conn, &dir);
+        assert_eq!(rep1.reset, 0);
+        let rep2 = heal_missing_covers(&conn, &dir);
+        assert_eq!(rep2.reset, 0);
+        let (nonempty, _, md1) = snapshot(&conn);
+        assert_eq!((nonempty, md1), (1, 1));
+    }
+
+    /// 1B：同 stem 冗余清扫 —— 只删「有引用且引用那份存在」的同 stem 其余扩展名。
+    /// 关键点：不按 mtime 判（被引用的那份可能更旧）；无引用一律保留；不碰 bg-* 与不同 stem。
+    #[test]
+    fn sweep_same_stem_keeps_referenced_and_is_conservative() {
+        let conn = tmpdb("stem_sweep");
+        let dir = tmpcovers(
+            "stem_sweep",
+            &[
+                "1.png", "1.webp",            // 引用 .png（且 .png 更旧）
+                "2.png", "2.webp",            // 引用 .webp（.webp 更旧）
+                "custom-3.png", "custom-3.webp", // 无引用（cover_path 为 NULL）
+                "custom-6.webp", "custom-6.jpg", // 引用 custom-6.png，而那份已缺失
+                "10.png", "100.png",          // 不同 stem：不得误判为一组
+                "bg-1-2.png", "bg-1-2.webp",  // 非封面命名：一律不碰
+            ],
+        );
+        // 让 1.webp 比 1.png 新、2.png 比 2.webp 新（证明不按 mtime）
+        let now = std::time::SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("2.png"))
+            .ok()
+            .and_then(|f| f.set_modified(now).ok());
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("1.webp"))
+            .ok()
+            .and_then(|f| f.set_modified(now).ok());
+        book(&conn, "/b/1.epub", Some("1.png"), 1);
+        book(&conn, "/b/2.epub", Some("2.webp"), 1);
+        book(&conn, "/b/3.epub", None, 1);
+        book(&conn, "/b/6.epub", Some("custom-6.png"), 1);
+        let rep = heal_missing_covers(&conn, &dir);
+        assert_eq!(rep.stem_groups, 4, "1 / 2 / custom-3 / custom-6 四组（10 与 100 不是一组）");
+        assert_eq!(rep.stem_removed, 2, "1.webp 与 2.png 各删一份");
+        assert_eq!(rep.stem_kept, 2, "custom-3（无引用）与 custom-6（引用那份已缺失）都保留");
+        assert!(dir.join("1.png").exists() && !dir.join("1.webp").exists());
+        assert!(dir.join("2.webp").exists() && !dir.join("2.png").exists());
+        assert!(dir.join("custom-3.png").exists() && dir.join("custom-3.webp").exists());
+        assert!(dir.join("custom-6.webp").exists() && dir.join("custom-6.jpg").exists());
+        assert!(dir.join("10.png").exists() && dir.join("100.png").exists());
+        assert!(dir.join("bg-1-2.png").exists() && dir.join("bg-1-2.webp").exists());
+        // 被引用扩展名分布：1.png + 2.webp
+        let mut dist = rep.stem_ref_ext.clone();
+        dist.sort();
+        assert_eq!(dist, vec![("png".to_string(), 1), ("webp".to_string(), 1)]);
+        // 清扫后 cover_path 非空行的文件存在率必须仍为 100%
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM books WHERE cover_path IS NOT NULL AND cover_path<>''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 2, "只剩 1.png 与 2.webp 两行非空");
+        // 第二次运行必须收敛为 0（幂等）
+        let rep2 = heal_missing_covers(&conn, &dir);
+        // 第二次运行：无可删（幂等）；只保留"无引用"的那两组继续被记数。\n        assert_eq!(rep2.stem_removed, 0);\n        assert_eq!(rep2.stem_groups, 2);
     }
 
     /// 需求2：Some/None 写 meta_done=1，Err 写 meta_done=2；三种情况都**不再是 0**，
@@ -2135,7 +2591,7 @@ mod fts_snippet_tests {
     /// 且用哨兵参数能标出命中（Rust 侧再转义并还原为 <mark>）。
     #[test]
     fn snippet_sql_marks_hits_with_sentinels() {
-        let p = std::env::temp_dir().join(format!("fr_ftssnip_{}.db", std::process::id()));
+        let p = std::env::temp_dir().join(format!("tp_ftssnip_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let conn = init(&p).unwrap();
         if !has_fts(&conn) {

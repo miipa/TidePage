@@ -87,7 +87,7 @@
     gap: var(--sp-2);
     min-width: 208px;
     user-select: none;
-    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   /* 组间细分隔线，层次更清晰 */

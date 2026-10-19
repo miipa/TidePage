@@ -212,7 +212,7 @@
     z-index: var(--z-popover);
     width: 250px;
     padding: 10px;
-    animation: fr-pop-in var(--dur-fast) var(--ease-premium) both;
+    animation: tp-pop-in var(--dur-fast) var(--ease-premium) both;
   }
 
   .cp-title {

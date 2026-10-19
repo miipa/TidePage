@@ -2,6 +2,7 @@
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api, coverUrl } from "../lib/api";
+  import { regeneratePdfCover } from "../lib/pdf";
 import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   import { appConfirm, copyText, toast } from "../lib/stores.svelte";
   import { outDissolve, outFade } from "../lib/motion";
@@ -121,7 +122,7 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
 
   async function reextract() {
     try {
-      const name = await api.reextractCover(book.id);
+      const name = book.format === "pdf" ? await regeneratePdfCover(book.id, 320) : await api.reextractCover(book.id);
       book.cover_path = name;
       book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
@@ -231,7 +232,7 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
     display: grid;
     place-items: center;
     padding: 24px;
-    animation: fr-fade-in var(--dur-scrim) var(--ease-in) both;
+    animation: tp-fade-in var(--dur-scrim) var(--ease-in) both;
   }
 
   .bd-panel {
@@ -245,7 +246,7 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    animation: fr-dialog-in var(--dur-modal) var(--ease-premium) both;
+    animation: tp-dialog-in var(--dur-modal) var(--ease-premium) both;
   }
 
   .bd-head {
