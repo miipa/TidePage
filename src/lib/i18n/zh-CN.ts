@@ -91,6 +91,7 @@ export const zhCN = {
 
   // ===== 独立面板外壳 =====
   "panel.unknown": "未知面板：{kind}",
+  "panel.noBook": "未打开书籍",
 
   // ===== 结构体 id → 本地化显示名（持久化值永远是 ASCII id，译文只用于显示）=====
   "dict.zone.tl": "左上区域",
@@ -600,6 +601,7 @@ export const zhCN = {
   "library.toolbar.refresh": "刷新",
   "library.toolbar.rescan": "重新扫描书库",
   "library.toolbar.searchPlaceholder": "搜索书名 / 作者…",
+  "library.toolbar.clearSearch": "清空搜索",
   "library.toolbar.reverseTip": "反向排序",
   "library.toolbar.category": "分类",
   "library.toolbar.filtered": "已筛选",

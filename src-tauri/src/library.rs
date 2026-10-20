@@ -2634,6 +2634,9 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         db::touch_book_opened(&conn, id);
         b
     };
+    // 任何窗口打开书都会更新“最后阅读时间”：广播给所有窗口，主窗书库据此即时刷新
+    // 「最近阅读」顺序（独立书窗打开时不经过主窗，没有这个事件要重启后才正确）。
+    state.app.emit("book-opened", ()).ok();
     let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
     let t_open = std::time::Instant::now();

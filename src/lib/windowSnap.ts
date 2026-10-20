@@ -1,13 +1,14 @@
 // ============================================================================
 // 窗口吸附与整组移动（任务 2 / 任务 5 复用，集中一处）
 //
-// 单向移动模型：基准窗 = 主窗口(label "main")；其余为卫星窗（AI 窗 / 面板独立窗）。
-//   · 拖主窗  → 主窗 onMoved 广播 snap:base-moved；卫星按【固定】offsetFromBase 盲跟贴住。
-//   · 拖卫星窗 → 立即解除吸附（不带动任何窗）。整组移动只有「主窗动→卫星跟」一条链。
+// 单向移动模型：基准窗默认主窗口(label "main")，独立书窗也可以作为它拉出的面板窗的基准；
+// 其余为卫星窗（AI 窗 / 面板独立窗），卫星窗自身也可能是下一级的基准。
+//   · 拖基准窗 → 该窗 onMoved 广播 snap:base-moved（带 label）；卫星按【固定】offsetFromBase 盲跟贴住。
+//   · 拖卫星窗 → 立即解除吸附（不带动任何窗）。跟随可能是两级链：主窗→书窗→面板窗，允许滞后。
 //
 // 吸附触发（本轮修正：不再"固定 offset 盲跟"，主/卫星两侧都会主动评估）：
-//   · 主窗移动：卫星收到 base-moved 后——已吸附则盲跟(mirrorToBase)；未吸附则节流评估一次
-//     evaluateSnapOnce，边缘进阈值即吸附。→ 拖主窗贴近卫星每次都能吸。
+//   · 基准窗移动：卫星收到 base-moved 后——已吸附则盲跟(mirrorToBase)；未吸附则节流评估一次
+//     evaluateSnapOnce，边缘进阈值即吸附。→ 拖基准窗贴近卫星每次都能吸。
 //   · 卫星移动：拖动中节流跑 evaluateSnapPreview（只算、不移、不写、不改 grouped）显示预吸附视觉；
 //     停动 SETTLE_MS(≈松手) 后跑 evaluateSnapOnce 真正吸附。
 //
@@ -25,6 +26,7 @@
 import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { prefersReducedMotion } from "./reducedMotion";
 
 const BASE_LABEL = "main";
@@ -43,6 +45,8 @@ type Geom = { x: number; y: number; w: number; h: number };
 let started = false;
 let isBase = false;
 let myLabel = "";
+let baseLabel = BASE_LABEL;              // 本窗的基准窗 label：默认主窗，面板窗可改为打开书的 reader-<id>
+let baseProvider: (() => string) | null = null; // 面板窗提供的基准窗解析函数
 let unlisteners: UnlistenFn[] = [];
 
 // 卫星窗状态
@@ -56,6 +60,11 @@ let lastSatPos: XY = { x: 0, y: 0 };
 let evalPending = false;
 let previewPending = false;
 let previewOn = false;
+// 广播节流：16ms 内的连续移动只发最后一次位置（尾部必发）
+let bcTimer: ReturnType<typeof setTimeout> | undefined;
+let bcPending: XY | null = null;
+// 抬升节流：吸附成组期间跟随移动很频繁，50ms 内只发一次置窗序命令
+let raiseTimer: ReturnType<typeof setTimeout> | undefined;
 
 function near(a: XY, b: XY, eps = ECHO_EPS): boolean {
   return Math.abs(a.x - b.x) <= eps && Math.abs(a.y - b.y) <= eps;
@@ -101,7 +110,54 @@ function flashSnap(): void {
   try { window.dispatchEvent(new CustomEvent("tp-snap-flash")); } catch { /* ignore */ }
 }
 
-/** 启动本窗吸附逻辑（主窗=基准；其余=卫星）。幂等。 */
+/** 合并广播：16ms 内的连续移动只发最后一次位置（尾部必发，停止时不会漏最后一位）。 */
+function broadcastMoved(pos: XY): void {
+  bcPending = pos;
+  if (bcTimer !== undefined) return;
+  bcTimer = setTimeout(() => {
+    bcTimer = undefined;
+    const p = bcPending;
+    bcPending = null;
+    if (p) void emit("snap:base-moved", { label: myLabel, x: p.x, y: p.y });
+  }, 16);
+}
+
+/** 把本窗抬到基准窗之上（不激活、不置顶其它程序）；50ms 内只发一次。 */
+function raiseAboveBase(): void {
+  if (!grouped || baseLabel === myLabel) return;
+  if (raiseTimer !== undefined) return;
+  raiseTimer = setTimeout(() => {
+    raiseTimer = undefined;
+    if (!grouped) return;
+    void invoke("raise_above", { baseLabel }).catch(() => {});
+  }, 50);
+}
+
+/** 设置本窗的基准窗来源（面板窗按当前书解析到 reader-<id>）；传 null 回到主窗。 */
+export function setSnapBaseLabelProvider(fn: (() => string) | null): void {
+  baseProvider = fn;
+}
+
+/** 重新解析本窗的基准窗；变化时解除现有吸附（offsetFromBase 是相对旧基准算的，留着会跳位）。
+ *  注意：本函数可能早于 startSnap() 被调用（子组件 onMount 先于父组件），那时 myLabel 还是空串，
+ *  解除吸附会发出一条无人匹配的 snap:leave —— 无副作用，属预期。 */
+export async function refreshSnapBase(): Promise<void> {
+  const want = baseProvider ? baseProvider() : BASE_LABEL;
+  let next = BASE_LABEL;
+  if (want && want !== BASE_LABEL) {
+    try { if (await WebviewWindow.getByLabel(want)) next = want; } catch { /* ignore */ }
+  }
+  if (next === baseLabel) return;
+  if (grouped) {
+    grouped = false;
+    offsetFromBase = null;
+    setPreview(false);
+    try { await emit("snap:leave", { label: myLabel }); } catch { /* ignore */ }
+  }
+  baseLabel = next;
+}
+
+/** 启动本窗吸附逻辑（主窗=基准；其余=卫星，基准可能是主窗或独立书窗）。幂等。 */
 export async function startSnap(): Promise<void> {
   if (started) return;
   started = true;
@@ -109,22 +165,34 @@ export async function startSnap(): Promise<void> {
   myLabel = win.label;
   isBase = myLabel === BASE_LABEL;
 
-  if (isBase) {
-    // 基准窗：被用户拖动即广播位置（始终广播，未吸附卫星也能据此评估并吸上）
-    const un = await win.onMoved(({ payload }) => {
-      void emit("snap:base-moved", { x: payload.x, y: payload.y });
-    });
-    unlisteners.push(un);
-    return;
-  }
-
-  // 卫星窗
-  const un = await win.onMoved(({ payload }) => { onSatelliteMoved({ x: payload.x, y: payload.y }); });
+  // 只注册一条 onMoved：每个窗都可能是某个卫星（面板窗）的基准，移动必须无条件广播；
+  // 广播要早于 onSatelliteMoved 的静音判断——否则书窗跟随主窗时不再转发，主窗→书窗→面板窗的链会断。
+  const un = await win.onMoved(({ payload }) => {
+    broadcastMoved({ x: payload.x, y: payload.y });
+    if (isBase) return;
+    onSatelliteMoved({ x: payload.x, y: payload.y });
+  });
   unlisteners.push(un);
-  unlisteners.push(await listen<XY>("snap:base-moved", (e) => { void onBaseMoved(e.payload); }));
-  unlisteners.push(await listen<{ label: string }>("snap:closed", (e) => {
-    if (e.payload.label === BASE_LABEL) { grouped = false; offsetFromBase = null; setPreview(false); } // 主窗关闭→解除，防悬空
+  // 每个窗被聚焦时广播：吸附组里的卫星据此重新把本窗抬到基准窗之上。
+  unlisteners.push(await win.onFocusChanged(({ payload }) => {
+    if (payload) void emit("snap:base-focused", { label: myLabel });
   }));
+  if (isBase) return;
+  unlisteners.push(await listen<{ label: string }>("snap:base-focused", (e) => {
+    if (e.payload.label === baseLabel && grouped) raiseAboveBase();
+  }));
+  unlisteners.push(await listen<{ label: string; x: number; y: number }>("snap:base-moved", (e) => {
+    if (e.payload.label !== baseLabel) return;
+    void onBaseMoved({ x: e.payload.x, y: e.payload.y });
+  }));
+  unlisteners.push(await listen<{ label: string }>("snap:closed", (e) => {
+    if (e.payload.label !== baseLabel) return;
+    grouped = false;
+    offsetFromBase = null;
+    setPreview(false);
+    void refreshSnapBase();
+  }));
+  await refreshSnapBase();
 }
 
 /** 停止并清理。 */
@@ -138,6 +206,9 @@ export async function stopSnap(): Promise<void> {
   for (const un of unlisteners) { try { un(); } catch { /* ignore */ } }
   unlisteners = [];
   if (settleTimer !== undefined) { clearTimeout(settleTimer); settleTimer = undefined; }
+  if (bcTimer !== undefined) { clearTimeout(bcTimer); bcTimer = undefined; }
+  bcPending = null;
+  if (raiseTimer !== undefined) { clearTimeout(raiseTimer); raiseTimer = undefined; }
   setPreview(false);
   grouped = false; offsetFromBase = null; syncing = false; expected = null; suppressUntil = 0;
   evalPending = false; previewPending = false;
@@ -156,6 +227,7 @@ async function mirrorToBase(basePos: XY): Promise<void> {
   const target = { x: Math.round(basePos.x + offsetFromBase.x), y: Math.round(basePos.y + offsetFromBase.y) };
   expected = target;
   try { await getCurrentWindow().setPosition(new PhysicalPosition(target.x, target.y)); } catch { /* ignore */ }
+  raiseAboveBase();
   queueMicrotask(() => { syncing = false; });
 }
 
@@ -191,7 +263,12 @@ function schedulePreview(): void {
 async function evaluateSnapPreview(): Promise<void> {
   if (grouped) { setPreview(false); return; }
   const self = getCurrentWindow();
-  const baseWin = await WebviewWindow.getByLabel(BASE_LABEL);
+  let baseWin = await WebviewWindow.getByLabel(baseLabel);
+  // 基准窗可能已被销毁而没送达 snap:closed：先重解析回退，否则永远只认一扇不存在的窗。
+  if (!baseWin && baseLabel !== BASE_LABEL) {
+    await refreshSnapBase();
+    baseWin = await WebviewWindow.getByLabel(baseLabel);
+  }
   if (!baseWin) { setPreview(false); return; }
   let base: Geom, ss: { width: number; height: number }, sp: { x: number; y: number };
   try { base = await geom(baseWin); ss = await self.outerSize(); sp = await self.outerPosition(); } catch { return; }
@@ -202,7 +279,12 @@ async function evaluateSnapPreview(): Promise<void> {
 async function evaluateSnapOnce(): Promise<void> {
   if (grouped) return;
   const self = getCurrentWindow();
-  const baseWin = await WebviewWindow.getByLabel(BASE_LABEL);
+  let baseWin = await WebviewWindow.getByLabel(baseLabel);
+  // 同 evaluateSnapPreview：基准窗消失时先回退到主窗，再评估吸附。
+  if (!baseWin && baseLabel !== BASE_LABEL) {
+    await refreshSnapBase();
+    baseWin = await WebviewWindow.getByLabel(baseLabel);
+  }
   if (!baseWin) return;
   let base: Geom, ss: { width: number; height: number }, sp: { x: number; y: number };
   try { base = await geom(baseWin); ss = await self.outerSize(); sp = await self.outerPosition(); } catch { return; }
@@ -220,6 +302,7 @@ async function evaluateSnapOnce(): Promise<void> {
   grouped = true;
   setPreview(false);
   flashSnap();                                            // 吸附成功特效
+  raiseAboveBase();                                       // 吸上后立即贴到基准窗之上
   try { await emit("snap:join", { label: myLabel }); } catch { /* ignore */ }
 }
 

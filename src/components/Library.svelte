@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { regeneratePdfCover, renderCoverImage } from "../lib/pdf";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
-  import { appConfirm, appChoose, config, convertState, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
+  import { appConfirm, appChoose, config, convertState, libSession, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
   import { updateState } from "../lib/update.svelte";
   import { dragSort } from "../lib/dragSort";
@@ -78,8 +78,9 @@ import { reorderByDrop } from "../lib/reorder";
       catch { return null; }
     })()
   );
-  let queryInput = $state("");
-  let query = $state("");
+  // 搜索词放模块级共享状态：进书会销毁本组件，返回时输入框与检索结果都保留。
+  let queryInput = $derived(libSession.queryInput);
+  let query = $derived(libSession.query);
   let sortKey = $state<"added" | "lastread" | "title" | "recent" | "size">(
     (() => {
       try {
@@ -122,6 +123,20 @@ import { reorderByDrop } from "../lib/reorder";
     dirs: string[];
     at: number;
   } | null>(null);
+
+  // DEV 探针：定位「进书返回后滚动位置丢失」。生产构建由 import.meta.env.DEV 摇掉。
+  function scrollProbe(tag: string, data: Record<string, unknown>): void {
+    if (!import.meta.env.DEV) return;
+    try {
+      const w = window as unknown as { __tpLibProbe?: unknown[] };
+      const arr = w.__tpLibProbe ?? [];
+      arr.push({ tag, t: Date.now(), ...data });
+      const last = arr.slice(-24);
+      w.__tpLibProbe = last;
+      console.warn("[tp-lib-probe]", tag, JSON.stringify(data));
+      void api.setSetting("debug.scrollProbe", JSON.stringify(last)).catch(() => {});
+    } catch { /* ignore */ }
+  }
 
   async function loadScanStale() {
     try {
@@ -1053,8 +1068,18 @@ import { reorderByDrop } from "../lib/reorder";
     const step = view === "grid" ? cellH : ROW_H;
     const row = view === "grid" ? Math.floor(r / Math.max(1, cols)) : r;
     const top = row * step;
+    const domBefore = gridEl.scrollTop;
     gridEl.scrollTop = top;
     scrollTop = top;
+    scrollProbe("scroll-to-rank", {
+      rank: r,
+      cols,
+      cellH,
+      top,
+      domBefore,
+      domAfter: gridEl.scrollTop,
+      total,
+    });
   }
 
   /** 重建有序 id 索引（换排序 / 换查询 / 增删书 / 首次进入）。
@@ -1203,7 +1228,25 @@ import { reorderByDrop } from "../lib/reorder";
     void backfillPdfCovers();
   }
   // 离开书架（组件卸载）即停止：令牌 +1 让在跑的循环在下一次检查点退出。
-  onDestroy(() => { pdfCoverToken++; clearTimeout(pdfCoverTimer); });
+  // 同时记下顶部锚点与滚动位置：进书后返回书库时据此还原视线。
+  onDestroy(() => {
+    pdfCoverToken++;
+    clearTimeout(pdfCoverTimer);
+    libSession.anchor = topAnchor() ?? null;
+    libSession.scrollTop = scrollTop;
+    scrollProbe("save", {
+      query: libSession.query,
+      anchor: libSession.anchor,
+      scrollTop: libSession.scrollTop,
+      indexMode,
+      view,
+      cols,
+      cellH,
+      gridW,
+      gridH,
+      total,
+    });
+  });
 
   /** 首屏取到行后向后端报一次「已进入书库」：启动日志据此判定上一轮是否崩溃，
    *  连续启动失败时下一次启动自动跳过封面重建。只报一次。 */
@@ -1273,7 +1316,7 @@ import { reorderByDrop } from "../lib/reorder";
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       if (q !== query) {
-        query = q;
+        libSession.query = q;
         reload();
       }
     }, 250);
@@ -1693,7 +1736,70 @@ import { reorderByDrop } from "../lib/reorder";
     }
     loadFolders();
     loadFormats();
-    reload();
+    // 进书返回时若有保存的锚点或滚动位置：按锚点重建后复原视线；否则照旧全量重载回顶。
+    if (libSession.anchor || libSession.scrollTop > 0) {
+      loading = true;
+      total = 0;
+      scrollProbe("restore-start", {
+        anchor: libSession.anchor,
+        savedScrollTop: libSession.scrollTop,
+        query: libSession.query,
+        view,
+        gridW,
+        gridH,
+        cols,
+        cellH,
+      });
+      void (async () => {
+        await rebuildIndex(libSession.anchor ?? undefined);
+        scrollProbe("restore-after-rebuild", {
+          indexMode,
+          total,
+          scrollTop,
+          domScroll: gridEl ? gridEl.scrollTop : null,
+          cols,
+          cellH,
+          gridW,
+          gridH,
+        });
+        // 挂载时 total=0、虚拟列表占位高度尚未建立，重建期间设的 scrollTop 会被浏览器夹回 0；
+        // 等 total 写入、DOM 高度建立后再设一次：回落档没有锚点，全靠这一步复原原位置。
+        await tick();
+        if (indexMode) {
+          // 索引档：重建时 scrollToRank 已按锚点算出目标行，这里把同一个值重新落到已建立高度的 DOM。
+          if (gridEl) gridEl.scrollTop = scrollTop;
+        } else {
+          if (gridEl) gridEl.scrollTop = libSession.scrollTop;
+          scrollTop = libSession.scrollTop;
+        }
+        scrollProbe("restore-after-apply", {
+          indexMode,
+          total,
+          scrollTop,
+          domScroll: gridEl ? gridEl.scrollTop : null,
+          cols,
+          cellH,
+          gridW,
+          gridH,
+        });
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            scrollProbe("restore-final", {
+              indexMode,
+              total,
+              scrollTop,
+              domScroll: gridEl ? gridEl.scrollTop : null,
+              cols,
+              cellH,
+              gridW,
+              gridH,
+            });
+          });
+        });
+      })();
+    } else {
+      reload();
+    }
     kickPdfCovers(); // 进书库就补一轮缺封面的 PDF（手动模式内部直接返回）
     // 启动竞态修复：首次 `meta-progress` 常在 webview 挂载前发出而丢失，仅靠事件会让底栏空着。
     // 挂载后主动拉一次当前进度快照初始化（若已有事件先到则保留更新值；后续帧仍由 meta-progress 事件更新）。
@@ -1803,6 +1909,13 @@ import { reorderByDrop } from "../lib/reorder";
       if (indexMode) void refreshVisibleIndex();
       else void reloadWindow();
     });
+    // 任何窗口打开书（含独立书窗）后端都会广播：主窗停在书库时重拉当前窗口，
+    // 让「最近阅读」排序即时反映刚打开的书。
+    const u11 = listen("book-opened", () => {
+      // 主窗自己开书时事件也会到，此刻正在离开书库，无需刷新。
+      if (ui.view !== "library") return;
+      void reloadWindow();
+    });
     let u3: Promise<() => void> | null = null;
     import("@tauri-apps/api/webview")
       .then((m) => {
@@ -1826,6 +1939,7 @@ import { reorderByDrop } from "../lib/reorder";
       u6.then((f) => f());
       u7.then((f) => f());
       u8.then((f) => f());
+      u11.then((f) => f());
       u9.then((f) => f());
       u10.then((f) => f());
       u3?.then((f) => f());
@@ -1868,7 +1982,18 @@ import { reorderByDrop } from "../lib/reorder";
         <div class="rm-backdrop" out:outDissolve onclick={() => (refreshMenu = false)}></div>
       {/if}
     </div>
-    <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={queryInput} />
+    <div class="search-wrap">
+      <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={libSession.queryInput} />
+      {#if libSession.queryInput}
+        <button
+          class="search-clear"
+          data-testid="lib-search-clear"
+          title={t("library.toolbar.clearSearch")}
+          aria-label={t("library.toolbar.clearSearch")}
+          onclick={() => (libSession.queryInput = "")}
+        ><IconX size={16} stroke={1.5} /></button>
+      {/if}
+    </div>
     <select data-testid="lib-sort" bind:value={sortKey} onchange={onSortChange}>
       <option value="lastread">{t("library.sort.lastread")}</option>
       <option value="added">{t("library.sort.added")}</option>
@@ -2267,6 +2392,44 @@ import { reorderByDrop } from "../lib/reorder";
 
   .search {
     width: 220px;
+    padding-right: 26px;
+  }
+
+  .search-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .search-clear {
+    position: absolute;
+    right: 3px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    min-height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-sm);
+    color: var(--fg2);
+    cursor: pointer;
+  }
+
+  .search-clear:hover {
+    background: var(--hover-bg);
+    color: var(--fg);
+  }
+  /* 全局 button:active 的位移优先级更高，会把按钮从居中位置拉下来；按下时保持居中。 */
+  .search-clear:active:not(:disabled) {
+    transform: translateY(-50%);
+  }
+  .search-clear :global(svg) {
+    flex: none;
   }
 
   .spacer { flex: 1; }

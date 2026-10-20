@@ -11,6 +11,7 @@
     "opener:allow-default-urls",
     "core:webview:allow-create-webview-window",
     "core:window:allow-close",
+    "core:window:allow-destroy",
     "core:window:allow-create",
     "core:window:allow-show",
     "core:window:allow-set-focus",

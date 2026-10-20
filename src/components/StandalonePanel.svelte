@@ -11,6 +11,7 @@
   import { api } from "../lib/api";
   import { mergeOutlineTitles, retitlePdfPageToc, type PdfOutlineItem } from "../lib/pdfPage";
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { setSnapBaseLabelProvider, refreshSnapBase } from "../lib/windowSnap";
   import type { TocEntry, HighlightRow, BookmarkRow } from "../lib/types";
   import TocPanel from "./TocPanel.svelte";
   import HighlightsPanel from "./HighlightsPanel.svelte";
@@ -35,6 +36,8 @@
   let unBm: UnlistenFn | null = null;
   let unStats: UnlistenFn | null = null;
   let unBook: UnlistenFn | null = null;
+  let unClosed: UnlistenFn | null = null;
+  let unActive: UnlistenFn | null = null;
 
   async function loadTitle() {
     try {
@@ -83,6 +86,12 @@
     document.documentElement.style.setProperty("--tp-titlebar-h", "40px");
   });
 
+  // 吸附基准：面板窗吸到「打开这本书的独立书窗」；该窗不在时回退主窗。
+  onMount(() => {
+    setSnapBaseLabelProvider(() => (bookId ? `reader-${bookId}` : "main"));
+    void refreshSnapBase();
+  });
+
   onMount(async () => {
     // 订阅主窗广播。除「换书」外都只对当前书生效。
     unChap = await listen<{ bookId: number; index: number }>("tidepage-chapter-changed", (e) => {
@@ -99,10 +108,32 @@
     unStats = await listen<{ bookId: number }>("tidepage-stats-changed", (e) => {
       if (e.payload?.bookId === bookId) statsVersion++;
     });
+    // 多本书窗并存：跟随最近激活的书窗（内容与吸附基准一起切过去）。
+    unActive = await listen<{ bookId: number; title?: string }>("tidepage-book-active", async (e) => {
+      const id = Number(e.payload?.bookId ?? 0);
+      if (!id || id === bookId) return;
+      bookId = id;
+      title = e.payload?.title || "";
+      void refreshSnapBase();
+      await load();
+    });
+    unClosed = await listen<{ bookId: number }>("tidepage-book-closed", (e) => {
+      if (!bookId || Number(e.payload?.bookId) !== bookId) return;
+      // 当前书已关闭：清空面板内容回到空状态，等下一本打开再显示（笔记面板不绑书，不受影响）。
+      bookId = 0;
+      title = "";
+      toc = [];
+      bookmarks = [];
+      curChapter = 0;
+      hlVersion++;
+      statsVersion++;
+      void refreshSnapBase();
+    });
     unBook = await listen<{ bookId: number; title?: string }>("tidepage-book-changed", async (e) => {
       const id = Number(e.payload?.bookId ?? 0);
       if (!id || id === bookId) return; // 0=主窗没在读书；同书不重复加载
       bookId = id;
+      void refreshSnapBase();
       title = e.payload?.title || "";
       await load();
     });
@@ -118,6 +149,8 @@
     unBm?.();
     unStats?.();
     unBook?.();
+    unClosed?.();
+    unActive?.();
   });
 
   function gotoChapter(index: number) {
@@ -132,7 +165,9 @@
   <!-- 顶部标题栏：无边框窗口的拖拽区（空白处拖动、双击最大化/还原）；
        右上角自绘窗口控制按钮浮于其上。面板内容整体下移让开这条 40px 的标题栏。 -->
   <div class="win-titlebar" data-tauri-drag-region></div>
-  {#if panel === "toc"}
+  {#if !bookId && panel !== "notes"}
+    <div class="pw-empty">{t("panel.noBook")}</div>
+  {:else if panel === "toc"}
     <TocPanel {toc} current={curChapter} onpick={(i) => gotoChapter(i)} />
   {:else if panel === "bookmarks"}
     <div class="sidepanel">

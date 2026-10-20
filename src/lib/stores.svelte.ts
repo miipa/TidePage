@@ -2734,6 +2734,16 @@ export const ui = $state({
   lastCoverId: 0,
 });
 
+/** 书库进出书后保留的会话级状态：搜索词、离开时的顶部锚点与滚动位置。
+ *  书库与阅读界面是条件渲染，切进阅读会销毁书库组件，这些值放模块级才不会丢。
+ *  只活在本次运行内，不写 localStorage（便携模式下各窗口的 localStorage 不共享）。 */
+export const libSession = $state({
+  queryInput: "",
+  query: "",
+  anchor: null as { id: number; rank: number } | null,
+  scrollTop: 0,
+});
+
 export const convertState = $state({
   open: false,
   book: null as { id: number; title: string; path: string; format: string } | null,

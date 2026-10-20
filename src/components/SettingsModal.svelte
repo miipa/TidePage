@@ -1677,7 +1677,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       <div class="set-search">
         <input placeholder={t("settings.nav.searchPlaceholder")} bind:value={navQuery} aria-label={t("settings.nav.searchAria")} onkeydown={(e) => { if (e.key === "Escape") navQuery = ""; }} />
         {#if navQuery}
-          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}><IconX /></button>
+          <button class="set-search-clear" title={t("settings.nav.clear")} aria-label={t("settings.nav.clearSearchAria")} onclick={() => (navQuery = "")}><IconX size={16} stroke={1.5} /></button>
         {/if}
       </div>
       <div class="set-nav-list" role="tablist" aria-label={t("settings.nav.group")} aria-orientation="vertical" onkeydown={onNavKeydown} use:dragSort={{ onDrop: navDrop, axis: "y" }}>
@@ -3177,19 +3177,33 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     display: flex;
     align-items: center;
     justify-content: center;
+    /* 全局 button 的 padding/min-height 会把 20px 宽的按钮内容区挤成 0（图标不可见），
+       并把盒高抬到 30px（translateY(-50%) 的居中基准随之偏移），这里一并覆盖。 */
+    padding: 0;
+    min-height: 0;
     border: none;
     background: transparent;
-    color: var(--fg2);
+    color: var(--fg);
+    opacity: 0.72;
     cursor: pointer;
     border-radius: 50%;
     font-size: var(--fs-md);
     letter-spacing: var(--ls-md);
     line-height: 1;
-    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+      opacity var(--dur) var(--ease);
   }
   .set-search-clear:hover {
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--fg);
+    opacity: 1;
+  }
+  /* 全局 button:active 的位移优先级更高，会把按钮从居中位置拉下来；按下时保持居中。 */
+  .set-search-clear:active:not(:disabled) {
+    transform: translateY(-50%);
+  }
+  .set-search-clear :global(svg) {
+    flex: none;
   }
 
 

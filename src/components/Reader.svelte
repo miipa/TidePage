@@ -1362,6 +1362,12 @@ import {
     }
   });
 
+  /** 广播本窗当前的书：多本书窗并存时，面板窗跟随最近激活的那本书窗。 */
+  function emitBookActive() {
+    if (!book) return;
+    void emit("tidepage-book-active", { bookId: book.book.id, title: book.book.title || "" });
+  }
+
   export async function open(bookId: number) {
     openError = "";
     try {
@@ -1446,6 +1452,7 @@ import {
           });
       }
       ui.currentBookId = book.book.id;
+      emitBookActive();
       // 弹出面板窗（目录/书签/划线/统计）的窗口 label 与书无关：换书后必须广播，
       // 让面板切到当前这本书（面板自己按 tidepage-book-changed 重载）。
       void emit("tidepage-book-changed", { bookId: book.book.id, title: book.book.title || "" });
@@ -1556,6 +1563,8 @@ import {
     sessionId = 0;
     if (statsTimer) clearInterval(statsTimer);
     scroller?.destroy();
+    // 关闭书籍：通知面板窗清空当前书，等下一本打开再显示。
+    if (book) await emit("tidepage-book-closed", { bookId: book.book.id });
     book = null;
     tocCharsTotal = 0;
     chapter = null;
@@ -4696,14 +4705,22 @@ import {
   function goBack() {
     stopTts();
     if (standalone) {
-      try {
-        doSaveProgress();
-        flushSession(true);
-      } catch { /* ignore */ }
-      import("@tauri-apps/api/window").then((m) => m.getCurrentWindow().close()).catch(() => { try { window.close(); } catch { /* ignore */ } });
-    } else {
-      close().then(() => (ui.view = "library"));
+      // 独立书窗关窗前按主窗 close() 的顺序补齐保存序列：先发云端推送（不 await，命令在
+      // 后端运行时执行，关窗不取消），再等本地进度落库与阅读时长结算，全部完成后才关窗。
+      void (async () => {
+        try {
+          webdavPush();
+          await doSaveProgress();
+          await flushSession(true);
+        } catch { /* ignore */ }
+        try {
+          const m = await import("@tauri-apps/api/window");
+          await m.getCurrentWindow().close();
+        } catch { try { window.close(); } catch { /* ignore */ } }
+      })();
+      return;
     }
+    close().then(() => (ui.view = "library"));
   }
 
   /** DEV 输入日志条目（__tpDebug.inputLog）：取证用，release 构建随 DEV 块一起被摇掉。
@@ -5253,6 +5270,12 @@ import {
       const i = e.payload?.index;
       if (book && typeof i === "number" && i >= 0 && i < book.toc.length) void navTo(i, { at: "head", extra: 0 });
     });
+    // 多本书窗并存：本窗获得焦点时广播当前书，面板窗跟随激活的书窗。
+    const bookFocusUn = import("@tauri-apps/api/window").then((m) =>
+      m.getCurrentWindow().onFocusChanged(({ payload }) => {
+        if (payload && book) emitBookActive();
+      }),
+    );
     const gotoHlUn = listen<{ id: number }>("tidepage-goto-highlight", async (e) => {
       const id = e.payload?.id;
       if (typeof id !== "number") return;
@@ -5271,6 +5294,7 @@ import {
       aiDockUn.then((un) => un()).catch(() => {});
       gotoChUn.then((un) => un()).catch(() => {});
       gotoHlUn.then((un) => un()).catch(() => {});
+      bookFocusUn.then((un) => un()).catch(() => {});
       clearTimeout(fsHintTimer);
       doSaveProgress();
       const el = document.getElementById("tidepage-dynamic-css");

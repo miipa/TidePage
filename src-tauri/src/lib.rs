@@ -174,6 +174,51 @@ fn restore_main_window_state(window: &tauri::WebviewWindow) {
     }
 }
 
+/// 把调用方窗口抬到指定基准窗之上（不移动、不改尺寸、不激活）。
+/// 用于吸附成组时让卫星窗紧贴其基准窗显示，且不置顶到其它程序之上。
+#[tauri::command]
+fn raise_above(window: tauri::WebviewWindow, base_label: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        use ::windows::Win32::Foundation::HWND;
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            GetWindow, SetWindowPos, GW_HWNDPREV, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SET_WINDOW_POS_FLAGS,
+        };
+        let app = window.app_handle();
+        let base = app.get_webview_window(&base_label).ok_or("base window not found")?;
+        let hwnd = HWND(window.hwnd().map_err(|e| e.to_string())?.0);
+        let base_hwnd = HWND(base.hwnd().map_err(|e| e.to_string())?.0);
+        // SetWindowPos 的 hWndInsertAfter 是「插到这扇窗的下面」：直接把基准窗传进来会把
+        // 卫星压到基准窗之下。要落在基准窗之上，应插到基准窗当前上方邻窗的下面；基准窗
+        // 已在最前（上方无窗）时用 HWND_TOP。
+        let insert_after = match unsafe { GetWindow(base_hwnd, GW_HWNDPREV) }.ok() {
+            // 已经紧贴在基准窗之上，不必再动。
+            Some(h) if h.0 == hwnd.0 => return Ok(()),
+            Some(h) if !h.0.is_null() => h,
+            _ => HWND_TOP,
+        };
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(insert_after),
+                0,
+                0,
+                0,
+                0,
+                SET_WINDOW_POS_FLAGS(SWP_NOMOVE.0 | SWP_NOSIZE.0 | SWP_NOACTIVATE.0),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (&window, &base_label);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -185,9 +230,35 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(WINDOW_STATE_FLAGS)
+                // 独立书窗的 label 是 reader-<id>（每本一个），插件按 label 各存各的，
+                // 新书没有历史尺寸就会用建窗时的固定初值。归并成同一个 reader 键后，
+                // 所有书窗共享一份尺寸与位置，新书沿用最近一次调整的结果。
+                .map_label(|label: &str| {
+                    if label.starts_with("reader-") {
+                        "reader"
+                    } else {
+                        label
+                    }
+                })
                 .skip_initial_state("main")
                 .build(),
         )
+        // 主窗关闭时连带关闭所有子窗（书窗 / 面板窗 / AI 窗）：每个子窗走自己的关闭流程，
+        // 窗口状态插件据此落盘；不用 exit 硬退。若将来有子窗拦截关闭，这里会留下残留进程。
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                use tauri::Manager;
+                let app = window.app_handle();
+                for (label, w) in app.webview_windows() {
+                    if label != "main" {
+                        let _ = w.close();
+                    }
+                }
+            }
+        })
         .setup(|app| {
             use tauri::Manager;
             let data_dir = data_dir(app.handle());
@@ -708,6 +779,7 @@ pub fn run() {
             library::get_book_word_count,
             library::book_char_counts,
             library::random_book_filtered,
+            raise_above,
             secret::secret_write,
             secret::secret_read,
             update::check_update,
