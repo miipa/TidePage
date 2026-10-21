@@ -47,6 +47,8 @@ export const api = {
     invoke<{
       removed: number;
       added: number;
+      /** 删除阶段失败的行数（>0 时前端提示「部分未能删除」）。 */
+      failed: number;
       /** 被挂起等待确认的待删条数（>0 表示需要二次确认）。 */
       pending: number;
       /** 因父目录不可列举被跳过的条数（>0 且 removed=0 表示本次什么也没删）。 */

@@ -198,17 +198,44 @@ pub fn layout_cover(title: &str, author: &str, w: usize, h: usize) -> CoverLayou
 }
 
 /// 解析 `#rgb` / `#rrggbb` 为 (r,g,b)；失败返回 None。
-fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
+/// 先判 ASCII 再按字节解析：旧实现按字节下标切片 `&full[0..2]`，
+/// 非 ASCII 字符（如 "中"，3 字节）会落在字符中间 panic；颜色值来自 URL 查询串，不可信。
+pub(crate) fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     let h = hex.trim().trim_start_matches('#');
-    let full = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => return None,
-    };
-    let r = u8::from_str_radix(&full[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&full[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&full[4..6], 16).ok()?;
-    Some((r, g, b))
+    if !h.is_ascii() {
+        return None;
+    }
+    let b = h.as_bytes();
+    // 单个十六进制字符 → 数值（ASCII 已保证，非 0-9a-fA-F 返回 None）。
+    let digit = |c: u8| (c as char).to_digit(16).map(|v| v as u8);
+    let pair = |hi: u8, lo: u8| -> Option<u8> { Some(digit(hi)? * 16 + digit(lo)?) };
+    match b.len() {
+        // 3 位缩写按字节展开，不再经过 String 拼接。
+        3 => Some((pair(b[0], b[0])?, pair(b[1], b[1])?, pair(b[2], b[2])?)),
+        6 => Some((pair(b[0], b[1])?, pair(b[2], b[3])?, pair(b[4], b[5])?)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod color_parse_tests {
+    use super::parse_hex;
+
+    /// 非 ASCII 输入必须返回 None 而不是 panic（旧实现按字节切片会落在字符中间）。
+    #[test]
+    fn parse_hex_rejects_non_ascii_without_panic() {
+        assert_eq!(parse_hex("中"), None);
+        assert_eq!(parse_hex("中文"), None);
+        assert_eq!(parse_hex("#中中中"), None);
+        assert_eq!(parse_hex("é"), None);
+        // 合法值不受影响：3 位缩写与 6 位全量都按字节解析。
+        assert_eq!(parse_hex("#abc"), Some((0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_hex("#A1B2C3"), Some((0xa1, 0xb2, 0xc3)));
+        // 长度只接受 3 / 6，其它一律 None（不再走 chars 展开）。
+        assert_eq!(parse_hex("#12345"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(parse_hex("#gggggg"), None);
+    }
 }
 
 fn srgb_chan(c: u8) -> f64 {
@@ -226,20 +253,23 @@ pub fn hex_is_light(hex: &str) -> bool {
     parse_hex(hex).map(|(r, g, b)| rel_lum(r, g, b) > 0.45).unwrap_or(false)
 }
 
-/// 分析已缩放底图「书名显示区域」（底部 42%）的平均亮度，判断该区偏亮还是偏暗。
-/// 返回 true=偏亮（应配深色字），false=偏暗（应配浅色字）。带 alpha 加权，透明像素不计。
+/// 分析已缩放底图「顶部书名区」（与 layout_cover 的叠字带一致）的平均亮度，
+/// 判断该区偏亮还是偏暗。返回 true=偏亮（应配深色字），false=偏暗（应配浅色字）。
+/// 带 alpha 加权，透明像素不计。
 pub fn region_is_light(img: &image::RgbaImage) -> bool {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return false;
     }
-    let y0 = ((h as f64) * 0.58) as u32; // 下部 42%（与文字区一致）
+    // 与 layout_cover 的书名区一致：480 高封面从 62px 起、高 42% 的带状区域。
+    let y0 = ((h as f64) * (62.0 / 480.0)).round() as u32;
+    let y1 = (y0 + ((h as f64) * 0.42).round() as u32).min(h);
     let sx = (w / 80).max(1);
-    let sy = ((h - y0) / 80).max(1);
+    let sy = ((y1 - y0) / 80).max(1);
     let mut sum = 0f64;
     let mut wsum = 0f64;
     let mut y = y0;
-    while y < h {
+    while y < y1 {
         let mut x = 0u32;
         while x < w {
             let p = img.get_pixel(x, y);
@@ -254,6 +284,32 @@ pub fn region_is_light(img: &image::RgbaImage) -> bool {
         return false;
     }
     sum / wsum > 0.5
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::region_is_light;
+
+    fn canvas(top_bright: bool) -> image::RgbaImage {
+        let mut img = image::RgbaImage::new(320, 480);
+        let y0 = (480.0f64 * (62.0 / 480.0)).round() as u32; // 62
+        let y1 = (y0 + (480.0f64 * 0.42).round() as u32).min(480); // 264
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let in_band = y >= y0 && y < y1;
+            let v = if in_band == top_bright { 235 } else { 20 };
+            *p = image::Rgba([v, v, v, 255]);
+        }
+        img
+    }
+
+    /// 顶部书名带亮、其余暗 → 偏亮；反过来 → 偏暗；全透明 → 偏暗（false）。
+    #[test]
+    fn samples_top_title_band() {
+        assert!(region_is_light(&canvas(true)), "顶部书名带亮应判定为偏亮");
+        assert!(!region_is_light(&canvas(false)), "顶部书名带暗应判定为偏暗");
+        let transparent = image::RgbaImage::new(320, 480);
+        assert!(!region_is_light(&transparent), "全透明没有有效像素，按偏暗处理");
+    }
 }
 
 /// 默认封面的可主题化样式（外壳主题驱动 / 自定义底图自适应）。

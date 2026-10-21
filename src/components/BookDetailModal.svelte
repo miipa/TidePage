@@ -1,6 +1,6 @@
 <script lang="ts">
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { api, coverUrl } from "../lib/api";
   import { regeneratePdfCover } from "../lib/pdf";
 import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
@@ -8,7 +8,16 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   import { outDissolve, outFade } from "../lib/motion";
   import type { BookRow, BookSession } from "../lib/types";
 
-  let { book, onclose }: { book: BookRow; onclose: () => void } = $props();
+  let {
+    book,
+    onclose,
+    onupdated,
+  }: {
+    book: BookRow;
+    onclose: () => void;
+    /** 保存成功后的回调：由父组件把新标题/作者写回结果集（不再就地改父对象的 book）。 */
+    onupdated?: (title: string, author: string) => void;
+  } = $props();
 
   let title = $state(book.title);
   let author = $state(book.author);
@@ -17,13 +26,28 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   let wc = $state<{ total: number; pure: number } | null>(null);
   let progress = $state<{ chapter_index: number; chapter_ratio: number; pct: number; updated_at: number } | null>(null);
   let coverTick = $state(0);
+  /** 从文件名识别出的建议（只展示，不自动保存/写库）。 */
+  let suggestion = $state<{ title: string; author: string } | null>(null);
 
   const cover = $derived(coverUrl(book) + (coverTick ? `&t=${coverTick}` : ""));
 
+  // Esc 关闭：捕获阶段拦截，避免同一次 Esc 继续触发下层阅读器的返回/关闭快捷键。
+  let keyHandler: ((e: KeyboardEvent) => void) | undefined;
   onMount(async () => {
+    keyHandler = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      onclose();
+    };
+    window.addEventListener("keydown", keyHandler, true);
     try { sessions = await api.getBookSessions(book.id); } catch { /* ignore */ }
     try { wc = await api.bookWordCount(book.id); } catch { /* ignore */ }
     try { progress = await api.loadProgress(book.id); } catch { /* ignore */ }
+    try { suggestion = await api.suggestMeta(book.path); } catch { /* 建议失败不影响详情框 */ }
+  });
+  onDestroy(() => {
+    if (keyHandler) window.removeEventListener("keydown", keyHandler, true);
   });
 
   const totalSeconds = $derived(sessions.reduce((a, s) => a + s.seconds, 0));
@@ -57,8 +81,8 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
     saving = true;
     try {
       await api.updateBookMeta(book.id, title.trim(), author.trim());
-      book.title = title.trim();
-      book.author = author.trim();
+      // 不就地改父对象：交给父组件回调更新结果集（本地 title/author 已是新值，显示不受影响）。
+      onupdated?.(title.trim(), author.trim());
       toast(t("bookDetail.savedInApp"));
     } catch (e) {
       toast(errText(e), "error");
@@ -76,14 +100,20 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
     writing = true;
     try {
       await api.writeBookMeta(book.id, title.trim(), author.trim());
-      book.title = title.trim();
-      book.author = author.trim();
+      onupdated?.(title.trim(), author.trim());
       toast(t("bookDetail.written"));
     } catch (e) {
       toast(errText(e), "error");
     } finally {
       writing = false;
     }
+  }
+
+  /** 只把建议填进输入框：不保存、不写库、不改 book。 */
+  function applySuggestion() {
+    if (!suggestion) return;
+    if (suggestion.title) title = suggestion.title;
+    if (suggestion.author) author = suggestion.author;
   }
 
   function infoText(): string {
@@ -166,6 +196,19 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
             <button class="icon" data-testid="bd-copy-author" title={t("bookDetail.copyAuthor")} onclick={() => copyText(author).then(() => toast(t("common.toast.copied")))}><IconCopy /></button>
           </div>
         </div>
+
+        {#if suggestion && (suggestion.title || suggestion.author)
+            && (suggestion.title !== title || suggestion.author !== author)}
+          <div class="bd-suggest" data-testid="bd-suggest">
+            <span class="bd-suggest-label">{t("bookDetail.suggest.label")}</span>
+            <span class="bd-suggest-value">
+              {#if suggestion.title}《{suggestion.title}》{/if}
+              {#if suggestion.title && suggestion.author} · {/if}
+              {#if suggestion.author}{suggestion.author}{/if}
+            </span>
+            <button class="bd-suggest-apply" data-testid="bd-suggest-apply" onclick={applySuggestion}>{t("bookDetail.suggest.apply")}</button>
+          </div>
+        {/if}
 
         <div class="bd-grid">
           <div class="bd-kv"><span>{t("bookDetail.field.format")}</span><b>{book.format.toUpperCase()}</b></div>
@@ -299,6 +342,29 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   .bd-row { display: flex; gap: 6px; align-items: center; }
   .bd-row input { flex: 1; min-width: 0; }
   .bd-row input.path { font-size: var(--fs-xs); letter-spacing: var(--ls-xs); color: var(--fg2); }
+
+  .bd-suggest {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 2px 0 10px;
+    font-size: var(--fs-sm);
+    color: var(--fg2);
+    min-width: 0;
+  }
+  .bd-suggest-label { flex-shrink: 0; }
+  .bd-suggest-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bd-suggest-apply {
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--fg2);
+    font-size: var(--fs-sm);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .bd-suggest-apply:hover { color: var(--fg); }
 
   .bd-grid {
     display: grid;

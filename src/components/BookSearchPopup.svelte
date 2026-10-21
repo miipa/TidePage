@@ -1,4 +1,4 @@
-﻿<script lang="ts">
+<script lang="ts">
   import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
@@ -40,17 +40,22 @@
   let indexing = $state(false);
   let popEl: HTMLDivElement | undefined = $state();
 
+  // 请求序号：并发/迟到的旧查询不能覆盖新结果。
+  let runSeq = 0;
   async function run() {
     const q = query.trim();
     if (q.length < 2) return;
+    const my = ++runSeq;
     searching = true;
     try {
-      hits = await api.searchInBook(bookId, q);
+      const r = await api.searchInBook(bookId, q);
+      if (my !== runSeq) return; // 旧查询：丢弃
+      hits = r;
       searched = true;
     } catch (e) {
-      toast(String(e), "error");
+      if (my === runSeq) toast(String(e), "error");
     } finally {
-      searching = false;
+      if (my === runSeq) searching = false;
     }
   }
 

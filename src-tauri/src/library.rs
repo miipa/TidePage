@@ -10,6 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// 全书图片列表缓存条目：带文件指纹，同一路径的文件被就地替换后不再命中。
+pub struct CachedImages {
+    /// (size, mtime)：取自 file_stamp；None 表示取不到指纹，此时不做命中（每次都重算）。
+    pub stamp: Option<(i64, i64)>,
+    pub images: Arc<Vec<BookImage>>,
+}
+
+/// 全书图片列表缓存上限（按书数）。超限整体清空，实现简单且内存上限可预期。
+const MAX_IMAGE_CACHE: usize = 32;
+
 pub struct CachedEpub {
     pub doc: crate::epub::EpubDoc,
     pub data: Arc<Vec<u8>>,
@@ -44,6 +54,9 @@ pub struct AppState {
     pub app: AppHandle,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub last_fs_event: AtomicU64,
+    /// 文件监听收到的最近一批事件路径（保留最近 512 条，超出丢最旧）。
+    /// watcher 循环据它把事件映射到「包含该路径的已登记目录」，只扫描受影响目录。
+    pub fs_paths: Mutex<Vec<PathBuf>>,
     pub rules_ver: AtomicU64,
     pub txt_cache: Mutex<HashMap<i64, CachedText>>,
     pub epub_cache: Mutex<HashMap<i64, Arc<CachedEpub>>>,
@@ -54,8 +67,8 @@ pub struct AppState {
     /// 已渲染章节 LRU：key = (book_id, chapter_index) → ChapterData。
     /// 避免每次 get_chapter 重开 zip/重跑正则/重复 base64 内联图片；随书切换/规则变化清理。
     pub chapter_cache: Mutex<ChapterCache>,
-    /// 全书图片列表缓存：key = book_id。
-    pub image_cache: Mutex<HashMap<i64, Arc<Vec<BookImage>>>>,
+    /// 全书图片列表缓存：key = book_id → 带文件指纹的条目（见 CachedImages）。
+    pub image_cache: Mutex<HashMap<i64, CachedImages>>,
     // staged: 通用兜底 HTTP client（见 lib.rs:220-221 的蓄意预留说明）；实际各处 HTTP 各自建 client。
     #[allow(dead_code)]
     pub http: reqwest::Client,
@@ -372,12 +385,71 @@ pub(crate) fn plan_stale(
     }
 }
 
-/// 扫描来源：**只有 `user` 才允许弹提示**；`startup` / `timer` 一律静默，
+/// 进程级扫描互斥：**串行化全部扫描**（rescan / add_folder / 文件监听 / WebDAV 导入）。
+/// 不加锁时两轮扫描会并发：后完成的一轮读到前一轮刚写入 `stale_pending` 的条目，
+/// 会把它当成「上一次已确认缺失」直接删书，绕过两段确认保护。
+static SCAN_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 文件事件时间基准：用**单调时钟**而不是系统墙钟。
+/// 系统时间回拨时墙钟差值会变成负数/长时间不满足静默判定，自动扫描会停。
+static EVENT_CLOCK_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 进程启动以来的单调毫秒数（文件事件回调与监听循环共用同一基准）。
+fn event_now_ms() -> u64 {
+    EVENT_CLOCK_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 发一帧目录扫描进度（仅作用域扫描使用；`phase` = walk / diff / insert / done）。
+fn emit_folder_scan_progress(
+    app: &AppHandle,
+    origin: &str,
+    phase: &str,
+    scanned: usize,
+    added: usize,
+    running: bool,
+) {
+    app.emit(
+        "folder-scan-progress",
+        serde_json::json!({
+            "running": running,
+            "phase": phase,
+            "scanned": scanned,
+            "added": added,
+            "origin": origin,
+        }),
+    )
+    .ok();
+}
+
+/// 把一批文件路径映射到「包含它的已登记目录」（最长前缀），去重保序。
+/// 用于文件监听与 WebDAV 导入：只扫描受影响的已登记目录，不做全量遍历。
+fn registered_dirs_for_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    folders: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for path in paths {
+        let hit = folders
+            .iter()
+            .filter(|f| path.starts_with(Path::new(f.as_str())))
+            .max_by_key(|f| f.len());
+        if let Some(f) = hit {
+            if !out.iter().any(|x| x == f) {
+                out.push(f.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 扫描来源：**只有 `user` 才允许弹提示**；`timer` 一律静默，
 /// 异常态改由书库页首屏常驻提示条呈现（数据安全信号不能因为静默而消失）。
 /// 必须由调用方显式传入，不能从 `progress_scope` 推导：`rescan`（用户动作）传的也是 None。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScanOrigin {
-    Startup,
     Timer,
     User,
 }
@@ -385,7 +457,6 @@ pub enum ScanOrigin {
 impl ScanOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
-            ScanOrigin::Startup => "startup",
             ScanOrigin::Timer => "timer",
             ScanOrigin::User => "user",
         }
@@ -408,9 +479,13 @@ fn write_scan_state(conn: &rusqlite::Connection, v: serde_json::Value) {
 }
 
 pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>, origin: ScanOrigin) {
+    // 串行化全部扫描：并发扫描会互相误判 `stale_pending`（见 SCAN_GUARD 注释）。
+    let _scan_guard = SCAN_GUARD.lock().await;
     let origin_str = origin.as_str().to_string();
-    // 两段式第一段：进入扫描即写入"扫描中"（清掉上一轮结论）。
-    {
+    let full_scan = progress_scope.is_none();
+    // 两段式第一段：**全量扫描**进入即写入"扫描中"（清掉上一轮结论，异常中断不会残留旧状态）。
+    // 作用域扫描只覆盖部分目录，不能把上一轮的全量结论清掉，故不预写。
+    if full_scan {
         let conn = state.db.0.lock().unwrap();
         write_scan_state(
             &conn,
@@ -421,12 +496,38 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         let conn = state.db.0.lock().unwrap();
         db::list_folders(&conn)
     };
+    // 本次实际遍历的目录：Some(scope) 时只保留其中确实已登记的路径（去重、保序）；
+    // None 时等于全部已登记目录（全量扫描，行为与旧版一致）。
+    let walked_folders: Vec<String> = match progress_scope.as_ref() {
+        Some(scope) => {
+            let mut out: Vec<String> = Vec::new();
+            for s in scope {
+                if folders.iter().any(|f| f == s) && !out.contains(s) {
+                    out.push(s.clone());
+                }
+            }
+            out
+        }
+        None => folders,
+    };
+    // 嵌套登记目录去重：扫描只走最外层已登记目录，避免父目录与子目录被重复遍历。
+    // stale/registered/pending 的作用域仍用 walked_folders（判定要覆盖全部登记路径）。
+    let effective_walk: Vec<String> = walked_folders
+        .iter()
+        .filter(|f| {
+            !walked_folders.iter().any(|other| {
+                other != *f && Path::new(f.as_str()).starts_with(Path::new(other.as_str()))
+            })
+        })
+        .cloned()
+        .collect();
     let progress_on = progress_scope.is_some();
     memlog::stage("scan_folders:start");
     // ---- 阶段一：无锁遍历目录，收集 (path → size, mtime, title, ext) ----
-    let folders_walk = folders.clone();
     let prog_app = state.app.clone();
     let origin_inner = origin_str.clone();
+    // 遍历在阻塞线程池里执行，需要把目录列表移进闭包；只遍历最外层目录（effective_walk）。
+    let walk_folders = effective_walk.clone();
     // 返回四元组：found / scanned / 每目录命中文件数 / 遍历出错的目录与原因
     let (found, scanned, per_folder, walk_bad): (
         HashMap<String, (i64, i64, String, String)>,
@@ -437,21 +538,16 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
             let mut found: HashMap<String, (i64, i64, String, String)> = HashMap::new();
             let mut per_folder: HashMap<String, usize> = HashMap::new();
             let mut walk_bad: Vec<(String, String)> = Vec::new();
-            // scanned 只统计「本次进度范围内」的条目：不把其它已登记目录的条目算进去。
+            // scanned = 本次已遍历的文件数（遍历范围只有 walked_folders）。
             let mut scanned: usize = 0;
-            let emit = |scanned: usize, added: usize, running: bool| {
-                prog_app
-                    .emit(
-                        "folder-scan-progress",
-                        serde_json::json!({ "running": running, "scanned": scanned, "added": added, "origin": origin_inner }),
-                    )
-                    .ok();
+            let emit = |phase: &str, scanned: usize, added: usize, running: bool| {
+                emit_folder_scan_progress(&prog_app, &origin_inner, phase, scanned, added, running);
             };
             if progress_on {
-                emit(0, 0, true);
+                emit("walk", 0, 0, true);
             }
             let mut last_emit = std::time::Instant::now();
-            for folder in &folders_walk {
+            for folder in &walk_folders {
                 let mut folder_files: usize = 0;
                 let mut walk_err: Option<String> = None;
                 for entry in walkdir::WalkDir::new(folder).follow_links(false).into_iter() {
@@ -464,15 +560,8 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
                         }
                     };
                     let path = entry.path().to_string_lossy().into_owned();
-                    let scoped = progress_on
-                        && progress_scope
-                            .as_ref()
-                            .map(|sc| sc.iter().any(|s| Path::new(&path).starts_with(Path::new(s))))
-                            .unwrap_or(false);
-                    if scoped {
-                        scanned += 1;
-                    }
                     if entry.file_type().is_file() {
+                        scanned += 1;
                         if let Some(ext) = ext_of(&path) {
                             let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
                             let mtime = file_mtime(entry.path());
@@ -482,12 +571,12 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
                         }
                     }
 
-                    // 心跳：范围内每 200 条或至少每 ~300ms 发一帧（即使条目数没到 200）。
+                    // 心跳：每 200 个文件或至少每 ~300ms 发一帧（即使文件数没到 200）。
                     if progress_on
-                        && (last_emit.elapsed().as_millis() >= 300 || (scoped && scanned % 200 == 0))
+                        && (last_emit.elapsed().as_millis() >= 300 || (scanned > 0 && scanned % 200 == 0))
                     {
                         last_emit = std::time::Instant::now();
-                        emit(scanned, 0, true);
+                        emit("walk", scanned, 0, true);
                     }
                 }
                 per_folder.insert(folder.clone(), folder_files);
@@ -501,26 +590,45 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         .unwrap_or_default();
 
     memlog::stage_note("scan_folders:walked", &format!("found={}", found.len()));
-    // ---- 阶段二：一次性取锁读 `SELECT path FROM books` 入 HashSet，立即释放锁 ----
-    let existing: std::collections::HashSet<String> = {
+    // 遍历结束：即将进入差集/失效判定，前端底栏切到「正在比对书库」。
+    if progress_on {
+        emit_folder_scan_progress(&state.app, &origin_str, "diff", scanned, 0, true);
+    }
+    // ---- 阶段二：一次性取锁读 books 的路径元信息与 ignored 集合，立即释放锁 ----
+    // existing: path -> (id, size, mtime)；ignored: 「移出书库」的长期忽略路径。
+    let (existing, ignored) = {
         let conn = state.db.0.lock().unwrap();
-        db::all_paths_set(&conn)
+        (db::all_paths_meta(&conn), db::ignored_paths_all(&conn))
     };
 
     // ---- 阶段三：无锁求差集 ----
-    // 新增文件 = found - existing（不再逐条 get_book_by_path 判定 size/mtime；
-    // 存量文件的实时变更由文件监听 install_watcher 负责，启动扫描只补新增）。
+    // 新增文件 = 磁盘有、库中没有；被「移出书库」的路径长期忽略，不导回。
     let new_files: Vec<(String, i64, i64, String, String)> = found
         .iter()
-        .filter(|(p, _)| !existing.contains(p.as_str()))
+        .filter(|(p, _)| !existing.contains_key(p.as_str()) && !ignored.contains(p.as_str()))
         .map(|(p, (s, m, t, e))| (p.clone(), *s, *m, t.clone(), e.clone()))
         .collect();
-    // 失效文件 = existing 中位于已登记目录、但磁盘上已不存在（不在 found）的。
-    let stale_all: Vec<String> = existing
+    // 存量文件指纹变化：同一路径但 size/mtime 与库中不同（同名替换）。
+    // 只刷新指纹并重跑封面/文本，不当作新增重复插入。
+    let changed_files: Vec<(i64, i64, i64)> = found
         .iter()
+        .filter_map(|(p, (size, mtime, _, _))| {
+            existing.get(p.as_str()).and_then(|(id, db_size, db_mtime)| {
+                if db_size != size || db_mtime != mtime {
+                    Some((*id, *size, *mtime))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    // 失效文件 = existing 中位于**本次 walked 目录**、但磁盘上已不存在（不在 found）的。
+    // 必须收窄到 walked：作用域扫描没遍历其它目录，不能据此判定它们缺失。
+    let stale_all: Vec<String> = existing
+        .keys()
         .filter(|p| {
             !found.contains_key(p.as_str())
-                && folders
+                && walked_folders
                     .iter()
                     .any(|f| std::path::Path::new(p).starts_with(std::path::Path::new(f)))
         })
@@ -528,9 +636,10 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         .collect();
 
     // 每目录登记数：既用于「本轮该目录结果为空」的判定，也用于规模阈值的基数。
+    // 只统计 walked 目录下的登记数（阈值基数与本次扫描范围同口径）。
     let mut registered_per_folder: HashMap<String, usize> = HashMap::new();
-    for path in existing.iter() {
-        if let Some(f) = folders
+    for path in existing.keys() {
+        if let Some(f) = walked_folders
             .iter()
             .find(|f| std::path::Path::new(path).starts_with(std::path::Path::new(f)))
         {
@@ -548,7 +657,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         );
         skip_folders.push(f.clone());
     }
-    for f in folders.iter() {
+    for f in effective_walk.iter() {
         let hit = per_folder.get(f).copied().unwrap_or(0);
         let reg = registered_per_folder.get(f).copied().unwrap_or(0);
         if hit == 0 && reg > 0 && !skip_folders.contains(f) {
@@ -559,16 +668,31 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
             skip_folders.push(f.clone());
         }
     }
-    let (pending_prev, books_before) = {
+    let (pending_prev_all, books_before) = {
         let conn = state.db.0.lock().unwrap();
         (db::stale_pending_all(&conn), db::count_books(&conn))
+    };
+    // 两段确认的记忆也按扫描范围收窄：作用域扫描只判定本次 walked 目录下的待确认条目，
+    // 不能把其它目录的 pending 当成「文件已回来」清掉（否则它们会一直循环在首次判定）。
+    // 全量扫描保持旧行为：walked = 全部已登记目录，越界的 pending 一并清理。
+    let pending_prev: std::collections::HashSet<String> = if full_scan {
+        pending_prev_all
+    } else {
+        pending_prev_all
+            .into_iter()
+            .filter(|p| {
+                walked_folders
+                    .iter()
+                    .any(|f| Path::new(p.as_str()).starts_with(Path::new(f)))
+            })
+            .collect()
     };
     let plan = plan_stale(stale_all, &pending_prev, &skip_folders, registered_in_scope);
     let stale_total = plan.pending.len() + plan.delete.len() + plan.skipped.len();
     // 目录分布：只看本轮将删/待确认，便于事后追
     let mut by_folder: HashMap<String, usize> = HashMap::new();
     for path in plan.pending.iter().chain(plan.delete.iter()) {
-        if let Some(f) = folders
+        if let Some(f) = walked_folders
             .iter()
             .find(|f| std::path::Path::new(path).starts_with(std::path::Path::new(f)))
         {
@@ -578,9 +702,10 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
     memlog::stage_note(
         "scan_folders:diff",
         &format!(
-            "existing={} new={} stale={} pending={} delete={} skipped={} refused={} limit={} books_before={}",
+            "existing={} new={} changed={} stale={} pending={} delete={} skipped={} refused={} limit={} books_before={}",
             existing.len(),
             new_files.len(),
+            changed_files.len(),
             stale_total,
             plan.pending.len(),
             plan.delete.len(),
@@ -618,6 +743,11 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
     // ---- 阶段四：分批写入，每 2000 条一个事务，批间释放锁并 yield_now() ----
     let mut changed = false;
     for chunk in plan.delete.chunks(2000) {
+        // 删除前先收集可再生资源（封面/res）：行删掉后就查不到了。
+        let artifacts = {
+            let conn = state.db.0.lock().unwrap();
+            db::book_artifacts_by_paths(&conn, chunk)
+        };
         let r: Result<(), String> = (|| {
             let mut guard = state.db.0.lock().unwrap();
             let tx = guard.transaction().map_err(|e| e.to_string())?;
@@ -627,8 +757,27 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         })();
         if r.is_ok() {
             changed = true;
+            cleanup_book_artifacts_for(&state.app, &artifacts);
         } else if let Err(e) = r {
             eprintln!("[scan] delete_books tx failed: {e}");
+        }
+        tokio::task::yield_now().await;
+    }
+    // 存量指纹刷新：每 2000 条一个独立事务，批间释放锁并 yield_now。
+    for chunk in changed_files.chunks(2000) {
+        let r: Result<(), String> = (|| {
+            let mut guard = state.db.0.lock().unwrap();
+            let tx = guard.transaction().map_err(|e| e.to_string())?;
+            for (id, size, mtime) in chunk {
+                db::refresh_book_fingerprint(&tx, *id, *size, *mtime)
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => changed = true,
+            Err(e) => eprintln!("[scan] refresh fingerprint tx failed: {e}"),
         }
         tokio::task::yield_now().await;
     }
@@ -641,7 +790,10 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
     // 并在同一份数据上决定要不要发 `folder-scan-stale`（事件里带 origin）。
     let stale = plan.refused || !skip_folders.is_empty();
     let top_dirs: Vec<String> = skip_folders.iter().take(3).map(|d| d.to_string()).collect();
-    {
+    // - 全量扫描结束时照旧重算并写入（含恢复正常，提示条据此消失）；
+    // - 作用域扫描只覆盖部分目录，仅在本次确实产生异常判定时写入，否则保留上一轮结论，
+    //   避免一次局部扫描把全局异常态覆盖成「正常」。
+    if full_scan || stale {
         let conn = state.db.0.lock().unwrap();
         let payload = serde_json::json!({
             "state": if stale { "stale" } else { "ok" },
@@ -655,8 +807,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
             "dirs": top_dirs,
         });
         write_scan_state(&conn, payload.clone());
-        // 无论正常还是异常、无论谁触发，都把最终态广播一次：提示条据此出现/消失。
-        // （`folder-scan-stale` 只在异常时发，恢复时没有事件 ⇒ 提示条会一直挂着。）
+        // `scan-stale-state` 与写入条件一致：全量扫描每次广播（含恢复），作用域扫描只在异常时广播。
         state.app.emit("scan-stale-state", payload).ok();
     }
     if stale {
@@ -698,6 +849,10 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
             }
             Err(e) => eprintln!("[scan] upsert tx failed: {e}"),
         }
+        // 入库每批完成：前端底栏切到「正在写入书库」并显示累计已写入本数。
+        if progress_on {
+            emit_folder_scan_progress(&state.app, &origin_str, "insert", scanned, new_ids.len(), true);
+        }
         tokio::task::yield_now().await;
     }
 
@@ -717,8 +872,8 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
     if changed {
         state.app.emit("library-changed", ()).ok();
     }
-    // 导入目录落库后：新书 meta_done=0，拉起增量扫描（若空闲）。
-    if !new_ids.is_empty() {
+    // 新书或存量指纹变化都会产生 meta_done=0，拉起增量扫描（若空闲）。
+    if !new_ids.is_empty() || !changed_files.is_empty() {
         ensure_scan_worker(&state.app);
     }
     // 扫描结束发 running:false，并带上本次新增书籍数（供前端提示）。
@@ -727,7 +882,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
             .app
             .emit(
                 "folder-scan-progress",
-                serde_json::json!({ "running": false, "scanned": scanned, "added": new_files.len(), "origin": origin_str }),
+                serde_json::json!({ "running": false, "phase": "done", "scanned": scanned, "added": new_files.len(), "origin": origin_str }),
             )
             .ok();
     }
@@ -739,16 +894,36 @@ pub fn install_watcher(state: &Arc<AppState>) {
         db::list_folders(&conn)
     };
     let state2 = state.clone();
-    let mut watcher =
-        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if res.is_ok() {
-                state2.last_fs_event.store(db::now_ms() as u64, Ordering::Relaxed);
+    let mut watcher = match notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(ev) = res {
+                // 单调时钟：系统墙钟回拨不会让自动扫描停掉。
+                state2.last_fs_event.store(event_now_ms(), Ordering::Relaxed);
+                let mut paths = state2.fs_paths.lock().unwrap();
+                paths.extend(ev.paths);
+                // 只保留最近 512 条：事件密集时避免无界增长。
+                if paths.len() > 512 {
+                    let drop_n = paths.len() - 512;
+                    paths.drain(0..drop_n);
+                }
             }
-        })
-        .ok();
+        },
+    ) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            // 创建失败不再静默：没有监听就没有自动扫描，事后日志要能看出来。
+            eprintln!("[watcher] create failed: {e}");
+            None
+        }
+    };
     if let Some(w) = watcher.as_mut() {
         for f in &folders {
-            let _ = notify::Watcher::watch(w, Path::new(f), notify::RecursiveMode::Recursive);
+            if let Err(e) =
+                notify::Watcher::watch(w, Path::new(f), notify::RecursiveMode::Recursive)
+            {
+                // 逐目录注册失败同样不能吞掉（外置盘/网络盘/权限受限目录最常见）。
+                eprintln!("[watcher] watch failed dir={f} err={e}");
+            }
         }
     }
     *state.watcher.lock().unwrap() = watcher;
@@ -756,7 +931,8 @@ pub fn install_watcher(state: &Arc<AppState>) {
 
 pub fn spawn_watcher_loop(app: AppHandle) {
     std::thread::spawn(move || {
-        let mut last_handled: u64 = db::now_ms() as u64;
+        // 事件先后与静默判定全部用单调时钟（系统时间回拨不影响）。
+        let mut last_handled: u64 = event_now_ms();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(2000));
             let state = match app.try_state::<Arc<AppState>>() {
@@ -764,9 +940,25 @@ pub fn spawn_watcher_loop(app: AppHandle) {
                 None => continue,
             };
             let last = state.last_fs_event.load(Ordering::Relaxed);
-            if last > last_handled && (db::now_ms() as u64) - last > 2500 {
+            // 静默判定（2.5 秒无新事件）保持现状。
+            if last > last_handled && event_now_ms().saturating_sub(last) > 2500 {
                 last_handled = last;
-                tauri::async_runtime::block_on(scan_folders(&state, None, ScanOrigin::Timer));
+                // 取出并清空本批事件路径（锁内只做搬移，不读盘）。
+                let paths: Vec<PathBuf> = {
+                    let mut buf = state.fs_paths.lock().unwrap();
+                    std::mem::take(&mut *buf)
+                };
+                let folders = {
+                    let conn = state.db.0.lock().unwrap();
+                    db::list_folders(&conn)
+                };
+                // 对每个路径找包含它的已登记目录（最长前缀）并去重。
+                let dirs = registered_dirs_for_paths(paths.iter().map(|p| p.as_path()), &folders);
+                // 映射不到任何已登记目录（非书库路径）→ 跳过，绝不回落成全量扫描。
+                if dirs.is_empty() {
+                    continue;
+                }
+                tauri::async_runtime::block_on(scan_folders(&state, Some(dirs), ScanOrigin::Timer));
             }
         }
     });
@@ -789,6 +981,10 @@ fn emit_scan_progress(app: &AppHandle, done: u64, total: u64) {
 /// 抢占用 `swap(true, AcqRel)`：若在「on_startup 收尾判空」与「store(false)」之间有新入队
 /// （打开书 / 列表插队 / 导入），本次释放后的复查能兜住并重新拉起，绝不出现「有待办却无 worker」。
 pub fn ensure_scan_worker(app: &AppHandle) {
+    // 崩溃保护触发时进程内不会再清除该标记：直接不创建工作线程，杜绝「跳过 → 释放 → 复查 → 再拉起」自转链。
+    if memlog::skip_cover_rebuild() {
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         let state = match app.try_state::<Arc<AppState>>() {
@@ -802,13 +998,18 @@ pub fn ensure_scan_worker(app: &AppHandle) {
         state.scan_start_count.fetch_add(1, Ordering::SeqCst);
         state.scan_stop.store(false, Ordering::SeqCst);
 
-        on_startup(state.clone());
+        let ran = on_startup(state.clone());
 
         // 释放单例标记（Release：on_startup 期间的写对随后的复查/新 worker 可见）。
         state.scan_running.store(false, Ordering::Release);
 
         // 主动停止（清缓存/退出）时不再复查、不再自拉起。
         if state.scan_stop.load(Ordering::Acquire) {
+            return;
+        }
+        // 本轮被崩溃保护跳过：不复查、不自拉起，否则会形成永不停止的线程自转链。
+        if !ran {
+            memlog::stage_note("scan:skip-no-respawn", "本轮封面扫描被跳过，不再自动重试");
             return;
         }
         // 复查：释放后是否仍有待办（普通待办或优先项）。有则递归拉起（会重新 swap 抢占）。
@@ -831,14 +1032,15 @@ pub fn ensure_scan_worker(app: &AppHandle) {
 /// - 批间 sleep 80ms；每 1000 次提交 wal_checkpoint(PASSIVE)；整轮结束 TRUNCATE（A7）；
 /// - 每批比较前后 `COUNT(meta_done=0)`，未下降则打印并终止（A6）；
 /// - 每本发 `cover-updated`{id}（B7），进度节流发 `meta-progress`。
-fn on_startup(state: Arc<AppState>) {
+/// 返回值：本轮是否真正执行了扫描（被崩溃保护跳过时返回 false，调用方据此不再自动重启 worker）。
+fn on_startup(state: Arc<AppState>) -> bool {
     // 连续启动失败保护：上一次启动没走到书库 → 本轮不做封面重建（只记日志）。
     // 为什么整轮跳过而不是缩小批量：封面重建本身没错，错的是「在启动路径上做全库封面」——
     // 崩溃恢复优先，让用户先能进书库，下一轮（成功一次后）再继续补。
     if memlog::skip_cover_rebuild() {
         memlog::stage_note("cover:skipped", "previous start crashed before library");
         eprintln!("[scan] skipped this run: previous start did not reach library");
-        return;
+        return false;
     }
     memlog::stage("cover:start");
     let covers_dir = covers::covers_dir(&state.app);
@@ -970,6 +1172,8 @@ fn on_startup(state: Arc<AppState>) {
                 Ok(r) => r,
                 Err(_) => {
                     budget.cancel(); // 取消：令 worker 的受限 reader 立即报错退出
+                    // MOBI 定位读取与大图解码不响应取消：线程可能继续跑完，实际并发可能超过配额。
+                    eprintln!("[scan] cover timeout id={id}: watchdog fired, worker may keep running");
                     Err(CoverFail::Timeout)
                 }
             }
@@ -1154,13 +1358,21 @@ fn on_startup(state: Arc<AppState>) {
         let conn = state.db.0.lock().unwrap();
         let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
     }
+    // 最终帧收敛分母：轮内可能有书被删除/移出或状态被并发改写，或 A6 提前终止，
+    // 旧 total0 会让进度永远到不了 100%。以「已处理 + 当前剩余待处理」作为最终 total。
+    let remaining = {
+        let conn = state.db.0.lock().unwrap();
+        db::count_meta_pending(&conn)
+    } as u64;
     let done = state.cover_scan_done.load(Ordering::SeqCst);
-    let total = state.cover_scan_total.load(Ordering::SeqCst);
+    let total = done + remaining;
+    state.cover_scan_total.store(total, Ordering::SeqCst);
     emit_scan_progress(&state.app, done, total);
     state.app.emit("library-meta", ()).ok();
     state.app
         .emit("scan-finished", serde_json::json!({ "done": done, "total": total }))
         .ok();
+    true
 }
 
 /// 打开书籍时调用（B2）：
@@ -1251,7 +1463,8 @@ pub fn log_cover_heal(rep: &db::CoverHeal) {
 /// 停 worker → 自愈 → 重新拉起扫描。运行时入口（前端推 set_cover_scan）用这一条，
 /// 避免与在途认领交叉（同 clear_cache 的停/起约定）。
 fn heal_covers_now(state: &Arc<AppState>) {
-    stop_cover_worker_and_wait(state);
+    // 自愈链路保持原行为：超时也继续，不阻塞设置项切换。
+    let _ = stop_cover_worker_and_wait(state);
     let rep = {
         let conn = state.db.0.lock().unwrap();
         let dir = covers::covers_dir(&state.app);
@@ -1273,15 +1486,18 @@ fn heal_covers_now(state: &Arc<AppState>) {
 /// 度量钩子已删除：调用点直接用本常量（不再读 DB 键）。
 pub const COVER_EXTRACT_CONCURRENCY: usize = 2;
 
-/// 停止封面扫描 worker 并等待其退出（最多约 3 秒），用于清缓存前避免删/写并发。
-fn stop_cover_worker_and_wait(state: &Arc<AppState>) {
+/// 停止封面扫描 worker 并等待其退出（最多约 10 秒）：覆盖单本 5 秒看门狗 + 批内线程收尾。
+/// 返回 false = 超时未确认退出，调用方必须放弃删目录，避免与仍在写封面的 worker 并发。
+fn stop_cover_worker_and_wait(state: &Arc<AppState>) -> bool {
     state.scan_stop.store(true, Ordering::SeqCst);
-    for _ in 0..60 {
+    for _ in 0..200 {
         if !state.scan_running.load(Ordering::SeqCst) {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    eprintln!("[covers] stop worker timeout (10s): still running, abort caller action");
+    false
 }
 
 /// 读取默认封面底图为 data URL（设置里可更换）；无则 None（用内置渐变）。
@@ -1627,6 +1843,30 @@ pub fn read_epub_image(state: &AppState, book_id: i64, target: &str) -> Option<(
     Some((crate::epub::mime_for_path(target).to_string(), bytes))
 }
 
+/// 把全书图片列表写入缓存并返回调用方要用的列表（避免调用方再从缓存 clone 一次）。
+/// 超上限整体清空：本缓存条目不可变、命中受文件指纹约束，逐条 LRU 的收益很小；
+/// 清空实现简单、上限确定（最多 MAX_IMAGE_CACHE 本书的清单）。
+fn image_cache_put(
+    state: &AppState,
+    book_id: i64,
+    stamp: Option<(i64, i64)>,
+    images: Vec<BookImage>,
+    out: Vec<BookImage>,
+) -> Vec<BookImage> {
+    let mut map = state.image_cache.lock().unwrap();
+    if map.len() >= MAX_IMAGE_CACHE {
+        map.clear();
+    }
+    map.insert(
+        book_id,
+        CachedImages {
+            stamp,
+            images: Arc::new(images),
+        },
+    );
+    out
+}
+
 /// 全书图片列表（按 spine/章节顺序，按解析出的 zip 路径去重）。
 /// 用于图片查看器浏览整本书所有图片。EPUB 走 zip 内路径；MOBI/AZW3 走已提取的 res 目录。
 #[tauri::command]
@@ -1634,19 +1874,31 @@ pub async fn list_book_images(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
 ) -> Result<Vec<BookImage>, String> {
-    if let Some(hit) = state.image_cache.lock().unwrap().get(&book_id) {
-        return Ok(hit.as_ref().clone());
+    // 指纹取 DB 的 size/mtime：缓存条目有同值且为 Some 才命中；否则文件可能已就地替换。
+    let stamp = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).map(|b| (b.size, b.mtime))
+    };
+    if let Some(s) = stamp {
+        let hit = state
+            .image_cache
+            .lock()
+            .unwrap()
+            .get(&book_id)
+            .map(|c| (c.stamp, c.images.clone()));
+        if let Some((cached, images)) = hit {
+            if cached == Some(s) {
+                return Ok(images.as_ref().clone());
+            }
+        }
     }
     let st = state.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || collect_book_images(&st, book_id))
         .await
         .map_err(|e| e.to_string())??;
-    state
-        .image_cache
-        .lock()
-        .unwrap()
-        .insert(book_id, Arc::new(result.clone()));
-    Ok(result)
+    // 缓存与返回各需一份：只 clone 一次（缓存内部持有 Arc）。
+    let out = result.clone();
+    Ok(image_cache_put(state.inner(), book_id, stamp, result, out))
 }
 
 fn collect_book_images(state: &AppState, book_id: i64) -> Result<Vec<BookImage>, String> {
@@ -1729,11 +1981,24 @@ pub async fn add_folder(state: State<'_, Arc<AppState>>, path: String) -> Result
         let conn = state.db.0.lock().unwrap();
         db::add_folder(&conn, &path)?;
     }
+    // 运行期新增目录：重建监听列表，该目录后续变化才能触发自动扫描。
+    install_watcher(state.inner());
     let st = state.inner().clone();
     tokio::spawn(async move {
         scan_folders(&st, Some(vec![path]), ScanOrigin::User).await;
     });
     Ok(())
+}
+
+/// 发一帧「移除目录」进度（delete → clean → done）；前端底栏据此显示文字进度。
+fn emit_remove_progress(app: &AppHandle, phase: &str, done: usize, total: usize, running: bool) {
+    app.emit(
+        "remove-folder-progress",
+        serde_json::json!({
+            "running": running, "phase": phase, "done": done, "total": total,
+        }),
+    )
+    .ok();
 }
 
 #[tauri::command]
@@ -1744,16 +2009,6 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
     // 入口第一行：必须在任何 `?` 之前 —— 否则"目录登记被删掉"这一步失败时，
     // 日志里连"用户点过移除目录"都看不到（这条链路历史上完全没有日志）。
     log_op("remove_folder", &format!("folder={path} start"));
-    {
-        let conn = st.db.0.lock().unwrap();
-        if let Err(e) = db::remove_folder(&conn, &path) {
-            log_op(
-                "remove_folder",
-                &format!("folder={path} failed err={e} elapsed_ms={}", t0.elapsed().as_millis()),
-            );
-            return Err(e);
-        }
-    }
     let base = path.trim_end_matches(['/', '\\']).to_string();
     let folder = Path::new(&base).to_path_buf();
     // 用可走索引的前缀范围代替 LIKE 全表扫描：base <= path < base+U+10FFFF。
@@ -1782,26 +2037,71 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
             doomed.len()
         );
     }
+    // 移除目录进度：删除 → 清理封面/res → 完成；失败路径也会发 running:false 收条。
+    let total = doomed.len();
+    emit_remove_progress(&state.app, "delete", 0, total, true);
+    if doomed.is_empty() {
+        // 没有书可删：立刻收条，继续后续的注销目录等流程。
+        emit_remove_progress(&state.app, "done", 0, 0, false);
+    }
     // 分批删除，每批一个事务；批间释放 db 锁并 yield，避免长持锁阻塞窗口取行等 DB 读取。
     // 与 scan_folders 阶段四同款：异步命令体直接跑（非同步命令/主线程），批间让出。
+    // 先删书、后注销目录：任何一批失败都保留目录登记，避免「目录已注销、书还在」的幽灵行。
     let t_del = std::time::Instant::now();
     let mut deleted_ok = 0usize;
+    let mut cleaned = 0usize;
     let mut first_err: Option<String> = None;
+    // 删除阶段细粒度进度：事务内按 100 本切段、80ms 节流发帧（不增加事务数/fsync）。
+    let mut last_emit = std::time::Instant::now();
+    let mut deleted_in_batch = 0usize;
     for chunk in doomed.chunks(2000) {
+        // 删除前先收集可再生资源（封面/res）：行删掉后就查不到了。
+        let artifacts = {
+            let conn = st.db.0.lock().unwrap();
+            db::book_artifacts_by_paths(&conn, chunk)
+        };
         let r: Result<(), String> = (|| {
             let mut guard = st.db.0.lock().unwrap();
             let tx = guard.transaction().map_err(|e| e.to_string())?;
-            db::delete_books_policy(&tx, chunk, true)?;
+            for sub in chunk.chunks(100) {
+                // 同一个事务内分批删除：不增加 fsync，只为让前端数字连续变化。
+                db::delete_books_policy(&tx, sub, true)?;
+                deleted_in_batch += sub.len();
+                // 进度帧允许领先于提交（纯展示；事务失败时随后会用已提交数收正）。
+                if last_emit.elapsed() >= std::time::Duration::from_millis(80) {
+                    emit_remove_progress(
+                        &state.app,
+                        "delete",
+                        deleted_ok + deleted_in_batch,
+                        total,
+                        true,
+                    );
+                    last_emit = std::time::Instant::now();
+                }
+            }
             tx.commit().map_err(|e| e.to_string())?;
             Ok(())
         })();
         match r {
-            Ok(()) => deleted_ok += chunk.len(),
-            Err(e) => {
-                eprintln!("[remove_folder] delete tx failed: {e}");
-                if first_err.is_none() {
-                    first_err = Some(e);
+            Ok(()) => {
+                deleted_ok += chunk.len();
+                deleted_in_batch = 0;
+                // 每批提交后必发一帧，保证数字与实际提交进度对齐。
+                emit_remove_progress(&state.app, "delete", deleted_ok, total, true);
+                last_emit = std::time::Instant::now();
+                // 资源清理：每 100 本一组，逐组推进 clean 相位。
+                for group in artifacts.chunks(100) {
+                    cleanup_book_artifacts(&st, group);
+                    cleaned += group.len();
+                    emit_remove_progress(&state.app, "clean", cleaned, total, true);
                 }
+            }
+            Err(e) => {
+                // 失败立即停止后续批次：先把数字回落到「已提交数」，再让外层发收条。
+                eprintln!("[remove_folder] delete tx failed: {e}");
+                emit_remove_progress(&state.app, "delete", deleted_ok, total, true);
+                first_err = Some(e);
+                break;
             }
         }
         tokio::task::yield_now().await;
@@ -1813,22 +2113,70 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
             t0.elapsed()
         );
     }
-    match first_err {
-        Some(e) => log_op(
+    if let Some(e) = first_err {
+        let failed = doomed.len() - deleted_ok;
+        log_op(
             "remove_folder",
             &format!(
-                "folder={path} failed err={e} prefix_rows={row_count} deleted_ok={deleted_ok} elapsed_ms={}",
+                "folder={path} failed err={e} prefix_rows={row_count} deleted_ok={deleted_ok} failed={failed} elapsed_ms={}",
                 t0.elapsed().as_millis()
             ),
-        ),
-        None => log_op(
-            "remove_folder",
-            &format!(
-                "folder={path} done prefix_rows={row_count} deleted_ok={deleted_ok} elapsed_ms={}",
-                t0.elapsed().as_millis()
-            ),
-        ),
+        );
+        state.app.emit("library-changed", ()).ok();
+        emit_remove_progress(&state.app, "done", deleted_ok, total, false);
+        return Err(format!(
+            "移除目录失败：已删除 {deleted_ok} 本，{failed} 本未删除，目录未注销，可重试"
+        ));
     }
+    // 全部书删除成功后才注销目录；注销失败时书已移除、目录仍在（可重试移除）。
+    {
+        let conn = st.db.0.lock().unwrap();
+        if let Err(e) = db::remove_folder(&conn, &path) {
+            log_op(
+                "remove_folder",
+                &format!(
+                    "folder={path} unregister_failed err={e} prefix_rows={row_count} deleted_ok={deleted_ok} elapsed_ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+            state.app.emit("library-changed", ()).ok();
+            emit_remove_progress(&state.app, "done", deleted_ok, total, false);
+            return Err(format!("书籍已移除，但目录注销失败：{e}"));
+        }
+    }
+    // 目录已注销：清掉该前缀下的「移出书库」忽略记录，重新添加同一目录会重新导入。
+    {
+        let conn = st.db.0.lock().unwrap();
+        if let Err(e) = db::remove_ignored_under(&conn, &base) {
+            log_op(
+                "remove_folder",
+                &format!(
+                    "folder={path} remove_ignored_failed err={e} elapsed_ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+        }
+        // 连带注销其下嵌套登记的子目录（失败只记日志，不影响主流程）。
+        if let Err(e) = db::remove_nested_folders(&conn, &base) {
+            log_op(
+                "remove_folder",
+                &format!(
+                    "folder={path} remove_nested_failed err={e} elapsed_ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+        }
+    }
+    // 注销成功：监听列表同步摘掉该目录。
+    install_watcher(state.inner());
+    log_op(
+        "remove_folder",
+        &format!(
+            "folder={path} done prefix_rows={row_count} deleted_ok={deleted_ok} failed=0 elapsed_ms={}",
+            t0.elapsed().as_millis()
+        ),
+    );
+    emit_remove_progress(&state.app, "done", deleted_ok, total, false);
     state.app.emit("library-changed", ()).ok();
     Ok(())
 }
@@ -1948,6 +2296,18 @@ pub async fn set_read_state(
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
+        // 书被并发删除时 UPDATE 会影响 0 行：先确认行存在，避免静默成功。
+        match conn.query_row(
+            "SELECT 1 FROM books WHERE id=?1",
+            rusqlite::params![book_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err("书籍不存在".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
         db::set_read_state(&conn, book_id, v)
     })
     .await
@@ -1988,6 +2348,8 @@ pub async fn rescan(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 pub struct RefreshResult {
     pub removed: usize,
     pub added: usize,
+    /// 删除阶段失败的行数（>0 时前端提示「部分未能删除」）。
+    pub failed: usize,
     /// 因"比例分级"被挂起、等待用户二次确认的待删条数（0 = 已直接处理）。
     pub pending: usize,
     /// 因父目录不可列举而跳过的条数（0 = 没有不可达目录）。
@@ -2202,6 +2564,7 @@ pub fn refresh_library_core(conn: &rusqlite::Connection) -> RefreshResult {
     RefreshResult {
         removed: ok,
         added,
+        failed,
         pending: 0,
         skipped: plan.skipped.len(),
         needs_confirm: false,
@@ -2357,9 +2720,13 @@ pub async fn refresh_library(
     };
 
     // 阶段 1：快照记录与书库根（短暂持锁），文件系统存在性检查不持锁。
-    let (records, folders) = {
+    let (records, folders, ignored) = {
         let conn = st.db.0.lock().unwrap();
-        (db::all_book_paths(&conn), db::list_folders(&conn))
+        (
+            db::all_book_paths(&conn),
+            db::list_folders(&conn),
+            db::ignored_paths_all(&conn),
+        )
     };
     emit("check", 0, records.len());
     let t0 = std::time::Instant::now();
@@ -2391,6 +2758,7 @@ pub async fn refresh_library(
         return Ok(RefreshResult {
             removed: 0,
             added: 0,
+            failed: 0,
             pending,
             skipped: plan.skipped.len(),
             needs_confirm: true,
@@ -2403,19 +2771,54 @@ pub async fn refresh_library(
             total: plan.total,
         });
     }
+    // 存活判定改 O(n)：先把待删/跳过路径收成集合，避免对每条记录线性扫两个 Vec。
+    let deleted_set: std::collections::HashSet<&str> =
+        plan.to_delete.iter().map(|(_, p)| p.as_str()).collect();
+    let skipped_set: std::collections::HashSet<&str> =
+        plan.skipped.iter().map(|(_, p)| p.as_str()).collect();
     let survivors: Vec<String> = records
         .iter()
-        .filter(|(_, p)| {
-            !plan.to_delete.iter().any(|(_, d)| d == p) && !plan.skipped.iter().any(|(_, s)| s == p)
-        })
+        .filter(|(_, p)| !deleted_set.contains(p.as_str()) && !skipped_set.contains(p.as_str()))
         .map(|(_, p)| p.clone())
         .collect();
-    let (removed_ok, removed_failed, first_err) = if plan.to_delete.is_empty() {
-        (0usize, 0usize, None)
-    } else {
-        let conn = st.db.0.lock().unwrap();
-        delete_rows(&conn, &plan.to_delete)
-    };
+    // 删除分批：每 2000 条一个独立事务；提交成功后清理这批书的封面与 res/<id> 资源。
+    // 批间释放锁并 yield，避免大规模删除期间长持锁阻塞其它 IPC。
+    let mut removed_ok = 0usize;
+    let mut removed_failed = 0usize;
+    let mut first_err: Option<String> = None;
+    for chunk in plan.to_delete.chunks(2000) {
+        let chunk_paths: Vec<String> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        // 同一把锁内：删除前先收集可再生资源清单（行删掉后就查不到了），再开本批事务。
+        let r: Result<(usize, usize, Option<String>, Vec<(i64, Option<String>)>), String> = (|| {
+            let mut guard = st.db.0.lock().unwrap();
+            let artifacts = db::book_artifacts_by_paths(&guard, &chunk_paths);
+            let tx = guard.transaction().map_err(|e| e.to_string())?;
+            let (ok, failed, err) = delete_rows(&tx, chunk);
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok((ok, failed, err, artifacts))
+        })();
+        match r {
+            Ok((ok, failed, err, artifacts)) => {
+                removed_ok += ok;
+                removed_failed += failed;
+                if first_err.is_none() {
+                    first_err = err;
+                }
+                // 整批全部删除成功才清理资源：部分失败的行还在库里，删封面会让它变成破图。
+                if failed == 0 && ok == chunk.len() {
+                    cleanup_book_artifacts(&st, &artifacts);
+                }
+            }
+            Err(e) => {
+                removed_failed += chunk.len();
+                if first_err.is_none() {
+                    first_err = Some(e.clone());
+                }
+                eprintln!("[refresh] delete chunk failed n={} err={e}", chunk.len());
+            }
+        }
+        tokio::task::yield_now().await;
+    }
     log_delete_result(
         "refresh_cmd",
         removed_ok,
@@ -2453,6 +2856,8 @@ pub async fn refresh_library(
     let dirs: Vec<PathBuf> = scan_dirs.into_iter().collect();
     emit("scan", 0, dirs.len());
     let mut new_books: Vec<(String, String, String, i64, i64)> = Vec::new();
+    // 新书去重改集合（原实现 O(n²)）：先判 known/ignored，避免把已存在路径塞进 seen_new。
+    let mut seen_new: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (di, dir) in dirs.iter().enumerate() {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for entry in rd.flatten() {
@@ -2465,7 +2870,10 @@ pub async fn refresh_library(
                     Some(e) => e,
                     None => continue,
                 };
-                if known.contains(&path) || new_books.iter().any(|(p, ..)| p == &path) {
+                if known.contains(&path)
+                    || ignored.contains(&path)
+                    || !seen_new.insert(path.clone())
+                {
                     continue;
                 }
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0) as i64;
@@ -2477,16 +2885,31 @@ pub async fn refresh_library(
         emit("scan", di + 1, dirs.len());
     }
 
+    // 新书入库分批：每 2000 条一个独立事务，批间释放锁并 yield。
+    // 单批失败只记日志、继续下一批（不让整次刷新失败）。
     let mut added = 0usize;
     let mut new_ids: Vec<i64> = Vec::new();
-    if !new_books.is_empty() {
-        let conn = st.db.0.lock().unwrap();
-        for (path, title, ext, size, mtime) in &new_books {
-            if let Ok(id) = db::upsert_book(&conn, path, title, ext, *size, *mtime) {
-                added += 1;
-                new_ids.push(id);
+    for chunk in new_books.chunks(2000) {
+        let r: Result<Vec<i64>, String> = (|| {
+            let mut guard = st.db.0.lock().unwrap();
+            let tx = guard.transaction().map_err(|e| e.to_string())?;
+            let mut ids = Vec::with_capacity(chunk.len());
+            for (path, title, ext, size, mtime) in chunk {
+                if let Ok(id) = db::upsert_book(&tx, path, title, ext, *size, *mtime) {
+                    ids.push(id);
+                }
             }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(ids)
+        })();
+        match r {
+            Ok(ids) => {
+                added += ids.len();
+                new_ids.extend(ids);
+            }
+            Err(e) => eprintln!("[refresh] upsert tx failed n={} err={e}", chunk.len()),
         }
+        tokio::task::yield_now().await;
     }
     if removed_ok > 0 || added > 0 {
         st.app.emit("library-changed", ()).ok();
@@ -2499,6 +2922,7 @@ pub async fn refresh_library(
     Ok(RefreshResult {
         removed: removed_ok,
         added,
+        failed: removed_failed,
         pending: 0,
         skipped: plan.skipped.len(),
         needs_confirm: false,
@@ -2722,7 +3146,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
     // 全书图片列表：随 open_book 一次算好并缓存，图片查看器无需再发命令（避免打开后
     // 再调用命令带来的排队/卡顿）。EPUB 用 OPF 清单（瞬时），MOBI 用已提取的 res 目录。
     let images = collect_book_images(&st, id).unwrap_or_default();
-    st.image_cache.lock().unwrap().insert(id, Arc::new(images.clone()));
+    let images = image_cache_put(&st, id, file_stamp(&book.path), images.clone(), images);
     // 漫画检测分两步，先廉价后昂贵：
     //  1) 图片门槛：图片数远多于章节数（每页基本一张图）。不过门槛直接 false，**不读正文**，
     //     带少量插图的普通书在这里就以零成本被排除（这是成本控制的关键）。
@@ -2944,8 +3368,49 @@ pub fn load_progress(state: State<'_, Arc<AppState>>, book_id: i64) -> Option<Pr
     db::get_progress(&conn, book_id)
 }
 
+/// 清理书籍的可再生资源：封面文件（covers 目录内）与 res/<book_id>/ 解包目录。
+/// 只处理这两类可再生资源；笔记/划线由 delete_books_policy 负责。失败只记日志，不影响删除结果。
+fn cleanup_book_artifacts(state: &Arc<AppState>, items: &[(i64, Option<String>)]) {
+    cleanup_book_artifacts_for(&state.app, items);
+}
+
+/// 同上，按 AppHandle 执行：scan_folders 只持有 &AppState，无法构造 Arc。
+fn cleanup_book_artifacts_for(app: &AppHandle, items: &[(i64, Option<String>)]) {
+    if items.is_empty() {
+        return;
+    }
+    let covers_dir = covers::covers_dir(app);
+    let res_dir = crate::data_dir(app).join("res");
+    for (id, cover) in items {
+        if let Some(name) = cover.as_deref().filter(|s| !s.trim().is_empty()) {
+            // 只删 covers 目录内的单一文件名（与协议端点同一套校验），防越界删除。
+            if let Some(p) = crate::resolve_under(&covers_dir, name) {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if p.exists() {
+                        eprintln!(
+                            "[cleanup] cover remove failed id={id} path={} err={e}",
+                            p.display()
+                        );
+                    }
+                }
+            }
+        }
+        let dir = res_dir.join(id.to_string());
+        if dir.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("[cleanup] res remove failed id={id} dir={} err={e}", dir.display());
+            }
+        }
+    }
+}
+
 /// 删除书籍。`fromDisk`=删除本地文件；`keepNotes`=保留带笔记的划线（默认 true）。
 /// 前端需先调用 `book_note_info` 判断是否有笔记并弹窗让用户选择。
+///
+/// 顺序约定：
+/// - fromDisk=true：先逐条移入回收站，只有成功的路径才删库；失败的保留行与文件，可重试。
+/// - fromDisk=false（移出书库）：不碰文件，删库的同一事务写入 ignored_paths，
+///   使该路径长期忽略；直到所在目录被移除后重新添加才会重新导入。
 #[tauri::command]
 pub async fn delete_books(
     state: State<'_, Arc<AppState>>,
@@ -2956,14 +3421,50 @@ pub async fn delete_books(
     let keep = keep_notes.unwrap_or(true);
     let st = state.inner().clone();
     let app = state.app.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         // 与 remove_folder 对齐：分批(2000/批) + 每批独立事务，消除「每本 7~8 条 DELETE
         // 各自自动提交 = 8N 次 fsync」的大批量删除慢。批间释放 db 锁，避免长持锁冻结其它读。
-        // 本闭包已在 spawn_blocking 的阻塞线程池内（非主线程），分批即可，无需 async yield。
         let t0 = std::time::Instant::now();
-        let total_batches = paths.len().div_ceil(2000).max(1);
+        // fromDisk=true：先物理删除。只有真的进回收站的路径才进 DB 删除；
+        // 失败的路径保留书库行与文件，用户可重试（旧实现先删库，文件删不掉也返回成功）。
+        let mut to_delete = paths;
+        let mut trash_failed = 0usize;
+        if from_disk {
+            let attempted = to_delete.len();
+            let mut ok_paths: Vec<String> = Vec::with_capacity(attempted);
+            for (i, p) in to_delete.iter().enumerate() {
+                match trash::delete(p) {
+                    Ok(()) => {
+                        log_op(
+                            "delete_books",
+                            &format!("trash {}/{} path={p} ok", i + 1, attempted),
+                        );
+                        ok_paths.push(p.clone());
+                    }
+                    Err(e) => {
+                        trash_failed += 1;
+                        log_op(
+                            "delete_books",
+                            &format!("trash {}/{} path={p} err={e:?}", i + 1, attempted),
+                        );
+                    }
+                }
+            }
+            log_op(
+                "delete_books",
+                &format!(
+                    "trash done ok={} failed={} attempted={attempted} elapsed_ms={}",
+                    ok_paths.len(),
+                    trash_failed,
+                    t0.elapsed().as_millis()
+                ),
+            );
+            to_delete = ok_paths;
+        }
+
+        let total_batches = to_delete.len().div_ceil(2000).max(1);
         let mut deleted_ok = 0usize;
-        for (i, chunk) in paths.chunks(2000).enumerate() {
+        for (i, chunk) in to_delete.chunks(2000).enumerate() {
             log_op(
                 "delete_books",
                 &format!(
@@ -2975,10 +3476,19 @@ pub async fn delete_books(
                     keep
                 ),
             );
+            // 删除前先收集可再生资源清单（封面/res）：行删掉后就查不到了。
+            let artifacts = {
+                let conn = st.db.0.lock().unwrap();
+                db::book_artifacts_by_paths(&conn, chunk)
+            };
             let r: Result<(), String> = (|| {
                 let mut guard = st.db.0.lock().unwrap();
                 let tx = guard.transaction().map_err(|e| e.to_string())?;
                 db::delete_books_policy(&tx, chunk, keep)?;
+                if !from_disk {
+                    // 移出书库：忽略记录与删行同一事务，避免「行已删、忽略未写」被扫描立刻导回。
+                    db::add_ignored_paths(&tx, chunk)?;
+                }
                 tx.commit().map_err(|e| e.to_string())?;
                 Ok(())
             })();
@@ -2998,6 +3508,8 @@ pub async fn delete_books(
                 return Err(e);
             }
             deleted_ok += chunk.len();
+            // 事务已提交：清理这批书的封面与 res 资源（失败只记日志）。
+            cleanup_book_artifacts(&st, &artifacts);
             log_op(
                 "delete_books",
                 &format!(
@@ -3009,54 +3521,30 @@ pub async fn delete_books(
                 ),
             );
         }
-        if from_disk {
-            // 逐条落日志：从不进回收站到失败在哪一条，都要能事后追。失败语义仍是
-            // 遇到第一个失败立即返回（后面的文件既不删也不再尝试）。
-            let mut trashed_ok = 0usize;
-            let attempted = paths.len();
-            for (i, p) in paths.iter().enumerate() {
-                match trash::delete(p) {
-                    Ok(()) => {
-                        trashed_ok += 1;
-                        log_op(
-                            "delete_books",
-                            &format!("trash {}/{} path={p} ok", i + 1, attempted),
-                        );
-                    }
-                    Err(e) => {
-                        let msg = format!("删除失败: {e:?}");
-                        log_op(
-                            "delete_books",
-                            &format!("trash {}/{} path={p} err={msg}", i + 1, attempted),
-                        );
-                        log_op(
-                            "delete_books",
-                            &format!(
-                                "trashed_ok={trashed_ok} attempted={attempted} remaining={} elapsed_ms={}",
-                                attempted - trashed_ok,
-                                t0.elapsed().as_millis()
-                            ),
-                        );
-                        return Err(msg);
-                    }
-                }
-            }
-            log_op(
-                "delete_books",
-                &format!(
-                    "trashed_ok={trashed_ok} attempted={attempted} remaining={} elapsed_ms={}",
-                    attempted - trashed_ok,
-                    t0.elapsed().as_millis()
-                ),
-            );
+        log_op(
+            "delete_books",
+            &format!(
+                "done deleted_ok={} trash_failed={} from_disk={} keep_notes={} elapsed_ms={}",
+                deleted_ok,
+                trash_failed,
+                from_disk,
+                keep,
+                t0.elapsed().as_millis()
+            ),
+        );
+        if from_disk && trash_failed > 0 {
+            return Err(format!(
+                "已删除 {deleted_ok} 本；{trash_failed} 本文件删除失败，仍保留在书库，可重试"
+            ));
         }
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?;
+    // 部分失败时也有书被删除/移出：仍要通知前端刷新书库与笔记视图。
     app.emit("library-changed", ()).ok();
     app.emit("notes-changed", ()).ok();
-    Ok(())
+    outcome
 }
 
 /// 查该书是否有带笔记的划线（供前端删除前弹窗判定）。
@@ -3719,7 +4207,7 @@ pub async fn webdav_backup_settings(
     c.ensure_dir("TidePage").await?;
     c.ensure_dir("TidePage/settings").await?;
     let path = format!("TidePage/settings/{name}");
-    c.put(&path, data.into_bytes()).await?;
+    c.put(&path, Arc::new(data.into_bytes())).await?;
     Ok(path)
 }
 
@@ -3790,7 +4278,7 @@ pub async fn webdav_sync_progress(
 
     if remote_p.is_none() || remote_p.as_ref().map(|r| r.updated_at) != local_p.as_ref().map(|l| l.updated_at) {
         let data = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
-        c.put(&remote_key, data).await?;
+        c.put(&remote_key, Arc::new(data)).await?;
     }
 
     {
@@ -3818,6 +4306,79 @@ pub async fn webdav_read_progress(
     })
 }
 
+/// WebDAV 单文件大小硬上限（8 GiB）：下载/上传读取共用，超限立即报错。
+pub(crate) const WEBDAV_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// 下载缓冲的预分配上限（4 MiB）：远端 Content-Length 不可信，按它全额预分配会 OOM/abort。
+const WEBDAV_PREALLOC_MAX: u64 = 4 * 1024 * 1024;
+
+/// WebDAV 远端条目名的校验与重建：只接受单一文件名。
+/// PROPFIND 名字不可信（percent_decode_path 会把 %5C 解成反斜杠）；
+/// 含 `/`、`\\`、`..`、盘符冒号，或 file_name() 与原名不一致的一律拒绝。
+fn safe_file_name(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains(':')
+    {
+        return None;
+    }
+    let file_name = Path::new(name).file_name()?.to_str()?;
+    if file_name != name {
+        return None;
+    }
+    Some(file_name.to_string())
+}
+
+/// 把已校验的文件名拼到目标目录下，并确认 join 结果没有跳出目标目录。
+/// 不用 canonicalize（目标文件可能还不存在）：逐组件校验 + 前缀比较即可。
+fn safe_join_under(base: &Path, name: &str) -> Option<PathBuf> {
+    let out = base.join(name);
+    if !out.starts_with(base) {
+        return None;
+    }
+    if out
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(out)
+}
+
+
+#[cfg(test)]
+mod webdav_name_tests {
+    use super::{safe_file_name, safe_join_under};
+    use std::path::Path;
+
+    /// 远端条目名不可信：路径分隔、反斜杠、盘符冒号与上跳目录一律拒绝。
+    #[test]
+    fn safe_file_name_rejects_traversal_and_absolute_names() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x.epub",
+            "..\\x.epub",
+            "a/b.epub",
+            "a\\b.epub",
+            "C:\\x.epub",
+            "C:/x.epub",
+            "d:x.epub",
+            "a..b.epub",
+        ] {
+            assert!(safe_file_name(bad).is_none(), "{bad:?} 必须拒绝");
+        }
+        assert_eq!(safe_file_name("x.epub").as_deref(), Some("x.epub"));
+        assert_eq!(safe_file_name("书名.epub").as_deref(), Some("书名.epub"));
+        // join 结果必须留在目标目录内（.. 会被拒绝）。
+        let base = Path::new("C:\\tidepage\\books");
+        assert!(safe_join_under(base, "x.epub").is_some());
+        assert!(safe_join_under(base, "..\\x.epub").is_none());
+    }
+}
+
 #[tauri::command]
 pub async fn webdav_upload_book(
     base: String,
@@ -3832,8 +4393,35 @@ pub async fn webdav_upload_book(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or("路径无效")?;
-    let data = std::fs::read(&book_path).map_err(|e| e.to_string())?;
-    c.put(&format!("TidePage/books/{name}"), data).await?;
+    // 整本读入前先按 metadata 卡上限，并放到阻塞线程池：async 命令里同步读大书会占住运行时。
+    let read_path = book_path.clone();
+    let data = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let meta = std::fs::metadata(&read_path).map_err(|e| e.to_string())?;
+        if meta.len() > WEBDAV_FILE_MAX_BYTES {
+            return Err(format!(
+                "文件超过上限 {} 字节，已取消上传",
+                WEBDAV_FILE_MAX_BYTES
+            ));
+        }
+        // take 在读取层再设一次硬上限：metadata 与读取之间文件变大也不会无界分配。
+        let file = std::fs::File::open(&read_path).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        file.take(WEBDAV_FILE_MAX_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| e.to_string())?;
+        if buf.len() as u64 > WEBDAV_FILE_MAX_BYTES {
+            return Err(format!(
+                "文件超过上限 {} 字节，已取消上传",
+                WEBDAV_FILE_MAX_BYTES
+            ));
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    c.put(&format!("TidePage/books/{name}"), std::sync::Arc::new(data))
+        .await?;
     Ok(format!("TidePage/books/{name}"))
 }
 
@@ -3858,17 +4446,37 @@ pub async fn webdav_download_books(
         if !EXT_BOOK.contains(&ext.as_str()) {
             continue;
         }
-        let out = target.join(&name);
+        // 远端名字不可信：只接受单一文件名，并确认 join 后没有跳出目标目录。
+        let safe_name = match safe_file_name(&name) {
+            Some(n) => n,
+            None => continue,
+        };
+        let out = match safe_join_under(&target, &safe_name) {
+            Some(p) => p,
+            None => continue,
+        };
         if out.exists() {
             continue;
         }
-        if let Some(data) = c.get(&format!("TidePage/books/{name}")).await? {
+        if let Some(data) = c
+            .get_limited(&format!("TidePage/books/{safe_name}"), WEBDAV_FILE_MAX_BYTES)
+            .await?
+        {
             std::fs::write(&out, &data).map_err(|e| e.to_string())?;
             imported.push(out.to_string_lossy().into_owned());
         }
     }
     if !imported.is_empty() {
-        scan_folders(&state, None, ScanOrigin::Timer).await;
+        // 只扫描导入文件所在的已登记目录；映射不到就不扫描（不做全量遍历）。
+        let folders = {
+            let conn = state.db.0.lock().unwrap();
+            db::list_folders(&conn)
+        };
+        let dirs =
+            registered_dirs_for_paths(imported.iter().map(|p| Path::new(p.as_str())), &folders);
+        if !dirs.is_empty() {
+            scan_folders(&state, Some(dirs), ScanOrigin::Timer).await;
+        }
     }
     Ok(imported)
 }
@@ -3963,15 +4571,19 @@ pub async fn webdav_download_file(
     remote_path: String,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
-    let data = c.get(&remote_path).await?.ok_or("远程文件不存在")?;
-    let name = remote_path.rsplit('/').next().unwrap_or("").to_string();
-    if name.is_empty() || name.contains("..") || name.contains('\\') {
-        return Err("无效文件名".into());
-    }
+    // 先校验远端文件名再下载：只接受单一文件名，join 结果不得跳出目标目录。
+    let name = match remote_path.rsplit('/').next().and_then(safe_file_name) {
+        Some(n) => n,
+        None => return Err("无效文件名".into()),
+    };
     let target = PathBuf::from(&target_dir);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    let out = target.join(&name);
+    let out = safe_join_under(&target, &name).ok_or("无效文件名")?;
+    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let data = c
+        .get_limited(&remote_path, WEBDAV_FILE_MAX_BYTES)
+        .await?
+        .ok_or("远程文件不存在")?;
     std::fs::write(&out, &data).map_err(|e| e.to_string())?;
     let ext = ext_of(&name).unwrap_or_default();
     if EXT_BOOK.contains(&ext.as_str()) {
@@ -4010,6 +4622,11 @@ pub async fn webdav_download_progress(
     remote_path: String,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
+    // 先校验文件名再开始下载：非法名字不浪费带宽与内存（原实现下载完才校验）。
+    let name = match remote_path.rsplit('/').next().and_then(safe_file_name) {
+        Some(n) => n,
+        None => return Err("无效文件名".into()),
+    };
     let c = crate::dav::DavClient::new(&base, &user, &pass);
     let g = state.app.clone();
     let resp = match c.get_stream(&remote_path).await {
@@ -4031,13 +4648,23 @@ pub async fn webdav_download_progress(
         );
     };
 
-    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    // 远端 Content-Length 不可信：只为它预分配一个上限内的起步缓冲，绝不按声明值全额分配。
+    let mut buf: Vec<u8> = Vec::with_capacity(total.min(WEBDAV_PREALLOC_MAX) as usize);
     let mut stream = resp.bytes_stream();
     let mut received: u64 = 0;
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
-                received += chunk.len() as u64;
+                // 先累计并卡硬上限，再写入内存：超限立即中止，不继续读也不继续涨。
+                received = received.saturating_add(chunk.len() as u64);
+                if received > WEBDAV_FILE_MAX_BYTES {
+                    let msg = format!(
+                        "文件超过上限 {} 字节，已中止下载",
+                        WEBDAV_FILE_MAX_BYTES
+                    );
+                    emit(received, "red", true, Some(msg.clone()));
+                    return Err(msg);
+                }
                 buf.extend_from_slice(&chunk);
                 if total == 0 || received % (1 << 20) < (1 << 16) {
                     emit(received, "auto", false, None);
@@ -4051,13 +4678,10 @@ pub async fn webdav_download_progress(
         }
     }
 
-    let name = remote_path.rsplit('/').next().unwrap_or("").to_string();
-    if name.is_empty() || name.contains("..") || name.contains('\\') {
-        return Err("无效文件名".into());
-    }
     let target = PathBuf::from(&target_dir);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    let out = target.join(&name);
+    // 文件名入口已校验；这里再确认 join 结果没有跳出目标目录。
+    let out = safe_join_under(&target, &name).ok_or("无效文件名")?;
     std::fs::write(&out, &buf).map_err(|e| e.to_string())?;
     let ext = ext_of(&name).unwrap_or_default();
     if EXT_BOOK.contains(&ext.as_str()) {
@@ -4094,8 +4718,7 @@ pub fn set_setting_kv(
     value: String,
 ) -> Result<(), String> {
     let conn = state.db.0.lock().unwrap();
-    db::set_setting(&conn, &key, &value);
-    Ok(())
+    db::set_setting_checked(&conn, &key, &value)
 }
 
 #[tauri::command]
@@ -4150,24 +4773,82 @@ pub struct StorageStats {
 }
 
 #[tauri::command]
-pub fn storage_stats(state: State<'_, Arc<AppState>>) -> StorageStats {
+pub async fn storage_stats(state: State<'_, Arc<AppState>>) -> Result<StorageStats, String> {
     let dir = crate::data_dir(&state.app);
-    let (covers_bytes, _) = dir_size(&dir.join("covers"));
-    let (res_bytes, _) = dir_size(&dir.join("res"));
-    let (fonts_bytes, _) = dir_size(&dir.join("fonts"));
-    let (total_bytes, _) = dir_size(&dir);
-    let db_bytes = ["tidepage.db", "tidepage.db-wal", "tidepage.db-shm"]
-        .iter()
-        .map(|n| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0))
-        .sum();
-    StorageStats {
-        data_dir: dir.to_string_lossy().into_owned(),
-        total_bytes,
-        covers_bytes,
-        res_bytes,
-        fonts_bytes,
-        db_bytes,
-        cache_bytes: covers_bytes + res_bytes,
+    let data_dir = dir.to_string_lossy().into_owned();
+    let fallback_dir = data_dir.clone();
+    // 大目录遍历是阻塞 IO：整体放阻塞线程池，避免同步命令卡主线程。
+    let stats = tauri::async_runtime::spawn_blocking(move || {
+        let mut s = StorageStats {
+            data_dir,
+            total_bytes: 0,
+            covers_bytes: 0,
+            res_bytes: 0,
+            fonts_bytes: 0,
+            db_bytes: 0,
+            cache_bytes: 0,
+        };
+        // 只遍历一次 data_dir：所有文件计入 total，按第一段分类到 covers/res/fonts/db。
+        collect_storage(&dir, &dir, &mut s);
+        s.cache_bytes = s.covers_bytes + s.res_bytes;
+        s
+    })
+    .await;
+    match stats {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            // 统计失败不阻塞设置页：返回空统计并记日志（前端照常渲染 0）。
+            eprintln!("[storage] stats task failed: {e}");
+            Ok(StorageStats {
+                data_dir: fallback_dir,
+                total_bytes: 0,
+                covers_bytes: 0,
+                res_bytes: 0,
+                fonts_bytes: 0,
+                db_bytes: 0,
+                cache_bytes: 0,
+            })
+        }
+    }
+}
+
+/// 递归累加存储分类：只遍历 data_dir 一次。
+/// - 相对 data_dir 的第一段 covers / res / fonts → 对应字段；
+/// - tidepage.db(-wal/-shm) → db_bytes；
+/// - 所有文件字节数都计入 total_bytes（含 db 与其它），分类字段互不重复。
+fn collect_storage(data_dir: &Path, dir: &Path, s: &mut StorageStats) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            collect_storage(data_dir, &p, s);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let bytes = meta.len();
+        s.total_bytes += bytes;
+        let rel = match p.strip_prefix(data_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        match rel.components().next().and_then(|c| c.as_os_str().to_str()) {
+            Some("covers") => s.covers_bytes += bytes,
+            Some("res") => s.res_bytes += bytes,
+            Some("fonts") => s.fonts_bytes += bytes,
+            Some("tidepage.db") | Some("tidepage.db-wal") | Some("tidepage.db-shm") => {
+                s.db_bytes += bytes
+            }
+            _ => {}
+        }
     }
 }
 
@@ -4257,48 +4938,59 @@ pub fn prioritize_covers(state: State<'_, Arc<AppState>>, ids: Vec<i64>) -> Resu
 
 /// 清理可再生的缓存目录。`what`: "covers" | "res" | "all"。
 /// 清理后把受影响书的 cover_path/meta_done 复位，让下次刷新/打开重新生成。
+/// 含封面时先停 worker（最多 10 秒）：**确认停住才删目录**，停不住直接报错让用户重试。
 #[tauri::command]
-pub fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Result<u64, String> {
-    let dir = crate::data_dir(&state.app);
-    let targets: Vec<&str> = match what.as_str() {
+pub async fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Result<u64, String> {
+    let st = state.inner().clone();
+    let targets: Vec<&'static str> = match what.as_str() {
         "covers" => vec!["covers"],
         "res" => vec!["res"],
         "all" => vec!["covers", "res"],
         other => return Err(format!("未知缓存类型: {other}")),
     };
-    // 含封面清理时：先停 worker 并等其退出，避免删文件与写封面并发（半成品残留）。
-    if targets.contains(&"covers") {
-        stop_cover_worker_and_wait(state.inner());
-    }
-    let mut freed: u64 = 0;
-    for name in &targets {
-        let p = dir.join(name);
-        let (b, _) = dir_size(&p);
-        if p.exists() {
-            std::fs::remove_dir_all(&p).map_err(|e| format!("清理 {name} 失败: {e}"))?;
+    let clear_covers = targets.contains(&"covers");
+    let clear_res = targets.contains(&"res");
+    // 停止等待最长 10 秒且全是阻塞 IO：整体放阻塞线程池，不占 async 运行时。
+    tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        if clear_covers && !stop_cover_worker_and_wait(&st) {
+            // 未确认停住：一个目录都不删，避免与仍在写封面的 worker 并发。
+            return Err("封面扫描仍在收尾，请稍后重试".into());
         }
-        std::fs::create_dir_all(&p).ok();
-        freed += b;
-    }
-    // 清理封面后，把元数据标记复位，下次扫描/打开会重建封面。
-    if targets.contains(&"covers") {
-        // 换底图/清缓存让旧封面缓存整体失效（F5）：规则版本 +1 参与缓存 key。
-        state.cover_style_ver.fetch_add(1, Ordering::SeqCst);
-        {
-            let conn = state.db.0.lock().unwrap();
-            conn.execute("UPDATE books SET cover_path=NULL, meta_done=0", [])
-                .map_err(|e| e.to_string())?;
+        let dir = crate::data_dir(&st.app);
+        let mut freed: u64 = 0;
+        for name in &targets {
+            let p = dir.join(name);
+            let (b, _) = dir_size(&p);
+            if p.exists() {
+                std::fs::remove_dir_all(&p).map_err(|e| format!("清理 {name} 失败: {e}"))?;
+            }
+            std::fs::create_dir_all(&p).ok();
+            freed += b;
         }
-        // worker 已停止：重新拉起增量扫描（全局互斥，若已在跑则 no-op）。
-        ensure_scan_worker(&state.app);
-    }
-    if targets.contains(&"res") {
-        // 提取资源清空后，已缓存的章节/图片需要失效。
-        state.chapter_cache.lock().unwrap().clear();
-        state.image_cache.lock().unwrap().clear();
-    }
-    state.app.emit("library-changed", ()).ok();
-    Ok(freed)
+        // 清理封面后，把元数据标记复位，下次扫描/打开会重建封面。
+        if clear_covers {
+            // 换底图/清缓存让旧封面缓存整体失效（F5）：规则版本 +1 参与缓存 key。
+            st.cover_style_ver.fetch_add(1, Ordering::SeqCst);
+            {
+                let conn = st.db.0.lock().unwrap();
+                conn.execute("UPDATE books SET cover_path=NULL, meta_done=0", [])
+                    .map_err(|e| e.to_string())?;
+            }
+            // worker 已确认停止：重新拉起增量扫描（全局互斥，若已在跑则 no-op）。
+            ensure_scan_worker(&st.app);
+        }
+        if clear_res {
+            // 提取资源清空后，已缓存的章节/文本/图片都需要失效
+            // （MOBI 章节 HTML 里的 /res/<id>/... URL 会指向已删文件）。
+            st.chapter_cache.lock().unwrap().clear();
+            st.txt_cache.lock().unwrap().clear();
+            st.image_cache.lock().unwrap().clear();
+        }
+        st.app.emit("library-changed", ()).ok();
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -5440,7 +6132,8 @@ pub fn library_ready() {
 }
 
 #[tauri::command]
-pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<String, String> {
+pub async fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<String, String> {
+    // 前置只做短锁读路径；「读整本 + 解析/解包 + 生成缩略图」整体放阻塞线程池，避免卡主线程。
     let book = {
         let conn = state.db.0.lock().unwrap();
         db::get_book(&conn, book_id).ok_or("书籍不存在")?
@@ -5449,39 +6142,42 @@ pub fn reextract_cover(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<
     let ext = ext_of(&book.path).unwrap_or_default();
     let name = format!("{}.png", db::path_id(&book.path));
     let out = covers_dir.join(&name);
-
-    let ok = if ext == "epub" {
-        let data = std::fs::read(&book.path).map_err(|e| e.to_string())?;
-        let doc = crate::epub::parse(&data).ok();
-        let bytes = doc
-            .as_ref()
-            .and_then(|d| d.cover_href.as_ref().and_then(|h| crate::epub::read_cover(&data, h)))
-            .or_else(|| doc.as_ref().map(|d| crate::epub::find_cover_fallback(&data, &d.spine)).flatten());
-        match bytes {
-            Some(b) => covers::make_thumbnail(&b, &out).is_ok(),
-            None => false,
+    let path = book.path.clone();
+    let ok = tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        if ext == "epub" {
+            let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let doc = crate::epub::parse(&data).ok();
+            let bytes = doc
+                .as_ref()
+                .and_then(|d| d.cover_href.as_ref().and_then(|h| crate::epub::read_cover(&data, h)))
+                .or_else(|| doc.as_ref().map(|d| crate::epub::find_cover_fallback(&data, &d.spine)).flatten());
+            Ok(match bytes {
+                Some(b) => covers::make_thumbnail(&b, &out).is_ok(),
+                None => false,
+            })
+        } else if is_mobi_ext(&ext) {
+            // MOBI/AZW3：EXTH201/202/129 或 first_image_index 起首张图
+            Ok(crate::mobi::extract_cover_path(&path)
+                .map(|b| covers::make_thumbnail(&b, &out).is_ok())
+                .unwrap_or(false))
+        } else {
+            Ok(false)
         }
-    } else if is_mobi_ext(&ext) {
-        // MOBI/AZW3：EXTH201/202/129 或 first_image_index 起首张图
-        crate::mobi::extract_cover_path(&book.path)
-            .map(|b| covers::make_thumbnail(&b, &out).is_ok())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     if ok {
-        let rel = name;
         {
             let conn = state.db.0.lock().unwrap();
             conn.execute(
                 "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
-                rusqlite::params![book_id, rel],
+                rusqlite::params![book_id, &name],
             )
             .map_err(|e| e.to_string())?;
         }
         state.app.emit("book-updated", ()).ok();
-        Ok(rel)
+        Ok(name)
     } else {
         Err("该书未能自动提取封面，请右键「设置封面」手动指定图片".into())
     }
@@ -5741,17 +6437,18 @@ pub async fn get_book_word_count(
             return Ok(WordCount { total: 0, pure: 0 });
         }
         let is_mobi = is_mobi_ext(&ext);
-        let (content, _r, _t) = if is_mobi {
+        if is_mobi {
             let doc = mobi_doc_for(&st, &path, book_id)?;
-            (doc.html, Vec::new(), Vec::new())
-        } else {
-            load_txt(&st, &path, book_id)?.as_ref().clone()
-        };
-        let text = if is_mobi {
-            crate::epub::html_to_text(&content)
-        } else {
-            content
-        };
+            // 借用解析结果生成纯文本，不额外复制整本 HTML。
+            let text = crate::epub::html_to_text(&doc.html);
+            let total = text.chars().count() as i64;
+            let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+            backfill_book_chars(&st, book_id, total, pure);
+            return Ok(WordCount { total, pure });
+        }
+        // TXT：load_txt 返回 Arc 元组，借用其中正文计数，不 clone 整本 String。
+        let cached = load_txt(&st, &path, book_id)?;
+        let text: &str = &cached.0;
         let total = text.chars().count() as i64;
         let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
         // 同样回填：下一次调用直接走 DB 短路。
@@ -6783,5 +7480,56 @@ mod cache_stamp_tests {
         // file_mtime 与 file_stamp 同源：mtime 部分一致
         assert_eq!(file_mtime(&p), s2.1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::{collect_storage, StorageStats};
+    use std::path::PathBuf;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tp_storage_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 单次遍历的分类口径：covers/res/fonts/db 各自累计，所有文件都计入 total。
+    #[test]
+    fn collect_storage_classifies_in_single_pass() {
+        let data = tmp_dir("stats");
+        for (rel, size) in [
+            ("covers/a.png", 10u64),
+            ("res/1/b.jpg", 20),
+            ("fonts/f.ttf", 30),
+            ("tidepage.db", 40),
+            ("tidepage.db-wal", 5),
+            ("tidepage.db-shm", 1),
+            ("other.txt", 7),
+        ] {
+            let p = data.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, vec![0u8; size as usize]).unwrap();
+        }
+        let mut s = StorageStats {
+            data_dir: data.to_string_lossy().into_owned(),
+            total_bytes: 0,
+            covers_bytes: 0,
+            res_bytes: 0,
+            fonts_bytes: 0,
+            db_bytes: 0,
+            cache_bytes: 0,
+        };
+        collect_storage(&data, &data, &mut s);
+        assert_eq!(s.covers_bytes, 10);
+        assert_eq!(s.res_bytes, 20);
+        assert_eq!(s.fonts_bytes, 30);
+        assert_eq!(s.db_bytes, 46);
+        // total = 10+20+30+40+5+1+7 = 113，分类字段互不重复但都包含在 total 内。
+        assert_eq!(s.total_bytes, 113);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }

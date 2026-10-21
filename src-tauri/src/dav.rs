@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 pub struct DavClient {
     base: String,
     user: String,
@@ -74,36 +76,49 @@ impl DavClient {
         method: &str,
         url: &str,
         depth: Option<&str>,
-        body: Option<Vec<u8>>,
+        body: Option<Arc<Vec<u8>>>,
     ) -> Result<reqwest::Response, String> {
         self.raw_ex(method, url, depth, body, &[]).await
     }
 
     /// 带重试的原始请求（覆盖传输错误与瞬时 429/5xx）；extra_headers 承载 Destination 等自定义头。
+    ///
+    /// body 用 Arc 承载：构造请求时若只此一份则零拷贝交给 reqwest，
+    /// 重试通过 try_clone 复用其 Bytes（只克隆句柄，不重复复制整块内存）。
     async fn raw_ex(
         &self,
         method: &str,
         url: &str,
         depth: Option<&str>,
-        body: Option<Vec<u8>>,
+        body: Option<Arc<Vec<u8>>>,
         extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response, String> {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "bad method")?;
+        let mut builder = self.http.request(method, url);
+        if let Some(a) = self.auth() {
+            builder = builder.header("Authorization", a);
+        }
+        if let Some(d) = depth {
+            builder = builder.header("Depth", d);
+        }
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        if let Some(data) = body {
+            // Arc 唯一持有者时直接取出 Vec（零拷贝）；否则只拷一份交给 reqwest。
+            let vec = match Arc::try_unwrap(data) {
+                Ok(v) => v,
+                Err(shared) => (*shared).clone(),
+            };
+            builder = builder.body(vec);
+        }
         let mut last: Option<String> = None;
         for attempt in 0..3 {
-            let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "bad method")?;
-            let mut req = self.http.request(method, url);
-            if let Some(a) = self.auth() {
-                req = req.header("Authorization", a);
-            }
-            if let Some(d) = depth {
-                req = req.header("Depth", d);
-            }
-            for (k, v) in extra_headers {
-                req = req.header(*k, *v);
-            }
-            if let Some(b) = &body {
-                req = req.body(b.clone());
-            }
+            // 可复用 Body（Vec→Bytes）的 try_clone 只克隆 Bytes 句柄，不复制整块数据。
+            let req = match builder.try_clone() {
+                Some(r) => r,
+                None => return Err("请求体不可重试".into()),
+            };
             match req.send().await {
                 Ok(r) => {
                     let s = r.status().as_u16();
@@ -168,7 +183,7 @@ impl DavClient {
         Ok(())
     }
 
-    pub async fn put(&self, path: &str, data: Vec<u8>) -> Result<(), String> {
+    pub async fn put(&self, path: &str, data: Arc<Vec<u8>>) -> Result<(), String> {
         let resp = self
             .raw("PUT", &join_url(&self.base, path), None, Some(data))
             .await?;
@@ -179,7 +194,19 @@ impl DavClient {
         }
     }
 
+    /// 普通 GET：16 MiB 上限（进度/设置备份等小文件）。
     pub async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        self.get_limited(path, 16 * 1024 * 1024).await
+    }
+
+    /// 带上限的 GET：边流式读取边累计字节，超过 max_bytes 立即返回 Err（不信任远端 Content-Length）。
+    /// 返回 Ok(None) = 404；其它非 2xx 返回 Err。
+    pub async fn get_limited(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        use futures_util::StreamExt;
         let resp = self.raw("GET", &join_url(&self.base, path), None, None).await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -187,7 +214,18 @@ impl DavClient {
         if !resp.status().is_success() {
             return Err(format!("GET {path} -> {}", resp.status()));
         }
-        Ok(Some(resp.bytes().await.map_err(|e| e.to_string())?.to_vec()))
+        let mut buf: Vec<u8> = Vec::new();
+        let mut received: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            received = received.saturating_add(chunk.len() as u64);
+            if received > max_bytes {
+                return Err(format!("GET {path} 超过上限 {max_bytes} 字节"));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Some(buf))
     }
 
     pub async fn get_stream(
@@ -368,14 +406,18 @@ fn parse_rfc822(s: &str) -> i64 {
     days * 86400 + hh * 3600 + mm * 60 + ss
 }
 
+/// 逐字节解码 %XX：不按字符边界切片，非 ASCII 或残缺的 % 序列都不会 panic。
+/// 整段解出的字节不是合法 UTF-8（远端可控）时丢弃该段返回空串，调用方按无效条目跳过。
 fn percent_decode_path(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -383,7 +425,7 @@ fn percent_decode_path(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -430,6 +472,10 @@ mod tests {
         // 结尾残缺 '%' 不 panic，原样保留
         assert_eq!(percent_decode_path("abc%"), "abc%");
         assert_eq!(percent_decode_path("ab%2"), "ab%2");
+        // 非 ASCII 与非法 UTF-8 字节序列不 panic：解不出合法 UTF-8 时整段丢弃为空串。
+        assert_eq!(percent_decode_path("%中"), "%中");
+        assert_eq!(percent_decode_path("%FF"), "");
+        assert_eq!(percent_decode_path("%E4"), "");
     }
 
     #[test]

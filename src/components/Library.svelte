@@ -104,10 +104,24 @@ import { reorderByDrop } from "../lib/reorder";
   );
   let loading = $state(true);
   let refreshing = $state(false);
+  /** 长按菜单「重新扫描书库」进行中：防止重复触发后台全量扫描。 */
+  let rescanBusy = $state(false);
   /** 刷新扫描进度（由后端 refresh-progress 事件驱动）。 */
   let refreshProgress = $state<{ phase: string; done: number; total: number } | null>(null);
   /** 添加目录扫描进度（由后端 folder-scan-progress 事件驱动；只统计本次目录的条目）。 */
-  let folderScan = $state<{ running: boolean; scanned: number; added: number } | null>(null);
+  let folderScan = $state<{
+    running: boolean;
+    phase: "walk" | "diff" | "insert" | "done";
+    scanned: number;
+    added: number;
+  } | null>(null);
+  /** 移除目录进度（由后端 remove-folder-progress 事件驱动；delete→clean→done）。 */
+  let removeProgress = $state<{
+    running: boolean;
+    phase: "delete" | "clean" | "done";
+    done: number;
+    total: number;
+  } | null>(null);
   /** 封面/元数据后台生成进度（由后端 meta-progress 事件驱动；不阻塞其它操作）。 */
   let metaProgress = $state<{ phase: string; done: number; total: number } | null>(null);
   /**
@@ -156,7 +170,7 @@ import { reorderByDrop } from "../lib/reorder";
   /** library-changed 防抖：移除大目录等场景可能短时多次触发，合并为一次全量刷新，
    *  避免叠加多次整库索引重建把主线程压死。 */
   let libChangedTimer: ReturnType<typeof setTimeout> | undefined;
-  /** 长按刷新弹出的菜单（普通点击=只读书籍；长按=可刷新封面）。 */
+  /** 长按刷新弹出的菜单（普通点击=检查增删；长按=重新扫描书库）。 */
   let refreshMenu = $state(false);
 
   // 书库顶栏右侧图标按钮注册表（可拖拽排序；顺序持久化到 config.library.topbarOrder）。
@@ -201,6 +215,12 @@ import { reorderByDrop } from "../lib/reorder";
     if (p.phase === "check") return t("library.refresh.phase.check", { done: p.done, total: p.total });
     if (p.phase === "scan") return t("library.refresh.phase.scan", { done: p.done, total: p.total });
     return t("library.refresh.phase.done");
+  };
+  /** 目录扫描底栏文案：按 phase 选键；done 在 running:false 时已清空，归入遍历分支兜底。 */
+  const folderScanText = (p: { phase: "walk" | "diff" | "insert" | "done"; scanned: number; added: number }): string => {
+    if (p.phase === "diff") return t("library.statusbar.scanDiff");
+    if (p.phase === "insert") return t("library.statusbar.scanInsert", { count: p.added });
+    return t("library.statusbar.scanWalk", { count: p.scanned });
   };
   const refreshPct = $derived(
     refreshProgress && refreshProgress.total > 0
@@ -281,6 +301,8 @@ import { reorderByDrop } from "../lib/reorder";
   /** 选中某文件夹（null=全部）：持久化并全量重载（排序/分类/随机随之限定作用域）。 */
   function selectFolder(f: string | null) {
     if (selectedFolder === f) return;
+    // 作用域变化：旧选中可能已不可见，先退出多选，避免批量删除误伤。
+    exitSelect();
     selectedFolder = f;
     saveFolder();
     reload();
@@ -295,17 +317,23 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   function toggleFormat(f: string) {
+    // 作用域变化：先退出多选，避免批量删除作用到当前不可见的旧选中书。
+    exitSelect();
     filterFormats = filterFormats.includes(f) ? filterFormats.filter((x) => x !== f) : [...filterFormats, f];
     saveFilter();
     reload();
   }
   function toggleState(s: ReadState) {
+    // 作用域变化：先退出多选，避免批量删除作用到当前不可见的旧选中书。
+    exitSelect();
     filterStates = filterStates.includes(s) ? filterStates.filter((x) => x !== s) : [...filterStates, s];
     saveFilter();
     reload();
   }
   function clearFilter() {
     if (!hasFilter) return;
+    // 作用域变化：先退出多选，避免批量删除作用到当前不可见的旧选中书。
+    exitSelect();
     filterFormats = [];
     filterStates = [];
     saveFilter();
@@ -876,10 +904,10 @@ import { reorderByDrop } from "../lib/reorder";
     });
   }
 
-  async function loadRange(offset: number) {
+  async function loadRange(offset: number, limit = FETCH) {
     const seq = ++generation;
     try {
-      const r = await api.listBooksPage(query, sortKey, offset, FETCH, filterFormats, filterStates, desc, selectedFolder ?? undefined);
+      const r = await api.listBooksPage(query, sortKey, offset, limit, filterFormats, filterStates, desc, selectedFolder ?? undefined);
       if (seq !== generation) return;
       total = r.total;
       rangeStart = offset;
@@ -891,12 +919,14 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
-  /** 回落档（搜索/超限）：窗口未覆盖 [start,end) 时按 FETCH 对齐拉取一段。 */
+  /** 回落档（搜索/超限）：窗口未覆盖 [start,end) 时按 FETCH 对齐拉取，跨段时一次取够整段。 */
   function ensureRange(start: number, end: number) {
     if (total === 0 || end <= start) return;
     const rangeEnd = rangeStart + booksWindow.length;
     if (booksWindow.length && rangeStart <= start && rangeEnd >= end) return;
-    loadRange(Math.max(0, Math.floor(start / FETCH) * FETCH));
+    const off = Math.max(0, Math.floor(start / FETCH) * FETCH);
+    const need = Math.max(FETCH, end - off);
+    loadRange(off, need);
   }
 
   // ===== 索引档：窗口取行 + 剪枝 + 重建 =====
@@ -1038,7 +1068,9 @@ import { reorderByDrop } from "../lib/reorder";
       try {
         rows = await api.listBooksByIds(chunk);
       } catch {
-        // 覆盖写取数失败：同样不能「取回来却无人重取」→ 重算模板 + 走有限重试。
+        // 覆盖写取数失败：先删掉本批 id 再重试。ensureWindowIndex 只补「rowMap 缺什么」，
+        // 旧行留在 map 里会让重试直接空转，更新永久丢失；成功批次不动。
+        for (const id of chunk) rowMap.delete(id);
         winVersion++;
         scheduleWindowRetry();
         return;
@@ -1316,6 +1348,8 @@ import { reorderByDrop } from "../lib/reorder";
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       if (q !== query) {
+        // 搜索作用域变化：先退出多选，避免旧选中书被批量删除。
+        exitSelect();
         libSession.query = q;
         reload();
       }
@@ -1324,12 +1358,16 @@ import { reorderByDrop } from "../lib/reorder";
   });
 
   function onSortChange() {
+    // 排序变化会重建结果集：先退出多选，避免旧选中书被批量删除。
+    exitSelect();
     saveSort();
     reload();
   }
 
   /** 反向排序：翻转方向并持久化，重新加载当前列表。 */
   function toggleReverse() {
+    // 排序变化会重建结果集：先退出多选，避免旧选中书被批量删除。
+    exitSelect();
     reversed = !reversed;
     saveSortDir();
     reload();
@@ -1376,9 +1414,10 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   async function addFolder() {
-    const p = await api.pickFolder(t("library.dialog.pickFolder"));
-    if (!p) return;
+    // pickFolder 也可能 reject（对话框/权限异常）：一并纳入 try，失败必须给出可读提示。
     try {
+      const p = await api.pickFolder(t("library.dialog.pickFolder"));
+      if (!p) return; // 用户取消
       await api.addFolder(p);
       await loadFolders();
       toast(t("toast.library.addedScanning"));
@@ -1393,8 +1432,12 @@ import { reorderByDrop } from "../lib/reorder";
     // remove_folder 已在后端分块删除完成；书籍列表刷新交给 library-changed 监听
     // （reloadWindow+loadFormats），这里只更新目录胶囊，避免显式 reloadWindow 与监听叠加造成
     // 两次全量重建索引。选中的文件夹被移除时，loadFolders 内部会回到「全部」并 reload()。
-    await api.removeFolder(p);
-    await loadFolders();
+    try {
+      await api.removeFolder(p);
+      await loadFolders();
+    } catch (e) {
+      toast(errText(e), "error");
+    }
   }
 
   function openBook(b: BookRow) {
@@ -1411,10 +1454,10 @@ import { reorderByDrop } from "../lib/reorder";
   // - 后端返回 needs_confirm ⇒ 一条都没删，这里用多行确认框把「数量 + 主要目录」告诉用户，
   //   确认后再以 confirm=true 调一次（此时才真正删除）。
   // - 返回 null 表示用户取消或发生错误（错误已 toast）。
-  async function runReconcile(): Promise<{ removed: number; added: number; pending: number; skipped: number } | null> {
+  async function runReconcile(): Promise<{ removed: number; added: number; failed: number; pending: number; skipped: number } | null> {
     try {
       const r = await api.refreshLibrary();
-      if (!r.needs_confirm) return { removed: r.removed, added: r.added, pending: r.pending, skipped: r.skipped };
+      if (!r.needs_confirm) return { removed: r.removed, added: r.added, failed: r.failed, pending: r.pending, skipped: r.skipped };
       // 确认框：第一行放数量（`word-break: break-all` 会断路径，关键数字必须在第一行）
       const lines = [t("library.refresh.confirmCount", { count: r.pending })];
       const dirs = r.dirs.slice(0, 3);
@@ -1425,7 +1468,7 @@ import { reorderByDrop } from "../lib/reorder";
       const ok = await appConfirm(lines.join("\n"));
       if (!ok) return null;
       const r2 = await api.refreshLibrary(true);
-      return { removed: r2.removed, added: r2.added, pending: r2.pending, skipped: r2.skipped };
+      return { removed: r2.removed, added: r2.added, failed: r2.failed, pending: r2.pending, skipped: r2.skipped };
     } catch (e) {
       toast(errText(e), "error");
       return null;
@@ -1462,7 +1505,7 @@ import { reorderByDrop } from "../lib/reorder";
 
   // 任务2：刷新按钮 → 按记录目录重扫（一次遍历，无实时监听）。
   // 16 万本下 IO 密集且耗时：立即给「进行中」提示并禁用按钮，完成后只增量刷新当前窗口。
-  // 注意：普通刷新**只读书籍**（对账增删），不重算封面；重算封面走「长按 → 刷新封面」。
+  // 注意：普通刷新**只做对账增删**；后台全量重扫走「长按 → 重新扫描书库」菜单（rescanLibrary）。
   async function refreshAll() {
     if (refreshing) return;
     refreshing = true;
@@ -1472,6 +1515,7 @@ import { reorderByDrop } from "../lib/reorder";
       if (r) {
         if (r.skipped > 0 && r.removed === 0) toast(t("toast.library.unreachable"));
         else toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
+        if (r.failed > 0) toast(t("toast.library.refreshPartial", { count: r.failed }), "error");
         await reloadWindow();
       }
     } finally {
@@ -1480,7 +1524,22 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
-  // 刷新按钮：单击=读书籍；长按（550ms）=弹出「刷新封面」选项。用 Pointer Events 兼容鼠标/触屏。
+  /** 长按菜单：后台全量重新扫描书库（独立于单击的对账刷新）。 */
+  async function rescanLibrary() {
+    refreshMenu = false;
+    if (rescanBusy) return;
+    rescanBusy = true;
+    try {
+      await api.rescan(); // 后端 rescan 命令：后台全量扫描
+      toast(t("toast.library.rescanStarted"));
+    } catch (e) {
+      toast(errText(e), "error");
+    } finally {
+      rescanBusy = false;
+    }
+  }
+
+  // 刷新按钮：单击=检查增删；长按（550ms）=重新扫描书库。用 Pointer Events 兼容鼠标/触屏。
   let refreshPressTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshLongPressed = false;
   function refreshDown(e: PointerEvent) {
@@ -1840,8 +1899,14 @@ import { reorderByDrop } from "../lib/reorder";
       if (e.payload) refreshProgress = e.payload;
     });
     // 添加目录扫描进度（专用事件）：只统计本次目录的条目；结束时提示新增书籍数。
-    // `origin` 分流：只有用户动作触发的扫描才提示；`startup` / `timer` 只更新进度条，不弹提示。
-    const u8 = listen<{ running: boolean; scanned: number; added: number; origin?: string }>("folder-scan-progress", (e) => {
+    // `origin` 分流：只有用户动作触发的扫描才显示底栏与提示；`timer` 触发的扫描两者都不显示。
+    const u8 = listen<{
+      running: boolean;
+      phase: "walk" | "diff" | "insert" | "done";
+      scanned: number;
+      added: number;
+      origin?: string;
+    }>("folder-scan-progress", (e) => {
       const p = e.payload;
       if (!p) return;
       const userScan = p.origin === "user";
@@ -1857,7 +1922,7 @@ import { reorderByDrop } from "../lib/reorder";
       if (p.added > 0) reload();
     });
     // 扫描删行护栏（后端 folder-scan-stale）：目录没走完或失效数超阈值时后端拒绝自动删除，只登记不清理。
-    // `origin="user"` 才弹提示（用户动作，弹了才知道结果）；`startup` / `timer` 一律静默，
+    // `origin="user"` 才弹提示（用户动作，弹了才知道结果）；`timer` 一律静默，
     // 异常态改由首屏常驻提示条呈现（`last_scan_stale`），数据安全信号不会因为静默而消失。
     const u9 = listen<{
       refused: boolean;
@@ -1891,6 +1956,17 @@ import { reorderByDrop } from "../lib/reorder";
         p.state === "stale"
           ? { refused: !!p.refused, pending: p.pending ?? 0, skipped: p.skipped ?? 0, unfinishedDirs: p.unfinishedDirs ?? 0, dirs: Array.isArray(p.dirs) ? p.dirs : [], at: p.at ?? 0 }
           : null;
+    });
+    // 移除目录进度（后端 remove_folder 发 delete/clean/done 三相位）。
+    const u12 = listen<{
+      running: boolean;
+      phase: "delete" | "clean" | "done";
+      done: number;
+      total: number;
+    }>("remove-folder-progress", (e) => {
+      const p = e.payload;
+      if (!p) return;
+      removeProgress = p.running ? p : null;
     });
     // 封面增量扫描进度（入队时发一帧 / 每 16 本发一帧 / done==total 必发）。
     const u5 = listen<{ phase: string; done: number; total: number }>("meta-progress", (e) => {
@@ -1940,6 +2016,7 @@ import { reorderByDrop } from "../lib/reorder";
       u7.then((f) => f());
       u8.then((f) => f());
       u11.then((f) => f());
+      u12.then((f) => f());
       u9.then((f) => f());
       u10.then((f) => f());
       u3?.then((f) => f());
@@ -1977,7 +2054,7 @@ import { reorderByDrop } from "../lib/reorder";
       ><IconRefresh />{refreshing ? t("library.toolbar.refreshing") : t("library.toolbar.refresh")}</button>
       {#if refreshMenu}
         <div class="refresh-menu" role="menu" out:outFade={{ from: 0.96 }}>
-          <button class="rm-item" data-testid="lib-btn-rescan" onclick={() => { refreshMenu = false; refreshAll(); }}>{t("library.toolbar.rescan")}</button>
+          <button class="rm-item" data-testid="lib-btn-rescan" onclick={rescanLibrary} disabled={rescanBusy}>{t("library.toolbar.rescan")}</button>
         </div>
         <div class="rm-backdrop" out:outDissolve onclick={() => (refreshMenu = false)}></div>
       {/if}
@@ -2126,10 +2203,10 @@ import { reorderByDrop } from "../lib/reorder";
     onpointercancel={onGridPointerCancel}
     onpointerleave={onGridPointerLeave}
   >
-    {#if loading && total === 0}
+    {#if (loading || refreshing || folderScan?.running) && total === 0}
       <div class="empty-state" data-testid="lib-hint-loading">{t("library.empty.loading")}</div>
     {:else if total === 0}
-      {#if query.trim()}
+      {#if query.trim() || hasFilter || selectedFolder}
         <div class="empty-state" data-testid="lib-hint-empty">{t("library.empty.noMatch")}</div>
       {:else}
         {@const blank = t("library.empty.blank").split("\n")}
@@ -2286,7 +2363,17 @@ import { reorderByDrop } from "../lib/reorder";
     {#if folderScan && folderScan.running}
       <div class="scan-progress" title={t("library.statusbar.folderScanTip")} out:outDissolve>
         <div class="scan-bar"><div class="scan-fill indeterminate"></div></div>
-        <span class="scan-text" data-testid="lib-statusbar-folderscan">{t("library.statusbar.folderScanText", { count: folderScan.scanned })}</span>
+        <span class="scan-text" data-testid="lib-statusbar-folderscan">{folderScanText(folderScan)}</span>
+      </div>
+    {/if}
+    {#if removeProgress}
+      <div class="scan-progress" title={t("library.statusbar.removeTip")} out:outDissolve>
+        <div class="scan-bar"><div class="scan-fill indeterminate"></div></div>
+        <span class="scan-text" data-testid="lib-statusbar-removefolder">
+          {removeProgress.phase === "clean"
+            ? t("library.statusbar.removeClean", { done: removeProgress.done, total: removeProgress.total })
+            : t("library.statusbar.removeDelete", { done: removeProgress.done, total: removeProgress.total })}
+        </span>
       </div>
     {/if}
     {#if metaProgress && metaProgress.phase !== "done" && metaProgress.total > 0}
@@ -2330,7 +2417,19 @@ import { reorderByDrop } from "../lib/reorder";
   {/if}
 
   {#if detailBook}
-    <BookDetailModal book={detailBook} onclose={() => { detailBook = null; touchWindow(); }} />
+    <BookDetailModal
+      book={detailBook}
+      onclose={() => { detailBook = null; touchWindow(); }}
+      onupdated={(title, author) => {
+        const b = detailBook;
+        if (!b) return;
+        const next = { ...b, title, author };
+        detailBook = next;
+        rowMap.set(b.id, next);
+        winVersion++;
+        touchWindow();
+      }}
+    />
   {/if}
 </div>
 

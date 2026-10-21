@@ -57,9 +57,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // 逐字节解析 %XX：旧实现用 `&s[i + 1..i + 3]` 切片，
+        // `%中` 这类输入会落在 UTF-8 字符中间 panic（URL 查询串不可信）。
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -71,21 +75,85 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// 从 cover URL 查询串解析外壳主题配色（g1/g2/g3/tc），供默认封面按主题上色。
+/// 颜色值来自 URL（不可信）：非法值一律回落到内置默认观感，绝不原样拼进 SVG。
 fn parse_dc_theme(query: Option<&str>) -> library::DcTheme {
     let mut t = library::DcTheme::default();
     let Some(q) = query else { return t };
+    // 与 render_default_cover 的回落色同源（CoverStyle::builtin），避免两处硬编码漂移。
+    let builtin = covers::CoverStyle::builtin(None);
     for pair in q.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let val = percent_decode(v);
+        let valid = covers::parse_hex(&val).is_some();
         match k {
-            "g1" => t.g1 = val,
-            "g2" => t.g2 = val,
-            "g3" => t.g3 = val,
-            "tc" => t.tc = val,
+            "g1" => t.g1 = if valid { val } else { builtin.g1.clone() },
+            "g2" => t.g2 = if valid { val } else { builtin.g2.clone() },
+            "g3" => t.g3 = if valid { val } else { builtin.g3.clone() },
+            "tc" => t.tc = if valid { val } else { builtin.text.clone() },
             _ => {}
         }
     }
     t
+}
+
+/// 协议端点单文件读取上限（32 MB）：超过直接按不存在处理，避免超大文件整份读入内存。
+const MAX_PROTOCOL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 把已解码的相对资源名解析到 `base` 之下：只接受单一文件名，拒绝路径穿越与绝对路径。
+///
+/// - 非空、不以 `/` 开头、不含 `\\` / `:` / `..`；
+/// - `Path::new(rel).file_name()` 必须与 rel 完全一致（排除任何分隔符/上层目录）；
+/// - join 后追加部分只允许 Normal 组件（Windows 下盘符/根路径会让 join 整体替换）；
+/// - 只认已存在的普通文件；不依赖文件是否存在做 canonicalize。
+fn resolve_under(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains('\\')
+        || rel.contains(':')
+        || rel.contains("..")
+    {
+        return None;
+    }
+    let rel_path = std::path::Path::new(rel);
+    let name = rel_path.file_name()?.to_str()?;
+    if name != rel {
+        return None;
+    }
+    if rel_path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return None;
+    }
+    let file = base.join(rel_path);
+    // 追加部分必须仍是 Normal（父目录/新前缀都不允许）；base 自身的盘符前缀属于可信配置。
+    let rest = file.strip_prefix(base).ok()?;
+    if rest
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return None;
+    }
+    if !file.is_file() {
+        return None;
+    }
+    Some(file)
+}
+
+/// 带上限读取协议端点文件：超过 `MAX_PROTOCOL_FILE_BYTES` 视为不存在。
+fn read_protocol_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    // take 在读取层设硬上限：即使文件在 metadata 之后变大也不会无界分配。
+    let mut buf = Vec::new();
+    f.take(MAX_PROTOCOL_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_PROTOCOL_FILE_BYTES {
+        return None;
+    }
+    Some(buf)
 }
 
 fn sniff_mime(b: &[u8]) -> &'static str {
@@ -409,6 +477,7 @@ pub fn run() {
                 app: app.handle().clone(),
                 watcher: Mutex::new(None),
                 last_fs_event: std::sync::atomic::AtomicU64::new(0),
+                fs_paths: Mutex::new(Vec::new()),
                 rules_ver: std::sync::atomic::AtomicU64::new(1),
                 txt_cache: Mutex::new(std::collections::HashMap::new()),
                 epub_cache: Mutex::new(std::collections::HashMap::new()),
@@ -438,11 +507,9 @@ pub fn run() {
                     let conn = st.db.0.lock().unwrap();
                     db::list_folders(&conn)
                 };
+                // 启动不再做全量扫描（数万本要数分钟，期间前端进度恒为 0，看起来像卡死）。
+                // 只安装监听：新增书籍由监听触发的、限定目录范围的扫描补齐；存量指纹刷新另做。
                 if !folders.is_empty() {
-                    let st2 = st.clone();
-                    tauri::async_runtime::spawn(async move {
-                        library::scan_folders(&st2, None, library::ScanOrigin::Startup).await;
-                    });
                     library::install_watcher(&st);
                 }
             }
@@ -531,18 +598,12 @@ pub fn run() {
                             let conn = st.db.0.lock().unwrap();
                             db::get_book(&conn, bid).and_then(|b| b.cover_path)
                         };
-                        let safe = name.unwrap_or_default();
-                        let valid = !safe.is_empty()
-                            && !safe.contains("..")
-                            && !safe.contains('/')
-                            && !safe.contains('\\');
-                        let served = if valid {
-                            std::fs::read(covers::covers_dir(ctx.app_handle()).join(&safe))
-                                .ok()
-                                .map(|b| (sniff_mime(&b).to_string(), b))
-                        } else {
-                            None
-                        };
+                        // 与 covers/ 端点同一套校验与读取上限：只接受单一文件名，32 MiB 封顶。
+                        let name = name.unwrap_or_default();
+                        let served = resolve_under(&covers::covers_dir(ctx.app_handle()), &name)
+                            .and_then(|f| {
+                                read_protocol_file(&f).map(|b| (sniff_mime(&b).to_string(), b))
+                            });
                         match served {
                             Some(v) => v,
                             None => {
@@ -557,55 +618,67 @@ pub fn run() {
                     ),
                 }
             } else if let Some(raw) = path.strip_prefix("covers/") {
+                // 解码后的名字必须仍是 covers 目录下的单一文件名：绝对路径/盘符/穿越一律拒绝。
                 let name = percent_decode(raw);
-                let safe = name.replace('\\', "/");
-                let file = covers::covers_dir(ctx.app_handle()).join(&safe);
-                if safe.is_empty() || safe.contains("..") || !file.is_file() {
-                    (
+                let base = covers::covers_dir(ctx.app_handle());
+                let served = resolve_under(&base, &name).and_then(|f| {
+                    read_protocol_file(&f).map(|b| (f, b))
+                });
+                match served {
+                    Some((file, b)) => {
+                        let ext = file
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let m = match ext.as_str() {
+                            "png" => "image/png",
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif" => "image/gif",
+                            "webp" => "image/webp",
+                            "svg" => "image/svg+xml",
+                            _ => "application/octet-stream",
+                        };
+                        (m.to_string(), b)
+                    }
+                    None => (
                         "image/svg+xml".to_string(),
                         covers::placeholder_svg("", "").into_bytes(),
-                    )
-                } else {
-                    let ext = safe.rsplit('.').next().unwrap_or("").to_lowercase();
-                    match std::fs::read(&file) {
-                        Ok(b) => {
-                            let m = match ext.as_str() {
-                                "png" => "image/png",
-                                "jpg" | "jpeg" => "image/jpeg",
-                                "gif" => "image/gif",
-                                "webp" => "image/webp",
-                                "svg" => "image/svg+xml",
-                                _ => "application/octet-stream",
-                            };
-                            (m.to_string(), b)
-                        }
-                        Err(_) => (
-                            "image/svg+xml".to_string(),
-                            covers::placeholder_svg("", "").into_bytes(),
-                        ),
-                    }
+                    ),
                 }
             } else if let Some(raw) = path.strip_prefix("res/") {
-                // MOBI/AZW3 提取出的正文插图：res/<book_id>/<file>
-                let name = percent_decode(raw);
-                let safe = name.replace('\\', "/");
-                let file = dir.parent().unwrap_or(&dir).join("res").join(&safe);
-                if safe.is_empty() || safe.contains("..") || !file.is_file() {
-                    ("image/png".to_string(), Vec::new())
+                // MOBI/AZW3 提取出的正文插图：res/<book_id>/<file>，路径固定两段。
+                // book_id 只接受纯数字目录名；文件名再走 resolve_under（只允许单一文件名）。
+                let decoded = percent_decode(raw);
+                let segs: Vec<&str> = decoded.split('/').collect();
+                let served = if segs.len() == 2
+                    && !segs[0].is_empty()
+                    && segs[0].bytes().all(|b| b.is_ascii_digit())
+                {
+                    let base = dir.parent().unwrap_or(&dir).join("res").join(segs[0]);
+                    resolve_under(&base, segs[1])
+                        .and_then(|f| read_protocol_file(&f).map(|b| (f, b)))
                 } else {
-                    let ext = safe.rsplit('.').next().unwrap_or("").to_lowercase();
-                    let m = match ext.as_str() {
-                        "png" => "image/png",
-                        "jpg" | "jpeg" => "image/jpeg",
-                        "gif" => "image/gif",
-                        "webp" => "image/webp",
-                        "bmp" => "image/bmp",
-                        _ => "application/octet-stream",
-                    };
-                    match std::fs::read(&file) {
-                        Ok(b) => (m.to_string(), b),
-                        Err(_) => ("image/png".to_string(), Vec::new()),
+                    None
+                };
+                match served {
+                    Some((file, b)) => {
+                        let ext = file
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let m = match ext.as_str() {
+                            "png" => "image/png",
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif" => "image/gif",
+                            "webp" => "image/webp",
+                            "bmp" => "image/bmp",
+                            _ => "application/octet-stream",
+                        };
+                        (m.to_string(), b)
                     }
+                    None => ("image/png".to_string(), Vec::new()),
                 }
             } else if let Some(raw) = path.strip_prefix("bg/") {
                 // 与 covers/res/epubimg 一致：空名、`..` 或含路径分隔的越界名一律拒绝，
@@ -820,5 +893,28 @@ mod tests {
         // 字体等保持原行为
         assert_eq!(cache_control_for("fonts/a.ttf"), None);
         assert_eq!(cache_control_for("other"), None);
+    }
+
+    /// 协议端点资源名解析：绝对路径、盘符、路径分隔与上跳目录一律拒绝。
+    #[test]
+    fn resolve_under_rejects_absolute_and_traversal() {
+        let base = std::path::Path::new("C:\\tidepage\\covers");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../a.png",
+            "..\\a.png",
+            "/etc/passwd",
+            "C:/Windows/win.ini",
+            "C:\\Windows\\win.ini",
+            "covers/a.png",
+            "a/b.png",
+            "a\\b.png",
+        ] {
+            assert!(resolve_under(base, bad).is_none(), "{bad:?} 必须拒绝");
+        }
+        // 合法单一文件名（文件不存在时同样返回 None，但不会误判为越界）。
+        assert_eq!(resolve_under(base, "ok.png"), None);
     }
 }

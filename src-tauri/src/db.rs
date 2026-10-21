@@ -113,6 +113,12 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             path TEXT PRIMARY KEY,
             seen_at INTEGER NOT NULL DEFAULT 0
         );
+        -- 「移出书库」的长期忽略路径：文件仍在磁盘，但扫描不再把它导回。
+        -- 恢复方式：移除所在目录后重新添加（remove_folder 会按前缀清掉这些记录），或被忽略文件重新出现在新目录。
+        CREATE TABLE IF NOT EXISTS ignored_paths(
+            path TEXT PRIMARY KEY,
+            ignored_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS orphan_books(
             book_id INTEGER PRIMARY KEY,
             title_snap TEXT NOT NULL DEFAULT '',
@@ -631,6 +637,16 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) {
     .ok();
 }
 
+/// 同 set_setting，但把写入失败返回给调用方（命令层需要把错误暴露给前端）。
+pub fn set_setting_checked(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn add_folder(conn: &Connection, path: &str) -> Result<(), String> {
     conn.execute("INSERT OR IGNORE INTO folders(path) VALUES(?1)", params![path])
         .map_err(|e| e.to_string())?;
@@ -640,6 +656,28 @@ pub fn add_folder(conn: &Connection, path: &str) -> Result<(), String> {
 pub fn remove_folder(conn: &Connection, path: &str) -> Result<(), String> {
     conn.execute("DELETE FROM folders WHERE path=?1", params![path])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 注销 base 之下嵌套登记的目录（不含 base 本身）：移除父目录时连带清掉子目录登记。
+/// 逐条删除，单条失败只记日志、不影响主流程（父目录本身已注销成功）。
+pub fn remove_nested_folders(conn: &Connection, base: &str) -> Result<(), String> {
+    let paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT path FROM folders")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let folder = Path::new(base);
+    for p in paths {
+        if p != base && Path::new(&p).starts_with(folder) {
+            if let Err(e) = remove_folder(conn, &p) {
+                eprintln!("[folders] remove nested failed path={p} err={e}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1170,16 +1208,112 @@ pub fn stale_pending_drop(conn: &Connection, paths: &[String]) -> Result<(), Str
     Ok(())
 }
 
-/// 一次性读入全部书籍路径为 `HashSet`（`SELECT path FROM books`）。
-/// 供 scan_folders 阶段二：单次短锁读取后立即释放，随后无锁求差集。
-pub fn all_paths_set(conn: &Connection) -> std::collections::HashSet<String> {
-    let mut stmt = match conn.prepare("SELECT path FROM books") {
+/// 一次性读入全部书籍的 path → (id, size, mtime)。
+/// 供 scan_folders 阶段二：一次查询同时判断新增与存量指纹变化，读完立即释放锁。
+pub fn all_paths_meta(conn: &Connection) -> std::collections::HashMap<String, (i64, i64, i64)> {
+    let mut out = std::collections::HashMap::new();
+    let mut stmt = match conn.prepare("SELECT path, id, size, mtime FROM books") {
         Ok(s) => s,
-        Err(_) => return std::collections::HashSet::new(),
+        Err(_) => return out,
     };
-    stmt.query_map([], |r| r.get::<_, String>(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    if let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+    }) {
+        for row in rows.flatten() {
+            out.insert(row.0, (row.1, row.2, row.3));
+        }
+    }
+    out
+}
+
+/// 按路径批量查删除前的 (book_id, cover_path)：供删除后清理封面与 res 资源。
+/// 对路径做 900 分块以兼容 SQLite 变量上限；不存在的路径不返回。
+pub fn book_artifacts_by_paths(
+    conn: &Connection,
+    paths: &[String],
+) -> Vec<(i64, Option<String>)> {
+    let mut out = Vec::new();
+    for chunk in paths.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT id, cover_path FROM books WHERE path IN ({placeholders})");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+    }
+    out
+}
+
+/// 「移出书库」的长期忽略路径：写入后扫描不再把这些路径导回书库。
+pub fn add_ignored_paths(conn: &Connection, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let now = now_ms();
+    let mut stmt = conn
+        .prepare("INSERT OR IGNORE INTO ignored_paths(path, ignored_at) VALUES(?1, ?2)")
+        .map_err(|e| e.to_string())?;
+    for p in paths {
+        stmt.execute(params![p, now]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 读全部长期忽略路径（扫描阶段与库内路径一次读出，避免竞态）。
+pub fn ignored_paths_all(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut stmt = match conn.prepare("SELECT path FROM ignored_paths") {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+        out.extend(rows.flatten());
+    }
+    out
+}
+
+/// 目录被移除时清掉其下的忽略记录：重新添加同一目录后文件会重新导入。
+/// 前缀范围与 remove_folder 同款，并再用 starts_with 做边界修正（避免 Books 前缀命中 Books2）。
+pub fn remove_ignored_under(conn: &Connection, prefix: &str) -> Result<(), String> {
+    let hi = format!("{}{}", prefix, char::MAX);
+    let paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT path FROM ignored_paths WHERE path >= ?1 AND path < ?2")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![prefix, hi], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let folder = Path::new(prefix);
+    for p in paths {
+        if Path::new(&p).starts_with(folder) {
+            conn.execute("DELETE FROM ignored_paths WHERE path=?1", params![p])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 存量文件指纹刷新（同名文件被替换）：更新 size/mtime，并把元数据状态归零，
+/// 让封面/文本按新文件重建；cover_path 保留（新封面写入时覆盖）。
+pub fn refresh_book_fingerprint(
+    conn: &Connection,
+    id: i64,
+    size: i64,
+    mtime: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE books SET size=?2, mtime=?3, meta_done=0, meta_error=NULL, fail_count=0 WHERE id=?1",
+        params![id, size, mtime],
+    )?;
+    Ok(())
 }
 
 
@@ -2832,3 +2966,70 @@ mod delete_bulk_tests {
         assert_eq!(fts_left, 0, "两条路径的 fts 行都应被删");
     }
 }
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn tmpdb(tag: &str) -> Connection {
+        let p = std::env::temp_dir().join(format!(
+            "tp_consistency_{}_{}.db",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        init(&p).unwrap()
+    }
+
+    /// 「移出书库」的忽略表：插入幂等、可全量读取、按目录前缀删除且不误伤相似前缀。
+    #[test]
+    fn ignored_paths_insert_query_and_prefix_delete() {
+        let conn = tmpdb("ignored");
+        let a = "/lib/a.txt".to_string();
+        let b = "/lib/sub/b.txt".to_string();
+        let c = "/lib2/c.txt".to_string();
+        add_ignored_paths(&conn, &[a.clone(), b.clone(), c.clone()]).unwrap();
+        // 幂等：重复插入不报错、不重复计数。
+        add_ignored_paths(&conn, &[a.clone()]).unwrap();
+        let all = ignored_paths_all(&conn);
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&a) && all.contains(&b) && all.contains(&c));
+        // 前缀删除 + 边界修正：/lib 不能命中 /lib2。
+        remove_ignored_under(&conn, "/lib").unwrap();
+        let all = ignored_paths_all(&conn);
+        assert_eq!(all.len(), 1);
+        assert!(all.contains(&c), "/lib2 下不能被 /lib 前缀误删");
+    }
+
+    /// all_paths_meta：一次查询返回 path → (id, size, mtime)。
+    #[test]
+    fn all_paths_meta_returns_id_size_mtime() {
+        let conn = tmpdb("meta");
+        let p = "/m/a.txt".to_string();
+        let id = upsert_book(&conn, &p, "a", "txt", 123, 456).unwrap();
+        let meta = all_paths_meta(&conn);
+        assert_eq!(meta.get(&p), Some(&(id, 123, 456)));
+    }
+
+    /// 同名文件替换：刷新 size/mtime，并把 meta_done 归零（封面/文本重建）。
+    #[test]
+    fn refresh_book_fingerprint_updates_and_resets_meta() {
+        let conn = tmpdb("fp");
+        let p = "/f/a.txt".to_string();
+        let id = upsert_book(&conn, &p, "a", "txt", 10, 100).unwrap();
+        mark_meta(&conn, id, 1, None).unwrap();
+        assert_eq!(meta_done_of(&conn, id), Some(1));
+        refresh_book_fingerprint(&conn, id, 20, 200).unwrap();
+        let (size, mtime): (i64, i64) = conn
+            .query_row(
+                "SELECT size, mtime FROM books WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((size, mtime), (20, 200));
+        assert_eq!(meta_done_of(&conn, id), Some(0), "内容换了必须重跑元数据");
+    }
+}
+

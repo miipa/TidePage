@@ -126,7 +126,7 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
         </div>
         <div class="sum-item">
           <div class="v">{speed || "—"}</div>
-          <div class="k">{t("bookStats.avgSpeed", { v: speed })}</div>
+          <div class="k">{t("bookStats.avgSpeedLabel")}</div>
         </div>
       </div>
 
