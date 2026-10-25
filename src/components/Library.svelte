@@ -132,6 +132,31 @@ import { reorderByDrop } from "../lib/reorder";
   let dupChipHidden = $state((() => { try { return localStorage.getItem(DUP_CHIP_HIDDEN_KEY) === "1"; } catch { return false; } })());
   let dupChipMenu = $state<{ x: number; y: number } | null>(null);
 
+  /** 点「重复」：从关闭进入时先清掉搜索/目录/格式/状态/标签范围，显示全库重复组；
+   *  已开启时再点则退出。之后用户可再点目录/搜索/筛选在重复视图内收窄。 */
+  function toggleDuplicateView() {
+    if (duplicateView) {
+      duplicateView = false;
+      reload();
+      return;
+    }
+    exitSelect();
+    libSession.queryInput = "";
+    libSession.query = "";
+    clearTimeout(searchTimer);
+    searchComposing = false;
+    selectedFolder = null;
+    saveFolder();
+    filterFormats = [];
+    filterStates = [];
+    filterTags = [];
+    saveFilter();
+    filterPanelOpen = false;
+    duplicateView = true;
+    invalidateListTotal();
+    reload();
+  }
+
   function saveDupChipHidden(v: boolean) {
     dupChipHidden = v;
     try { localStorage.setItem(DUP_CHIP_HIDDEN_KEY, v ? "1" : "0"); } catch { /* ignore */ }
@@ -2769,8 +2794,8 @@ import { reorderByDrop } from "../lib/reorder";
           tabindex="0"
           data-testid="lib-folder-duplicates"
           title={t("library.folders.duplicatesTip")}
-          onclick={() => { duplicateView = !duplicateView; reload(); }}
-          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); duplicateView = !duplicateView; reload(); } }}
+          onclick={toggleDuplicateView}
+          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleDuplicateView(); } }}
         >
           <IconCopy size={14} stroke={1.8} /> {t("library.folders.duplicates")} · {t("library.folders.duplicatesCount", { n: dupGroupCount })}
           <button
