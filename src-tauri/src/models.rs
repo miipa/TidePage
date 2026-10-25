@@ -62,6 +62,14 @@ pub struct BookImage {
     pub chapter_title: String,
 }
 
+/// 首次书内搜索建立纯文本缓存的进度（R7-3）：done=已写入批数，total=总批数。
+#[derive(Debug, Clone, Serialize)]
+pub struct BookTextProgress {
+    pub book_id: i64,
+    pub done: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRow {
     pub day: String,
@@ -92,6 +100,10 @@ pub struct OpenResult {
     /// 是否检测为漫画书籍（图片资源远多于文本；用于漫画图片大小默认值与首次引导）。
     #[serde(default)]
     pub is_manga: bool,
+    /// 图片页型书籍（图片多且平均每图文字很少，独立于漫画判定）：前端默认按图片页式排版
+    /// 并隐藏文字层；旧前端不读该字段（serde 默认 false），行为不变。
+    #[serde(default)]
+    pub image_pages: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

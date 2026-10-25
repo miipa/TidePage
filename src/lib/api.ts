@@ -2,6 +2,138 @@ import { invoke } from "@tauri-apps/api/core";
 import { coverTheme, defaultCoverBust, secretsReady } from "./stores.svelte";
 import type { AiTestResult, BookImage, BookPage, BookRow, BookSearchHit, BookSession, BookmarkRow, ChapterData, HighlightRow, OpenResult, Progress, SearchHit, TocEntry, UpdateInfo } from "./types";
 
+
+
+/** D2：阅读统计（真实字段；无数据为 0/null）。 */
+export interface ReadingStats {
+  totalSeconds: number; totalChars: number; sessionCount: number; activeDays: number;
+  prevSeconds: number; todaySeconds: number; longestSessionSeconds: number; readSpeedCpm: number;
+  daily: { day: string; seconds: number; chars: number }[];
+  heatmap: { day: string; seconds: number; chars: number }[];
+  hourly: { hour: number; seconds: number }[];
+  activeDates: string[];
+  finishedBooks: number; readingBooks: number;
+  currentBook: { id: number; title: string; author: string; pct: number } | null;
+  highlightsTotal: number; notesTotal: number;
+  quote: { text: string; note: string; bookTitle: string; bookAuthor: string; createdAt: number } | null;
+  composition: { label: string; seconds: number }[];
+  completedBooks: { id: number; title: string; author: string; coverPath: string; coverVer: number; seconds: number; highlightCount: number; lastRead: number }[];
+}
+/** D7：重复书检测结果。 */
+export interface DuplicateBook {
+  id: number;
+  path: string;
+  title: string;
+  author: string;
+  format: string;
+  size: number;
+  addedAt: number;
+  lastRead: number;
+  readPct: number;
+}
+export interface DupDisplayGroup {
+  repId: number;
+  copies: number;
+  memberIds: number[];
+}
+
+export interface DupDisplay {
+  hiddenIds: number[];
+  groups: DupDisplayGroup[];
+}
+
+export interface CoverAudit {
+  dir: string;
+  files: number;
+  bytes: number;
+  validNamed: number;
+  protectedFiles: number;
+  protectedBytes: number;
+  customFiles: number;
+  customBytes: number;
+  orphanFiles: number;
+  orphanBytes: number;
+  missingFiles: number;
+  sameStemGroups: number;
+  sameStemBytes: number;
+  recoverableBytes: number;
+  lastScanAt: number;
+  examples: string[];
+}
+
+export interface CoverCleanResult {
+  deleted: number;
+  failed: number;
+  freedBytes: number;
+  errors: string[];
+}
+
+export interface DuplicateGroup {
+  key: string;
+  size: number;
+  suspected: boolean;
+  /** C14：exact / title-author-equal / title-prefix-volume。 */
+  reason: string;
+  /** C14：0–1。 */
+  confidence: number;
+  books: DuplicateBook[];
+}
+export interface DuplicateScanResult {
+  cancelled: boolean;
+  groups: DuplicateGroup[];
+  scanned: number;
+  skipped: number;
+  elapsedMs: number;
+}
+/** D4：备份导出/预览/恢复摘要。 */
+export interface DataBackupExportSummary {
+  progress: number;
+  bookmarks: number;
+  highlights: number;
+  tags: number;
+  bookTags: number;
+  skipped: number;
+  sizeBytes: number;
+  path: string;
+}
+
+export interface DataBackupPreview {
+  format: string;
+  version: number;
+  appVersion: string;
+  createdAt: number;
+  progress: number;
+  bookmarks: number;
+  highlights: number;
+  tags: number;
+  bookTags: number;
+  matchedBooks: number;
+  skipped: number;
+  conflicts: number;
+  hasConfig: boolean;
+  hasShelves: boolean;
+  empty: boolean;
+}
+
+export interface DataBackupRestoreSummary {
+  progress: number;
+  bookmarks: number;
+  highlights: number;
+  tags: number;
+  bookTags: number;
+  skipped: number;
+  conflicts: number;
+  overwrite: boolean;
+  configJson: string | null;
+}
+
+/** D3：标签信息（book_count 仅在 list_tags 中有值）。 */
+export interface TagInfo {
+  id: number;
+  name: string;
+  book_count: number;
+}
+
 /** 依赖凭据的封装统一先等凭据回填完成再 invoke，避免启动瞬间用到空密钥。
  *  仅延后 invoke；调用方传入的参数保持不变（命令签名不变）。 */
 function needsSecrets<A extends unknown[], R>(fn: (...args: A) => Promise<R>) {
@@ -22,17 +154,42 @@ export const api = {
   /** 书库挂载并取到首屏行后调用一次：启动日志据此判断「上次是否走到书库」，
    *  连续失败时下一次启动自动跳过封面重建（见 Rust memlog 模块）。 */
   libraryReady: () => invoke<void>("library_ready"),
-  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean, folder?: string) =>
-    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null }),
+  /** B1：前端启动阶段打点（写 startup.log）。 */
+  bootStage: (stage: string) => invoke<void>("boot_stage", { stage }),
+  /** includeTotal=false 跳过后端 COUNT（滚动窗口取数用），此时返回的 total=-1 哨兵。 */
+  listBooksPage: (query: string, sort: string, offset: number, limit: number, formats?: string[], states?: string[], desc?: boolean, folder?: string, includeTotal = true, tags?: string[]) =>
+    invoke<BookPage>("list_books_page", { query, sort, offset, limit, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null, includeTotal, tags: tags ?? null }),
+  /** R11-3：暂停/恢复后台封面扫描（进程内状态）。 */
+  setScanPaused: (paused: boolean) => invoke<void>("set_scan_paused", { paused }),
+  /** R12-3：切分书跨虚拟章锚点定位；返回目标章号，null=不适用/找不到。 */
+  locateEpubAnchor: (bookId: number, fileBase: string, fragment: string) =>
+    invoke<number | null>("locate_epub_anchor", { bookId, fileBase, fragment }),
   /** 秩可寻址分页命令 1：返回小端 i64 原始字节流（ArrayBuffer，每 8 字节一个 books.id）。
    *  query 为空=全量；非空=与 list_books_page 同源的 title/author 过滤（搜索档同样 O(W)）。
    *  formats/states：分类筛选（格式取「或」、状态取「或」、两组取「且」），空/省略=不约束该维度。
    *  folder：文件夹单选作用域（路径前缀），省略/null=全库。
    *  结果超过后端上限（30 万）时抛 "order_index_too_large:300000"，调用方须切 keyset 档。 */
-  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[], desc?: boolean, folder?: string) =>
-    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null }),
+  listOrderIndex: (sort: string, query: string, formats?: string[], states?: string[], desc?: boolean, folder?: string, tags?: string[]) =>
+    invoke<ArrayBuffer>("list_order_index", { sort, query, formats: formats ?? null, states: states ?? null, desc: desc ?? null, folder: folder ?? null, tags: tags ?? null }),
   /** Task B：书库当前实际存在的格式列表（去重、固定排序 count DESC, format ASC）。 */
   listFormats: () => invoke<string[]>("list_formats"),
+  /** D7：重复书检测（后台扫描，emit duplicate-progress）/ 取消。 */
+  /** C15：封面审计（只读）/ 手动清理无主封面。 */
+  coverAudit: () => invoke<CoverAudit>("cover_audit"),
+  cleanCoverOrphans: (confirm: boolean) => invoke<CoverCleanResult>("clean_cover_orphans", { confirm }),
+  /** 默认视图去重：返回主书库每组需隐藏的 book id（只读 SQL，不删文件）。 */
+  duplicateDisplayHidden: () => invoke<DupDisplay>("duplicate_display_hidden"),
+  findDuplicateBooks: (options?: { includeSuspected?: boolean; titleThreshold?: number; sizeTolerancePct?: number; maxCandidates?: number }) =>
+    invoke<DuplicateScanResult>("find_duplicate_books", { options: options ?? null }),
+  cancelDuplicateScan: () => invoke<void>("cancel_duplicate_scan"),
+  /** D3：标签列表（含 book_count）。 */
+  listTags: () => invoke<TagInfo[]>("list_tags"),
+  listBookTags: (bookId: number) => invoke<TagInfo[]>("list_book_tags", { bookId }),
+  createTag: (name: string) => invoke<TagInfo>("create_tag", { name }),
+  renameTag: (id: number, name: string) => invoke<void>("rename_tag", { id, name }),
+  deleteTag: (id: number) => invoke<void>("delete_tag", { id }),
+  setBookTags: (bookId: number, tagIds: number[]) =>
+    invoke<void>("set_book_tags", { bookId, tagIds }),
   /** Task F：手动设置阅读状态覆盖。state 取 "read" | "unread" | "auto"。只写 read_state，不动真实进度。 */
   setReadState: (bookId: number, state: "read" | "unread" | "auto") =>
     invoke<void>("set_read_state", { bookId, stateStr: state }),
@@ -183,6 +340,15 @@ export const api = {
   pickFolder: (title: string) => invoke<string | null>("pick_folder", { title }),
   pickSave: (title: string, ext: string, defaultName: string) =>
     invoke<string | null>("pick_save", { title, ext, defaultName }),
+  /** D1：写文本文件（导出划线/笔记用；不碰 DB）。 */
+  writeTextFile: (path: string, content: string) => invoke<void>("write_text_file", { path, content }),
+  /** D4：完整备份导出（config 传脱敏 JSON）/ 预览 / 恢复。 */
+  exportDataBackup: (path: string, configJson?: string) =>
+    invoke<DataBackupExportSummary>("export_data_backup", { path, configJson: configJson ?? null }),
+  inspectDataBackup: (path: string) =>
+    invoke<DataBackupPreview>("inspect_data_backup", { path }),
+  restoreDataBackup: (path: string, overwrite: boolean) =>
+    invoke<DataBackupRestoreSummary>("restore_data_backup", { path, overwrite }),
   exportAi: (path: string, target: string, title: string, author: string, items: { title: string; html: string }[]) =>
     invoke<string>("export_ai", { path, target, title, author, items }),
   setCustomCover: (bookId: number, imagePath: string) =>
@@ -219,6 +385,26 @@ export const api = {
   webdavDownloadProgress: needsSecrets((base: string, user: string, pass: string, remotePath: string, targetDir: string, session: string) =>
     invoke<string[]>("webdav_download_progress", { base, user, pass, remotePath, targetDir, session })),
   /** 上传设置备份到 TidePage/settings/{name}，返回远端路径。 */
+  /** D5：书签/划线/标签/书架单文件同步（下载→合并→上传）。resolve: local/remote/undefined。 */
+  webdavSyncData: (
+    base: string,
+    user: string,
+    pass: string,
+    options: { syncNotes: boolean; syncTags: boolean; syncShelves: boolean },
+    resolve?: "local" | "remote",
+    resolveChoices?: { key: string; choice: "local" | "remote" }[],
+    device?: string,
+  ) =>
+    invoke<{
+      added: number;
+      updated: number;
+      skipped: number;
+      conflicts: number;
+      conflictsPreview: { key: string; kind: string; book: string; summary: string; localTime: number; remoteTime: number }[];
+      remoteFound: boolean;
+      uploaded: boolean;
+      path: string;
+    }>("webdav_sync_data", { base, user, pass, options, resolve: resolve ?? null, resolveChoices: resolveChoices ?? null, device: device ?? null }),
   webdavBackupSettings: needsSecrets((base: string, user: string, pass: string, name: string, data: string) =>
     invoke<string>("webdav_backup_settings", { base, user, pass, name, data })),
   /** 读取云端指定设置备份；无则 null。 */
@@ -247,8 +433,30 @@ export const api = {
       fonts_bytes: number;
       db_bytes: number;
       cache_bytes: number;
+      parse_cache_bytes: number;
+      freelist_bytes: number;
+      db_dir_free_bytes: number | null;
+      temp_dir: string;
+      temp_free_bytes: number | null;
+      temp_same_disk: boolean;
+      last_checkpoint_at: number;
+      last_checkpoint_busy: boolean;
+      checkpoint_wal_before: number;
+      checkpoint_wal_after: number;
     }>("storage_stats"),
   clearCache: (what: "covers" | "res" | "all") => invoke<number>("clear_cache", { what }),
+  /** B3：清理解析缓存，返回释放字节数。 */
+  clearParseCache: () => invoke<number>("clear_parse_cache"),
+  /** B3：数据库整理（VACUUM），返回释放字节数；用户显式确认后调用。 */
+  vacuumDb: (auto = false) => invoke<number>("vacuum_db", { auto }),
+  /** B10：维护/扫描运行状态（自动整理调度用）。 */
+  maintenanceStatus: () => invoke<{ maintenanceRunning: boolean; scanRunning: boolean }>("maintenance_status"),
+  /** B10：维护历史（最近 5 条）。 */
+  maintenanceHistory: () => invoke<{
+    at: number; kind: string; result: string; error: string;
+    beforeDb: number; beforeWal: number; afterDb: number; afterWal: number;
+    freed: number; durationMs: number; checkpointBusy: boolean; backupPath: string;
+  }[]>("maintenance_history"),
   metaDebugStats: () => invoke<{ startCount: number; running: boolean; pending: number; priority: number }>("meta_debug_stats"),
   /** 封面扫描进度快照：前端挂载时主动拉取，初始化底栏进度条（消除启动事件早于挂载的竞态）。 */
   scanProgress: () => invoke<{ running: boolean; done: number; total: number; pending: number }>("scan_progress"),
@@ -261,15 +469,21 @@ export const api = {
     invoke<void>("add_bookmark", { bookId, chapterIndex, title, excerpt }),
   listBookmarks: (bookId: number) => invoke<BookmarkRow[]>("list_bookmarks", { bookId }),
   deleteBookmark: (id: number) => invoke<void>("delete_bookmark", { id }),
+  /** B9：记录同步墓碑（书架等非 DB 同步项删除时调用）。 */
+  recordSyncTombstone: (kind: string, key: string, deletedAt?: number) =>
+    invoke<void>("record_sync_tombstone", { kind, key, deletedAt: deletedAt ?? null }),
   addStats: (bookId: number, seconds: number) => invoke<void>("add_stats", { bookId, seconds }),
   getStats: () => invoke<[string, number][]>("get_stats"),
+  /** D2：阅读统计汇总（区间由前端按本地日历传入）。 */
+  getReadingStats: (startDay: string, endDay: string, prevStartDay: string, prevEndDay: string, heatStartDay: string, heatEndDay: string) =>
+    invoke<ReadingStats>("get_reading_stats", { startDay, endDay, prevStartDay, prevEndDay, heatStartDay, heatEndDay }),
   // keep：仍被引用的背景图文件名（全局 bgImage 与各方案的 schemeBgImage）；其余旧图按时间窗回收。
   setBgImage: (imagePath: string, keep: string[] = []) => invoke<string>("set_background_image", { imagePath, keep }),
   clearBgImage: (keep: string[] = []) => invoke<void>("clear_background_image", { keep }),
   randomBook: () => invoke<BookRow | null>("random_book"),
   /** 从当前筛选结果随机一书（query/sort/formats/states/folder 与列表同源）。 */
-  randomBookFiltered: (query: string, sort: string, formats: string[], states: string[], folder?: string) =>
-    invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states, folder: folder ?? null }),
+  randomBookFiltered: (query: string, sort: string, formats: string[], states: string[], folder?: string, tags?: string[]) =>
+    invoke<BookRow | null>("random_book_filtered", { query, sort, formats, states, folder: folder ?? null, tags: tags ?? null }),
   reextractCover: (bookId: number) => invoke<string>("reextract_cover", { bookId }),
   setCoverScan: (enabled: boolean) => invoke<void>("set_cover_scan", { enabled }),
   pdfBooksMissingCover: () => invoke<number[]>("pdf_books_missing_cover"),
@@ -361,7 +575,8 @@ export const api = {
   suggestMeta: (path: string) =>
     invoke<{ title: string; author: string }>("suggest_meta", { path }),
   rebuildFts: () => invoke<number>("rebuild_fts"),
-  indexBookFts: (bookId: number) => invoke<number>("index_book_fts", { bookId }),
+  /** auto=true 为后台自动索引（受体积/章数上限约束）；用户显式操作传 false/省略。 */
+  indexBookFts: (bookId: number, auto = false) => invoke<number>("index_book_fts", { bookId, auto }),
   revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
 };

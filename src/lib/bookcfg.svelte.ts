@@ -17,6 +17,10 @@ export interface BookOverride {
   overrideBookCss?: boolean;
   /** 手动切换漫画模式（true/false 覆盖自动检测；未设置则用自动检测结果） */
   mangaMode?: boolean;
+  /** D8：本书 TTS 音色覆盖（voice name/voiceURI/在线音色 id）；未设置回退全局。 */
+  ttsVoice?: string;
+  /** D8：本书 TTS 语速覆盖（0.5~4）；未设置回退全局。 */
+  ttsRate?: number;
 
   // ===== 阅读配色方案（"仅应用到本书"时写入的整套排版快照）=====
   // 任一 scheme* 字段存在即表示本书已单独套用方案；清除这些字段即回到全局。
@@ -34,6 +38,8 @@ export interface BookOverride {
   schemeCssExtra?: string;
   schemeFontWeight?: number;
 }
+
+import { mergeBookOverride } from "./bookOverrideMerge";
 
 const KEY = "tidepage.bookcfg.v1";
 
@@ -69,10 +75,7 @@ export function setBookOverride(id: number, patch: Partial<BookOverride>): void 
   if (!id) return;
   const key = String(id);
   const cur = bookOverrides.map[key] ?? {};
-  const next: BookOverride = { ...cur, ...patch };
-  for (const k of Object.keys(next) as (keyof BookOverride)[]) {
-    if (next[k] === undefined) delete next[k];
-  }
+  const next: BookOverride = mergeBookOverride(cur, patch);
   bookOverrides.map[key] = next;
   save();
 }

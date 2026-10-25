@@ -3,9 +3,12 @@
      （minmax(min(168px,100%),1fr)），任何窗口尺寸下封面都不会越界被窗口边缘裁掉。 -->
 <script lang="ts">
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
+  import { displayChapterTitle } from "../lib/chapterTitle";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
   import { toast, ui, requestOpenBook, APP_VERSION, openPanelWindow } from "../lib/stores.svelte";
   import { onMount } from "svelte";
+  import ExportPreview from "./ExportPreview.svelte";
+  import { sortExportRows, type HighlightExportRow } from "../lib/highlightExport";
   import { outDissolve, outSlideR } from "../lib/motion";
   import { listen } from "@tauri-apps/api/event";
   import {
@@ -62,6 +65,35 @@
   });
   const totalHl = $derived(shown.reduce((n, b) => n + b.hlCount, 0));
   const totalNotes = $derived(shown.reduce((n, b) => n + b.noteCount, 0));
+
+  /** D1：全库导出——按书取全量 listHighlights（不用 searchHighlights 的 500 上限），分批让出事件循环。 */
+  async function loadAllExportRows(): Promise<HighlightExportRow[]> {
+    const list = await api.listNoteBooks();
+    const out: HighlightExportRow[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      try {
+        const hs = await api.listHighlights(b.bookId);
+        for (const h of hs) {
+          out.push({
+            bookTitle: b.title,
+            bookAuthor: b.author ?? "",
+            chapterTitle: h.chapter_title,
+            chapterIndex: h.chapter_index,
+            text: h.text,
+            note: h.note ?? "",
+            style: h.style ?? "",
+            color: h.color ?? "",
+            createdAt: h.created_at,
+          });
+        }
+      } catch {
+        /* 单本失败不阻断全库导出 */
+      }
+      if (i % 5 === 4) await new Promise((r) => setTimeout(r, 0));
+    }
+    return sortExportRows(out);
+  }
 
   async function load() {
     loading = true;
@@ -178,6 +210,7 @@
     <div class="spacer"></div>
     {#if !standalone}<button class="icon" data-testid="nl-popout" title={t("notes.popoutTip")} aria-label={t("notes.popoutTip")} onclick={popout}><IconArrowsSplit2 /></button>{/if}
     <button class="icon" data-testid="nl-refresh" title={t("common.action.refresh")} aria-label={t("common.action.refresh")} onclick={load}><IconRefresh /></button>
+    <ExportPreview loadRows={loadAllExportRows} defaultName="tidepage-notes" />
   </div>
 
   <div class="nl-body">
@@ -288,7 +321,7 @@
                 <div class="note none">{t("notes.noNote")}</div>
               {/if}
               <div class="foot">
-                <span class="ch">{n.chapterTitle || t("common.sectionN", { n: n.chapterIndex + 1 })} · {fmtDate(n.createdAt)}</span>
+                <span class="ch">{displayChapterTitle(n.chapterTitle, n.chapterIndex, (nn) => t("common.sectionN", { n: nn }))} · {fmtDate(n.createdAt)}</span>
                 {#if n.note}
                   <button class="icon" data-testid="nl-del-note" title={t("notes.delNoteTip")} onclick={() => removeNote(n)}><IconTrash /></button>
                 {:else}

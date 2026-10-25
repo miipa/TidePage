@@ -7,6 +7,7 @@
      吸附：本窗作为卫星窗 startSnap()，onDestroy 时 stopSnap() 清理监听与吸附组引用。 -->
 <script lang="ts">
   import { t } from "../lib/i18n/index.svelte";
+  import { displayChapterTitle } from "../lib/chapterTitle";
   import { onMount, onDestroy } from "svelte";
   import { api } from "../lib/api";
   import { mergeOutlineTitles, retitlePdfPageToc, type PdfOutlineItem } from "../lib/pdfPage";
@@ -176,7 +177,7 @@
         {#each bookmarks as bm (bm.id)}
           <div class="sp-item bm-item">
             <div class="bm-main" onclick={() => gotoChapter(bm.chapter_index)}>
-              <div class="bm-title">{bm.title || t("common.untitled")}</div>
+              <div class="bm-title">{displayChapterTitle(bm.title, bm.chapter_index, (n) => t("common.sectionN", { n }))}</div>
               {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
             </div>
           </div>
@@ -186,7 +187,7 @@
       </div>
     </div>
   {:else if panel === "highlights"}
-    <HighlightsPanel {bookId} version={hlVersion} onjump={gotoHighlight} onchanged={() => {}} />
+    <HighlightsPanel {bookId} version={hlVersion} bookTitle={title} onjump={gotoHighlight} onchanged={() => {}} />
   {:else if panel === "stats"}
     <BookStatsModal {bookId} bookTitle={title} version={statsVersion} />
   {:else if panel === "notes"}

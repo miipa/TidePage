@@ -1,26 +1,16 @@
 <script lang="ts">
+  // B7：首屏只静态加载 Library/WindowControls；Reader、全部弹窗与独立窗口按需 import。
   import Library from "../components/Library.svelte";
-  import Reader from "../components/Reader.svelte";
-  import SettingsModal from "../components/SettingsModal.svelte";
-  import SearchModal from "../components/SearchModal.svelte";
-  import StatsModal from "../components/StatsModal.svelte";
-  import ConvertModal from "../components/ConvertModal.svelte";
-  import AiPanel from "../components/AiPanel.svelte";
-  import WebdavBrowser from "../components/WebdavBrowser.svelte";
-  import StandaloneBook from "../components/StandaloneBook.svelte";
-  import StandalonePanel from "../components/StandalonePanel.svelte";
-  import NotesPanel from "../components/NotesPanel.svelte";
   import WindowControls from "../components/WindowControls.svelte";
   import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
   import { AI_OPEN_KEY, AI_WIN_H_KEY, AI_WIN_W_KEY } from "../lib/aiPanelKeys";
   import { t } from "../lib/i18n/index.svelte";
+  import { onMount } from "svelte";
   import { IconCopy, IconX } from "@tabler/icons-svelte";
-  import { preloadReaderFonts, syncCustomFontFaces } from "../lib/fontfaces";
-  import { startSnap, stopSnap } from "../lib/windowSnap";
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
   import { outDissolve, outFade, outSlideR } from "../lib/motion";
-  import { checkForUpdates } from "../lib/update.svelte";
+
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const standalone = !!params && params.get("ai") === "1";
@@ -44,18 +34,45 @@
 
   // 自定义字体 @font-face：所有窗口（主窗口 / 独立阅读 / 独立 AI 窗口）统一注入，
   // 独立 AI 窗口不挂载 Reader，必须在这里也能加载用户安装的字体。
+  // B1：启动打点 + 非首屏任务延后到空闲（字体预加载/更新检查不再与首屏抢主线程）。
+  function whenIdle(fn: () => void, timeout: number): void {
+    const ric = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout?: number }) => number })
+      .requestIdleCallback;
+    if (typeof ric === "function") ric(fn, { timeout });
+    else setTimeout(fn, Math.min(timeout, 1200));
+  }
+  onMount(() => {
+    void api.bootStage("page_mount");
+  });
+
+  // B7：首屏 ready 后空闲预取 Reader chunk（失败不影响首屏；真正打开时会再次 import）。
+  $effect(() => {
+    if (standalone || standalonePanel || standaloneBook) return;
+    let cancelled = false;
+    whenIdle(() => {
+      if (!cancelled) void import("../components/Reader.svelte").catch(() => undefined);
+    }, 6000);
+    return () => { cancelled = true; };
+  });
+
   // 启动后静默检查更新（失败不提示）：有新版本时由界面（设置入口/关于）显示红点。
   let updateCheckStarted = false;
   $effect(() => {
     if (updateCheckStarted || standalone || standalonePanel || standaloneBook) return;
     updateCheckStarted = true;
-    const timer = setTimeout(() => void checkForUpdates(), 3000);
-    return () => clearTimeout(timer);
+    let cancelled = false;
+    whenIdle(() => {
+      if (!cancelled) void import("../lib/update.svelte").then((m) => m.checkForUpdates()).catch(() => undefined);
+    }, 4000);
+    return () => {
+      cancelled = true;
+    };
   });
 
   $effect(() => {
     void config.reader.customFonts;
-    syncCustomFontFaces();
+    // B7：字体注入不阻塞首屏（改字体时也会在下一空闲帧注入）。
+    whenIdle(() => { void import("../lib/fontfaces").then((m) => m.syncCustomFontFaces()).catch(() => undefined); }, 1500);
   });
   // 启动即预加载设定字体，首次打开书籍时可直接以正确字体呈现（消除字体闪烁）
   //
@@ -70,10 +87,14 @@
     void config.reader.latinFont;
     void config.reader.fontSize;
     // 换字体时值得立刻预加载，但仍合并同一帧内的连续改动，避免拖动字体选择器时逐项触发。
+    // B1：非首屏任务——等空闲再预加载（timeout 兜底 1500ms），不与首屏行/列表抢主线程。
     if (fontPreloadTimer) clearTimeout(fontPreloadTimer);
     fontPreloadTimer = setTimeout(() => {
       fontPreloadTimer = undefined;
-      void preloadReaderFonts();
+      whenIdle(() => {
+        void api.bootStage("font_preload_start");
+        void import("../lib/fontfaces").then((m) => m.preloadReaderFonts()).catch(() => undefined);
+      }, 1500);
     }, 200);
     return () => {
       if (fontPreloadTimer) {
@@ -91,9 +112,18 @@
   });
 
   // 窗口吸附体系：每个窗口启动一次（模块内按 label 自动区分基准窗/卫星窗），卸载时清理监听与组引用。
+  // B7：吸附监听不参与首屏关键路径，延后到首个空闲帧启动（卫星窗拖动时仍生效）。
+  let snapMod: typeof import("../lib/windowSnap") | null = null;
   $effect(() => {
-    void startSnap();
-    return () => { void stopSnap(); };
+    whenIdle(() => {
+      void import("../lib/windowSnap").then((m) => {
+        snapMod = m;
+        void m.startSnap();
+      }).catch(() => undefined);
+    }, 1200);
+    return () => {
+      if (snapMod) void snapMod.stopSnap();
+    };
   });
 
   // 吸附特效：卫星窗拖动进入吸附区显示预吸附虚线（tp-snap-preview），吸附命中闪一下发光（tp-snap-flash）。
@@ -187,25 +217,35 @@
 
 {#if standalone}
   <div class="ai-window-root" style={aiRootStyle}>
-    <AiPanel standalone />
+    {#await import("../components/AiPanel.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: AiPanel }}
+      <AiPanel standalone />
+    {:catch}<div class="comp-loading">{t("boot.dynamicFailed")} <button onclick={() => location.reload()}>{t("boot.retry")}</button></div>{/await}
   </div>
   {#if ui.settingsOpen}
     <div class="overlay" out:outDissolve onpointerdown={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}></div>
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}>
-      <SettingsModal initialTab="ai" />
+      {#await import("../components/SettingsModal.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+        <C initialTab="ai" />
+      {:catch}<div class="comp-loading">{t("boot.dynamicFailed")} <button onclick={() => location.reload()}>{t("boot.retry")}</button></div>{/await}
     </dialog>
   {/if}
 {/if}
 {#if standalonePanel}
-  <StandalonePanel />
+  {#await import("../components/StandalonePanel.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+    <C />
+  {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
 {:else if standaloneBook}
-  <StandaloneBook />
+  {#await import("../components/StandaloneBook.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+    <C />
+  {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
 {:else if !standalone}
 <div class="layout-root">
   {#if ui.view === "library"}
     <Library />
   {:else}
-    <Reader />
+    {#await import("../components/Reader.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+      <C />
+    {:catch}<div class="comp-loading">{t("boot.dynamicFailed")} <button onclick={() => location.reload()}>{t("boot.retry")}</button></div>{/await}
   {/if}
 </div>
 {/if}
@@ -214,26 +254,34 @@
   {#if ui.settingsOpen}
     <div class="overlay" out:outDissolve onpointerdown={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}></div>
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) { ui.settingsOpen = false; } }}>
-      <SettingsModal />
+      {#await import("../components/SettingsModal.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+        <C />
+      {:catch}<div class="comp-loading">{t("boot.dynamicFailed")} <button onclick={() => location.reload()}>{t("boot.retry")}</button></div>{/await}
     </dialog>
   {/if}
   {#if ui.searchOpen}
     <div class="overlay" out:outDissolve onpointerdown={(e) => { if (e.target === e.currentTarget) { ui.searchOpen = false; } }}></div>
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) { ui.searchOpen = false; } }}>
-      <SearchModal />
+      {#await import("../components/SearchModal.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+        <C />
+      {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
     </dialog>
   {/if}
   {#if ui.statsOpen}
     <div class="overlay" out:outDissolve onclick={() => (ui.statsOpen = false)}></div>
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) { ui.statsOpen = false; } }}>
-      <StatsModal />
+      {#await import("../components/StatsModal.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+        <C />
+      {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
     </dialog>
   {/if}
 
   {#if ui.webdavOpen}
     <div class="overlay" out:outDissolve onclick={() => (ui.webdavOpen = false)}></div>
     <div class="wd-drawer" out:outSlideR>
-      <WebdavBrowser />
+      {#await import("../components/WebdavBrowser.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+        <C />
+      {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
     </div>
   {/if}
 
@@ -245,7 +293,9 @@
       onclick={(e) => { if (e.target === e.currentTarget) { convertState.open = false; convertState.book = null; } }}
     >
       {#if convertState.book}
-        <ConvertModal />
+        {#await import("../components/ConvertModal.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+          <C />
+        {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
       {/if}
     </dialog>
   {/if}
@@ -265,13 +315,25 @@
   {/if}
 
   {#if ui.notesOpen}
-    <NotesPanel />
+    {#await import("../components/NotesPanel.svelte")}<div class="comp-loading">{t("common.loading")}</div>{:then { default: C }}
+      <C />
+    {:catch}<div class="comp-loading">{t("boot.dynamicFailed")}</div>{/await}
   {/if}
 
   {#if confirmBox.active}
     <div class="overlay" out:outDissolve onpointerdown={(e) => { if (e.target === e.currentTarget) { confirmAnswer(false); } }}></div>
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) { confirmAnswer(false); } }}>
       <div class="modal-body confirm-body">
+        {#if confirmBox.detail?.length}
+          <div class="confirm-detail" style={"--cd-cols:" + (1 + Math.max(...confirmBox.detail.map((r) => r.cells.length)))}>
+            {#each confirmBox.detail as row (row.label)}
+              <span class="cd-label">{row.label}</span>
+              {#each row.cells as cell, i (i)}
+                <span class="cd-cell" class:end={cell.align === "end"}>{cell.text}</span>
+              {/each}
+            {/each}
+          </div>
+        {/if}
         <p class="confirm-msg">{confirmBox.msg}</p>
         <div class="confirm-row">
           <button data-testid="confirm-cancel" onclick={() => confirmAnswer(false)}>{t("common.confirm.cancel")}</button>
@@ -304,6 +366,8 @@
 </div>
 
 <style>
+  .comp-loading { position: fixed; inset: 0; display: grid; place-items: center; gap: 8px; color: var(--fg2); background: var(--bg); z-index: var(--z-modal); font-size: var(--fs-sm); }
+  .comp-loading button { padding: 4px 12px; }
   .tp-toast-wrap {
     position: fixed;
     left: 16px;
@@ -451,6 +515,21 @@
     word-break: break-all;
   }
 
+  .confirm-detail {
+    display: grid;
+    grid-template-columns: repeat(var(--cd-cols, 2), max-content);
+    justify-content: start;
+    column-gap: 14px;
+    row-gap: 4px;
+    margin: 0 0 14px;
+    line-height: 1.6;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .confirm-detail .cd-label { color: var(--fg2); }
+  .confirm-detail .cd-cell { white-space: nowrap; }
+  .confirm-detail .cd-cell.end { text-align: end; }
+
   .confirm-row {
     display: flex;
     justify-content: flex-end;
@@ -467,3 +546,4 @@
     margin-top: 6px;
   }
 </style>
+

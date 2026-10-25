@@ -5,12 +5,17 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
   import { HIGHLIGHT_STYLES, appConfirm, config, saveConfig, toast } from "../lib/stores.svelte";
   import { labelOfId } from "../lib/i18n/index.svelte";
   import { dragOutHandle } from "../lib/windowSnap";
+  import { displayChapterTitle } from "../lib/chapterTitle";
   import type { HighlightRow } from "../lib/types";
   import ColorPalette from "./ColorPalette.svelte";
+  import ExportPreview from "./ExportPreview.svelte";
+  import { sortExportRows, type HighlightExportRow } from "../lib/highlightExport";
 
   let {
     bookId,
     version = 0,
+    bookTitle = "",
+    bookAuthor = "",
     onjump,
     onclose,
     onchanged,
@@ -18,6 +23,8 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
   }: {
     bookId: number;
     version?: number;
+    bookTitle?: string;
+    bookAuthor?: string;
     onjump: (h: HighlightRow) => void;
     onclose?: () => void;
     onchanged: () => void;
@@ -80,6 +87,26 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
     }
   }
 
+  /** D1：导出取本书全部划线（不受面板搜索过滤影响）。 */
+  async function loadExportRows(): Promise<HighlightExportRow[]> {
+    const all = await api.listHighlights(bookId);
+    return sortExportRows(
+      all.map((h) => ({
+        bookTitle: bookTitle || h.book_title || "",
+        bookAuthor,
+        chapterTitle: displayChapterTitle(h.chapter_title, h.chapter_index, (n) =>
+          t("common.sectionN", { n }),
+        ),
+        chapterIndex: h.chapter_index,
+        text: h.text,
+        note: h.note ?? "",
+        style: h.style ?? "",
+        color: h.color ?? "",
+        createdAt: h.created_at,
+      })),
+    );
+  }
+
   function when(ts: number): string {
     try {
       return new Date(ts).toLocaleString(dateLocale());
@@ -93,6 +120,7 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
   <div class="sp-head" data-testid="hlp-head" use:dragOutHandle={onpopout} title={t("common.panel.popoutTip")}>
     <span>{t("highlight.panelTitle")}</span>
     <div style="display:flex; gap:6px; align-items:center;">
+      <ExportPreview loadRows={loadExportRows} defaultName={(bookTitle || "tidepage") + "-highlights"} />
       {#if onpopout}<button class="icon" data-testid="hlp-popout" title={t("common.panel.popout")} onclick={onpopout}><IconArrowsSplit2 /></button>{/if}
       {#if onclose}<button class="icon" data-testid="hlp-close" title={t("common.action.close")} onclick={onclose}><IconX /></button>{/if}
     </div>
@@ -112,7 +140,7 @@ import { IconArrowsSplit2, IconTrash, IconX } from "@tabler/icons-svelte";
       <div class="sp-item hl-item">
         <div class="hl-top" onclick={() => onjump(h)} title={t("highlight.jumpTip")}>
           <div class="bm-title">
-            {h.chapter_title || t("common.sectionN", { n: h.chapter_index + 1 })}
+            {displayChapterTitle(h.chapter_title, h.chapter_index, (n) => t("common.sectionN", { n }))}
             {#if query.trim()}<span class="hl-book">· {h.book_title}</span>{/if}
           </div>
           <div class="bm-excerpt hl-text">{h.text}</div>

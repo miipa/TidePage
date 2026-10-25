@@ -1,8 +1,15 @@
 <script lang="ts">
   import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
   import { toast } from "../lib/stores.svelte";
+  import { displayChapterTitle } from "../lib/chapterTitle";
+  import {
+    applySearchProgress,
+    resetSearchProgress,
+    type SearchProgress,
+  } from "../lib/searchProgress";
   import { placePopup, type PopupAnchor } from "../lib/placePopup";
   import { outFade } from "../lib/motion";
   import type { BookSearchHit } from "../lib/types";
@@ -38,6 +45,8 @@
   let searching = $state(false);
   let searched = $state(false);
   let indexing = $state(false);
+  // R7-3：首次搜索建立全文缓存时的进度（null=不显示）；请求结束/失败后清空。
+  let preparing = $state<SearchProgress | null>(null);
   let popEl: HTMLDivElement | undefined = $state();
 
   // 请求序号：并发/迟到的旧查询不能覆盖新结果。
@@ -47,15 +56,21 @@
     if (q.length < 2) return;
     const my = ++runSeq;
     searching = true;
+    preparing = resetSearchProgress();
     try {
       const r = await api.searchInBook(bookId, q);
       if (my !== runSeq) return; // 旧查询：丢弃
       hits = r;
       searched = true;
     } catch (e) {
-      if (my === runSeq) toast(String(e), "error");
+      // 不向用户暴露内部错误；原文只进控制台，便于排查。
+      console.error(e);
+      if (my === runSeq) toast(t("search.popup.prepareFailed"), "error");
     } finally {
-      if (my === runSeq) searching = false;
+      if (my === runSeq) {
+        searching = false;
+        preparing = resetSearchProgress();
+      }
     }
   }
 
@@ -63,10 +78,14 @@
     indexing = true;
     try {
       await api.ensureBookText(bookId);
+      preparing = resetSearchProgress();
       await run();
     } catch (e) {
-      toast(String(e), "error");
+      console.error(e);
+      toast(t("search.popup.prepareFailed"), "error");
     } finally {
+      // 失败/结束时清掉进度行，避免残留。
+      preparing = resetSearchProgress();
       indexing = false;
     }
   }
@@ -99,7 +118,35 @@
   });
 
   onMount(() => {
-    run();
+    // R7-3：先注册监听再触发搜索，避免首次大书建缓存时丢掉最前面的进度事件。
+    // 监听注册只多几毫秒，弹窗打开即有搜索结果的体验不变。
+    let destroyed = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ book_id: number; done: number; total: number }>("book-text-progress", (e) => {
+      if (destroyed) return;
+      preparing = applySearchProgress(
+        preparing,
+        { bookId: e.payload.book_id, done: e.payload.done, total: e.payload.total },
+        bookId,
+      );
+    })
+      .then((un) => {
+        if (destroyed) {
+          un();
+          return;
+        }
+        unlisten = un;
+        run();
+      })
+      .catch(() => {
+        // 监听注册失败不阻塞搜索。
+        if (!destroyed) run();
+      });
+    return () => {
+      destroyed = true;
+      preparing = resetSearchProgress();
+      unlisten?.();
+    };
   });
 
   function pick(i: number, h: BookSearchHit) {
@@ -151,7 +198,7 @@
       {#if canBack}
         <button class="mini ico" data-testid="bsp-back" onclick={onback} title={t("search.popup.backTip")}><IconArrowLeft />{t("search.popup.back")}</button>
       {/if}
-      <button class="x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")}><IconX /></button>
+      <button class="x tp-x" data-testid="bsp-close" onclick={onclose} title={t("common.action.close")} aria-label={t("common.action.close")}><IconX size={14} stroke={1.8} /></button>
     </div>
   </div>
   <div class="sb-row">
@@ -163,6 +210,11 @@
     />
     <button class="primary" data-testid="bsp-go" onclick={run} disabled={searching}>{searching ? "…" : t("common.action.search")}</button>
   </div>
+  {#if preparing}
+    <div class="sb-prep" data-testid="bsp-prep">
+      {t("search.popup.preparing", { p: preparing.pct })}
+    </div>
+  {/if}
   <div class="sb-list">
     {#if searched && !hits.length}
       <div class="sb-empty" data-testid="bsp-empty">
@@ -174,7 +226,7 @@
     {/if}
     {#each hits as h, i (i)}
       <div class="sb-hit" class:active={activeIdx === i} onclick={() => pick(i, h)}>
-        <div class="sb-ch">{h.chapter_title || t("common.sectionN", { n: h.chapter_index + 1 })}</div>
+        <div class="sb-ch">{displayChapterTitle(h.chapter_title, h.chapter_index, (n) => t("common.sectionN", { n }))}</div>
         <div class="sb-sn">{@html h.snippet.replaceAll("<mark>", '<mark class="mk">')}</div>
       </div>
     {/each}
@@ -247,6 +299,20 @@
   }
 
   .sb-row input { flex: 1; min-width: 0; }
+
+  /* R7-3：首次搜索建立全文缓存的进度行（完成后由请求结束清空）。 */
+  .sb-prep {
+    padding: 4px var(--sp-3);
+    font-size: var(--fs-xs);
+    letter-spacing: var(--ls-xs);
+    color: var(--fg-soft);
+    border-bottom: 1px solid var(--line-soft);
+    /* 文案过长时不撑破弹窗：单行省略。颜色/描边全部走主题变量。 */
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .sb-list {
     overflow-y: auto;

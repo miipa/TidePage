@@ -6,8 +6,8 @@ use crate::txt;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 全书图片列表缓存条目：带文件指纹，同一路径的文件被就地替换后不再命中。
@@ -20,9 +20,22 @@ pub struct CachedImages {
 /// 全书图片列表缓存上限（按书数）。超限整体清空，实现简单且内存上限可预期。
 const MAX_IMAGE_CACHE: usize = 32;
 
+impl CachedEpub {
+    /// C13：仅显式用户动作（链接跳转/全文文本等）可临时整本读取；超过 64MB 拒绝，
+    /// 避免 990MB 书在非首屏路径再次瞬时读入整本。
+    pub fn read_all(&self) -> Option<Vec<u8>> {
+        let limit = 64 * 1024 * 1024u64;
+        if std::fs::metadata(&self.path).map(|m| m.len() > limit).unwrap_or(true) {
+            return None;
+        }
+        std::fs::read(&self.path).ok()
+    }
+}
+
 pub struct CachedEpub {
     pub doc: crate::epub::EpubDoc,
-    pub data: Arc<Vec<u8>>,
+    /// C13：只保留文件路径；zip 条目按需打开读取，不再常驻整本字节。
+    pub path: String,
     /// zip 条目名 → 索引（含 basename 兜底），解析一次复用，避免每章重跑 build_ci。
     pub ci: crate::epub::CiMap,
     /// 解析时该文件的指纹（大小, mtime）。命中缓存前必须与磁盘现读指纹一致，
@@ -38,6 +51,8 @@ pub struct CachedText {
     pub ver: u64,
     pub stamp: Option<(i64, i64)>,
     pub doc: Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>,
+    /// 解析时的编码告警（MOBI 用）。随缓存保存：命中缓存时 open_book 仍要返回与冷解析一致的提示。
+    pub warn: Option<String>,
 }
 
 /// EPUB 字数统计缓存条目：文件指纹 + 每章字数 + 全书 total/pure。
@@ -60,6 +75,8 @@ pub struct AppState {
     pub rules_ver: AtomicU64,
     pub txt_cache: Mutex<HashMap<i64, CachedText>>,
     pub epub_cache: Mutex<HashMap<i64, Arc<CachedEpub>>>,
+    /// C1：EPUB 缓存的插入顺序（最旧在前），用于按字节权重淘汰。
+    pub epub_cache_order: Mutex<Vec<i64>>,
     /// EPUB 字数统计缓存：key = book_id → EpubStats（带文件指纹）。
     /// 「全书总页数」（book_char_counts）与书详情/本书统计（get_book_word_count）共用同一份，
     /// 避免同一本书被完整解析两次；容量很小（4），因为一条就够几 MB 的逐章数组。
@@ -78,6 +95,17 @@ pub struct AppState {
     pub scan_running: std::sync::atomic::AtomicBool,
     /// 请求 worker 尽快退出（清缓存前避免删封面目录与写封面并发；或应用退出）。
     pub scan_stop: std::sync::atomic::AtomicBool,
+    /// R11-3：书库首屏就绪后置 true；就绪前的 ensure_scan_worker 一律不启动扫描。
+    pub library_ready: std::sync::atomic::AtomicBool,
+    /// R11-3：扫描暂停开关（进程内状态；resume 后原地继续，不重复处理已标记书籍）。
+    pub scan_paused: std::sync::atomic::AtomicBool,
+    /// B3：维护任务（VACUUM）互斥；与 FTS 重建/封面扫描互斥，避免长时间锁与并发写。
+    pub maintenance_running: std::sync::atomic::AtomicBool,
+    /// B2/B3：空闲 FTS optimize 正在执行（VACUUM 与手动重建都要避开它）。
+    pub fts_optimize_running: std::sync::atomic::AtomicBool,
+    /// R12-2：格式分组计数缓存（epoch, formats）；books 实际变更时 bump formats_epoch。
+    pub formats_cache: Mutex<Option<(u64, Vec<String>)>>,
+    pub formats_epoch: AtomicU64,
     /// worker 累计启动次数（仅诊断用）。
     pub scan_start_count: AtomicU64,
     /// 本轮扫描已处理数 / 待处理总数（进度条分子分母，worker 启动时按 DB 实测赋值）。
@@ -91,6 +119,129 @@ pub struct AppState {
     pub cover_scan_ws_base: AtomicU64,
     /// 封面默认底图 id 与解析规则版本，参与缓存失效（F5）。
     pub cover_style_ver: AtomicU64,
+    /// 进程内 FTS 索引单实例闸门：自动索引 / 命令调用 / 全库重建共用，避免并发写出重复行。
+    pub fts_index_running: AtomicBool,
+    /// get_chapter 每章都要的书籍元信息缓存：book_id → (path, ext)。
+    /// 命中路径完全不碰 state.db.0；删除书籍 / 移除目录 / 刷新书库后整体清空。
+    pub book_meta: Mutex<HashMap<i64, (String, String)>>,
+    /// 最近一次 open_book 的书 id：同书重复打开（弹出目录/面板窗）不失效章节缓存，只有真换书才整体清空。
+    pub last_open_book: AtomicI64,
+    /// 字数统计单飞表（P13）：book_id → 在途航班；并发调用同书统计时只有 leader 真正解析。
+    pub epub_stats_flights: Mutex<HashMap<i64, Arc<Flight<Result<Arc<EpubStats>, String>>>>>,
+    /// R8-1：MOBI/AZW3 图片清单进程内缓存（key=book_id，带源文件指纹，容量 4，淘汰最旧）。
+    pub mobi_manifest_cache: Mutex<Vec<(i64, i64, i64, Arc<crate::mobi::ResManifest>)>>,
+}
+
+/// FTS 索引单实例闸门（RAII）：同一进程内只允许一个索引任务写库，
+/// 避免自动索引与手动重建并发产生重复行。析构时复位，异常/提前 return 也不会卡住后续索引。
+struct FtsIndexGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> FtsIndexGuard<'a> {
+    /// 抢占闸门；已有任务在跑时返回 None（调用方按「跳过」处理）。
+    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for FtsIndexGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// 单飞航班（P13）：一个 key 的第一次调用成为 leader 执行计算，其余调用等 Condvar 复用结果。
+pub struct Flight<V> {
+    done: Mutex<Option<V>>,
+    cv: Condvar,
+}
+
+impl<V> Default for Flight<V> {
+    fn default() -> Self {
+        Self { done: Mutex::new(None), cv: Condvar::new() }
+    }
+}
+
+/// 单飞辅助（P13）：同 key 并发调用只让第一个执行 compute，其余等待并克隆同一结果。
+/// 完成顺序：leader 写结果 → 从 map 移除 → notify_all（等待者不会拿到已删除的表项）；
+/// leader panic 时同样移除表项并唤醒等待者，等待者回到循环重新竞争，不会永久挂起。
+fn single_flight<V: Clone>(
+    map: &Mutex<HashMap<i64, Arc<Flight<V>>>>,
+    key: i64,
+    compute: impl FnOnce() -> V,
+) -> V {
+    enum Role<V> {
+        Leader,
+        Follower(Arc<Flight<V>>),
+    }
+    loop {
+        let role = {
+            let mut m = map.lock().unwrap();
+            match m.get(&key) {
+                Some(f) => Role::Follower(f.clone()),
+                None => {
+                    let f = Arc::new(Flight::default());
+                    m.insert(key, f.clone());
+                    Role::Leader
+                }
+            }
+        };
+        match role {
+            Role::Leader => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute));
+                match outcome {
+                    Ok(value) => {
+                        // 顺序：先写结果 → 再移除表项 → 最后唤醒。这样「写结果后、移除前」到达的
+                        // 新调用仍会等到结果，不会在窗口期重复计算；等待者也不会拿到已删除的表项。
+                        let flight = map.lock().unwrap().get(&key).cloned();
+                        if let Some(f) = flight {
+                            *f.done.lock().unwrap() = Some(value.clone());
+                            map.lock().unwrap().remove(&key);
+                            f.cv.notify_all();
+                        }
+                        return value;
+                    }
+                    Err(payload) => {
+                        let flight = map.lock().unwrap().remove(&key);
+                        if let Some(f) = flight {
+                            f.cv.notify_all();
+                        }
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+            Role::Follower(f) => loop {
+                let mut done = f.done.lock().unwrap();
+                if let Some(v) = done.as_ref() {
+                    return v.clone();
+                }
+                // wait_timeout：即使 leader panic 时恰好错过 notify，也能定期复查表项，避免挂死。
+                let (guard, _timeout) = f
+                    .cv
+                    .wait_timeout(done, std::time::Duration::from_millis(20))
+                    .unwrap();
+                done = guard;
+                if let Some(v) = done.as_ref() {
+                    return v.clone();
+                }
+                drop(done);
+                // 判据必须是「表里当前航班是否仍是我等待的同一个 Arc」：leader panic 移除表项后，
+                // 新调用可能已插入同 key 的新 Flight；只看 contains_key 会误以为仍是旧航班而继续
+                // 等一个再也不会被唤醒的 Arc（线程挂起）。
+                let still_ours = map
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map_or(false, |cur| Arc::ptr_eq(cur, &f));
+                if !still_ours {
+                    break; // 回外层重新竞争（成为新 leader 或跟新航班）
+                }
+            },
+        }
+    }
 }
 
 /// 简单的按书维度 LRU 章节缓存：容量按条数限制，随书切换/规则变化整体失效。
@@ -212,6 +363,17 @@ fn stamp_matches(cached: Option<(i64, i64)>, current: Option<(i64, i64)>) -> boo
     matches!((cached, current), (Some(a), Some(b)) if a == b)
 }
 
+/// 解析缓存条目是否可复用：规则版本一致，且两侧文件指纹都有值且相等。
+/// 抽成纯函数便于单测；load_txt / load_mobi / get_chapter 的内联快路径共用同一判据，避免漂移。
+fn cache_entry_valid(
+    entry_ver: u64,
+    ver: u64,
+    entry_stamp: Option<(i64, i64)>,
+    file_stamp: Option<(i64, i64)>,
+) -> bool {
+    entry_ver == ver && stamp_matches(entry_stamp, file_stamp)
+}
+
 /// DB 里缓存的字数是否可用：必须有值，且行上的 size/mtime 与磁盘当前指纹一致。
 /// 抽成纯函数便于单测（不碰文件系统）。
 /// 为什么 DB 短路也要校验：扫描（upsert_book 更新 size/mtime）不一定在用户打开书详情之前跑到，
@@ -229,6 +391,13 @@ fn db_chars_usable(
         Some((size, mtime)) => size == book_size && mtime == book_mtime,
         None => false,
     }
+}
+
+/// DB 里持久化的解析缓存（TXT 编码判定 / EPUB 字数统计）与磁盘文件是否仍匹配：
+/// 行上 size+mtime 必须与当前指纹完全一致；取不到当前指纹一律不复用。
+/// 抽成纯函数便于单测（与 db_chars_usable 同理，防「同路径文件被就地替换」后读到旧缓存）。
+fn db_cache_stamp_usable(row_size: i64, row_mtime: i64, disk: Option<(i64, i64)>) -> bool {
+    matches!(disk, Some((size, mtime)) if size == row_size && mtime == row_mtime)
 }
 
 fn quick_title(path: &str) -> String {
@@ -758,6 +927,8 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         if r.is_ok() {
             changed = true;
             cleanup_book_artifacts_for(&state.app, &artifacts);
+            // 扫描确认删除的书籍也要让元信息缓存失效（否则 get_chapter 会拿旧 path 当成书还在）。
+            state.book_meta.lock().unwrap().clear();
         } else if let Err(e) = r {
             eprintln!("[scan] delete_books tx failed: {e}");
         }
@@ -870,6 +1041,7 @@ pub async fn scan_folders(state: &AppState, progress_scope: Option<Vec<String>>,
         );
     }
     if changed {
+        bump_formats_epoch(state);
         state.app.emit("library-changed", ()).ok();
     }
     // 新书或存量指纹变化都会产生 meta_done=0，拉起增量扫描（若空闲）。
@@ -984,6 +1156,12 @@ pub fn ensure_scan_worker(app: &AppHandle) {
     // 崩溃保护触发时进程内不会再清除该标记：直接不创建工作线程，杜绝「跳过 → 释放 → 复查 → 再拉起」自转链。
     if memlog::skip_cover_rebuild() {
         return;
+    }
+    // R11-3：首屏就绪前的启动调用一律不启动（library_ready 之后才会再拉起）。
+    if let Some(st) = app.try_state::<Arc<AppState>>() {
+        if !st.library_ready.load(Ordering::SeqCst) {
+            return;
+        }
     }
     let app = app.clone();
     std::thread::spawn(move || {
@@ -1248,6 +1426,10 @@ fn on_startup(state: Arc<AppState>) -> bool {
     };
 
     'outer: loop {
+        // R11-3：暂停时原地等待（150ms 轮询 scan_stop），resume 后从当前批次继续。
+        while state.scan_paused.load(Ordering::SeqCst) && !state.scan_stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
         if state.scan_stop.load(Ordering::SeqCst) {
             break;
         }
@@ -1312,6 +1494,14 @@ fn on_startup(state: Arc<AppState>) -> bool {
                         if i >= batch_ref.len() || state.scan_stop.load(Ordering::SeqCst) {
                             break;
                         }
+                        while state.scan_paused.load(Ordering::SeqCst)
+                            && !state.scan_stop.load(Ordering::SeqCst)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                        }
+                        if state.scan_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let (id, path, format) = &batch_ref[i];
                         // B3：每本之前再查优先表（打开书籍可随时插队）。
                         while drain_one_priority(&commits, &since_emit) {}
@@ -1368,7 +1558,10 @@ fn on_startup(state: Arc<AppState>) -> bool {
     let total = done + remaining;
     state.cover_scan_total.store(total, Ordering::SeqCst);
     emit_scan_progress(&state.app, done, total);
-    state.app.emit("library-meta", ()).ok();
+    // 空轮/no-op 不触发前端可见区刷新与优先 effect；有实际提交才发 library-meta。
+    if commits.load(Ordering::Relaxed) > 0 {
+        state.app.emit("library-meta", ()).ok();
+    }
     state.app
         .emit("scan-finished", serde_json::json!({ "done": done, "total": total }))
         .ok();
@@ -1701,6 +1894,62 @@ fn extract_cover_only(
     }
 }
 
+/// C1：EPUB 缓存按「字节权重 + 条目数」双上限淘汰；当前打开的书不淘汰（允许单本超限）。
+const EPUB_CACHE_MAX_BYTES: usize = 1536 * 1024 * 1024;
+const EPUB_CACHE_MAX_ITEMS: usize = 4;
+
+/// 纯函数：计算需要淘汰的缓存条目（从 order 最旧开始，跳过 current/已不存在的 id）。
+fn plan_epub_evictions(
+    sizes: &[(i64, usize)],
+    order: &[i64],
+    current: i64,
+    max_bytes: usize,
+    max_items: usize,
+) -> Vec<i64> {
+    let mut present: HashMap<i64, usize> = sizes.iter().copied().collect();
+    let mut total: usize = present.values().sum();
+    let mut evicted = Vec::new();
+    for id in order {
+        if total <= max_bytes && present.len() <= max_items {
+            break;
+        }
+        if *id == current || !present.contains_key(id) {
+            continue;
+        }
+        if let Some(sz) = present.remove(id) {
+            total = total.saturating_sub(sz);
+            evicted.push(*id);
+        }
+    }
+    evicted
+}
+
+/// C1：把 book_id 移到 LRU 末尾（命中缓存/重新插入都要更新，避免正在读的旧书被当作最旧淘汰）。
+fn touch_epub_cache_order(order: &mut Vec<i64>, book_id: i64) {
+    order.retain(|id| *id != book_id);
+    order.push(book_id);
+}
+
+/// C1：插入 EPUB 缓存并按权重淘汰；当前书 book_id 永不被本轮淘汰。
+fn push_epub_cache(state: &AppState, book_id: i64, value: Arc<CachedEpub>) {
+    let mut m = state.epub_cache.lock().unwrap();
+    let mut order = state.epub_cache_order.lock().unwrap();
+    m.insert(book_id, value);
+    touch_epub_cache_order(&mut order, book_id);
+    // C13：按文件大小估算缓存权重（不再持有整本字节）。
+    let sizes: Vec<(i64, usize)> = m.iter().map(|(k, v)| (*k, std::fs::metadata(&v.path).map(|x| x.len() as usize).unwrap_or(0))).collect();
+    for victim in plan_epub_evictions(
+        &sizes,
+        &order,
+        book_id,
+        EPUB_CACHE_MAX_BYTES,
+        EPUB_CACHE_MAX_ITEMS,
+    ) {
+        m.remove(&victim);
+        order.retain(|id| *id != victim);
+    }
+}
+
 fn push_cache<K, V>(map: &Mutex<HashMap<K, V>>, key: K, value: V, max: usize)
 where
     K: std::hash::Hash + Eq + Copy,
@@ -1714,6 +1963,23 @@ where
     m.insert(key, value);
 }
 
+/// 书籍元信息（path, ext）进程内缓存：get_chapter 每章都要它，旧实现每章抢一次 state.db.0
+/// 全局锁读 books 行 —— 后台建索引持锁时会连带把翻章拖住。命中路径完全不碰 DB；
+/// 未命中回退读取并回填。容量有限（1024），删除书籍 / 移除目录 / 刷新书库后整体清空。
+fn cached_book_meta(state: &Arc<AppState>, book_id: i64) -> Option<(String, String)> {
+    if let Some(v) = state.book_meta.lock().unwrap().get(&book_id).cloned() {
+        return Some(v);
+    }
+    let book = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id)?
+    };
+    let ext = ext_of(&book.path).unwrap_or_default();
+    let meta = (book.path, ext);
+    push_cache(&state.book_meta, book_id, meta.clone(), 1024);
+    Some(meta)
+}
+
 /// EPUB 字数统计（每章字数 + 全书 total/pure）：先查共享缓存，未命中则读盘并完整解析一次，随后回填 DB。
 ///
 /// 为什么共享缓存：book_char_counts（全书总页数）与 get_book_word_count（书详情/本书统计）
@@ -1722,6 +1988,15 @@ where
 ///
 /// 本函数是阻塞的（读盘 + rayon 逐章统计），**只能在 spawn_blocking 里调用**。
 fn epub_stats_for(state: &Arc<AppState>, book_id: i64, path: &str) -> Result<Arc<EpubStats>, String> {
+    // P13 单飞去重：book_char_counts 与 get_book_word_count 同时触发时，只让一个调用真正跑下面的
+    // 整本统计，其余调用等待并复用同一结果（复测出现过一次 21,600ms 的重复解析）。
+    single_flight(&state.epub_stats_flights, book_id, || {
+        epub_stats_compute(state, book_id, path)
+    })
+}
+
+/// epub_stats_for 的实际计算体（内存缓存 → DB 持久化短路 → 整本解析）。
+fn epub_stats_compute(state: &Arc<AppState>, book_id: i64, path: &str) -> Result<Arc<EpubStats>, String> {
     let stamp = file_stamp(path);
     let hit = state.epub_stats_cache.lock().unwrap().get(&book_id).cloned();
     if let Some(h) = hit {
@@ -1731,12 +2006,30 @@ fn epub_stats_for(state: &Arc<AppState>, book_id: i64, path: &str) -> Result<Arc
         // 文件换过了：旧条目立刻移除，避免它被其它入口（book_char_counts / 书详情）再读走。
         state.epub_stats_cache.lock().unwrap().remove(&book_id);
     }
-    let data = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
-    let (per_chapter, total, pure) = crate::epub::epub_word_stats(&data)?;
+    // 持久化短路（P8）：上次已算过且文件指纹一致 → 反序列化逐章数组直接复用，不再读盘/整本解析。
+    if let Some((size, mtime, total, pure, per_json)) = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_epub_stats(&conn, book_id)
+    } {
+        if db_cache_stamp_usable(size, mtime, stamp) {
+            if let Ok(per_chapter) = serde_json::from_str::<Vec<i64>>(&per_json) {
+                let stats = Arc::new(EpubStats { stamp, per_chapter, total, pure });
+                push_cache(&state.epub_stats_cache, book_id, stats.clone(), 4);
+                return Ok(stats);
+            }
+        }
+    }
+    // C13：按文件路径统计字数，不整本读入常驻。
+    let (per_chapter, total, pure) = crate::epub::epub_word_stats_file(std::path::Path::new(path))?;
     let stats = Arc::new(EpubStats { stamp, per_chapter, total, pure });
-    // 指纹取不到就不入缓存：否则这条「无法校验」的条目会一直命中。
-    if stamp.is_some() {
+    // 指纹取不到就不入缓存/不写库：否则这条「无法校验」的条目会一直命中。
+    if let Some((size, mtime)) = stamp {
         push_cache(&state.epub_stats_cache, book_id, stats.clone(), 4);
+        // 逐章数组持久化：每个文件一辈子只算一次（跨重启短路）。
+        if let Ok(per_json) = serde_json::to_string(&stats.per_chapter) {
+            let conn = state.db.0.lock().unwrap();
+            db::set_epub_stats(&conn, book_id, size, mtime, stats.total, stats.pure, &per_json);
+        }
     }
     backfill_book_chars(state, book_id, stats.total, stats.pure);
     Ok(stats)
@@ -1764,10 +2057,31 @@ pub fn load_txt(
     let stamp = file_stamp(path);
     let hit = state.txt_cache.lock().unwrap().get(&book_id).cloned();
     if let Some(c) = hit {
-        if c.ver == ver && stamp_matches(c.stamp, stamp) {
+        if cache_entry_valid(c.ver, ver, c.stamp, stamp) {
             return Ok(c.doc.clone());
         }
         state.txt_cache.lock().unwrap().remove(&book_id);
+    }
+    // L2 磁盘解析缓存（P10）：规则版本 + 文件指纹都命中就直接复用，免去解码 + 切分。
+    // 缓存本身不可信：read_cache 遇坏文件会删除并返回 None，走下面正常解析。
+    if let Some((size, mtime)) = stamp {
+        let key = crate::parsecache::CacheKey {
+            kind: crate::parsecache::KIND_TXT,
+            book_id,
+            rules_ver: ver,
+            size,
+            mtime,
+        };
+        if let Some(doc) = crate::parsecache::read_cache(&crate::parsecache::cache_dir(&state.app), key) {
+            let result = Arc::new((doc.text, doc.ranges, doc.toc));
+            push_cache(
+                &state.txt_cache,
+                book_id,
+                CachedText { ver, stamp, doc: result.clone(), warn: doc.warn },
+                3,
+            );
+            return Ok(result);
+        }
     }
     let pattern = get_rules(state);
     // 手动兜底:正文字符编码设置(与 MOBI 共用 `mobi.encoding` 键)也作用于 TXT。
@@ -1780,17 +2094,135 @@ pub fn load_txt(
         let t = forced.trim().to_ascii_lowercase();
         if t.is_empty() || t == "auto" { None } else { Some(t) }
     };
-    let doc = txt::decode_and_split(path, Some(&pattern), forced.as_deref())?;
+    // 编码判定缓存（P7）：用户没强制编码时，指纹一致的判定直接当强制编码用，跳过三候选检测链；
+    // 检测结果写回 DB（带文件指纹），同一文件后续启动检测耗时为 0。
+    let cached_enc = if forced.is_none() {
+        let conn = state.db.0.lock().unwrap();
+        db::get_txt_encoding(&conn, book_id)
+            .filter(|(size, mtime, _)| db_cache_stamp_usable(*size, *mtime, stamp))
+            .map(|(_, _, enc)| enc)
+            .filter(|enc| !enc.trim().is_empty())
+    } else {
+        None
+    };
+    let forced_eff = forced.clone().or(cached_enc);
+    let (doc, enc) = txt::decode_and_split_detect(path, Some(&pattern), forced_eff.as_deref())?;
+    // 指纹取不到就不写缓存：无法校验的判定会一直命中错误编码。
+    if forced.is_none() {
+        if let Some((size, mtime)) = stamp {
+            let conn = state.db.0.lock().unwrap();
+            db::set_txt_encoding(&conn, book_id, size, mtime, enc);
+        }
+    }
     let result = Arc::new((doc.text, doc.ranges, doc.toc));
-    if stamp.is_some() {
+    // 落盘（P10）：只在拿到文件指纹时写；写失败忽略（缓存只是加速手段，不影响打开）。
+    if let Some((size, mtime)) = stamp {
+        // L1 先入缓存：本次调用立即可用。
         push_cache(
             &state.txt_cache,
             book_id,
-            CachedText { ver, stamp, doc: result.clone() },
+            CachedText { ver, stamp, doc: result.clone(), warn: None },
             3,
+        );
+        // L2 异步落盘（补丁）：TXT 正文 60~80MB，同步压缩写实测把首次打开从 3.2s 拖到 8.3s，
+        // 且命中后还要解压；改为后台线程不压缩 + 流式写，不阻塞打开返回。
+        // 线程只持有目录/键/结果 Arc，不借用 state；失败只记诊断日志。
+        let key = crate::parsecache::CacheKey {
+            kind: crate::parsecache::KIND_TXT,
+            book_id,
+            rules_ver: ver,
+            size,
+            mtime,
+        };
+        crate::parsecache::spawn_write_txt_cache(
+            crate::parsecache::cache_dir(&state.app),
+            key,
+            result.clone(),
         );
     }
     Ok(result)
+}
+
+/// MOBI/AZW3 解析：带 rules_ver + 文件指纹校验的内存缓存，open_book / get_chapter /
+/// collect_book_chapters 共用同一条路径（旧实现三处各自解析，同一进程内整本 MOBI 会被解析两次以上）。
+/// 缓存命中时不再解析、不再重新抽图（图片已在首次解析时落到 res/<book_id>/）。
+/// 返回值带编码告警：告警随缓存保存，命中时与冷解析返回同样的 encoding_warning。
+pub(crate) fn load_mobi(
+    state: &Arc<AppState>,
+    path: &str,
+    book_id: i64,
+) -> Result<(Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>, Option<String>), String> {
+    let ver = state.rules_ver.load(Ordering::Relaxed);
+    // 命中必须同时满足「规则版本一致」与「文件指纹一致」（与 load_txt 同一套判据）。
+    let stamp = file_stamp(path);
+    let hit = state.txt_cache.lock().unwrap().get(&book_id).cloned();
+    if let Some(c) = hit {
+        if cache_entry_valid(c.ver, ver, c.stamp, stamp) {
+            return Ok((c.doc.clone(), c.warn.clone()));
+        }
+        state.txt_cache.lock().unwrap().remove(&book_id);
+    }
+    // L2 磁盘解析缓存（P10）：除规则版本 + 文件指纹外，还要求 res 图片目录与源文件一致
+    //（否则缓存 HTML 里的图片 URL 会指向缺失文件）——不满足就按未命中重解析（重解析会重写图片）。
+    let res_dir = crate::data_dir(&state.app).join("res").join(book_id.to_string());
+    if let Some((size, mtime)) = stamp {
+        if crate::mobi::res_dir_ready(&res_dir, stamp) {
+            let key = crate::parsecache::CacheKey {
+                kind: crate::parsecache::KIND_MOBI,
+                book_id,
+                rules_ver: ver,
+                size,
+                mtime,
+            };
+            if let Some(doc) =
+                crate::parsecache::read_cache(&crate::parsecache::cache_dir(&state.app), key)
+            {
+                let result = Arc::new((doc.text, doc.ranges, doc.toc));
+                push_cache(
+                    &state.txt_cache,
+                    book_id,
+                    CachedText {
+                        ver,
+                        stamp,
+                        doc: result.clone(),
+                        warn: doc.warn.clone(),
+                    },
+                    3,
+                );
+                return Ok((result, doc.warn));
+            }
+        }
+    }
+    let doc = mobi_doc_for(state, path, book_id)?;
+    // 拆包取所有权，避免再 clone 一份可能很大的 html。
+    let crate::mobi::MobiDoc { html, toc, parts, warning, .. } = doc;
+    let result = Arc::new((html, parts, toc));
+    // 指纹取不到就不入缓存/不落盘：无法校验的条目会一直命中。
+    if let Some((size, mtime)) = stamp {
+        // 落盘（P10）：res 标记已由 extract_images 在本次解析中原子写入；写缓存失败忽略。
+        let key = crate::parsecache::CacheKey {
+            kind: crate::parsecache::KIND_MOBI,
+            book_id,
+            rules_ver: ver,
+            size,
+            mtime,
+        };
+        // R8-2：MOBI 解析缓存改为后台异步写（不压缩 + 流式），不阻塞打开返回；
+        // 进程提前退出则下次按未命中重解析（可接受），失败只打诊断日志。
+        crate::parsecache::spawn_write_cache(
+            crate::parsecache::cache_dir(&state.app),
+            key,
+            result.clone(),
+            warning.clone(),
+        );
+        push_cache(
+            &state.txt_cache,
+            book_id,
+            CachedText { ver, stamp, doc: result.clone(), warn: warning.clone() },
+            3,
+        );
+    }
+    Ok((result, warning))
 }
 
 pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<CachedEpub>, String> {
@@ -1799,14 +2231,40 @@ pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<Cache
     let hit = state.epub_cache.lock().unwrap().get(&book_id).cloned();
     if let Some(c) = hit {
         if stamp_matches(c.stamp, stamp) {
+            // C1：命中时把该书移到 LRU 末尾（缓存锁已在上面克隆后释放，这里只锁 order）。
+            touch_epub_cache_order(&mut state.epub_cache_order.lock().unwrap(), book_id);
             return Ok(c.clone());
         }
         state.epub_cache.lock().unwrap().remove(&book_id);
+        state.epub_cache_order.lock().unwrap().retain(|id| *id != book_id);
     }
     let t0 = std::time::Instant::now();
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    // 借用解析（Cursor 只借用 data），避免对 600MB+ 大书再复制一份；解析完再 Arc 移交所有权。
-    let (doc, ci) = crate::epub::parse_with_ci(&data)?;
+    // C13：File+ZipArchive 按需读取 central directory/OPF/导航，不把整本读入常驻。
+    let (mut doc, ci) = crate::epub::parse_file_with_ci(std::path::Path::new(path))?;
+    // P11：切章只用于「目录折叠 + 图片页型」的书；该书已有划线时关掉切分（划线按旧章号记录，
+    // 切章会让位置错乱）。门控放在缓存前，同一进程内后续命中都是已门控的结果。
+    if doc.split {
+        // 门控细节：只有「有划线且尚未迁移过」才关闭切分。迁移标记存在说明该书切章后已按新章号
+        // 使用过（用户之后新建的划线也是新章号），此时再关切分反而会让这些划线错位。
+        let (has_highlights, migrated) = {
+            let conn = state.db.0.lock().unwrap();
+            let hl = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM highlights WHERE book_id=?1)",
+                    [book_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            let key = format!("epub.split_migrated.{book_id}");
+            (hl, db::get_setting(&conn, &key).is_some())
+        };
+        if has_highlights && !migrated {
+            doc.split = false;
+            doc.split_toc.clear();
+            doc.chapters.clear();
+        }
+    }
     if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[open] load_epub book={book_id} parse+ci={:?} spine={} toc={}",
@@ -1815,12 +2273,12 @@ pub fn load_epub(state: &AppState, path: &str, book_id: i64) -> Result<Arc<Cache
     }
     let cached = Arc::new(CachedEpub {
         doc,
-        data: Arc::new(data),
+        path: path.to_string(),
         ci,
         stamp,
     });
     if stamp.is_some() {
-        push_cache(&state.epub_cache, book_id, cached.clone(), 3);
+        push_epub_cache(state, book_id, cached.clone());
     }
     Ok(cached)
 }
@@ -1839,7 +2297,7 @@ pub fn read_epub_image(state: &AppState, book_id: i64, target: &str) -> Option<(
             load_epub(state, &path, book_id).ok()?
         }
     };
-    let bytes = crate::epub::read_entry(&cached.data, &cached.ci, target)?;
+    let bytes = crate::epub::read_entry_file(std::path::Path::new(&cached.path), &cached.ci, target)?;
     Some((crate::epub::mime_for_path(target).to_string(), bytes))
 }
 
@@ -1932,14 +2390,24 @@ fn collect_book_images(state: &AppState, book_id: i64) -> Result<Vec<BookImage>,
             });
         }
     } else if is_mobi_ext(&ext) {
-        // 已提取到 appdata/res/<book_id>/ 的图片
+        // 已提取到 appdata/res/<book_id>/ 的图片（R8-1：Lazy 模式优先用清单，旧目录回退扫描）
         let dir = crate::data_dir(&state.app).join("res").join(book_id.to_string());
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut files: Vec<String> = rd
-                .flatten()
-                .filter(|e| e.path().is_file())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
+        let mut files: Vec<String> = crate::mobi::res_image_names(&dir).unwrap_or_else(|| {
+            std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.path().is_file()
+                                && crate::mobi::is_res_image_name(
+                                    &e.file_name().to_string_lossy(),
+                                )
+                        })
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        {
             files.sort();
             for f in files {
                 let url = format!("http://tidepage.localhost/res/{book_id}/{}", f);
@@ -2122,6 +2590,7 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
                 t0.elapsed().as_millis()
             ),
         );
+        bump_formats_epoch(state.inner());
         state.app.emit("library-changed", ()).ok();
         emit_remove_progress(&state.app, "done", deleted_ok, total, false);
         return Err(format!(
@@ -2139,6 +2608,7 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
                     t0.elapsed().as_millis()
                 ),
             );
+            bump_formats_epoch(state.inner());
             state.app.emit("library-changed", ()).ok();
             emit_remove_progress(&state.app, "done", deleted_ok, total, false);
             return Err(format!("书籍已移除，但目录注销失败：{e}"));
@@ -2177,7 +2647,10 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, path: String) -> Res
         ),
     );
     emit_remove_progress(&state.app, "done", deleted_ok, total, false);
+    bump_formats_epoch(state.inner());
     state.app.emit("library-changed", ()).ok();
+    // 目录下的书已删：元信息缓存整体失效（避免残留已删书的 path/ext）。
+    st.book_meta.lock().unwrap().clear();
     Ok(())
 }
 
@@ -2205,12 +2678,27 @@ pub async fn list_books_page(
     states: Option<Vec<String>>,
     desc: Option<bool>,
     folder: Option<String>,
+    include_total: Option<bool>,
+    tags: Option<Vec<String>>,
 ) -> Result<BookPage, String> {
     memlog::watch("cmd:list_books_page");
     let st = state.inner().clone();
+    let count_total = include_total.unwrap_or(true);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
-        db::list_books_page(&conn, &query, &sort, offset, limit, &formats, &states, desc.unwrap_or(false), &folder)
+        db::list_books_page_opts_tags(
+            &conn,
+            &query,
+            &sort,
+            offset,
+            limit,
+            &formats,
+            &states,
+            desc.unwrap_or(false),
+            &folder,
+            count_total,
+            &tags,
+        )
     })
     .await
     .map_err(|e| e.to_string())
@@ -2242,6 +2730,7 @@ pub async fn list_order_index(
     states: Option<Vec<String>>,
     desc: Option<bool>,
     folder: Option<String>,
+    tags: Option<Vec<String>>,
 ) -> Result<tauri::ipc::Response, String> {
     memlog::watch("cmd:list_order_index");
     // 白名单归一（未知回落 added），避免把任意字符串带入下游。
@@ -2255,7 +2744,7 @@ pub async fn list_order_index(
     let bytes: Vec<u8> = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let conn = st.db.0.lock().unwrap();
         // 边收集边计数：越限立即 Err（禁止静默截断），不为超大结果集构建巨大 Vec。
-        let ids = db::order_index_ids(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize, &formats, &states, desc, &folder)?;
+        let ids = db::order_index_ids_tags(&conn, &sort, &query, MAX_ORDER_INDEX_ROWS as usize, &formats, &states, desc, &folder, &tags)?;
         let mut buf = Vec::with_capacity(ids.len() * 8);
         for id in ids {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -2267,16 +2756,92 @@ pub async fn list_order_index(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// R12-2：格式列表缓存命中判断（纯函数，供命令与单测共用）。
+fn formats_cache_get(
+    cache: &Mutex<Option<(u64, Vec<String>)>>,
+    epoch: u64,
+) -> Option<Vec<String>> {
+    let c = cache.lock().ok()?;
+    c.as_ref()
+        .filter(|(e, _)| *e == epoch)
+        .map(|(_, v)| v.clone())
+}
+
+/// R12-2：查询完成后写缓存；若查询期间 epoch 已变则丢弃（避免把旧结果写回）。
+/// 返回是否真的写入。
+fn formats_cache_put(
+    cache: &Mutex<Option<(u64, Vec<String>)>>,
+    epoch_at_query: u64,
+    current_epoch: u64,
+    formats: &[String],
+) -> bool {
+    if epoch_at_query != current_epoch {
+        return false;
+    }
+    if let Ok(mut c) = cache.lock() {
+        *c = Some((current_epoch, formats.to_vec()));
+        return true;
+    }
+    false
+}
+
+/// R12-2：books 实际变更后递增格式缓存 epoch（仅真正变化路径调用）。
+pub fn bump_formats_epoch(state: &AppState) {
+    state.formats_epoch.fetch_add(1, Ordering::SeqCst);
+}
+
 /// Task B：书库当前实际存在的格式列表（去重、固定排序）。供前端「分类」面板动态生成格式标签。
+/// R12-2：带进程内缓存（epoch 匹配直接返回 clone；命令级 warm 命中 <1ms）。
 #[tauri::command]
 pub async fn list_formats(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
     let st = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = st.db.0.lock().unwrap();
+    let epoch = st.formats_epoch.load(Ordering::SeqCst);
+    if let Some(cached) = formats_cache_get(&st.formats_cache, epoch) {
+        return Ok(cached);
+    }
+    let st2 = st.clone();
+    let formats = tauri::async_runtime::spawn_blocking(move || {
+        let conn = st2.db.0.lock().unwrap();
         db::list_formats(&conn)
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    formats_cache_put(
+        &st.formats_cache,
+        epoch,
+        st.formats_epoch.load(Ordering::SeqCst),
+        &formats,
+    );
+    Ok(formats)
+}
+
+/// R12-3：切分书跨虚拟章锚点定位命令。返回目标虚拟章号；None=未切分/文件不匹配/找不到锚点。
+#[tauri::command]
+pub async fn locate_epub_anchor(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    file_base: String,
+    fragment: String,
+) -> Result<Option<i64>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = {
+            let conn = st.db.0.lock().unwrap();
+            db::get_book(&conn, book_id).map(|b| b.path).ok_or("书籍不存在")?
+        };
+        let cached = load_epub(&st, &path, book_id)?;
+        let data = cached.read_all().ok_or("读取 EPUB 失败")?;
+        Ok(crate::epub::locate_split_anchor_chapter(
+            &cached.doc,
+            &data,
+            &cached.ci,
+            &file_base,
+            &fragment,
+        )
+        .map(|i| i as i64))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Task F：手动设置阅读状态覆盖。stateStr 取 "read" / "unread" / "auto"（read→1，unread→2，auto→0）。
@@ -2912,6 +3477,7 @@ pub async fn refresh_library(
         tokio::task::yield_now().await;
     }
     if removed_ok > 0 || added > 0 {
+        bump_formats_epoch(&st);
         st.app.emit("library-changed", ()).ok();
     }
     emit("done", 1, 1);
@@ -2919,6 +3485,8 @@ pub async fn refresh_library(
     if !new_ids.is_empty() {
         ensure_scan_worker(&st.app);
     }
+    // 刷新可能删除/重导书籍：元信息缓存整体失效。
+    st.book_meta.lock().unwrap().clear();
     Ok(RefreshResult {
         removed: removed_ok,
         added,
@@ -3000,6 +3568,80 @@ fn is_manga_like(images: usize, spine_n: usize, toc_n: usize, ext: &str, max_bod
     manga_image_gate(images, spine_n, toc_n, ext) && max_body_chars <= MANGA_BODY_CHAR_LIMIT
 }
 
+/// 图片页书判定（第五轮）：图片数门槛与「每张图平均最多配多少非空白文字」。
+/// 目标书 3,659 图 / 约 33,059 字 ≈ 9.0 字/图 → 命中；普通插图小说正文比例远高于此。
+const IMAGE_PAGES_MIN_IMAGES: usize = 100;
+const IMAGE_PAGES_TEXT_PER_IMG_MAX: i64 = 20;
+
+/// 图片页书判定（纯函数，独立于 is_manga）：图片够多、文本按比例足够少、扫描完整
+/// （被预算截断一律不判，保守兜底），且图片数不少于 spine 文档数（每个内容文档至少一张图）。
+/// 不修改 is_manga_like 与既有漫画判定。
+fn is_image_page_like(images: usize, text_chars: i64, complete: bool, spine_n: usize) -> bool {
+    complete
+        && images >= IMAGE_PAGES_MIN_IMAGES
+        && text_chars <= images as i64 * IMAGE_PAGES_TEXT_PER_IMG_MAX
+        && images >= spine_n.max(1)
+}
+
+
+/// R6-1 门控（纯函数）：P11 锚点切分绝对优先（doc_split=true 直接 false）；只有「目录折叠
+/// （legacy 目录 <=2 项）+ 单篇 spine 文档图片数 > AUTO_BLOCK_IMGS_PER_CHAPTER + 图片主导度
+/// 达标」的候选书才自动块级切章；有划线且未迁移时保持旧行为（划线按旧章号可见）。
+fn should_auto_block_split(
+    doc_split: bool,
+    legacy_chapters: usize,
+    max_doc_imgs: usize,
+    image_dominant: bool,
+    has_highlights: bool,
+    migrated: bool,
+) -> bool {
+    !doc_split
+        && legacy_chapters <= 2
+        && max_doc_imgs > crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER
+        && image_dominant
+        && (!has_highlights || migrated)
+}
+
+
+/// R6-B 迁移标记动作（纯函数，便于单测）：标记值格式 {size}-{mtime}|{layout_sig}，
+/// layout_sig：P11 锚点原布局 v1 / 块级切章或超大章细分后的布局 v2。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum MarkerAction {
+    /// 标记已是最新（stamp|sig 完全一致）：no-op。
+    Noop,
+    /// 旧格式同 stamp 且当前布局仍为 v1：只重写标记，不改 progress/bookmarks。
+    Rewrite,
+    /// 同 stamp 但布局签名不同（v1→v2）：按 base_chapters 做布局升级映射。
+    LayoutUpgrade,
+    /// 无标记或文件已替换：沿用 legacy 迁移（map_legacy_position）。
+    LegacyMigrate,
+}
+
+fn split_marker_action(marker: Option<&str>, stamp: &str, sig: &str) -> MarkerAction {
+    let Some(m) = marker else {
+        return MarkerAction::LegacyMigrate;
+    };
+    if let Some((ms, msig)) = m.split_once('|') {
+        if ms != stamp {
+            return MarkerAction::LegacyMigrate;
+        }
+        return if msig == sig {
+            MarkerAction::Noop
+        } else {
+            MarkerAction::LayoutUpgrade
+        };
+    }
+    // 旧格式：只有文件指纹，没有布局签名。
+    if m != stamp {
+        return MarkerAction::LegacyMigrate;
+    }
+    if sig == "v1" {
+        MarkerAction::Rewrite
+    } else {
+        MarkerAction::LayoutUpgrade
+    }
+}
+
 /// 单章正文量：去掉所有空白后的字符数，再减去该章目录标题的非空白字符数 —— 标题本来就
 /// 出现在章节文档里，不能当作正文证据。
 fn body_chars_excluding_title(text: &str, title: &str) -> i64 {
@@ -3047,6 +3689,173 @@ fn manga_body_chars_mobi(html: &str, parts: &[(usize, usize)], toc: &[TocEntry])
     max_body
 }
 
+
+/// R7-1：读取迁移标记里的布局签名。旧格式（无 |）视为 v1；无 marker 返回 None。
+fn marker_layout_sig(marker: Option<&str>) -> Option<&str> {
+    marker.map(|m| m.split_once('|').map(|(_, s)| s).unwrap_or("v1"))
+}
+
+/// R7-1 布局目标：KeepP11=不 patch、保持 P11 锚点原布局；Restricted=第六轮受限细分（v2）；
+/// General=第七轮泛化细分（v3）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SplitLayoutTarget {
+    KeepP11,
+    Restricted,
+    General,
+}
+
+/// R7-1 布局目标选择（纯函数）：
+/// - 有划线：不改变既有布局——v3 用 General、v2 用 Restricted 重建，v1/无 marker 保持 P11；
+/// - 无划线：有 General 可用就升 v3；否则现有 v2 用 Restricted 重建（避免降级）；其余保持 P11。
+fn choose_split_layout(
+    has_highlights: bool,
+    current_sig: Option<&str>,
+    general_available: bool,
+    restricted_available: bool,
+) -> SplitLayoutTarget {
+    if has_highlights {
+        match current_sig {
+            Some("v3") if general_available => SplitLayoutTarget::General,
+            Some("v2") if restricted_available => SplitLayoutTarget::Restricted,
+            _ => SplitLayoutTarget::KeepP11,
+        }
+    } else if general_available {
+        SplitLayoutTarget::General
+    } else if current_sig == Some("v2") && restricted_available {
+        SplitLayoutTarget::Restricted
+    } else {
+        SplitLayoutTarget::KeepP11
+    }
+}
+
+/// 按新 chapters 的 legacy 字段迁移 progress/bookmarks（marker 缺失、文件替换、或布局升级
+/// 但 base 缺失时的退化路径）。pct 按章平均重算，updated_at 由 set_progress 保持。
+fn legacy_migrate_positions(
+    tx: &rusqlite::Transaction<'_>,
+    book_id: i64,
+    chapters: &[crate::epub::EpubChapter],
+) {
+    if let Some(mut p) = db::get_progress(tx, book_id) {
+        let (new_idx, new_ratio) =
+            crate::epub::map_legacy_position(chapters, p.chapter_index, p.chapter_ratio);
+        let n = chapters.len().max(1) as f64;
+        p.chapter_index = new_idx as i64;
+        p.chapter_ratio = new_ratio;
+        p.pct = (((new_idx as f64 + new_ratio) / n) * 100.0).clamp(0.0, 100.0);
+        let _ = db::set_progress(tx, book_id, &p);
+    }
+    let mut first_by_legacy: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for (i, c) in chapters.iter().enumerate() {
+        first_by_legacy.entry(c.legacy as i64).or_insert(i as i64);
+    }
+    for (legacy, new_idx) in &first_by_legacy {
+        tx.execute(
+            "UPDATE bookmarks SET chapter_index=?1 WHERE book_id=?2 AND chapter_index=?3",
+            rusqlite::params![new_idx, book_id, legacy],
+        )
+        .ok();
+    }
+}
+
+/// P11/R6-B：图片页书切章/细分后的一次性位置迁移。标记键 epub.split_migrated.<book_id>，
+/// 值 = "{size}-{mtime}|{layout_sig}"（layout_sig：P11 锚点原布局 v1 / 块级切章或超大章细分后 v2）。
+/// 同一事务内先重查标记：多窗口并发打开时只有第一个迁移，其余直接提交返回。
+/// 四类动作（split_marker_action）：Noop（完全匹配）/ Rewrite（旧格式同 stamp 且仍 v1）/
+/// LayoutUpgrade（同 stamp 但 v1→v2，用 base_chapters 按全书图片累计位置映射）/
+/// LegacyMigrate（无标记或文件替换，按新 chapters 的 legacy 字段映射）。
+/// updated_at 保持原值，避免迁移被当成一次新阅读影响「按最近阅读」或同步排序。
+#[allow(clippy::too_many_arguments)]
+fn migrate_epub_split_positions(
+    state: &Arc<AppState>,
+    book_id: i64,
+    size: i64,
+    mtime: i64,
+    chapters: &[crate::epub::EpubChapter],
+    base_chapters: Option<&[crate::epub::EpubChapter]>,
+    layout_sig: &str,
+) {
+    if chapters.is_empty() {
+        return;
+    }
+    let key = format!("epub.split_migrated.{book_id}");
+    let stamp = format!("{size}-{mtime}");
+    let marker = format!("{stamp}|{layout_sig}");
+    let mut conn = state.db.0.lock().unwrap();
+    let action = split_marker_action(db::get_setting(&conn, &key).as_deref(), &stamp, layout_sig);
+    if action == MarkerAction::Noop {
+        return;
+    }
+    let Ok(tx) = conn.transaction() else {
+        return;
+    };
+    let action = split_marker_action(db::get_setting(&tx, &key).as_deref(), &stamp, layout_sig);
+    if action == MarkerAction::Noop {
+        let _ = tx.commit();
+        return;
+    }
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+        eprintln!(
+            "[split-migrate] book={book_id} action={action:?} sig={layout_sig} chapters={} base={}",
+            chapters.len(),
+            base_chapters.map(|b| b.len()).unwrap_or(0)
+        );
+    }
+    let base = base_chapters.unwrap_or(&[]);
+    if action == MarkerAction::LayoutUpgrade {
+        if !base.is_empty() {
+            if crate::epub::same_chapter_layout(base, chapters) {
+                // R7-1：布局没变（如 776MB 样本 v2→v3 只是签名变化）→ 只重写 marker，
+                // progress/bookmarks 坐标原样保留，不做任何数据迁移。
+                if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+                    eprintln!("[split-migrate] book={book_id} same_layout => marker only");
+                }
+            } else {
+                // 旧布局 → 新布局：按全书图片累计位置映射。
+                if let Some(mut p) = db::get_progress(&tx, book_id) {
+                    let (new_idx, new_ratio) = crate::epub::map_split_layout_position(
+                        base,
+                        chapters,
+                        p.chapter_index,
+                        p.chapter_ratio,
+                    );
+                    let n = chapters.len().max(1) as f64;
+                    p.chapter_index = new_idx as i64;
+                    p.chapter_ratio = new_ratio;
+                    p.pct = (((new_idx as f64 + new_ratio) / n) * 100.0).clamp(0.0, 100.0);
+                    let _ = db::set_progress(&tx, book_id, &p);
+                }
+                // 书签：旧章号（ratio=0）→ 新章号（书签无章内偏移）。
+                let mut rows: Vec<(i64, i64)> = Vec::new();
+                if let Ok(mut stmt) =
+                    tx.prepare("SELECT id, chapter_index FROM bookmarks WHERE book_id=?1")
+                {
+                    if let Ok(it) = stmt.query_map([book_id], |r| Ok((r.get(0)?, r.get(1)?))) {
+                        for row in it.flatten() {
+                            rows.push(row);
+                        }
+                    }
+                }
+                for (bid, old_idx) in rows {
+                    let (new_idx, _) =
+                        crate::epub::map_split_layout_position(base, chapters, old_idx, 0.0);
+                    tx.execute(
+                        "UPDATE bookmarks SET chapter_index=?1 WHERE id=?2",
+                        rusqlite::params![new_idx as i64, bid],
+                    )
+                    .ok();
+                }
+            }
+        } else {
+            // R7-1：base 缺失（无法重建旧布局）时退化为 legacy 迁移，不得静默重写旧坐标。
+            legacy_migrate_positions(&tx, book_id, chapters);
+        }
+    } else if action == MarkerAction::LegacyMigrate {
+        legacy_migrate_positions(&tx, book_id, chapters);
+    }
+    db::set_setting(&tx, &key, &marker);
+    let _ = tx.commit();
+}
+
 #[tauri::command]
 pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenResult, String> {
     // 打开未扫描的书：把该本封面扫描提升为最高优先级（处理完当前这一本后立即执行）。
@@ -3063,78 +3872,387 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
     state.app.emit("book-opened", ()).ok();
     let ext = ext_of(&book.path).unwrap_or_default();
     let st = state.inner().clone();
+    // 开书是最权威的元信息来源：顺手写入元信息缓存，后续 get_chapter 不必每章抢 DB 锁。
+    push_cache(&st.book_meta, id, (book.path.clone(), ext.clone()), 1024);
     let t_open = std::time::Instant::now();
-    // 换书整体失效已渲染章节缓存，避免跨书串味与无界增长。
-    st.chapter_cache.lock().unwrap().clear();
-    // spine（内容文档）数量：漫画判定分母。EPUB 分支填入；TXT/MOBI 无 spine 清单保持 0。
+    // 同书重复打开（弹出目录/面板窗会再调 openBook）不失效已渲染章节；只有真换书才整体清空
+    // （换书仍整体清空：内存有界；章节缓存 key 已含 book_id，不会串书）。
+    if st.last_open_book.swap(id, Ordering::Relaxed) != id {
+        st.chapter_cache.lock().unwrap().clear();
+    }
+    // 阶段 1：按格式加载解析结果（各格式现有路径与耗时不变；EPUB 只持有 Arc，不复制正文）。
+    // 解析 7000+ 章的大书可达数秒：全部放阻塞线程池，避免占用 async 运行时。
     let mut spine_n: usize = 0;
-    // 漫画正文探针的原料：仅在「图片门槛通过」后才真正使用，普通书不为它付文本读取成本。
-    // EPUB 直接持有 Arc<CachedEpub>（廉价浅拷贝），复用已读入内存的 zip 字节，不再读盘。
-    let mut epub_probe: Option<Arc<CachedEpub>> = None;
-    let mut mobi_probe: Option<(String, Vec<(usize, usize)>, Vec<TocEntry>)> = None;
-    let (toc, docs, warn) = if ext == "epub" {
-        // 解析 7000+ 章的大书可达数秒：放到阻塞线程池，避免占用 async 运行时
-        // 导致其它 IPC（预取、进度保存等）排队卡死。
+    let mut epub_cached: Option<Arc<CachedEpub>> = None;
+    let mut txt_cached: Option<Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>> = None;
+    let mut mobi_cached: Option<Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>> = None;
+    let mut pdf_toc: Option<Vec<TocEntry>> = None;
+    let mut warn: Option<String> = None;
+    if ext == "epub" {
         let st2 = st.clone();
         let bpath = book.path.clone();
         let cached = tauri::async_runtime::spawn_blocking(move || load_epub(&st2, &bpath, id))
             .await
             .map_err(|e| e.to_string())??;
         spine_n = cached.doc.spine.len();
-        let docs = cached
-            .doc
-            .toc
-            .iter()
-            .map(|t| {
-                cached
-                    .doc
-                    .spine
-                    .get(t.index)
-                    .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
-                    .unwrap_or_default()
-            })
-            .collect();
-        epub_probe = Some(cached.clone());
-        (cached.doc.toc.clone(), docs, None)
+        epub_cached = Some(cached);
     } else if ext == "txt" {
-        // TXT 整读+正则切分同样可能耗时：与 EPUB 一样放阻塞线程池。
         let st2 = st.clone();
         let bpath = book.path.clone();
         let cached = tauri::async_runtime::spawn_blocking(move || load_txt(&st2, &bpath, id))
             .await
             .map_err(|e| e.to_string())??;
-        (cached.2.clone(), Vec::new(), None)
+        txt_cached = Some(cached);
     } else if ext == "pdf" {
         // PDF：后端不解析内容，正文由前端 pdf.js 逐页渲染（见 Reader.svelte）。
         // 目录 = 页码列表，页数来自前端上次上报的设置项；缺失时先给空目录。
-        // is_manga 保持 false：漫画判据依赖图片清单，PDF 走的是「前端恒判漫画模式」这条路
-        // （见 Reader.svelte 的 isMangaMode），渲染仍复用漫画的按图块管线。
-        (pdf_page_toc(&st, id), Vec::new(), None)
+        pdf_toc = Some(pdf_page_toc(&st, id));
     } else {
-        // MOBI/AZW3 解压 + 切分：放阻塞线程池。
         let st2 = st.clone();
         let bpath = book.path.clone();
-        let doc = tauri::async_runtime::spawn_blocking(move || mobi_doc_for(&st2, &bpath, id))
+        let (cached, warning) = tauri::async_runtime::spawn_blocking(move || load_mobi(&st2, &bpath, id))
             .await
             .map_err(|e| e.to_string())??;
-        // 拆包取所有权，避免再 clone 一份可能很大的 html（push_cache 本来就要一份）。
-        let crate::mobi::MobiDoc { html, toc, parts, warning, .. } = doc;
-        let ver = st.rules_ver.load(Ordering::Relaxed);
-        let stamp = file_stamp(&book.path);
-        if stamp.is_some() {
-            push_cache(
-                &st.txt_cache,
-                id,
-                CachedText {
-                    ver,
-                    stamp,
-                    doc: Arc::new((html.clone(), parts.clone(), toc.clone())),
-                },
-                3,
-            );
+        mobi_cached = Some(cached);
+        warn = warning;
+    }
+    // 目录条数（漫画判定分母；EPUB 用 legacy toc —— 切章不改变漫画/图片页判定语义）。
+    let toc_n = if let Some(c) = &epub_cached {
+        c.doc.toc.len()
+    } else if let Some(c) = &txt_cached {
+        c.2.len()
+    } else if let Some(c) = &mobi_cached {
+        c.2.len()
+    } else {
+        pdf_toc.as_ref().map(|t| t.len()).unwrap_or(0)
+    }
+    .max(1);
+
+    // 阶段 2：图片列表 + 漫画判定（顺序与各格式原有逻辑一致，只读必要正文）。
+    let images = collect_book_images(&st, id).unwrap_or_default();
+    let images = image_cache_put(&st, id, file_stamp(&book.path), images.clone(), images);
+    let mut body_chars = 0i64;
+    let mut scanned_bytes = 0usize;
+    let mut is_manga = false;
+    if manga_image_gate(images.len(), spine_n, toc_n, &ext) {
+        if let Some(c) = &epub_cached {
+            // C13：大文件跳过整本探针（预算边界 32MB），避免 990MB 图片型书瞬时读入整本。
+            let small = std::fs::metadata(&c.path).map(|m| m.len() <= 32 * 1024 * 1024).unwrap_or(false);
+            if small {
+                if let Some(data) = c.read_all() {
+                    let (b, used) = manga_body_chars_epub(&data, &c.doc.spine, &c.doc.toc);
+                    body_chars = b;
+                    scanned_bytes = used;
+                }
+            }
+        } else if let Some(c) = &mobi_cached {
+            body_chars = manga_body_chars_mobi(&c.0, &c.1, &c.2);
         }
-        mobi_probe = Some((html, parts, toc.clone()));
-        (toc, Vec::new(), warning)
+        is_manga = is_manga_like(images.len(), spine_n, toc_n, &ext, body_chars);
+    }
+
+    // 阶段 3：图片页判定 + R7-1 泛化/受限细分 + R6-1 块级切章 + R6-2 划线门控（仅 EPUB）。
+    let mut image_pages = false;
+    // R7-1：patch 前保留旧布局（base_chapters）供迁移映射；desired 签名 v1/v2/v3。
+    let mut split_base_chapters: Option<Vec<crate::epub::EpubChapter>> = None;
+    let mut split_layout_sig = "v1";
+    if let Some(cached) = epub_cached.clone() {
+        // 折叠目录候选（R6-1）：P11 锚点切分绝对优先（split=true 不进入）；普通多章书 toc>2 不进入。
+        let fold_candidate = !cached.doc.split && cached.doc.toc.len() <= 2;
+        // C13：打开路径只允许小文件临时整本视图（≤32MB）；大文件探针/切章计划一律跳过，
+        // 保持文本模式（P11 已切分的 split 布局不受影响）。
+        let probe_data: Option<Vec<u8>> = if std::fs::metadata(&cached.path).map(|m| m.len() <= 32 * 1024 * 1024).unwrap_or(false) {
+            cached.read_all()
+        } else {
+            None
+        };
+        let mut max_doc_imgs = 0usize;
+        if fold_candidate && images.len() >= IMAGE_PAGES_MIN_IMAGES {
+            if let Some(data) = &probe_data {
+                max_doc_imgs =
+                    crate::epub::spine_doc_max_img_count(data, &cached.ci, &cached.doc.spine);
+            }
+        }
+        let block_candidate =
+            fold_candidate && max_doc_imgs > crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER;
+        // R7-1 候选：P11 已切且存在单章实际图片数 >200（不再限制章数；春秋 17 章进入）。
+        let mut max_split_imgs = 0usize;
+        if cached.doc.split && images.len() >= IMAGE_PAGES_MIN_IMAGES {
+            if let Some(data) = &probe_data {
+                max_split_imgs =
+                    crate::epub::max_split_chapter_imgs(&cached.doc, data, &cached.ci);
+            }
+        }
+        let subdiv_candidate = cached.doc.split
+            && max_split_imgs > crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER;
+        // R6-2：有划线且未迁移 → 不自动图片页排版、不自动切章（保持文字模式让划线可见）。
+        let (has_highlights, migrated, cur_marker) = if images.len() >= IMAGE_PAGES_MIN_IMAGES {
+            let conn = st.db.0.lock().unwrap();
+            let hl = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM highlights WHERE book_id=?1)",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            let marker = db::get_setting(&conn, &format!("epub.split_migrated.{id}"));
+            let migrated = marker.is_some();
+            (hl, migrated, marker)
+        } else {
+            (false, false, None)
+        };
+        let current_sig: Option<&str> = marker_layout_sig(cur_marker.as_deref());
+        // 探测：普通书（图片<100）零成本；漫画书只在块级切章/细分候选上探测
+        // （主样本 is_manga=true 也要拿到数据）；image_pages 排版标记仍要求 !is_manga，复用同一次结果。
+        if images.len() >= IMAGE_PAGES_MIN_IMAGES
+            && (!is_manga || block_candidate || subdiv_candidate)
+        {
+            let t_probe = std::time::Instant::now();
+            // 大文件无 probe_data：用空探测结果（complete=false → dominant=false），
+            // 因 max_doc_imgs/max_split_imgs 也为 0，block/subdiv gate 同样不触发。
+            let probe = match probe_data.as_ref() {
+                Some(data) => crate::epub::image_page_text_probe(
+                    data,
+                    &cached.doc.spine,
+                    images.len(),
+                    MANGA_SCAN_BUDGET,
+                ),
+                None => crate::epub::ImagePageProbe { text_chars: 0, scanned_bytes: 0, complete: false },
+            };
+            let dominant = is_image_page_like(
+                images.len(),
+                probe.text_chars,
+                probe.complete,
+                cached.doc.spine.len(),
+            );
+            image_pages = !is_manga && dominant && !has_highlights;
+            if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+                let ratio = if images.is_empty() {
+                    0.0
+                } else {
+                    probe.text_chars as f64 / images.len() as f64
+                };
+                eprintln!(
+                    "[open] image_pages id={id} images={} text={} ratio={:.1} complete={} scanned={} probe_ms={} dominant={} has_highlights={} => {image_pages}",
+                    images.len(),
+                    probe.text_chars,
+                    ratio,
+                    probe.complete,
+                    probe.scanned_bytes,
+                    t_probe.elapsed().as_millis(),
+                    dominant,
+                    has_highlights
+                );
+            }
+            let block_gate = should_auto_block_split(
+                cached.doc.split,
+                cached.doc.toc.len(),
+                max_doc_imgs,
+                dominant,
+                has_highlights,
+                migrated,
+            );
+            // R7-1 门控：存在单章实际图片 >200 + 图片主导度 + 划线门控（章数不再限制）。
+            let subdiv_gate = subdiv_candidate && dominant && (!has_highlights || migrated);
+            if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+                eprintln!(
+                    "[open] split_candidates id={id} block={block_candidate} subdiv={subdiv_candidate} max_doc_imgs={max_doc_imgs} max_split_imgs={max_split_imgs} cur_sig={current_sig:?} dominant={dominant} has_highlights={has_highlights} migrated={migrated} => block_gate={block_gate} subdiv_gate={subdiv_gate}"
+                );
+            }
+            if block_gate {
+                let data = probe_data.clone().ok_or("读取 EPUB 失败")?;
+                let ci = cached.ci.clone();
+                let doc = cached.doc.clone();
+                let t_plan = std::time::Instant::now();
+                let plan = crate::epub::plan_block_split(
+                    &doc,
+                    &data,
+                    &ci,
+                    crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER,
+                    crate::epub::AUTO_BLOCK_MAX_CHAPTERS,
+                );
+                if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+                    eprintln!(
+                        "[open] auto_split kind=block id={id} max_doc_imgs={max_doc_imgs} cur_sig={current_sig:?} plan_ms={} => chapters={}",
+                        t_plan.elapsed().as_millis(),
+                        plan.as_ref().map(|p| p.1.len()).unwrap_or(0)
+                    );
+                }
+                if let Some((split_toc, chapters)) = plan {
+                    // 旧布局：v2 就是同一次块级切章结果（确定性重算）；v1/无 marker 是未切分布局。
+                    let old_layout = if current_sig == Some("v2") {
+                        Some(chapters.clone())
+                    } else {
+                        Some(doc.chapters.clone())
+                    };
+                    let mut patched_doc = doc.clone();
+                    patched_doc.split = true;
+                    patched_doc.split_toc = split_toc;
+                    patched_doc.chapters = chapters;
+                    patched_doc.auto_block_split = true;
+                    let patched = Arc::new(CachedEpub {
+                        doc: patched_doc,
+                        path: cached.path.clone(),
+                        ci: ci.clone(),
+                        stamp: cached.stamp,
+                    });
+                    push_epub_cache(&st, id, patched.clone());
+                    epub_cached = Some(patched);
+                    split_base_chapters = old_layout;
+                    // R7-1：块级切章布局统一签名为 v3（与第六轮 v2 布局相同 → 迁移只重写 marker）。
+                    split_layout_sig = "v3";
+                }
+            } else if subdiv_gate {
+                let data = probe_data.clone().ok_or("读取 EPUB 失败")?;
+                let ci = cached.ci.clone();
+                let doc = cached.doc.clone();
+                let t_plan = std::time::Instant::now();
+                // 无划线：优先泛化细分（v3）；有划线：按现有签名恢复既有布局。
+                let general_plan = if !has_highlights || current_sig == Some("v3") {
+                    crate::epub::plan_subdivide_oversized_chapters_mode(
+                        &doc,
+                        &data,
+                        &ci,
+                        crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER,
+                        crate::epub::AUTO_BLOCK_MAX_CHAPTERS,
+                        crate::epub::SubdivideMode::General,
+                    )
+                } else {
+                    None
+                };
+                let restricted_plan = if current_sig == Some("v2") {
+                    crate::epub::plan_subdivide_oversized_chapters(
+                        &doc,
+                        &data,
+                        &ci,
+                        crate::epub::AUTO_BLOCK_IMGS_PER_CHAPTER,
+                        crate::epub::AUTO_BLOCK_MAX_CHAPTERS,
+                    )
+                } else {
+                    None
+                };
+                let target = choose_split_layout(
+                    has_highlights,
+                    current_sig,
+                    general_plan.is_some(),
+                    restricted_plan.is_some(),
+                );
+                // 旧布局 base：v2→受限计划、v3→泛化计划、v1/无 marker→P11 原布局；
+                // 计划无法重建时置 None，迁移退化为 legacy 映射（不静默重写旧坐标）。
+                let base: Option<Vec<crate::epub::EpubChapter>> = match current_sig {
+                    Some("v2") => restricted_plan.as_ref().map(|p| p.1.clone()),
+                    Some("v3") => general_plan.as_ref().map(|p| p.1.clone()),
+                    _ => Some(doc.chapters.clone()),
+                };
+                let general_len = general_plan.as_ref().map(|p| p.1.len()).unwrap_or(0);
+                let restricted_len = restricted_plan.as_ref().map(|p| p.1.len()).unwrap_or(0);
+                if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+                    eprintln!(
+                        "[open] layout_target id={id} cur_sig={current_sig:?} target={target:?} general_chapters={general_len} restricted_chapters={restricted_len} plan_ms={}",
+                        t_plan.elapsed().as_millis()
+                    );
+                }
+                let chosen = match target {
+                    SplitLayoutTarget::General => general_plan,
+                    SplitLayoutTarget::Restricted => restricted_plan,
+                    SplitLayoutTarget::KeepP11 => None,
+                };
+                if let Some((split_toc, chapters)) = chosen {
+                    let mut patched_doc = doc.clone();
+                    patched_doc.split = true;
+                    patched_doc.split_toc = split_toc;
+                    patched_doc.chapters = chapters;
+                    patched_doc.auto_block_split = true;
+                    let patched = Arc::new(CachedEpub {
+                        doc: patched_doc,
+                        path: cached.path.clone(),
+                        ci: ci.clone(),
+                        stamp: cached.stamp,
+                    });
+                    push_epub_cache(&st, id, patched.clone());
+                    epub_cached = Some(patched);
+                    split_base_chapters = base;
+                    split_layout_sig = if target == SplitLayoutTarget::General {
+                        "v3"
+                    } else {
+                        "v2"
+                    };
+                } else {
+                    // 保持 P11 原布局；若 marker 是 v2/v3，迁移会把旧坐标映射回 v1。
+                    split_base_chapters = base;
+                    split_layout_sig = "v1";
+                }
+            }
+        }
+    }
+
+    // 阶段 4：构建 toc/docs（EPUB 切分书走 split 分支：迁移 + 搜索缓存按书懒清理）。
+    let (toc, docs) = if let Some(cached) = &epub_cached {
+        if cached.doc.split {
+            // P11/R6-1/R6-B/R7-1：切分书按虚拟章给目录与文档清单（docs 与 toc 等长，spine 文档可重复）。
+            // 迁移标记带布局签名：P11 锚点原布局 v1 / 第六轮受限细分 v2 / 第七轮泛化细分或块级切章 v3。
+            // 顺手做一次进度/书签迁移（已迁移过则为空操作；布局变化时用 base_chapters 映射）。
+            let layout_sig = split_layout_sig;
+            migrate_epub_split_positions(
+                &st,
+                id,
+                book.size,
+                book.mtime,
+                &cached.doc.chapters,
+                split_base_chapters.as_deref(),
+                layout_sig,
+            );
+            // 切章/细分后旧搜索缓存按书懒清理：只删该书 chapter_text 并给 fts_meta 写负哨兵，
+            // 不做 DELETE FROM fts（book_id 是 UNINDEXED，全表扫描会卡住全局 DB 锁）。
+            // marker 带布局签名：v1→v2 后会重新清理一次，避免旧布局缓存残留。
+            {
+                let conn = st.db.0.lock().unwrap();
+                db::invalidate_split_book_search_cache(
+                    &conn,
+                    id,
+                    cached.doc.chapters.len() as i64,
+                    &format!("{}-{}|{}", book.size, book.mtime, layout_sig),
+                );
+            }
+            let docs: Vec<String> = cached
+                .doc
+                .chapters
+                .iter()
+                .map(|c| {
+                    cached
+                        .doc
+                        .spine
+                        .get(c.spine)
+                        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            (cached.doc.split_toc.clone(), docs)
+        } else {
+            let docs: Vec<String> = cached
+                .doc
+                .toc
+                .iter()
+                .map(|t| {
+                    cached
+                        .doc
+                        .spine
+                        .get(t.index)
+                        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            (cached.doc.toc.clone(), docs)
+        }
+    } else if let Some(c) = &txt_cached {
+        (c.2.clone(), Vec::new())
+    } else if let Some(t) = &pdf_toc {
+        (t.clone(), Vec::new())
+    } else if let Some(c) = &mobi_cached {
+        (c.2.clone(), Vec::new())
+    } else {
+        (Vec::new(), Vec::new())
     };
     if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
@@ -3142,38 +4260,11 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
             t_open.elapsed(),
             toc.len()
         );
-    }
-    // 全书图片列表：随 open_book 一次算好并缓存，图片查看器无需再发命令（避免打开后
-    // 再调用命令带来的排队/卡顿）。EPUB 用 OPF 清单（瞬时），MOBI 用已提取的 res 目录。
-    let images = collect_book_images(&st, id).unwrap_or_default();
-    let images = image_cache_put(&st, id, file_stamp(&book.path), images.clone(), images);
-    // 漫画检测分两步，先廉价后昂贵：
-    //  1) 图片门槛：图片数远多于章节数（每页基本一张图）。不过门槛直接 false，**不读正文**，
-    //     带少量插图的普通书在这里就以零成本被排除（这是成本控制的关键）。
-    //  2) 正文检查：门槛通过后逐章取纯文本，只有「每章除标题外几乎没有别的文字」才判漫画，
-    //     否则普通小说（正文很长）立刻 false —— 旧实现完全不看正文，故带插图的正常小说会误判。
-    let toc_n = toc.len().max(1);
-    let mut body_chars = 0i64;
-    let mut scanned_bytes = 0usize;
-    let mut is_manga = false;
-    if manga_image_gate(images.len(), spine_n, toc_n, &ext) {
-        if ext == "epub" {
-            if let Some(c) = &epub_probe {
-                let (b, used) = manga_body_chars_epub(&c.data, &c.doc.spine, &c.doc.toc);
-                body_chars = b;
-                scanned_bytes = used;
-            }
-        } else if let Some((html, parts, t)) = &mobi_probe {
-            body_chars = manga_body_chars_mobi(html, parts, t);
-        }
-        is_manga = is_manga_like(images.len(), spine_n, toc_n, &ext, body_chars);
-    }
-    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[open] is_manga id={id} images={} spine={} toc={} body_chars={} scanned={} => {is_manga}",
             images.len(),
             spine_n,
-            toc.len(),
+            toc_n,
             body_chars,
             scanned_bytes
         );
@@ -3185,6 +4276,7 @@ pub async fn open_book(state: State<'_, Arc<AppState>>, id: i64) -> Result<OpenR
         encoding_warning: warn,
         images,
         is_manga,
+        image_pages,
     })
 }
 
@@ -3195,11 +4287,9 @@ pub async fn get_chapter(
     chapter_index: i64,
     keep_styles: bool,
 ) -> Result<ChapterData, String> {
-    let book = {
-        let conn = state.db.0.lock().unwrap();
-        db::get_book(&conn, book_id).ok_or("书籍不存在")?
-    };
-    let ext = ext_of(&book.path).unwrap_or_default();
+    // 元信息走进程内缓存（P3）：命中路径完全不碰 state.db.0，翻章不再与后台建索引抢全局锁；
+    // 未命中回退 DB（书籍不存在时的错误行为不变）。
+    let (path, ext) = cached_book_meta(state.inner(), book_id).ok_or("书籍不存在")?;
     let idx = chapter_index.max(0) as usize;
     let st = state.inner().clone();
 
@@ -3216,11 +4306,55 @@ pub async fn get_chapter(
     if ext == "epub" {
         // 解析/渲染放到阻塞线程池，避免占用 async 运行时拖死其它 IPC。
         let st2 = st.clone();
-        let bpath = book.path.clone();
+        let bpath = path.clone();
         let t_render = std::time::Instant::now();
         let data = tauri::async_runtime::spawn_blocking(move || -> Result<ChapterData, String> {
             let cached = load_epub(&st2, &bpath, book_id)?;
             let doc = &cached.doc;
+            // P11：切分书按虚拟章渲染：切片章只渲染自身 body 区间（图片 URL/样式与整篇一致），
+            // 整篇 fallback 章仍走多文件渲染；切片章不参与字数统计（chars=0）。
+            if doc.split {
+                let (title, html, chars) = match doc.chapters.get(idx) {
+                    Some(c) => {
+                        if let Some(start) = c.start {
+                            let dp = doc.spine.get(c.spine).cloned().unwrap_or_default();
+                            let raw = crate::epub::read_entry_file(std::path::Path::new(&cached.path), &cached.ci, &dp)
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                                .unwrap_or_default();
+                            let html = crate::epub::chapter_html_fragment_file(
+                                std::path::Path::new(&cached.path),
+                                &cached.ci,
+                                &dp,
+                                &raw,
+                                start,
+                                c.end,
+                                Some(book_id),
+                                keep_styles,
+                            )?;
+                            (c.title.clone(), html, 0)
+                        } else {
+                            let end = c.spine_end.min(doc.spine.len());
+                            let docs: Vec<String> = (c.spine..end)
+                                .filter_map(|si| doc.spine.get(si).cloned())
+                                .collect();
+                            let html = crate::epub::chapter_html_multi_file(
+                                std::path::Path::new(&cached.path),
+                                &cached.ci,
+                                &docs,
+                                Some(book_id),
+                                keep_styles,
+                            )
+                            .unwrap_or_default();
+                            let chars: i64 = (c.spine..end)
+                                .map(|si| doc.spine_chars.get(si).copied().unwrap_or(0))
+                                .sum();
+                            (c.title.clone(), html, chars)
+                        }
+                    }
+                    None => (format!("第 {} 节", idx + 1), String::new(), 0),
+                };
+                return Ok(ChapterData { title, html, chars });
+            }
             // 章节 = 从本章目录项指向的 spine 下标，到下一章目录项（或末尾）为止：
             // 支持「一章被拆成多个小文件」的 EPUB（目录只指向首个小文件）。
             let start = doc
@@ -3240,9 +4374,9 @@ pub async fn get_chapter(
             let docs: Vec<String> = (start..end)
                 .filter_map(|si| doc.spine.get(si).cloned())
                 .collect();
-            let mut html = crate::epub::chapter_html_multi_ci(
-                &cached.data,
-                Some(&cached.ci),
+            let mut html = crate::epub::chapter_html_multi_file(
+                std::path::Path::new(&cached.path),
+                &cached.ci,
                 &docs,
                 Some(book_id),
                 keep_styles,
@@ -3254,9 +4388,9 @@ pub async fn get_chapter(
             if html.is_empty() {
                 // 区间异常时兜底返回本章首文件，避免整章空白。
                 if let Some(dp) = doc.spine.get(start) {
-                    html = crate::epub::chapter_html_ci(
-                        &cached.data,
-                        Some(&cached.ci),
+                    html = crate::epub::chapter_html_ci_file(
+                        std::path::Path::new(&cached.path),
+                        &cached.ci,
                         dp,
                         Some(book_id),
                         keep_styles,
@@ -3293,47 +4427,48 @@ pub async fn get_chapter(
     }
 
     let is_mobi = is_mobi_ext(&ext);
-    let ver = st.rules_ver.load(Ordering::Relaxed);
-    // 与 load_txt 同一套判据：规则版本 + 文件指纹都对上才复用。
-    let stamp = file_stamp(&book.path);
-    let cached_hit = {
-        let m = st.txt_cache.lock().unwrap();
-        m.get(&book_id)
-            .filter(|c| c.ver == ver && stamp_matches(c.stamp, stamp))
-            .map(|c| c.doc.clone())
-    };
-    let (content, ranges, toc) = match cached_hit {
-        Some(c) => c.as_ref().clone(),
-        None => {
-            // 缓存未命中才解析：TXT/MOBI 的解析放阻塞线程池，避免占用 async 运行时。
-            let st2 = st.clone();
-            let bpath = book.path.clone();
-            let entry = tauri::async_runtime::spawn_blocking(
-                move || -> Result<Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)>, String> {
-                    if is_mobi {
-                        let doc = mobi_doc_for(&st2, &bpath, book_id)?;
-                        Ok(Arc::new((doc.html.clone(), doc.parts.clone(), doc.toc.clone())))
-                    } else {
-                        load_txt(&st2, &bpath, book_id)
-                    }
-                },
-            )
+    // MOBI：解析统一走 load_mobi（自己带缓存判据），不再在本函数里内联第二套逻辑。
+    // TXT：保留原来的内联缓存快路径（命中不额外 spawn_blocking），未命中走 load_txt。
+    let entry: Arc<(String, Vec<(usize, usize)>, Vec<TocEntry>)> = if is_mobi {
+        let st2 = st.clone();
+        let bpath = path.clone();
+        tauri::async_runtime::spawn_blocking(move || load_mobi(&st2, &bpath, book_id).map(|r| r.0))
             .await
-            .map_err(|e| e.to_string())??;
-            // 指纹取不到就不入缓存：无法校验的条目会一直命中。
-            if stamp.is_some() {
-                push_cache(
-                    &st.txt_cache,
-                    book_id,
-                    CachedText { ver, stamp, doc: entry.clone() },
-                    3,
-                );
+            .map_err(|e| e.to_string())??
+    } else {
+        let ver = st.rules_ver.load(Ordering::Relaxed);
+        // 与 load_txt 同一套判据：规则版本 + 文件指纹都对上才复用。
+        let stamp = file_stamp(&path);
+        let cached_hit = {
+            let m = st.txt_cache.lock().unwrap();
+            m.get(&book_id)
+                .filter(|c| cache_entry_valid(c.ver, ver, c.stamp, stamp))
+                .map(|c| c.doc.clone())
+        };
+        match cached_hit {
+            Some(c) => c,
+            None => {
+                let st2 = st.clone();
+                let bpath = path.clone();
+                let entry = tauri::async_runtime::spawn_blocking(move || load_txt(&st2, &bpath, book_id))
+                    .await
+                    .map_err(|e| e.to_string())??;
+                // 指纹取不到就不入缓存：无法校验的条目会一直命中。
+                if stamp.is_some() {
+                    push_cache(
+                        &st.txt_cache,
+                        book_id,
+                        CachedText { ver, stamp, doc: entry.clone(), warn: None },
+                        3,
+                    );
+                }
+                entry
             }
-            entry.as_ref().clone()
         }
     };
+    let (content, ranges, toc) = entry.as_ref();
     let (start, end) = ranges.get(idx).copied().ok_or("章节越界")?;
-    let body = safe_slice(&content, start, end);
+    let body = safe_slice(content, start, end);
     let title = toc
         .get(idx)
         .map(|t| t.title.clone())
@@ -3401,6 +4536,8 @@ fn cleanup_book_artifacts_for(app: &AppHandle, items: &[(i64, Option<String>)]) 
                 eprintln!("[cleanup] res remove failed id={id} dir={} err={e}", dir.display());
             }
         }
+        // 解析结果磁盘缓存（P10）随书清理：删掉的书不需要重启后还留着几十 MB 缓存。
+        crate::parsecache::cleanup_book(&crate::data_dir(app).join("parse_cache"), *id);
     }
 }
 
@@ -3541,9 +4678,12 @@ pub async fn delete_books(
     })
     .await
     .map_err(|e| e.to_string())?;
-    // 部分失败时也有书被删除/移出：仍要通知前端刷新书库与笔记视图。
+    // 部分失败时也有书被删除/移出：仍要通知前端刷新书库与笔记视图（格式集可能变化）。
+    bump_formats_epoch(state.inner());
     app.emit("library-changed", ()).ok();
     app.emit("notes-changed", ()).ok();
+    // 删过的书不再需要元信息缓存（st 已被 move 进闭包，这里用 state 访问同一份表）。
+    state.book_meta.lock().unwrap().clear();
     outcome
 }
 
@@ -3641,6 +4781,77 @@ pub fn save_split_rules(state: State<'_, Arc<AppState>>, pattern: String) -> Res
     Ok(())
 }
 
+/// R8-1：按需读取 MOBI/AZW3 正文图片。请求级快路径：进程内清单缓存 → 直接文件读取 →
+/// 最后才查 DB/目录三态（避免每张图都读整份清单或扫 res 目录）。
+pub fn read_mobi_res_image(state: &AppState, book_id: i64, name: &str) -> Option<(String, Vec<u8>)> {
+    if book_id <= 0 {
+        return None;
+    }
+    let mime = crate::mobi::res_mime_for_name(name)?;
+    let out_dir = crate::data_dir(&state.app).join("res").join(book_id.to_string());
+    // a. 清单缓存命中（按 book_id，不查 DB、不读盘）：Lazy 模式下绝大多数图片走这里。
+    let cached = {
+        let c = state.mobi_manifest_cache.lock().unwrap();
+        c.iter()
+            .find(|(id, _, _, _)| *id == book_id)
+            .map(|(_, _, _, m)| m.clone())
+    };
+    if let Some(m) = cached {
+        if let Some(v) = crate::mobi::read_res_image_manifest(&m, name, None) {
+            return Some(v);
+        }
+    }
+    // b. 直接文件回退（旧 Files 目录/已落盘图片）：不扫目录、不查 DB。
+    if let Some(v) = crate::mobi::read_res_image_file(&out_dir, name) {
+        return Some(v);
+    }
+    // c. 仍未命中：取 DB 当前路径/指纹后按目录三态处理（Lazy 首次请求加载清单）。
+    let book_path = {
+        let conn = state.db.0.lock().unwrap();
+        db::get_book(&conn, book_id).map(|b| b.path)
+    };
+    let stamp = book_path.as_deref().and_then(crate::mobi::src_file_stamp);
+    match crate::mobi::res_dir_state(&out_dir, stamp) {
+        crate::mobi::ResDirState::Lazy => {
+            let m = cached_mobi_manifest(state, book_id, &out_dir, stamp)?;
+            crate::mobi::read_res_image_manifest(&m, name, book_path.as_deref())
+        }
+        _ => None,
+    }
+    .map(|(_, b)| (mime.to_string(), b))
+}
+
+/// R8-1：进程内缓存图片清单（容量 4，带源文件指纹；指纹变化/清单不符即视为未命中）。
+fn cached_mobi_manifest(
+    state: &AppState,
+    book_id: i64,
+    out_dir: &std::path::Path,
+    stamp: Option<(i64, i64)>,
+) -> Option<Arc<crate::mobi::ResManifest>> {
+    let (size, mtime) = stamp?;
+    {
+        let mut c = state.mobi_manifest_cache.lock().unwrap();
+        if let Some(pos) = c.iter().position(|(id, _, _, _)| *id == book_id) {
+            let e = c.remove(pos);
+            if e.1 == size && e.2 == mtime {
+                c.push(e.clone());
+                return Some(e.3);
+            }
+        }
+    }
+    let m = Arc::new(crate::mobi::read_res_manifest(out_dir)?);
+    if m.size != size || m.mtime != mtime {
+        return None;
+    }
+    let mut c = state.mobi_manifest_cache.lock().unwrap();
+    c.retain(|(id, _, _, _)| *id != book_id);
+    c.push((book_id, size, mtime, m.clone()));
+    if c.len() > 4 {
+        c.remove(0);
+    }
+    Some(m)
+}
+
 /// 用当前设置解析 MOBI/AZW3：强制编码 + 图片提取到 res/<book_id>/
 pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crate::mobi::MobiDoc, String> {
     let force = {
@@ -3655,7 +4866,12 @@ pub fn mobi_doc_for(st: &Arc<AppState>, path: &str, book_id: i64) -> Result<crat
         .join("res")
         .join(book_id.to_string());
     let prefix = format!("http://tidepage.localhost/res/{book_id}/");
-    let doc = crate::mobi::parse_full(path, force.as_deref(), Some((&dir, &prefix)))?;
+    let doc = crate::mobi::parse_full_mode(
+        path,
+        force.as_deref(),
+        Some((&dir, &prefix)),
+        crate::mobi::ResMode::Lazy,
+    )?;
     if std::env::var("TIDEPAGE_MOBI_DIAG").is_ok() {
         eprintln!(
             "[mobi] {path} imgs={} res_urls={} placeholder={}",
@@ -3804,6 +5020,17 @@ pub async fn pick_save(title: String, ext: String, default_name: String) -> Opti
 pub struct AiExportItemIn {
     pub title: String,
     pub html: String,
+}
+
+/// D1：导出划线/笔记等文本文件（仅写目标文件，不碰 DB、不做迁移）。
+/// 内容可能较大（全库导出），放到阻塞线程池写，避免占用 Tauri 命令线程。
+#[tauri::command]
+pub async fn write_text_file(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, content).map_err(|e| format!("写入文件失败：{e}"))
+    })
+    .await
+    .map_err(|e| format!("写入任务失败：{e}"))?
 }
 
 #[tauri::command]
@@ -4607,6 +5834,7 @@ pub async fn webdav_download_file(
                 .ok();
             }
         }
+        bump_formats_epoch(state.inner());
         state.app.emit("library-changed", ()).ok();
     }
     Ok(vec![out.to_string_lossy().into_owned()])
@@ -4705,6 +5933,7 @@ pub async fn webdav_download_progress(
                 .ok();
             }
         }
+        bump_formats_epoch(state.inner());
         state.app.emit("library-changed", ()).ok();
     }
     emit(received, "green", true, None);
@@ -4770,8 +5999,90 @@ pub struct StorageStats {
     pub db_bytes: u64,
     /// 「可清理缓存」= 封面 + 提取资源（可再生，删除后重新打开/刷新会重建）。
     pub cache_bytes: u64,
+    /// B3：解析缓存目录（data_dir/parse_cache）占用；可单独清理，不计入 cache_bytes。
+    pub parse_cache_bytes: u64,
+    /// B10：freelist 可回收字节（page_size * freelist_count）。
+    pub freelist_bytes: u64,
+    /// B10：数据库所在盘可用字节（取不到为 None）。
+    pub db_dir_free_bytes: Option<u64>,
+    /// B10：临时目录路径与可用字节。
+    pub temp_dir: String,
+    pub temp_free_bytes: Option<u64>,
+    /// B10：临时目录与数据库是否同一卷（同卷只计一次临时空间）。
+    pub temp_same_disk: bool,
+    /// B10：最近一次 WAL checkpoint 记录。
+    pub last_checkpoint_at: i64,
+    pub last_checkpoint_busy: bool,
+    pub checkpoint_wal_before: u64,
+    pub checkpoint_wal_after: u64,
 }
 
+
+#[tauri::command]
+pub async fn cover_audit(state: State<'_, Arc<AppState>>) -> Result<crate::covers::CoverAudit, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = crate::covers::covers_dir(&st.app);
+        let refs = {
+            let conn = st.db.0.lock().unwrap();
+            let mut set = std::collections::HashSet::new();
+            if let Ok(mut query) = conn.prepare(
+                "SELECT DISTINCT lower(cover_path) FROM books WHERE cover_path IS NOT NULL AND cover_path<>''",
+            ) {
+                if let Ok(rows) = query.query_map([], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() { set.insert(r); }
+                }
+            }
+            set
+        };
+        let mut audit = crate::covers::audit_covers(&dir, &refs);
+        {
+            let conn = st.db.0.lock().unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+            // 首次扫描也返回本次时间；写入 now，后续扫描自然更新。
+            audit.last_scan_at = now;
+            let _ = db::set_setting(&conn, "maintenance.cover_audit_at", &now.to_string());
+        }
+        Ok(audit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn clean_cover_orphans(
+    state: State<'_, Arc<AppState>>,
+    confirm: bool,
+) -> Result<crate::covers::CoverCleanResult, String> {
+    if !confirm {
+        return Err("需要二次确认后才能清理孤儿封面".into());
+    }
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = crate::covers::covers_dir(&st.app);
+        let refs = {
+            let conn = st.db.0.lock().unwrap();
+            let mut set = std::collections::HashSet::new();
+            if let Ok(mut query) = conn.prepare(
+                "SELECT DISTINCT lower(cover_path) FROM books WHERE cover_path IS NOT NULL AND cover_path<>''",
+            ) {
+                if let Ok(rows) = query.query_map([], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() { set.insert(r); }
+                }
+            }
+            set
+        };
+        let result = crate::covers::clean_cover_orphans(&dir, &refs);
+        {
+            let conn = st.db.0.lock().unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+            let _ = db::set_setting(&conn, "maintenance.cover_audit_at", &now.to_string());
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 #[tauri::command]
 pub async fn storage_stats(state: State<'_, Arc<AppState>>) -> Result<StorageStats, String> {
     let dir = crate::data_dir(&state.app);
@@ -4787,10 +6098,45 @@ pub async fn storage_stats(state: State<'_, Arc<AppState>>) -> Result<StorageSta
             fonts_bytes: 0,
             db_bytes: 0,
             cache_bytes: 0,
+            parse_cache_bytes: 0,
+            freelist_bytes: 0,
+            db_dir_free_bytes: None,
+            temp_dir: String::new(),
+            temp_free_bytes: None,
+            temp_same_disk: false,
+            last_checkpoint_at: 0,
+            last_checkpoint_busy: false,
+            checkpoint_wal_before: 0,
+            checkpoint_wal_after: 0,
         };
         // 只遍历一次 data_dir：所有文件计入 total，按第一段分类到 covers/res/fonts/db。
         collect_storage(&dir, &dir, &mut s);
+        // 解析缓存单独统计（parsecache 只认合法缓存扩展名，忽略临时文件）。
+        s.parse_cache_bytes = crate::parsecache::cache_bytes(&dir.join("parse_cache"));
         s.cache_bytes = s.covers_bytes + s.res_bytes;
+        // B10：freelist 可回收 + 数据库盘/临时目录空间（不读取大表，只查 PRAGMA）。
+        s.freelist_bytes = rusqlite::Connection::open(dir.join("tidepage.db"))
+            .ok()
+            .and_then(|c| {
+                let page: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0)).ok()?;
+                let free: i64 = c.query_row("PRAGMA freelist_count", [], |r| r.get(0)).ok()?;
+                Some((page.max(0) * free.max(0)) as u64)
+            })
+            .unwrap_or(0);
+        s.db_dir_free_bytes = disk_free_bytes(&dir);
+        if let Some(cp) = rusqlite::Connection::open(dir.join("tidepage.db")).ok().and_then(|c| {
+            db::get_setting(&c, "maintenance.last_checkpoint")
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        }) {
+            s.last_checkpoint_at = cp.get("at").and_then(|v| v.as_i64()).unwrap_or(0);
+            s.last_checkpoint_busy = cp.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+            s.checkpoint_wal_before = cp.get("walBefore").and_then(|v| v.as_u64()).unwrap_or(0);
+            s.checkpoint_wal_after = cp.get("walAfter").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+        let temp = std::env::temp_dir();
+        s.temp_same_disk = same_disk(&dir, &temp);
+        s.temp_free_bytes = disk_free_bytes(&temp);
+        s.temp_dir = temp.to_string_lossy().into_owned();
         s
     })
     .await;
@@ -4807,8 +6153,344 @@ pub async fn storage_stats(state: State<'_, Arc<AppState>>) -> Result<StorageSta
                 fonts_bytes: 0,
                 db_bytes: 0,
                 cache_bytes: 0,
+                parse_cache_bytes: 0,
+                freelist_bytes: 0,
+                db_dir_free_bytes: None,
+                temp_dir: String::new(),
+                temp_free_bytes: None,
+                temp_same_disk: false,
+                last_checkpoint_at: 0,
+                last_checkpoint_busy: false,
+                checkpoint_wal_before: 0,
+                checkpoint_wal_after: 0,
             })
         }
+    }
+}
+
+#[cfg(windows)]
+fn disk_free_bytes(path: &Path) -> Option<u64> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    wide.push(0);
+    let mut free = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), None, None).ok()?;
+    }
+    Some(free)
+}
+
+#[cfg(not(windows))]
+fn disk_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// B3：VACUUM 前磁盘余量判定（保守：至少 DB 大小 + 64MB；取不到余量时拒绝执行）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn vacuum_space_ok(free: Option<u64>, db_bytes: u64) -> bool {
+    match free {
+        Some(f) => f > db_bytes.saturating_add(64 * 1024 * 1024),
+        None => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_disk(a: &Path, b: &Path) -> bool {
+    let ra: String = a.to_string_lossy().chars().take(2).collect::<String>().to_ascii_lowercase();
+    let rb: String = b.to_string_lossy().chars().take(2).collect::<String>().to_ascii_lowercase();
+    !ra.is_empty() && ra == rb && a.exists() && b.exists()
+}
+
+#[cfg(not(windows))]
+fn same_disk(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+fn maintenance_now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// B10：维护历史记录（保留最近 5 次，settings JSON 幂等）。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceRecord {
+    pub at: i64,
+    pub kind: String,
+    pub result: String,
+    pub error: String,
+    pub before_db: u64,
+    pub before_wal: u64,
+    pub after_db: u64,
+    pub after_wal: u64,
+    pub freed: u64,
+    pub duration_ms: u64,
+    pub checkpoint_busy: bool,
+    pub backup_path: String,
+}
+
+fn push_maintenance_record(conn: &rusqlite::Connection, rec: MaintenanceRecord) {
+    let mut list: Vec<MaintenanceRecord> = db::get_setting(conn, "maintenance.history.v1")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    list.insert(0, rec);
+    list.truncate(5);
+    let _ = db::set_setting(conn, "maintenance.history.v1", &serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()));
+}
+
+/// B10：维护历史（最近 5 条）。
+/// B10：维护/扫描运行状态（自动整理调度用）。
+#[tauri::command]
+pub fn maintenance_status(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    serde_json::json!({
+        "maintenanceRunning": state.maintenance_running.load(Ordering::SeqCst),
+        "scanRunning": state.scan_running.load(Ordering::SeqCst),
+    })
+}
+
+#[tauri::command]
+pub fn maintenance_history(state: State<'_, Arc<AppState>>) -> Result<Vec<MaintenanceRecord>, String> {
+    let conn = state.db.0.lock().unwrap();
+    Ok(db::get_setting(&conn, "maintenance.history.v1")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
+/// B10：VACUUM 空间预检（同卷只要求一次；异卷要求 DB 盘与临时目录各自满足）。
+pub fn vacuum_precheck(
+    db_free: Option<u64>,
+    temp_free: Option<u64>,
+    same_disk: bool,
+    db_bytes: u64,
+) -> Result<(), String> {
+    let required = db_bytes.saturating_add(64 * 1024 * 1024);
+    let need = required as f64 / 1024.0 / 1024.0;
+    let check = |name: &str, free: Option<u64>| -> Result<(), String> {
+        match free {
+            Some(f) if f > required => Ok(()),
+            Some(f) => Err(format!("{name}空间不足：整理约需 {need:.0}MB，可用 {:.0}MB。请清理后重试", f as f64 / 1024.0 / 1024.0)),
+            None => Err(format!("无法读取{name}可用空间；为避免损坏数据库，已取消整理")),
+        }
+    };
+    check("数据库所在盘", db_free)?;
+    if !same_disk {
+        check("临时目录", temp_free)?;
+    }
+    Ok(())
+}
+
+/// B3：清理解析缓存（可再生），返回释放字节数。
+#[tauri::command]
+pub async fn clear_parse_cache(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
+    let app = state.app.clone();
+    let dir = crate::parsecache::cache_dir(&state.app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut last_emit = std::time::Instant::now();
+        crate::parsecache::clear_cache_with_progress(&dir, |p| {
+            if p.done == 0 || p.done == p.total || last_emit.elapsed().as_millis() >= 200 {
+                last_emit = std::time::Instant::now();
+                let _ = app.emit(
+                    "maintenance-progress",
+                    serde_json::json!({
+                        "phase": "parse_cache",
+                        "state": if p.done == 0 && p.total > 0 { "start" } else if p.done >= p.total { "done" } else { "progress" },
+                        "done": p.done,
+                        "total": p.total,
+                        "bytes": p.bytes,
+                    }),
+                );
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// B3：数据库主体 + WAL 文件大小（释放量口径：VACUUM 期间 WAL 会临时增大，必须合计）。
+fn db_file_sizes(db: &Path) -> (u64, u64) {
+    let db_len = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+    let wal_path = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
+    let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    (db_len, wal_len)
+}
+
+/// B3：执行 WAL checkpoint(TRUNCATE)，最多重试 attempts 次；返回是否仍 busy。
+/// 非 WAL 模式返回 (0,0,0) 视为成功；busy 时由调用方退化为 freelist 估算。
+fn checkpoint_truncate(conn: &rusqlite::Connection, attempts: u32) -> bool {
+    for i in 0..attempts {
+        let busy = match conn.query_row(
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ) {
+            Ok((busy, _log, _ckpt)) => busy != 0,
+            Err(e) => {
+                memlog::stage_note("maintenance:checkpoint", &format!("err={e}"));
+                true
+            }
+        };
+        if !busy {
+            return false;
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    true
+}
+
+/// B3：数据库整理（VACUUM）。仅用户显式触发；与 FTS 重建/其它维护互斥；先检查磁盘余量。
+/// VACUUM 期间打开/搜索会等待数据库锁，前端应提示「可能耗时」。
+#[tauri::command]
+pub async fn vacuum_db(state: State<'_, Arc<AppState>>, auto: Option<bool>) -> Result<u64, String> {
+    let auto = auto.unwrap_or(false);
+    if state.fts_index_running.load(Ordering::SeqCst)
+        || state.fts_optimize_running.load(Ordering::SeqCst)
+    {
+        return Err("正在优化搜索索引，请稍后再试".into());
+    }
+    if state.maintenance_running.swap(true, Ordering::SeqCst) {
+        return Err("已有维护任务在进行中".into());
+    }
+    // 双检：拿到维护标志后再确认没有 FTS 任务刚好启动，避免两边同时写库。
+    if state.fts_index_running.load(Ordering::SeqCst)
+        || state.fts_optimize_running.load(Ordering::SeqCst)
+    {
+        state.maintenance_running.store(false, Ordering::SeqCst);
+        return Err("正在优化搜索索引，请稍后再试".into());
+    }
+    // B10：自动整理不在书库扫描期间执行；手动维护保持原行为。
+    if auto && state.scan_running.load(Ordering::SeqCst) {
+        state.maintenance_running.store(false, Ordering::SeqCst);
+        return Err("正在扫描书库，已跳过自动整理".into());
+    }
+    let st = state.inner().clone();
+    let app = st.app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        let dir = crate::data_dir(&app);
+        let db = dir.join("tidepage.db");
+        let (db_len, _) = db_file_sizes(&db);
+        if db_len == 0 {
+            return Err("数据库文件不存在".into());
+        }
+        let conn = rusqlite::Connection::open(&db).map_err(|e| format!("打开数据库失败：{e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5)).ok();
+        // VACUUM 期间 WAL 会临时增大、结束后 checkpoint 回落：前后都先 checkpoint 再按
+        // (db + db-wal) 总大小计量，避免刚结束时 db 文件未缩小而显示释放 0。
+        let initial_busy = checkpoint_truncate(&conn, 3);
+        let (before_db, before_wal) = db_file_sizes(&db);
+        let before_total = before_db + before_wal;
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(4096);
+        let freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let reclaim = (page_size * freelist).max(0) as u64;
+        // B10：同时检查 DB 盘与临时目录；同卷只计一次，取不到空间信息则拒绝。
+        let temp = std::env::temp_dir();
+        let same = same_disk(&dir, &temp);
+        if let Err(e) = vacuum_precheck(disk_free_bytes(&dir), disk_free_bytes(&temp), same, before_db) {
+            if auto {
+                push_maintenance_record(&conn, MaintenanceRecord {
+                    at: maintenance_now_ms(), kind: "vacuum-auto".into(), result: "skipped".into(), error: e.clone(),
+                    before_db, before_wal, after_db: before_db, after_wal: before_wal, freed: 0,
+                    duration_ms: 0, checkpoint_busy: initial_busy, backup_path: String::new(),
+                });
+            }
+            return Err(e);
+        }
+        // B10 自动整理：先做用户数据逻辑备份（非整库镜像），保留最近 1 份；失败则跳过。
+        let mut backup_path = String::new();
+        if auto {
+            let backups = dir.join("backups");
+            if let Err(e) = std::fs::create_dir_all(&backups) {
+                let msg = format!("创建备份目录失败：{e}");
+                push_maintenance_record(&conn, MaintenanceRecord {
+                    at: maintenance_now_ms(), kind: "vacuum-auto".into(), result: "skipped".into(), error: msg.clone(),
+                    before_db, before_wal, after_db: before_db, after_wal: before_wal, freed: 0,
+                    duration_ms: 0, checkpoint_busy: initial_busy, backup_path: String::new(),
+                });
+                return Err(msg);
+            }
+            let path = backups.join(format!("auto-vacuum-{}.json", maintenance_now_ms()));
+            match crate::databackup::export_backup_to_file(&conn, &path.to_string_lossy(), None) {
+                Ok(_) => {
+                    backup_path = path.to_string_lossy().into_owned();
+                    // 保留最近 1 份自动备份。
+                    if let Ok(rd) = std::fs::read_dir(&backups) {
+                        let mut olds: Vec<_> = rd.flatten().filter(|e| {
+                            let n = e.file_name().to_string_lossy().into_owned();
+                            n.starts_with("auto-vacuum-") && n.ends_with(".json")
+                        }).collect();
+                        olds.sort_by_key(|e| e.file_name());
+                        while olds.len() > 1 {
+                            let e = olds.remove(0);
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("自动整理前备份失败：{e}");
+                    push_maintenance_record(&conn, MaintenanceRecord {
+                        at: maintenance_now_ms(), kind: "vacuum-auto".into(), result: "skipped".into(), error: msg.clone(),
+                        before_db, before_wal, after_db: before_db, after_wal: before_wal, freed: 0,
+                        duration_ms: 0, checkpoint_busy: initial_busy, backup_path: String::new(),
+                    });
+                    return Err(msg);
+                }
+            }
+        }
+        let _ = app.emit(
+            "maintenance-progress",
+            serde_json::json!({"phase":"vacuum","state":"start","reclaim_bytes":reclaim}),
+        );
+        let started = std::time::Instant::now();
+        if let Err(e) = conn.execute_batch("VACUUM") {
+            push_maintenance_record(&conn, MaintenanceRecord {
+                at: maintenance_now_ms(), kind: "vacuum".into(), result: "error".into(), error: format!("数据库整理失败：{e}"),
+                before_db, before_wal, after_db: before_db, after_wal: before_wal, freed: 0,
+                duration_ms: started.elapsed().as_millis() as u64, checkpoint_busy: initial_busy, backup_path: backup_path.clone(),
+            });
+            return Err(format!("数据库整理失败：{e}"));
+        }
+        let (vac_db, vac_wal) = db_file_sizes(&db);
+        let checkpoint_busy = checkpoint_truncate(&conn, 5);
+        let (after_db, after_wal) = db_file_sizes(&db);
+        let after_total = after_db + after_wal;
+        let actual = before_total.saturating_sub(after_total);
+        // checkpoint 始终 busy 或实际差值为 0 时，退化为 freelist 估算，避免界面显示 0。
+        let freed = if (checkpoint_busy || actual == 0) && reclaim > 0 {
+            reclaim
+        } else {
+            actual
+        };
+        memlog::stage_note(
+            "maintenance:vacuum",
+            &format!(
+                "before_db={before_db} before_wal={before_wal} init_busy={initial_busy} vac_db={vac_db} vac_wal={vac_wal} after_db={after_db} after_wal={after_wal} checkpoint_busy={checkpoint_busy} reclaim={reclaim} actual={actual} freed={freed}"
+            ),
+        );
+        push_maintenance_record(&conn, MaintenanceRecord {
+            at: maintenance_now_ms(), kind: "vacuum".into(), result: "success".into(), error: String::new(),
+            before_db, before_wal, after_db, after_wal, freed,
+            duration_ms: started.elapsed().as_millis() as u64, checkpoint_busy, backup_path: backup_path.clone(),
+        });
+        let _ = db::set_setting(&conn, "maintenance.last_checkpoint", &serde_json::json!({
+            "at": maintenance_now_ms(), "busy": checkpoint_busy, "walBefore": before_wal, "walAfter": after_wal
+        }).to_string());
+        let _ = app.emit(
+            "maintenance-progress",
+            serde_json::json!({"phase":"vacuum","state":"done","freed_bytes":freed}),
+        );
+        Ok(freed)
+    })
+    .await;
+    // 无论 join 成功/失败都必须复位维护标志，否则后续维护会被永久挡住。
+    state.maintenance_running.store(false, Ordering::SeqCst);
+    match result {
+        Ok(r) => r,
+        Err(e) => Err(format!("维护任务异常终止：{e}")),
     }
 }
 
@@ -4844,6 +6526,7 @@ fn collect_storage(data_dir: &Path, dir: &Path, s: &mut StorageStats) {
             Some("covers") => s.covers_bytes += bytes,
             Some("res") => s.res_bytes += bytes,
             Some("fonts") => s.fonts_bytes += bytes,
+            Some("parse_cache") => s.parse_cache_bytes += bytes,
             Some("tidepage.db") | Some("tidepage.db-wal") | Some("tidepage.db-shm") => {
                 s.db_bytes += bytes
             }
@@ -4890,6 +6573,12 @@ pub fn scan_progress(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     })
 }
 
+/// 优先封面只接受真正未扫描的书：md=0。md=1（已完成）/2（pathological/超时失败）/3（处理中）
+/// 一律跳过，避免失败书被前端可见区 effect 反复入队形成自转。
+pub fn prioritize_eligible(meta_done: i64) -> bool {
+    meta_done == 0
+}
+
 /// 方案 A：把「列表可见的未扫描书籍」提升为高优先级扫描目标（按用户视野顺序生成封面）。
 /// - 单事务批量入队，复用 `enqueue_priority`（ON CONFLICT 刷新 queued_at → 幂等，重复滚动不膨胀）；
 /// - 逐本校验 `meta_done != 1` 才入队（已完成的不入队）；
@@ -4916,8 +6605,8 @@ pub fn prioritize_covers(state: State<'_, Arc<AppState>>, ids: Vec<i64>) -> Resu
         let tx = guard.transaction().map_err(|e| e.to_string())?;
         let mut n = 0u64;
         for id in &ids {
-            // 仅对仍需处理的书入队（meta_done != 1；不存在的书跳过，避免孤儿优先项）。
-            if matches!(db::meta_done_of(&tx, *id), Some(md) if md != 1) {
+            // 仅对真正未扫描的书入队：md=1/2/3 一律跳过（失败/处理中不得被可见区反复入队）。
+            if matches!(db::meta_done_of(&tx, *id), Some(md) if prioritize_eligible(md)) {
                 match db::enqueue_priority(&tx, *id) {
                     Ok(()) => n += 1,
                     Err(e) => eprintln!("[scan] enqueue_priority failed id={id}: {e}"),
@@ -5041,6 +6730,43 @@ pub fn add_stats(state: State<'_, Arc<AppState>>, book_id: i64, seconds: i64) ->
     db::add_stats(&conn, book_id, seconds)
 }
 
+
+/// D2：阅读统计汇总（只读；区间由前端按本地日历传入）。
+/// B9：前端删除书架等非 DB 同步项时记录墓碑（幂等；不推断缺失删除）。
+#[tauri::command]
+pub fn record_sync_tombstone(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    key: String,
+    deleted_at: Option<i64>,
+) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    let at = deleted_at.unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    });
+    db::record_tombstone(&conn, &kind, &key, at)
+}
+
+#[tauri::command]
+pub async fn get_reading_stats(
+    state: State<'_, Arc<AppState>>,
+    start_day: String,
+    end_day: String,
+    prev_start_day: String,
+    prev_end_day: String,
+    heat_start_day: String,
+    heat_end_day: String,
+) -> Result<db::ReadingStats, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        Ok(db::get_reading_stats(
+            &conn, &start_day, &end_day, &prev_start_day, &prev_end_day, &heat_start_day, &heat_end_day,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 #[tauri::command]
 pub fn get_stats(state: State<'_, Arc<AppState>>) -> Vec<(String, i64)> {
     let conn = state.db.0.lock().unwrap();
@@ -5627,33 +7353,74 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
         // 复用解析缓存（load_epub）：不再重新 fs::read + parse。
         let cached = load_epub(state, &book.path, book_id)?;
         let doc = &cached.doc;
-        let spine_len = doc.spine.len();
-        // 一次性建好「spine 下标 → 章节号 / 标题」，避免逐章线性查找目录（大书 O(n²)）。
-        let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
-        let mut title_by_spine: Vec<String> = vec![String::new(); spine_len];
-        for (i, t) in doc.toc.iter().enumerate() {
-            if t.index < spine_len {
-                if toc_pos_by_spine[t.index].is_none() {
-                    toc_pos_by_spine[t.index] = Some(i as i64);
-                }
-                if title_by_spine[t.index].is_empty() {
-                    title_by_spine[t.index] = t.title.clone();
+        if doc.split {
+            // P11：切分书按虚拟章收集纯文本；每个 spine 文档只读一次。
+            let mut raws: HashMap<usize, String> = HashMap::new();
+            for c in &doc.chapters {
+                for si in c.spine..c.spine_end.min(doc.spine.len()) {
+                    if !raws.contains_key(&si) {
+                        if let Some(b) = doc
+                            .spine
+                            .get(si)
+                            .and_then(|dp| crate::epub::read_entry_file(std::path::Path::new(&cached.path), &cached.ci, dp))
+                        {
+                            raws.insert(si, String::from_utf8_lossy(&b).into_owned());
+                        }
+                    }
                 }
             }
+            doc.chapters
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let text = if let Some(start) = c.start {
+                        raws.get(&c.spine)
+                            .map(|raw| {
+                                crate::epub::html_to_text(crate::epub::slice_body(
+                                    raw, start, c.end,
+                                ))
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        (c.spine..c.spine_end.min(doc.spine.len()))
+                            .filter_map(|si| raws.get(&si))
+                            .map(|raw| crate::epub::html_to_text(raw))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    (i as i64, c.title.clone(), text)
+                })
+                .collect()
+        } else {
+            let spine_len = doc.spine.len();
+            // 一次性建好「spine 下标 → 章节号 / 标题」，避免逐章线性查找目录（大书 O(n²)）。
+            let mut toc_pos_by_spine: Vec<Option<i64>> = vec![None; spine_len];
+            let mut title_by_spine: Vec<String> = vec![String::new(); spine_len];
+            for (i, t) in doc.toc.iter().enumerate() {
+                if t.index < spine_len {
+                    if toc_pos_by_spine[t.index].is_none() {
+                        toc_pos_by_spine[t.index] = Some(i as i64);
+                    }
+                    if title_by_spine[t.index].is_empty() {
+                        title_by_spine[t.index] = t.title.clone();
+                    }
+                }
+            }
+            // 复用单个 zip/CiMap 提取全章文本（而非每章重建索引）。
+            let data = cached.read_all().ok_or("读取 EPUB 失败")?;
+            let texts = crate::epub::collect_texts(&data, &doc.spine);
+            doc.spine
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    (
+                        toc_pos_by_spine[i].unwrap_or(i as i64),
+                        title_by_spine[i].clone(),
+                        texts.get(i).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect()
         }
-        // 复用单个 zip/CiMap 提取全章文本（而非每章重建索引）。
-        let texts = crate::epub::collect_texts(&cached.data, &doc.spine);
-        doc.spine
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                (
-                    toc_pos_by_spine[i].unwrap_or(i as i64),
-                    title_by_spine[i].clone(),
-                    texts.get(i).cloned().unwrap_or_default(),
-                )
-            })
-            .collect()
     } else if ext == "pdf" {
         // PDF 的文字**只能由前端 pdf.js 抽取后回传**（后端不解析 PDF）：直接用回传结果。
         // 没回传过（扫描版 / 乱码页 / 尚未访问的页）就是空 —— 搜索与朗读自然跳过，不报错。
@@ -5674,12 +7441,13 @@ fn collect_book_chapters(state: &Arc<AppState>, book_id: i64) -> Result<Vec<(i64
             .collect::<Vec<_>>();
         rows
     } else {
-        let doc = mobi_doc_for(state, &book.path, book_id)?;
-        doc.toc
-            .iter()
-            .zip(&doc.parts)
+        // 复用 MOBI 解析缓存（load_mobi）：建索引不再重复解析整本（旧实现 open 一次 + 索引一次）。
+        let (cached, _warn) = load_mobi(state, &book.path, book_id)?;
+        let (html, parts, toc) = cached.as_ref();
+        toc.iter()
+            .zip(parts)
             .map(|(t, (s, e))| {
-                let raw = safe_slice(&doc.html, *s, *e);
+                let raw = safe_slice(html, *s, *e);
                 (t.index as i64, t.title.clone(), crate::epub::html_to_text(&raw))
             })
             .collect()
@@ -5703,16 +7471,32 @@ fn ensure_book_text(state: &Arc<AppState>, book_id: i64) -> Result<usize, String
         }
     }
     let chapters = collect_book_chapters(state, book_id)?;
-    let mut conn = state.db.0.lock().unwrap();
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    for (idx, title, body) in &chapters {
-        tx.execute(
-            "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![book_id, idx, title, body],
-        )
-        .ok();
+    // 分批写（P2）：与 FTS 同款上限，批间释放 state.db.0，避免首次书内搜索建缓存时长时间卡住翻章/进度保存。
+    let batches = plan_fts_batches(&chapters);
+    let total = batches.len();
+    for (n, (start, end)) in batches.iter().enumerate() {
+        {
+            let mut conn = state.db.0.lock().unwrap();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for (idx, title, body) in &chapters[*start..*end] {
+                tx.execute(
+                    "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![book_id, idx, title, body],
+                )
+                .ok();
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        // R7-3：每批提交后发一次进度（最后一次 done=total），供搜索弹窗显示百分比。
+        state
+            .app
+            .emit(
+                "book-text-progress",
+                crate::models::BookTextProgress { book_id, done: n + 1, total },
+            )
+            .ok();
+        std::thread::sleep(std::time::Duration::from_millis(FTS_BATCH_PAUSE_MS));
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(chapters.len())
 }
 
@@ -5761,29 +7545,31 @@ pub async fn search_in_book(state: State<'_, Arc<AppState>>, book_id: i64, query
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || search_in_book_inner(&st, book_id, query))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
 }
 
-fn search_in_book_inner(state: &Arc<AppState>, book_id: i64, query: String) -> Vec<BookSearchHit> {
+fn search_in_book_inner(
+    state: &Arc<AppState>,
+    book_id: i64,
+    query: String,
+) -> Result<Vec<BookSearchHit>, String> {
     let compact_q: Vec<char> = query
         .chars()
         .filter(|c| !c.is_whitespace())
         .map(|c| c.to_ascii_lowercase())
         .collect();
     if compact_q.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
-    if ensure_book_text(state, book_id).is_err() {
-        return vec![];
-    }
+    // R7-3：首次搜索建立缓存失败时把错误上抛（前端提示重试），不再静默返回空结果。
+    ensure_book_text(state, book_id)?;
     let rows: Vec<(i64, String, String)> = {
         let conn = state.db.0.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT chapter_index, title, body FROM chapter_text WHERE book_id=?1 ORDER BY chapter_index",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT chapter_index, title, body FROM chapter_text WHERE book_id=?1 ORDER BY chapter_index",
+            )
+            .map_err(|e| e.to_string())?;
         stmt.query_map([book_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map(|rs| rs.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
@@ -5828,7 +7614,7 @@ fn search_in_book_inner(state: &Arc<AppState>, book_id: i64, query: String) -> V
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[tauri::command]
@@ -5955,96 +7741,290 @@ pub fn write_book_meta(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    let st = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let conn = st.db.0.lock().unwrap();
-            if !db::has_fts(&conn) {
-                return Err("SQLite 编译未包含 FTS5".into());
-            }
-            db::ensure_fts(&conn)?;
-            // 先清空索引，再逐本重建（此前只 DELETE 不重建，会把索引清空）。
-            conn.execute("DELETE FROM fts", []).map_err(|e| e.to_string())?;
-        }
-        let ids: Vec<i64> = {
-            let conn = st.db.0.lock().unwrap();
-            db::all_book_paths(&conn).into_iter().map(|(id, _)| id).collect()
+/// ── FTS 索引（P2）──
+///
+/// 旧实现把整本正文放进**一个事务**写 fts（47MB TXT 实测持锁 18.6s、MOBI 建索引 26.1s），
+/// 期间任何 DB IPC（翻章/进度保存）都排在 state.db.0 后面 → 用户感知「点什么都没反应」。
+/// 现在：一致性判据决定是否重建；重建时按小批提交，批间释放锁并短暂 sleep，让其它 IPC 拿到锁。
+
+/// 每批最多章数。
+const FTS_BATCH_MAX_CHAPTERS: usize = 32;
+/// 每批正文累计字节上限（title + body）。32 章 / 256KB 的单批提交是几十毫秒级，
+/// 把整本 18.6~26.1s 的持锁压到约 100~150ms。
+const FTS_BATCH_MAX_BYTES: usize = 256 * 1024;
+/// 批间让出 state.db.0 的停顿：给翻章/存进度等短 IPC 拿锁窗口，整本索引只多花毫秒级。
+const FTS_BATCH_PAUSE_MS: u64 = 2;
+
+/// 自动索引的体积上限（P9）：超过只允许用户在搜索时显式建立（大书建索引实测 8~40s，
+/// 阅读中/关书时自动跑就是用户感知的「更卡」）。显式搜索仍可建（auto=false 不受限）。
+const AUTO_INDEX_MAX_BYTES: i64 = 20 * 1024 * 1024;
+/// 自动索引的章数上限（同上：章数极多的书建索引同样贵）。
+const AUTO_INDEX_MAX_CHAPTERS: i64 = 3000;
+
+/// 自动索引是否允许这个体积（等于上限通过）。
+fn auto_index_size_allowed(size: i64) -> bool {
+    size <= AUTO_INDEX_MAX_BYTES
+}
+
+/// 自动索引是否允许这个章数（等于上限通过）。
+fn auto_index_chapters_allowed(n: i64) -> bool {
+    n <= AUTO_INDEX_MAX_CHAPTERS
+}
+
+/// FTS 是否需要重建：行数与期望章数不一致就重建。
+/// 相等 = 已索引完成；0/N、部分行、历史重复多出行都会走到重建（先 DELETE 再写，重复行被修正）。
+fn fts_needs_rebuild(fts_rows: i64, expected: i64) -> bool {
+    fts_rows != expected
+}
+
+/// FTS 一致性检查结论（P12）：meta 优先；meta 缺失时用一次旧实例 count 做迁移。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FtsMetaPlan {
+    /// 已索引（meta 行数 == 期望章数），无需动作。
+    Skip,
+    /// 旧库迁移：实例行数 == 期望章数，补写 meta 后视为已索引（不重建）。
+    Adopt(i64),
+    /// 需要重建（meta 与期望不一致，或没有 meta 且实例也不一致）。
+    Rebuild,
+}
+
+/// 纯函数：根据 meta 行数 / 旧实例计数 / 期望章数给出动作。
+/// - meta 存在：与 expected 一致 → Skip，否则 Rebuild；
+/// - meta 缺失：旧实例 count 与 expected 一致 → Adopt(count)（升级迁移，避免全库重建），否则 Rebuild。
+fn fts_meta_plan(meta_rows: Option<i64>, legacy_count: Option<i64>, expected: i64) -> FtsMetaPlan {
+    if let Some(rows) = meta_rows {
+        return if fts_needs_rebuild(rows, expected) {
+            FtsMetaPlan::Rebuild
+        } else {
+            FtsMetaPlan::Skip
         };
-        let mut total = 0i64;
-        for id in ids {
-            // 单本失败（文件缺失等）跳过，不影响整体重建。
-            if let Ok(n) = index_book_fts_inner(&st, id) {
-                total += n;
-            }
-        }
-        Ok(total)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-pub async fn index_book_fts(state: State<'_, Arc<AppState>>, book_id: i64) -> Result<i64, String> {
-    let st = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || index_book_fts_inner(&st, book_id))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn index_book_fts_inner(state: &Arc<AppState>, book_id: i64) -> Result<i64, String> {
-    let needs_index = {
-        let conn = state.db.0.lock().unwrap();
-        if !db::has_fts(&conn) {
-            return Ok(0);
-        }
-        db::ensure_fts(&conn)?;
-        let existing: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM fts WHERE book_id=?1",
-                [book_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        existing == 0
-    };
-    if !needs_index {
-        // 已建过 FTS：顺手确保纯文本缓存存在（划词全文搜索不依赖 FTS）
-        let _ = ensure_book_text(state, book_id);
-        return Ok(0);
     }
+    match legacy_count {
+        Some(n) if !fts_needs_rebuild(n, expected) => FtsMetaPlan::Adopt(n),
+        _ => FtsMetaPlan::Rebuild,
+    }
+}
 
-    let chapters = collect_book_chapters(state, book_id)?;
-    let text_empty = {
+/// 按「章数 + 正文字节」上限把整本书切成若干批，返回每批的 [start, end)。
+/// 单章超过字节上限时独占一批（fts 行是一章一条，不能拆章）。
+fn plan_fts_batches(chapters: &[(i64, String, String)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, (_, title, body)) in chapters.iter().enumerate() {
+        let n = title.len() + body.len();
+        let count = i - start;
+        if count > 0 && (count >= FTS_BATCH_MAX_CHAPTERS || bytes + n > FTS_BATCH_MAX_BYTES) {
+            out.push((start, i));
+            start = i;
+            bytes = 0;
+        }
+        bytes += n;
+    }
+    if start < chapters.len() {
+        out.push((start, chapters.len()));
+    }
+    out
+}
+
+/// 该书写入 FTS 后应有的行数（一致性判据的基准）。
+/// PDF：文字只能由前端回传，直接数 chapter_text 行；其它格式：解析缓存里的章数
+/// （load_* 在「刚打开/刚索引」这类 warm 路径上是 Arc 命中，成本可忽略）。
+/// 注意 EPUB 按 spine 出章（一章可拆成多个文件），所以用 spine.len() 而不是 toc.len()。
+fn expected_fts_rows(state: &Arc<AppState>, book_id: i64, path: &str, ext: &str) -> Result<i64, String> {
+    if ext == "pdf" {
         let conn = state.db.0.lock().unwrap();
-        let n: i64 = conn
+        let n = conn
             .query_row(
                 "SELECT count(*) FROM chapter_text WHERE book_id=?1",
                 [book_id],
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        n == 0
+        return Ok(n);
+    }
+    let n = if ext == "epub" {
+        let cached = load_epub(state, path, book_id)?;
+        // P11：切分书的索引行数是虚拟章数，不是 spine 文档数。
+        if cached.doc.split {
+            cached.doc.chapters.len()
+        } else {
+            cached.doc.spine.len()
+        }
+    } else if ext == "txt" {
+        load_txt(state, path, book_id)?.2.len()
+    } else {
+        load_mobi(state, path, book_id)?.0.2.len()
     };
+    Ok(n as i64)
+}
 
+/// 写一批 fts 行（独立事务）；函数返回时 state.db.0 已释放。
+fn insert_fts_batch(
+    state: &Arc<AppState>,
+    book_id: i64,
+    chapters: &[(i64, String, String)],
+) -> Result<(), String> {
     let mut conn = state.db.0.lock().unwrap();
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    for (idx, title, body) in &chapters {
+    for (idx, title, body) in chapters {
         tx.execute(
             "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
             rusqlite::params![book_id, idx, title, body],
         )
         .ok();
-        if text_empty {
-            tx.execute(
-                "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
-                rusqlite::params![book_id, idx, title, body],
-            )
-            .ok();
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 与自动索引共用闸门；手动重建是用户显式操作，等后台索引让出后继续（不会静默返回 0）。
+        let guard = loop {
+            if let Some(g) = FtsIndexGuard::acquire(&st.fts_index_running) {
+                break g;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let out = rebuild_fts_inner(&st);
+        drop(guard);
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 全库重建（调用方必须已持有索引闸门）：清空 fts 后逐本重建，返回总章数。
+fn rebuild_fts_inner(state: &Arc<AppState>) -> Result<i64, String> {
+    {
+        let conn = state.db.0.lock().unwrap();
+        if !db::has_fts(&conn) {
+            return Err("SQLite 编译未包含 FTS5".into());
+        }
+        db::ensure_fts(&conn)?;
+        // 先清空索引，再逐本重建（此前只 DELETE 不重建，会把索引清空）。
+        conn.execute("DELETE FROM fts", []).map_err(|e| e.to_string())?;
+        // P12：元信息同步清空；逐本重建后每本写回（搜索仍只读 fts 表，meta 仅服务检查）。
+        db::clear_fts_meta(&conn);
+    }
+    let ids: Vec<i64> = {
+        let conn = state.db.0.lock().unwrap();
+        db::all_book_paths(&conn).into_iter().map(|(id, _)| id).collect()
+    };
+    let mut total = 0i64;
+    for id in ids {
+        // 单本失败（文件缺失等）跳过，不影响整体重建；全库重建是用户显式操作，传 auto=false。
+        if let Ok(n) = index_book_fts_inner(state, id, false) {
+            total += n;
         }
     }
-    tx.commit().map_err(|e| e.to_string())?;
+    // R11-4：重建完成后整理 FTS5 索引（只压缩索引、不删数据）。副本库实测 14.6s
+    //（远低于 60s 阈值，故放在重建命令内同步执行；启动期绝不执行）。
+    {
+        let t = std::time::Instant::now();
+        let conn = state.db.0.lock().unwrap();
+        match db::optimize_fts(&conn) {
+            Ok(()) => eprintln!("[fts] optimize done ms={}", t.elapsed().as_millis()),
+            Err(e) => eprintln!("[fts] optimize failed: {e}"),
+        }
+    }
+    Ok(total)
+}
+
+#[tauri::command]
+pub async fn index_book_fts(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    auto: Option<bool>,
+) -> Result<i64, String> {
+    // 前端显式操作传 false/缺省，自动调度传 true：后者受体积/章数上限约束（P9）。
+    let auto = auto.unwrap_or(false);
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 单实例闸门：已有索引任务在跑就直接跳过（前端是延迟调度，下一轮还会触发）。
+        let Some(_guard) = FtsIndexGuard::acquire(&st.fts_index_running) else {
+            return Ok(0);
+        };
+        index_book_fts_inner(&st, book_id, auto)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn index_book_fts_inner(state: &Arc<AppState>, book_id: i64, auto: bool) -> Result<i64, String> {
+    // 1) 能力检查 + 书元信息（短锁）。
+    let (path, ext, size) = {
+        let conn = state.db.0.lock().unwrap();
+        if !db::has_fts(&conn) {
+            return Ok(0);
+        }
+        db::ensure_fts(&conn)?;
+        let book = db::get_book(&conn, book_id).ok_or("书籍不存在")?;
+        let ext = ext_of(&book.path).unwrap_or_default();
+        (book.path, ext, book.size)
+    };
+    // 自动索引只服务小书（P9）：体积判断放在解析之前，避免为超大文件白解析一遍。
+    if auto && !auto_index_size_allowed(size) {
+        return Ok(0);
+    }
+    // 2) 一致性判据：行数与期望章数相等视为已索引（含空书），不做整本解析/写库；
+    //    不一致（0/N、部分、历史重复）才重建 —— 中断/崩溃留下的半成品会被自动修正。
+    let expected = expected_fts_rows(state, book_id, &path, &ext)?;
+    // 章数上限同样只约束自动索引：超大书留给用户搜索时显式建立（P9）。
+    if auto && !auto_index_chapters_allowed(expected) {
+        return Ok(0);
+    }
+    // P12：一致性检查优先用 fts_meta（fts5 的 book_id 是 UNINDEXED，count(*) 会全表扫描）；
+    // meta 缺失时读一次旧实例计数做升级迁移（避免升级后全库重建）。
+    let (meta_rows, legacy_count) = {
+        let conn = state.db.0.lock().unwrap();
+        let meta = db::get_fts_meta(&conn, book_id);
+        let legacy = if meta.is_none() {
+            Some(
+                conn.query_row(
+                    "SELECT count(*) FROM fts WHERE book_id=?1",
+                    [book_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            )
+        } else {
+            None
+        };
+        (meta, legacy)
+    };
+    match fts_meta_plan(meta_rows, legacy_count, expected) {
+        FtsMetaPlan::Skip => return Ok(0),
+        FtsMetaPlan::Adopt(rows) => {
+            let conn = state.db.0.lock().unwrap();
+            db::set_fts_meta(&conn, book_id, rows);
+            return Ok(0);
+        }
+        FtsMetaPlan::Rebuild => {}
+    }
+    // 3) 先清掉本书旧行与 meta（短事务）：部分行不会与本次写入叠加成重复行；
+    //    崩溃在批次中间时 meta 缺失，下次按「实例行数不符」重建立。
+    {
+        let conn = state.db.0.lock().unwrap();
+        conn.execute("DELETE FROM fts WHERE book_id=?1", [book_id])
+            .map_err(|e| e.to_string())?;
+        db::delete_fts_meta(&conn, book_id);
+    }
+    // 4) 取整本章节纯文本（warm 路径命中解析缓存），分批提交，批间释放锁并短暂让出。
+    //    不再顺带写 chapter_text：书内搜索首次会自己按需建（见 ensure_book_text），
+    //    非搜索用户少写一遍整本正文，DB 写入与体积约减半。
+    let chapters = collect_book_chapters(state, book_id)?;
+    for (start, end) in plan_fts_batches(&chapters) {
+        insert_fts_batch(state, book_id, &chapters[start..end])?;
+        std::thread::sleep(std::time::Duration::from_millis(FTS_BATCH_PAUSE_MS));
+    }
+    // P12：全部批次写完才写 meta；崩溃在中间时 meta 缺失，下次按不一致重建立。
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::set_fts_meta(&conn, book_id, chapters.len() as i64);
+    }
     Ok(chapters.len() as i64)
 }
 
@@ -6096,11 +8076,18 @@ pub fn set_cover_scan(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<
         let conn = state.db.0.lock().unwrap();
         db::set_setting(&conn, COVER_SCAN_MODE_KEY, if enabled { "auto" } else { "manual" });
     }
+    // R11-3：首屏就绪前只持久化模式/开关，不触发自愈/扫描；ready 时由 library_ready 补做。
+    if !state.library_ready.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     // 模式键此前不存在（升级后第一次启动）时，启动路径没敢复位；这里在 auto 下补做一次。
     // 每进程最多一次，且整段带 worker 停/起，避免与在途认领交叉。
     if enabled && !COVER_HEAL_DONE.swap(true, Ordering::SeqCst) {
         heal_covers_now(state.inner());
     }
+    // R11-3：无论 auto/manual 都要确保 worker 在跑——manual 只跳过封面提取，
+    // 仍要处理 meta_done=0 的元数据/字数（cover_scan_enabled=false 在 worker 内部生效）。
+    ensure_scan_worker(&state.app);
     Ok(())
 }
 
@@ -6125,10 +8112,205 @@ pub async fn list_book_ids_page(
 
 /// 前端书库挂载并取到首屏行后调用：把本轮启动标记为「已走到书库」。
 /// 下一次启动据此判断上一轮是否崩溃 —— 崩溃则自动跳过封面重建并记一条日志。
+/// B2：空闲 FTS optimize 的进程内调度闸门（同一时刻最多一个后台检查线程，避免风暴）。
+/// 暂停/索引/维护中不是放弃，而是延后：线程内每 3 分钟重试一轮，最多 10 轮；
+/// set_scan_paused(false) 也会再触发一次（若闸门空闲）。
+static FTS_IDLE_OPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn schedule_fts_idle_optimize(st: &Arc<AppState>, initial_delay_secs: u64) {
+    if FTS_IDLE_OPT_ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let st = st.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(initial_delay_secs));
+        for attempt in 0..10u32 {
+            match try_idle_optimize_fts(&st) {
+                FtsOptimizeOutcome::Done => break,
+                FtsOptimizeOutcome::Retry => {
+                    memlog::stage_note(
+                        "fts:optimize",
+                        &format!("retry attempt={attempt} wait=180s"),
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(180));
+                }
+            }
+        }
+        FTS_IDLE_OPT_ACTIVE.store(false, Ordering::SeqCst);
+    });
+}
+
+enum FtsOptimizeOutcome {
+    Done,
+    Retry,
+}
+
+/// B2：后台检查并执行 FTS5 optimize（独立连接，不持有全局 db Mutex）。
+/// 返回 Retry 表示当前被暂停/索引/维护/临时打开失败挡住，稍后再试；Done 表示本轮无需或已完成。
+fn try_idle_optimize_fts(st: &Arc<AppState>) -> FtsOptimizeOutcome {
+    if st.scan_paused.load(Ordering::SeqCst)
+        || st.fts_index_running.load(Ordering::SeqCst)
+        || st.maintenance_running.load(Ordering::SeqCst)
+    {
+        memlog::stage_note("fts:optimize", "skip paused_indexing_or_maintenance");
+        return FtsOptimizeOutcome::Retry;
+    }
+    let path = crate::data_dir(&st.app).join("tidepage.db");
+    let conn = match rusqlite::Connection::open(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            memlog::stage_note("fts:optimize", &format!("skip open_err={e}"));
+            return FtsOptimizeOutcome::Retry;
+        }
+    };
+    if !db::has_fts(&conn) {
+        return FtsOptimizeOutcome::Done;
+    }
+    let Some((bytes, rows)) = db::fts_stats(&conn) else {
+        memlog::stage_note("fts:optimize", "skip no_dbstat");
+        return FtsOptimizeOutcome::Done;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let marker = db::get_setting(&conn, "fts.optimize.marker").unwrap_or_default();
+    let mut parts = marker.split('|');
+    let last_at = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let last_bytes = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let last_rows = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    // 失败退避：6 小时内不重复尝试，避免每次启动风暴。
+    let fail_at = db::get_setting(&conn, "fts.optimize.fail_at")
+        .and_then(|v| v.split('|').next().and_then(|s| s.parse::<i64>().ok()))
+        .unwrap_or(0);
+    if fail_at > 0 && now.saturating_sub(fail_at) < 6 * 3600 {
+        memlog::stage_note("fts:optimize", "skip backoff");
+        return FtsOptimizeOutcome::Done;
+    }
+    if !db::should_optimize_fts(
+        now,
+        last_at,
+        last_bytes,
+        last_rows,
+        bytes,
+        rows,
+        st.fts_index_running.load(Ordering::SeqCst),
+        st.scan_paused.load(Ordering::SeqCst),
+    ) {
+        memlog::stage_note(
+            "fts:optimize",
+            &format!("skip bytes={bytes} rows={rows} marker_at={last_at}"),
+        );
+        return FtsOptimizeOutcome::Done;
+    }
+    // 长耗时操作前再与维护/VACUUM 做一次互斥握手：拿到 optimize 标志后再确认维护没启动。
+    if st.maintenance_running.load(Ordering::SeqCst) {
+        memlog::stage_note("fts:optimize", "skip maintenance_before_exec");
+        return FtsOptimizeOutcome::Retry;
+    }
+    if st.fts_optimize_running.swap(true, Ordering::SeqCst) {
+        return FtsOptimizeOutcome::Retry;
+    }
+    if st.maintenance_running.load(Ordering::SeqCst) {
+        st.fts_optimize_running.store(false, Ordering::SeqCst);
+        return FtsOptimizeOutcome::Retry;
+    }
+    let t = std::time::Instant::now();
+    let exec_result = conn.execute("INSERT INTO fts(fts) VALUES('optimize')", []);
+    st.fts_optimize_running.store(false, Ordering::SeqCst);
+    match exec_result {
+        Ok(_) => {
+            let new_marker = format!("{now}|{bytes}|{rows}");
+            let _ = db::set_setting(&conn, "fts.optimize.marker", &new_marker);
+            memlog::stage_note(
+                "fts:optimize",
+                &format!(
+                    "done elapsed_ms={} bytes={bytes} rows={rows}",
+                    t.elapsed().as_millis()
+                ),
+            );
+        }
+        Err(e) => {
+            let _ = db::set_setting(&conn, "fts.optimize.fail_at", &format!("{now}|{e}"));
+            memlog::stage_note("fts:optimize", &format!("failed err={e}"));
+        }
+    }
+    FtsOptimizeOutcome::Done
+}
+
+/// B1：前端启动阶段打点（写入 startup.log，供首屏分解；不参与业务逻辑）。
 #[tauri::command]
-pub fn library_ready() {
+pub fn boot_stage(stage: String) {
+    memlog::stage_note("frontend:boot", &stage);
+}
+
+#[tauri::command]
+pub fn library_ready(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     memlog::stage("frontend:library_ready");
     memlog::ready();
+    let st = state.inner().clone();
+    // R11-3：首屏就绪后才允许启动封面自愈/扫描；重复调用只置位一次。
+    if st.library_ready.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    std::thread::spawn(move || {
+        if memlog::skip_cover_rebuild() {
+            return;
+        }
+        // 模式键可能由前端 set_cover_scan 稍后才写入：短暂轮询（最多 2s）再决定，
+        // 避免「library_ready 早于 set_cover_scan」时自愈被永久推迟。
+        let mut mode = None;
+        for _ in 0..20 {
+            mode = {
+                let conn = st.db.0.lock().unwrap();
+                db::get_setting(&conn, COVER_SCAN_MODE_KEY)
+            };
+            if mode.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        match mode.as_deref() {
+            Some("manual") => {
+                // manual 只跳过封面提取（heal 也不做），但仍要处理 meta_done=0 的元数据/字数，
+                // 所以不能在这里 return：由 match 之后统一 ensure_scan_worker。
+                memlog::stage("setup:cover_heal_skipped_manual");
+            }
+            Some(_) => {
+                // 每进程最多一次（与启动路径同一标记）；自愈完再由下面统一拉起 worker。
+                if !COVER_HEAL_DONE.swap(true, Ordering::SeqCst) {
+                    heal_covers_now(&st);
+                    mark_cover_heal_done();
+                }
+            }
+            None => {
+                // 模式未知：不猜自愈；worker 仍启动（前端随后 set_cover_scan 会写入模式）。
+                memlog::stage("setup:cover_heal_deferred");
+            }
+        }
+        ensure_scan_worker(&st.app);
+        // B2：首屏就绪后 25s 由独立线程检查 FTS 空闲 optimize（不占启动关键路径，可暂停跳过）。
+        schedule_fts_idle_optimize(&st, 25);
+    });
+    Ok(())
+}
+
+/// R11-3：暂停/恢复后台封面扫描（进程内状态；resume 后有 pending/优先项时确保 worker 在跑）。
+#[tauri::command]
+pub fn set_scan_paused(state: State<'_, Arc<AppState>>, paused: bool) -> Result<(), String> {
+    state.scan_paused.store(paused, Ordering::SeqCst);
+    if !paused && state.library_ready.load(Ordering::SeqCst) {
+        let has_work = {
+            let conn = state.db.0.lock().unwrap();
+            db::count_meta_pending(&conn) > 0 || db::next_priority(&conn).is_some()
+        };
+        if has_work {
+            ensure_scan_worker(&state.app);
+        }
+        // B2：恢复（离开阅读/窗口可见）后再给空闲 FTS optimize 一次机会；闸门保证不并发风暴。
+        schedule_fts_idle_optimize(&state.inner().clone(), 2);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -6286,6 +8468,72 @@ pub async fn random_book(state: State<'_, Arc<AppState>>) -> Result<Option<BookR
     .map_err(|e| e.to_string())
 }
 
+
+/* ---------------- D3：标签命令 ---------------- */
+
+#[derive(serde::Serialize)]
+pub struct TagInfo {
+    pub id: i64,
+    pub name: String,
+    pub book_count: i64,
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, Arc<AppState>>) -> Result<Vec<TagInfo>, String> {
+    let conn = state.db.0.lock().unwrap();
+    Ok(db::list_tags(&conn)
+        .into_iter()
+        .map(|(id, name, book_count)| TagInfo { id, name, book_count })
+        .collect())
+}
+
+#[tauri::command]
+pub fn list_book_tags(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+) -> Result<Vec<TagInfo>, String> {
+    let conn = state.db.0.lock().unwrap();
+    Ok(db::list_book_tags(&conn, book_id)
+        .into_iter()
+        .map(|(id, name)| TagInfo { id, name, book_count: 0 })
+        .collect())
+}
+
+#[tauri::command]
+pub fn create_tag(state: State<'_, Arc<AppState>>, name: String) -> Result<TagInfo, String> {
+    let conn = state.db.0.lock().unwrap();
+    let (id, name) = db::create_tag(&conn, &name)?;
+    state.app.emit("library-tags-changed", ()).ok();
+    Ok(TagInfo { id, name, book_count: 0 })
+}
+
+#[tauri::command]
+pub fn rename_tag(state: State<'_, Arc<AppState>>, id: i64, name: String) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    db::rename_tag(&conn, id, &name)?;
+    state.app.emit("library-tags-changed", ()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_tag(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    let conn = state.db.0.lock().unwrap();
+    db::delete_tag(&conn, id)?;
+    state.app.emit("library-tags-changed", ()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_book_tags(
+    state: State<'_, Arc<AppState>>,
+    book_id: i64,
+    tag_ids: Vec<i64>,
+) -> Result<(), String> {
+    let mut conn = state.db.0.lock().unwrap();
+    db::set_book_tags(&mut conn, book_id, &tag_ids)?;
+    state.app.emit("library-tags-changed", ()).ok();
+    Ok(())
+}
 /// 从「当前筛选结果」中随机一本书（query/sort/formats/states 与列表同源）。
 #[tauri::command]
 pub async fn random_book_filtered(
@@ -6295,11 +8543,12 @@ pub async fn random_book_filtered(
     formats: Option<Vec<String>>,
     states: Option<Vec<String>>,
     folder: Option<String>,
+    tags: Option<Vec<String>>,
 ) -> Result<Option<BookRow>, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = st.db.0.lock().unwrap();
-        db::random_book_filtered(&conn, &query, &sort, &formats, &states, &folder)
+        db::random_book_filtered_tags(&conn, &query, &sort, &formats, &states, &folder, &tags)
     })
     .await
     .map_err(|e| e.to_string())
@@ -6359,6 +8608,7 @@ pub fn add_dropped_book(state: State<'_, Arc<AppState>>, path: String) -> Result
         }
         (id, db::get_book(&conn, id))
     };
+    bump_formats_epoch(state.inner());
     state.app.emit("library-changed", ()).ok();
     // 导入书籍落库后：新书 meta_done=0，拉起增量扫描（若空闲）。
     ensure_scan_worker(&state.app);
@@ -6438,9 +8688,10 @@ pub async fn get_book_word_count(
         }
         let is_mobi = is_mobi_ext(&ext);
         if is_mobi {
-            let doc = mobi_doc_for(&st, &path, book_id)?;
-            // 借用解析结果生成纯文本，不额外复制整本 HTML。
-            let text = crate::epub::html_to_text(&doc.html);
+            // 复用 MOBI 解析缓存（load_mobi）：书详情/本书统计不再整本重解析（同进程内刚读过也不重读）。
+            let (cached, _warn) = load_mobi(&st, &path, book_id)?;
+            // 借用缓存里的正文生成纯文本，不额外复制整本 HTML。
+            let text = crate::epub::html_to_text(&cached.0);
             let total = text.chars().count() as i64;
             let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
             backfill_book_chars(&st, book_id, total, pure);
@@ -6481,6 +8732,12 @@ pub async fn book_char_counts(
     let st = state.inner().clone();
     let path = book.path.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // P11：切分书的章节是虚拟章（目录项数 != 逐章数组长度），「全书总页数」直接给空数组，
+        // 前端按长度不符忽略（该类书不显示总页数），避免整本解析后返回错位的逐章字数。
+        let cached = load_epub(&st, &path, book_id)?;
+        if cached.doc.split {
+            return Ok(Vec::new());
+        }
         epub_stats_for(&st, book_id, &path).map(|s| s.per_chapter.clone())
     })
     .await
@@ -6973,6 +9230,22 @@ mod refresh_tests {
         let p7 = db::list_books_page(&conn, "", "title", 0, 10, &None, &None, false, &None);
         assert_eq!(p7.rows[0].title, "100%_marker", "title COLLATE NOCASE 升序");
 
+        // R11-2：include_total=false 跳过 COUNT（total=-1 哨兵），行数据与完整版逐行一致。
+        let full = db::list_books_page(&conn, "", "recent", 0, 3, &None, &None, true, &None);
+        let no_count =
+            db::list_books_page_opts(&conn, "", "recent", 0, 3, &None, &None, true, &None, false);
+        assert_eq!(no_count.total, -1, "未计数时 total 必须为哨兵 -1");
+        assert_eq!(
+            no_count.rows.iter().map(|b| b.id).collect::<Vec<_>>(),
+            full.rows.iter().map(|b| b.id).collect::<Vec<_>>(),
+            "行数据与完整版一致"
+        );
+        // 过滤 + 搜索场景同样成立。
+        let q0 = db::list_books_page_opts(
+            &conn, "epsilon", "title", 0, 10, &None, &None, false, &None, false,
+        );
+        assert_eq!((q0.total, q0.rows.len()), (-1, 1));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7390,6 +9663,606 @@ mod refresh_tests {
             "带插图的普通小说不得判漫画"
         );
     }
+
+    /// 图片页书判定（第五轮）：按「平均每图文字数」识别图片页型书，独立于漫画判定。
+    #[test]
+    fn image_page_like_thresholds() {
+        // 目标书：3,659 图 / 33,059 字 ≈ 9.0 字/图 → true。
+        assert!(is_image_page_like(3659, 33059, true, 3), "图片页书应命中");
+        // 插图小说：正文远高于 20 字/图 → false。
+        assert!(!is_image_page_like(120, 300_000, true, 3), "插图小说不得判图片页书");
+        // 图片数门槛 100。
+        assert!(!is_image_page_like(99, 100, true, 1), "图片数低于 100 不判");
+        // 图片数不得少于 spine 文档数。
+        assert!(!is_image_page_like(100, 100, true, 101), "图片数少于 spine 数不判");
+        // 边界：恰好 images*20 命中，多 1 即否。
+        assert!(is_image_page_like(100, 2000, true, 1), "text == images*20 应命中");
+        assert!(!is_image_page_like(100, 2001, true, 1), "text 超 images*20 不命中");
+        // 扫描不完整（预算截断/提前退出）一律不判，保守兜底。
+        assert!(!is_image_page_like(3659, 33059, false, 3), "扫描不完整不得判");
+        // 空 spine 时 max(1) 兜底：100 图 >= 1。
+        assert!(is_image_page_like(100, 0, true, 0));
+    }
+
+    /// R6-1 门控：P11 锚点切分绝对优先；只有折叠目录 + 单文档巨量图片 + 图片主导度达标才
+    /// 自动块级切章；有划线且未迁移时保持旧行为。
+    #[test]
+    fn auto_block_split_gate() {
+        // 目标无锚点样本结构：1 个 legacy 目录项、单文档 2042 图、图片主导 → true。
+        assert!(should_auto_block_split(false, 1, 2042, true, false, false));
+        // P11 已切分（doc_split=true）绝对优先 → false。
+        assert!(!should_auto_block_split(true, 1, 2042, true, false, false));
+        // 多章漫画/普通书（legacy 目录多）→ false。
+        assert!(!should_auto_block_split(false, 20, 5000, true, false, false));
+        assert!(!should_auto_block_split(false, 3, 2042, true, false, false));
+        // 单文档图片不够多 → false。
+        assert!(!should_auto_block_split(false, 1, 200, true, false, false));
+        // 图片主导度不达标（带大量正文）→ false。
+        assert!(!should_auto_block_split(false, 1, 2042, false, false, false));
+        // 有划线且未迁移 → false；已迁移（之前已切过章）→ true（保持章号一致）。
+        assert!(!should_auto_block_split(false, 1, 2042, true, true, false));
+        assert!(should_auto_block_split(false, 1, 2042, true, true, true));
+    }
+
+    /// R6-B 迁移标记动作：完全匹配 no-op；旧格式同 stamp v1 只重写；同 stamp 布局变化
+    /// 做布局升级；无标记/文件替换走 legacy 迁移。
+    #[test]
+    fn split_marker_action_branches() {
+        assert_eq!(split_marker_action(None, "100-200", "v1"), MarkerAction::LegacyMigrate);
+        // 旧格式（只有指纹）+ 同 stamp + 当前 v1：只重写标记。
+        assert_eq!(
+            split_marker_action(Some("100-200"), "100-200", "v1"),
+            MarkerAction::Rewrite
+        );
+        // 旧格式 + 同 stamp + 当前 v2（R6-B 细分）：布局升级。
+        assert_eq!(
+            split_marker_action(Some("100-200"), "100-200", "v2"),
+            MarkerAction::LayoutUpgrade
+        );
+        // 新格式完全匹配：no-op（进程重启后重复打开）。
+        assert_eq!(
+            split_marker_action(Some("100-200|v1"), "100-200", "v1"),
+            MarkerAction::Noop
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200|v2"), "100-200", "v2"),
+            MarkerAction::Noop
+        );
+        // 同 stamp 但布局签名不同（v1→v2）：布局升级。
+        assert_eq!(
+            split_marker_action(Some("100-200|v1"), "100-200", "v2"),
+            MarkerAction::LayoutUpgrade
+        );
+        // 文件替换（stamp 不同）：legacy 迁移。
+        assert_eq!(
+            split_marker_action(Some("100-200"), "101-201", "v1"),
+            MarkerAction::LegacyMigrate
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200|v1"), "101-201", "v2"),
+            MarkerAction::LegacyMigrate
+        );
+        // R7-1：v3（泛化细分/新块级布局）分支。
+        assert_eq!(
+            split_marker_action(Some("100-200|v3"), "100-200", "v3"),
+            MarkerAction::Noop
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200"), "100-200", "v3"),
+            MarkerAction::LayoutUpgrade,
+            "旧格式同 stamp + 当前 v3 → 布局升级"
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200|v2"), "100-200", "v3"),
+            MarkerAction::LayoutUpgrade,
+            "v2→v3 → 布局升级"
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200|v1"), "100-200", "v3"),
+            MarkerAction::LayoutUpgrade,
+            "v1→v3 → 布局升级"
+        );
+        assert_eq!(
+            split_marker_action(Some("100-200|v3"), "101-201", "v3"),
+            MarkerAction::LegacyMigrate,
+            "文件替换 → legacy 迁移"
+        );
+    }
+
+    /// R7-1 布局目标选择：无划线优先 v3；有划线按现有签名恢复既有布局；无法重建保持 P11。
+    #[test]
+    fn choose_split_layout_targets() {
+        // 无划线：General 可用就升 v3。
+        assert_eq!(
+            choose_split_layout(false, Some("v2"), true, true),
+            SplitLayoutTarget::General
+        );
+        assert_eq!(
+            choose_split_layout(false, Some("v1"), true, false),
+            SplitLayoutTarget::General
+        );
+        // 无划线：General 不可用、现有 v2 → 用受限细分保持 v2，避免降级。
+        assert_eq!(
+            choose_split_layout(false, Some("v2"), false, true),
+            SplitLayoutTarget::Restricted
+        );
+        // 无划线：General 不可用、现有 v1/无 marker → 保持 P11。
+        assert_eq!(
+            choose_split_layout(false, Some("v1"), false, false),
+            SplitLayoutTarget::KeepP11
+        );
+        assert_eq!(choose_split_layout(false, None, false, true), SplitLayoutTarget::KeepP11);
+        // 有划线：不改变既有布局。
+        assert_eq!(
+            choose_split_layout(true, Some("v3"), true, false),
+            SplitLayoutTarget::General
+        );
+        assert_eq!(
+            choose_split_layout(true, Some("v3"), false, false),
+            SplitLayoutTarget::KeepP11,
+            "v3 恢复失败保持 P11"
+        );
+        assert_eq!(
+            choose_split_layout(true, Some("v2"), true, true),
+            SplitLayoutTarget::Restricted,
+            "有划线 v2 只按 v2 恢复，不升 v3"
+        );
+        assert_eq!(
+            choose_split_layout(true, Some("v2"), false, false),
+            SplitLayoutTarget::KeepP11
+        );
+        assert_eq!(
+            choose_split_layout(true, Some("v1"), true, true),
+            SplitLayoutTarget::KeepP11
+        );
+        assert_eq!(choose_split_layout(true, None, true, true), SplitLayoutTarget::KeepP11);
+    }
+
+    /// R12-2：格式缓存 miss→hit、epoch 变化重算、查询期间 epoch 变化不写旧值。
+    #[test]
+    fn formats_cache_miss_hit_and_epoch_guard() {
+        let cache: std::sync::Mutex<Option<(u64, Vec<String>)>> = std::sync::Mutex::new(None);
+        assert_eq!(formats_cache_get(&cache, 1), None, "冷缓存 miss");
+        assert!(formats_cache_put(&cache, 1, 1, &["epub".into(), "pdf".into()]));
+        assert_eq!(
+            formats_cache_get(&cache, 1),
+            Some(vec!["epub".to_string(), "pdf".to_string()]),
+            "同 epoch 命中"
+        );
+        assert_eq!(formats_cache_get(&cache, 2), None, "epoch 变化必须重算");
+        // 查询期间 epoch 已变：不得写回旧值。
+        assert!(!formats_cache_put(&cache, 3, 4, &["txt".into()]));
+        assert_eq!(formats_cache_get(&cache, 4), None);
+        assert!(formats_cache_put(&cache, 4, 4, &["txt".into()]));
+        assert_eq!(formats_cache_get(&cache, 4), Some(vec!["txt".to_string()]));
+    }
+
+    /// B2：FTS 空闲 optimize 触发条件（无 marker/超期/体积/行数变化/暂停/索引中）。
+    #[test]
+    fn fts_idle_optimize_trigger_conditions() {
+        let big = 300 * 1024 * 1024i64;
+        let small = 64 * 1024 * 1024i64;
+        let now = 1_700_000_000i64;
+        let day = 24 * 3600i64;
+        // 无 marker：体积超阈值才执行一次；体积不足不执行。
+        assert!(db::should_optimize_fts(now, 0, 0, 0, big, 100, false, false));
+        assert!(!db::should_optimize_fts(now, 0, 0, 0, small, 100, false, false));
+        // 暂停/运行中一律不执行。
+        assert!(!db::should_optimize_fts(now, 0, 0, 0, big, 100, true, false));
+        assert!(!db::should_optimize_fts(now, 0, 0, 0, big, 100, false, true));
+        // 未超期、体积/行数变化都很小 → 不执行。
+        assert!(!db::should_optimize_fts(
+            now,
+            now - day,
+            big,
+            1000,
+            big + 1024,
+            1000,
+            false,
+            false
+        ));
+        // 超过 7 天 → 执行。
+        assert!(db::should_optimize_fts(
+            now,
+            now - 8 * day,
+            big,
+            1000,
+            big,
+            1000,
+            false,
+            false
+        ));
+        // 行数变化 >2%（体积不变）→ 执行；2% 以内不执行。
+        assert!(db::should_optimize_fts(
+            now,
+            now - day,
+            big,
+            1000,
+            big,
+            1030,
+            false,
+            false
+        ));
+        assert!(!db::should_optimize_fts(
+            now,
+            now - day,
+            big,
+            1000,
+            big,
+            1010,
+            false,
+            false
+        ));
+        // 体积变化 >10% → 执行。
+        assert!(db::should_optimize_fts(
+            now,
+            now - day,
+            big,
+            1000,
+            big + big / 5,
+            1000,
+            false,
+            false
+        ));
+    }
+
+    /// B3：VACUUM 磁盘余量判定（保守：DB 大小 + 64MB 以上才允许；取不到余量拒绝）。
+    #[test]
+    fn vacuum_space_guard() {
+        let db = 2_000_000_000u64;
+        let margin = 64 * 1024 * 1024u64;
+        assert!(!vacuum_space_ok(None, db));
+        assert!(!vacuum_space_ok(Some(db + margin), db));
+        assert!(vacuum_space_ok(Some(db + margin + 1), db));
+        assert!(vacuum_space_ok(Some(5_000_000_000), db));
+        assert!(!vacuum_space_ok(Some(100), 0));
+    }
+
+
+    /// B10：VACUUM 预检（同盘只查一次；异盘两处都要够；取不到拒绝；边界严格）。
+    #[test]
+    fn vacuum_precheck_same_and_diff_disk() {
+        let db = 1024 * 1024 * 1024u64;
+        let req = db + 64 * 1024 * 1024;
+        assert!(vacuum_precheck(Some(req + 1), None, true, db).is_ok());
+        assert!(vacuum_precheck(Some(req + 1), Some(req + 1), false, db).is_ok());
+        assert!(vacuum_precheck(Some(req + 1), None, false, db).is_err(), "异盘临时空间未知应拒绝");
+        assert!(vacuum_precheck(Some(req + 1), Some(10), false, db).is_err(), "异盘临时不足应拒绝");
+        assert!(vacuum_precheck(None, Some(req + 1), true, db).is_err(), "取不到拒绝");
+        assert!(vacuum_precheck(Some(req), Some(req + 1), true, db).is_err(), "边界必须严格大于");
+    }
+
+    /// B10：维护历史写入/倒序/最多 5 条。
+    #[test]
+    fn maintenance_history_truncates_to_five() {
+        let root = tmp_root("b10-history");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        for i in 0..7 {
+            push_maintenance_record(&conn, MaintenanceRecord {
+                at: i, kind: "vacuum".into(), result: "success".into(), error: String::new(),
+                before_db: 10, before_wal: 1, after_db: 5, after_wal: 1, freed: 5,
+                duration_ms: 1, checkpoint_busy: false, backup_path: String::new(),
+            });
+        }
+        let raw = db::get_setting(&conn, "maintenance.history.v1").unwrap();
+        let list: Vec<MaintenanceRecord> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[0].at, 6, "最新在前");
+        // 自动整理跳过/成功（含备份路径）可持久化。
+        push_maintenance_record(&conn, MaintenanceRecord {
+            at: 10, kind: "vacuum-auto".into(), result: "skipped".into(), error: "备份失败".into(),
+            before_db: 10, before_wal: 1, after_db: 10, after_wal: 1, freed: 0,
+            duration_ms: 0, checkpoint_busy: true, backup_path: String::new(),
+        });
+        push_maintenance_record(&conn, MaintenanceRecord {
+            at: 11, kind: "vacuum-auto".into(), result: "success".into(), error: String::new(),
+            before_db: 10, before_wal: 1, after_db: 5, after_wal: 1, freed: 5,
+            duration_ms: 2, checkpoint_busy: false, backup_path: "backups/auto-vacuum-1.json".into(),
+        });
+        let raw2 = db::get_setting(&conn, "maintenance.history.v1").unwrap();
+        let list2: Vec<MaintenanceRecord> = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(list2[0].result, "success");
+        assert_eq!(list2[0].backup_path, "backups/auto-vacuum-1.json");
+        assert_eq!(list2[1].result, "skipped");
+        assert_eq!(list2[1].error, "备份失败");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D3：标签迁移幂等、CRUD/归一、过滤同源、删书清理、刷新保留。
+
+    /// D2：统计区间/日/小时/上期/完成/引用与空数据。
+
+
+    /// A2：folder 生效时强制排序索引，结果顺序与无索引查询逐条一致；EXPLAIN 命中排序索引。
+    #[test]
+    fn folder_sort_index_equivalence_and_plan() {
+        let root = tmp_root("a2-folder");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        std::fs::create_dir_all(root.join("dir").join("sub")).unwrap();
+        for i in 0..40 {
+            let dir = root.join("dir");
+            let p = if i % 2 == 0 { dir.join(format!("b{i}.txt")) } else { dir.join("sub").join(format!("b{i}.txt")) };
+            std::fs::write(&p, b"x").unwrap();
+            db::upsert_book(&conn, &p.to_string_lossy(), &format!("t{:02}", (i * 7) % 40), "txt", (i * 13) as i64, i as i64).unwrap();
+        }
+        let folder = Some(root.join("dir").to_string_lossy().into_owned());
+        // A2：count 不得强制排序索引（否则退化为 SCAN 排序索引）。
+        let base = root.join("dir").to_string_lossy().replace('/', "\\") + "\\";
+        let hi = format!("{base}\u{10FFFF}");
+        let count_plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM books b WHERE b.path>=?1 AND b.path<?2")
+            .unwrap()
+            .query_map([&base, &hi], |r| r.get::<_, String>(3))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(!count_plan.join("|").contains("idx_books_added_id"), "count 不应强制排序索引: {count_plan:?}");
+        for sort in ["added", "lastread", "title", "recent", "size"] {
+            for desc in [true, false] {
+                let order = db::order_by_clause(sort, desc);
+                let base = root.join("dir").to_string_lossy().replace('/', "\\");
+                let hi = format!("{base}􏿿");
+                let expect: Vec<i64> = conn
+                    .prepare(&format!("SELECT b.id FROM books b WHERE b.path>=?1 AND b.path<?2 ORDER BY {order}"))
+                    .unwrap()
+                    .query_map([&base, &hi], |r| r.get(0))
+                    .unwrap()
+                    .flatten()
+                    .collect();
+                let p = db::list_books_page_opts_tags(&conn, "", sort, 0, 500, &None, &None, desc, &folder, true, &None);
+                let got: Vec<i64> = p.rows.iter().map(|b| b.id).collect();
+                let (frag, _) = db::build_book_filter(&None, &None, &Some(folder.clone().unwrap_or_default()), &None);
+                assert_eq!(got, expect, "sort={sort} desc={desc} got={got:?} expect={expect:?} base={base:?} frag={frag} total={}", p.total);
+                let plan: Vec<String> = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN SELECT b.id FROM books b INDEXED BY {} WHERE b.path>=?1 AND b.path<?2 ORDER BY {order}", db::sort_index_name(sort)))
+                    .unwrap()
+                    .query_map([&base, &hi], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .flatten()
+                    .collect();
+                assert!(plan.iter().any(|x| x.contains("USING INDEX") || x.contains("INDEX")), "plan: {plan:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a1_indexes_exist_and_day_plan() {
+        let root = tmp_root("idx-a1");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let _ = db::init(&root.join("t.db")).unwrap();
+        for name in ["idx_sessions_day", "idx_sessions_started"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [name], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{name} 应存在");
+        }
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT day, SUM(seconds) FROM reading_sessions WHERE day>=?1 AND day<=?2 GROUP BY day")
+            .unwrap()
+            .query_map(["2026-01-01", "2026-01-31"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .flatten()
+            .collect();
+        let joined = plan.join(" | ");
+        assert!(joined.contains("idx_sessions_day") || joined.contains("USING INDEX"), "day 查询应走索引: {joined}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reading_stats_intervals_and_empty() {
+        let root = tmp_root("stats2");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let p = root.join("a.epub");
+        std::fs::write(&p, b"x").unwrap();
+        let id = db::upsert_book(&conn, &p.to_string_lossy(), "书", "epub", 10, 1).unwrap();
+        conn.execute("UPDATE books SET read_pct=100, last_read=5 WHERE id=?1", [id]).unwrap();
+        // 2026-01-05 10:00 本地时间的毫秒（用 SQLite 反推，避免时区假设）。
+        let ts: i64 = conn.query_row("SELECT CAST(strftime('%s','2026-01-05 10:00:00','utc') AS INTEGER)*1000", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO reading_sessions(book_id,day,started_at,seconds,chars) VALUES(?1,'2026-01-05',?2,1800,900)", rusqlite::params![id, ts]).unwrap();
+        conn.execute("INSERT INTO reading_sessions(book_id,day,started_at,seconds,chars) VALUES(?1,'2026-01-06',0,600,300)", [id]).unwrap();
+        conn.execute("INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,0,'c',1,2,'q','underline','','n',1)", [id]).unwrap();
+        let s = db::get_reading_stats(&conn, "2026-01-05", "2026-01-06", "2026-01-01", "2026-01-04", "2026-01-01", "2026-01-06");
+        assert_eq!((s.total_seconds, s.total_chars, s.session_count, s.active_days), (2400, 1200, 2, 2));
+        assert_eq!(s.prev_seconds, 0);
+        assert_eq!(s.daily.len(), 2);
+        assert_eq!(s.heatmap.len(), 2);
+        assert_eq!(s.active_dates, vec!["2026-01-05".to_string(), "2026-01-06".to_string()]);
+        assert_eq!(s.hourly.iter().map(|h| h.seconds).sum::<i64>(), 2400);
+        assert_eq!((s.finished_books, s.reading_books, s.highlights_total, s.notes_total), (1, 0, 1, 1));
+        assert!(s.finished_books == 1 && s.quote.is_some() && s.composition.len() == 1);
+        assert_eq!(s.completed_books.len(), 1);
+        assert!(s.current_book.is_none(), "已读完/无 progress 不应算当前在读");
+        db::set_progress(&conn, id, &crate::models::Progress {
+            chapter_index: 0, chapter_ratio: 0.0, pct: 40.0, updated_at: 9, device: String::new(),
+        }).unwrap();
+        let cur = db::get_reading_stats(&conn, "2026-01-01", "2026-01-31", "2025-12-01", "2025-12-31", "2025-10-01", "2026-01-31");
+        assert_eq!(cur.current_book.as_ref().map(|b| b.id), Some(id));
+        assert!((cur.current_book.as_ref().unwrap().pct - 40.0).abs() < 1e-6);
+        let empty = db::get_reading_stats(&conn, "2030-01-01", "2030-01-02", "2030-01-01", "2030-01-01", "2030-01-01", "2030-01-02");
+        assert_eq!((empty.total_seconds, empty.daily.len(), empty.hourly.len()), (0, 0, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tags_crud_filter_and_cleanup() {
+        let root = tmp_root("tags");
+        let db_path = root.join("t.db");
+        let mut conn = db::init(&db_path).unwrap();
+        let _ = db::init(&db_path).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('tags','book_tags','idx_book_tags_tag')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        let sp = |p: &Path| p.to_string_lossy().into_owned();
+        let p1 = root.join("a.txt");
+        let p2 = root.join("b.txt");
+        std::fs::write(&p1, b"x").unwrap();
+        std::fs::write(&p2, b"y").unwrap();
+        let b1 = db::upsert_book(&conn, &sp(&p1), "A", "txt", 1, 1).unwrap();
+        let b2 = db::upsert_book(&conn, &sp(&p2), "B", "txt", 1, 2).unwrap();
+
+        let (t1, n1) = db::create_tag(&conn, "  Work   Tag ").unwrap();
+        assert_eq!(n1, "Work Tag");
+        let (t1b, _) = db::create_tag(&conn, "work tag").unwrap();
+        assert_eq!(t1, t1b);
+        assert!(db::create_tag(&conn, "   ").is_err());
+        assert!(db::create_tag(&conn, &"字".repeat(33)).is_err());
+        let (t2, _) = db::create_tag(&conn, "Shelf").unwrap();
+        assert!(db::rename_tag(&conn, t2, "WORK TAG").is_err());
+        db::rename_tag(&conn, t2, "Shelf 2").unwrap();
+
+        db::set_book_tags(&mut conn, b1, &[t1, t1, t2]).unwrap();
+        db::set_book_tags(&mut conn, b2, &[t1]).unwrap();
+        assert_eq!(db::list_book_tags(&conn, b1).len(), 2);
+        let all = db::list_tags(&conn);
+        assert_eq!(all.iter().find(|(id, _, _)| *id == t1).unwrap().2, 2);
+
+        let both = db::list_books_page_opts_tags(
+            &conn, "", "title", 0, 10, &None, &None, false, &None, true,
+            &Some(vec!["work tag".into(), "shelf 2".into()]),
+        );
+        assert_eq!((both.total, both.rows.len()), (1, 1));
+        let one = db::list_books_page_opts_tags(
+            &conn, "", "title", 0, 10, &None, &None, false, &None, true,
+            &Some(vec!["work tag".into()]),
+        );
+        assert_eq!(one.total, 2);
+        let ids = db::order_index_ids_tags(
+            &conn, "title", "", 10, &None, &None, false, &None,
+            &Some(vec!["shelf 2".into()]),
+        )
+        .unwrap();
+        assert_eq!(ids, vec![b1]);
+        let rnd = db::random_book_filtered_tags(
+            &conn, "", "title", &None, &None, &None, &Some(vec!["shelf 2".into()]),
+        );
+        assert_eq!(rnd.map(|b| b.id), Some(b1));
+
+        // 不存在标签：多选任一缺失 → 空集合，total=0/order 空/random 无。
+        let missing = db::list_books_page_opts_tags(
+            &conn, "", "title", 0, 10, &None, &None, false, &None, true,
+            &Some(vec!["work tag".into(), "no-such-tag".into()]),
+        );
+        assert_eq!((missing.total, missing.rows.len()), (0, 0));
+        assert!(db::order_index_ids_tags(
+            &conn, "title", "", 10, &None, &None, false, &None,
+            &Some(vec!["no-such-tag".into()]),
+        )
+        .unwrap()
+        .is_empty());
+        assert!(db::random_book_filtered_tags(
+            &conn, "", "title", &None, &None, &None,
+            &Some(vec!["no-such-tag".into()]),
+        )
+        .is_none());
+
+        // 粗略性能对比（debug 口径，非基准）：集合式单标签/多标签/不存在标签。
+        let tx = conn.transaction().unwrap();
+        for i in 0..2000 {
+            let p = root.join(format!("bulk-{i}.txt"));
+            db::upsert_book(&tx, &sp(&p), "Bulk", "txt", 10, i as i64).unwrap();
+        }
+        tx.commit().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO book_tags(book_id, tag_id) SELECT id, ?1 FROM books WHERE title='Bulk'",
+            [t1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO book_tags(book_id, tag_id) SELECT id, ?1 FROM books WHERE title='Bulk' AND id % 2 = 0",
+            [t2],
+        )
+        .unwrap();
+        let time = |label: &str, f: &dyn Fn() -> (i64, usize)| {
+            let t0 = std::time::Instant::now();
+            let (total, rows) = f();
+            eprintln!("[tags {label}] {}ms total={total} rows={rows}", t0.elapsed().as_millis());
+        };
+        time("single-count-page", &|| {
+            let p = db::list_books_page_opts_tags(
+                &conn, "", "title", 0, 50, &None, &None, false, &None, true,
+                &Some(vec!["work tag".into()]),
+            );
+            (p.total, p.rows.len())
+        });
+        time("multi-and-count-page", &|| {
+            let p = db::list_books_page_opts_tags(
+                &conn, "", "title", 0, 50, &None, &None, false, &None, true,
+                &Some(vec!["work tag".into(), "shelf 2".into()]),
+            );
+            (p.total, p.rows.len())
+        });
+        time("multi-missing-count-page", &|| {
+            let p = db::list_books_page_opts_tags(
+                &conn, "", "title", 0, 50, &None, &None, false, &None, true,
+                &Some(vec!["work tag".into(), "no-such-tag".into()]),
+            );
+            (p.total, p.rows.len())
+        });
+        time("order-index-multi", &|| {
+            let ids = db::order_index_ids_tags(
+                &conn, "title", "", 10_000, &None, &None, false, &None,
+                &Some(vec!["work tag".into(), "shelf 2".into()]),
+            )
+            .unwrap();
+            (ids.len() as i64, ids.len())
+        });
+        // EXPLAIN QUERY PLAN：仅打印并宽松断言命中标签表（不绑定具体索引名）。
+        let (frag, fp) = db::build_book_filter(&None, &None, &None, &Some(vec!["work tag".into(), "shelf 2".into()]));
+        let sql = format!("EXPLAIN QUERY PLAN SELECT b.id FROM books b WHERE {frag}");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(fp.iter()), |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        eprintln!("[tags plan] {}", plan.join(" | "));
+        assert!(plan.iter().any(|x| x.contains("book_tags") || x.contains("tags")), "plan 应使用标签表: {plan:?}");
+
+        db::upsert_book(&conn, &sp(&p1), "A2", "txt", 3, 3).unwrap();
+        assert_eq!(db::list_book_tags(&conn, b1).len(), 2);
+        db::delete_books(&conn, &[sp(&p1)]).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM book_tags WHERE book_id=?1", [b1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// C1：EPUB 缓存按字节权重/条目数淘汰，当前书不被淘汰。
+    #[test]
+    fn epub_cache_weight_eviction() {
+        let mb = 1024 * 1024usize;
+        let sizes = [(1, 600 * mb), (2, 600 * mb), (3, 600 * mb)];
+        let order = [1, 2, 3];
+        assert_eq!(plan_epub_evictions(&sizes, &order, 3, 1536 * mb, 4), vec![1]);
+        let ev = plan_epub_evictions(&sizes, &order, 1, 1000 * mb, 4);
+        assert!(ev.contains(&2) && ev.contains(&3) && !ev.contains(&1));
+        let sizes4 = [(1, 10), (2, 10), (3, 10), (4, 10), (9, 10)];
+        let ev4 = plan_epub_evictions(&sizes4, &[1, 2, 3, 4, 9], 9, 10 * mb, 4);
+        assert_eq!(ev4, vec![1]);
+        assert!(plan_epub_evictions(&[(7, 5000 * mb)], &[7], 7, 1536 * mb, 4).is_empty());
+        assert_eq!(
+            plan_epub_evictions(&sizes, &[8, 1, 2, 3], 3, 1000 * mb, 4),
+            vec![1, 2]
+        );
+        // 命中缓存后 order 更新：1 变成最新，后续淘汰不会先淘汰它。
+        let mut order_hit = vec![1, 2, 3];
+        touch_epub_cache_order(&mut order_hit, 1);
+        assert_eq!(order_hit, vec![2, 3, 1]);
+        assert_eq!(
+            plan_epub_evictions(&sizes, &order_hit, 3, 1200 * mb, 4),
+            vec![2],
+            "命中过的 1 不应被当作最旧淘汰"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7484,6 +10357,231 @@ mod cache_stamp_tests {
 }
 
 #[cfg(test)]
+mod cache_and_batch_tests {
+    //! 第一批性能优化引入的三个纯函数判据：
+    //! 1) 解析缓存命中（规则版本 + 文件指纹）—— MOBI/TXT 共用；
+    //! 2) FTS 一致性（行数 vs 期望章数）—— 决定要不要重建；
+    //! 3) 建索引分批切分（章数 / 正文字节上限）。
+    use super::*;
+
+    #[test]
+    fn cache_entry_valid_requires_same_ver_and_stamps() {
+        let a = Some((10, 20));
+        let b = Some((10, 20));
+        assert!(cache_entry_valid(3, 3, a, b), "同版本同指纹应命中");
+        assert!(!cache_entry_valid(2, 3, a, b), "规则版本不同必须失效");
+        assert!(!cache_entry_valid(3, 3, None, b), "缓存侧没指纹不得复用");
+        assert!(!cache_entry_valid(3, 3, a, None), "当前取不到指纹不得复用");
+        assert!(!cache_entry_valid(3, 3, Some((11, 20)), b), "大小不同必须失效");
+        assert!(!cache_entry_valid(3, 3, Some((10, 21)), b), "mtime 不同必须失效");
+    }
+
+    #[test]
+    fn fts_needs_rebuild_compares_rows_with_expected() {
+        assert!(!fts_needs_rebuild(0, 0), "空书行数一致，不重建");
+        assert!(!fts_needs_rebuild(120, 120), "已索引完成，不重建");
+        assert!(fts_needs_rebuild(0, 120), "从未建过要重建");
+        assert!(fts_needs_rebuild(60, 120), "中断/崩溃留下的部分行要重建");
+        assert!(fts_needs_rebuild(121, 120), "历史重复多出的行要重建");
+    }
+
+    fn ch(i: i64, body_bytes: usize) -> (i64, String, String) {
+        (i, format!("第{i}章"), "x".repeat(body_bytes))
+    }
+
+    #[test]
+    fn plan_fts_batches_handles_empty_single_and_oversized() {
+        // 空书：没有批次（不写任何行）。
+        assert!(plan_fts_batches(&[]).is_empty());
+
+        // 少量章节：单批。
+        let small: Vec<_> = (0..3).map(|i| ch(i, 10)).collect();
+        assert_eq!(plan_fts_batches(&small), vec![(0usize, 3usize)]);
+
+        // 超长章：独占一批（fts 行是一章一条，不能拆章）。
+        let mut mixed = vec![ch(0, 10)];
+        mixed.push(ch(1, FTS_BATCH_MAX_BYTES + 1));
+        mixed.push(ch(2, 10));
+        assert_eq!(
+            plan_fts_batches(&mixed),
+            vec![(0usize, 1usize), (1, 2), (2, 3)]
+        );
+
+        // 章数上限：41 章且每章很小 → 32 + 9 两批。
+        let many: Vec<_> = (0..41).map(|i| ch(i, 10)).collect();
+        assert_eq!(plan_fts_batches(&many), vec![(0usize, 32usize), (32, 41)]);
+
+        // 字节上限：每章约 100KB，三章累计超 256KB → 每批两章。
+        let per = 100 * 1024;
+        let bytes_limited: Vec<_> = (0..5).map(|i| ch(i, per)).collect();
+        assert_eq!(
+            plan_fts_batches(&bytes_limited),
+            vec![(0usize, 2usize), (2, 4), (4, 5)]
+        );
+    }
+
+    #[test]
+    fn auto_index_thresholds_are_inclusive() {
+        // P9：自动索引的体积/章数上限，等于上限通过、超过拒绝。
+        assert!(auto_index_size_allowed(0));
+        assert!(auto_index_size_allowed(AUTO_INDEX_MAX_BYTES), "等于体积上限应通过");
+        assert!(!auto_index_size_allowed(AUTO_INDEX_MAX_BYTES + 1), "超过体积上限应拒绝");
+        assert!(auto_index_chapters_allowed(AUTO_INDEX_MAX_CHAPTERS), "等于章数上限应通过");
+        assert!(!auto_index_chapters_allowed(AUTO_INDEX_MAX_CHAPTERS + 1), "超过章数上限应拒绝");
+    }
+
+    #[test]
+    fn db_cache_stamp_usable_requires_equal_fingerprint() {
+        // P7/P8 共用的 DB 缓存判据：文件指纹一致才复用。
+        assert!(db_cache_stamp_usable(10, 20, Some((10, 20))), "指纹一致应复用");
+        assert!(!db_cache_stamp_usable(10, 20, Some((11, 20))), "size 变了必须失效");
+        assert!(!db_cache_stamp_usable(10, 20, Some((10, 21))), "mtime 变了必须失效");
+        assert!(!db_cache_stamp_usable(10, 20, None), "取不到指纹不得复用");
+    }
+
+    #[test]
+    fn epub_per_chapter_json_roundtrip() {
+        // P8：逐章字数数组以 JSON 存表，反序列化后长度与内容必须完全一致。
+        let per: Vec<i64> = vec![0, 1, 123, 4567, -1];
+        let json = serde_json::to_string(&per).unwrap();
+        let back: Vec<i64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, per, "逐章字数数组 JSON 往返应完全一致");
+        assert_eq!(back.len(), per.len());
+    }
+
+    #[test]
+    fn fts_meta_plan_covers_meta_and_legacy_paths() {
+        // P12：meta 存在时以 meta 为准；meta 缺失时用旧实例计数做一次性迁移。
+        assert_eq!(fts_meta_plan(Some(5), None, 5), FtsMetaPlan::Skip);
+        assert_eq!(fts_meta_plan(Some(5), None, 4), FtsMetaPlan::Rebuild);
+        assert_eq!(fts_meta_plan(Some(0), None, 0), FtsMetaPlan::Skip, "空书 meta=0 视为已索引");
+        assert_eq!(fts_meta_plan(None, Some(5), 5), FtsMetaPlan::Adopt(5));
+        assert_eq!(fts_meta_plan(None, Some(0), 0), FtsMetaPlan::Adopt(0));
+        assert_eq!(fts_meta_plan(None, Some(5), 6), FtsMetaPlan::Rebuild);
+        assert_eq!(fts_meta_plan(None, None, 5), FtsMetaPlan::Rebuild);
+    }
+
+    #[test]
+    fn single_flight_same_key_computes_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let map: Mutex<HashMap<i64, Arc<Flight<i32>>>> = Mutex::new(HashMap::new());
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                single_flight(&map, 7, || {
+                    calls.fetch_add(1, AOrd::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    42
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let b = s.spawn(|| {
+                single_flight(&map, 7, || {
+                    calls.fetch_add(1, AOrd::SeqCst);
+                    99
+                })
+            });
+            assert_eq!(a.join().unwrap(), 42);
+            assert_eq!(b.join().unwrap(), 42, "follower 应复用 leader 的结果");
+        });
+        assert_eq!(calls.load(AOrd::SeqCst), 1, "同 key 只应计算一次");
+    }
+
+    #[test]
+    fn single_flight_different_keys_run_in_parallel() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let map: Mutex<HashMap<i64, Arc<Flight<i32>>>> = Mutex::new(HashMap::new());
+        let started = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                single_flight(&map, 1, || {
+                    started.store(true, AOrd::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    1
+                })
+            });
+            while !started.load(AOrd::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let t0 = std::time::Instant::now();
+            let v = single_flight(&map, 2, || 2i32);
+            assert_eq!(v, 2);
+            assert!(
+                t0.elapsed() < std::time::Duration::from_millis(200),
+                "不同 key 的调用不应互相阻塞"
+            );
+            assert_eq!(a.join().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn single_flight_propagates_leader_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let map: Mutex<HashMap<i64, Arc<Flight<Result<i32, String>>>>> = Mutex::new(HashMap::new());
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                single_flight(&map, 3, || {
+                    calls.fetch_add(1, AOrd::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    Err::<i32, String>("boom".into())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let b = s.spawn(|| {
+                single_flight(&map, 3, || {
+                    calls.fetch_add(1, AOrd::SeqCst);
+                    Ok::<i32, String>(1)
+                })
+            });
+            assert_eq!(a.join().unwrap().unwrap_err(), "boom");
+            assert_eq!(
+                b.join().unwrap().unwrap_err(),
+                "boom",
+                "follower 应拿到同一错误而不是挂起"
+            );
+        });
+        assert_eq!(calls.load(AOrd::SeqCst), 1, "出错时也不应重复计算");
+    }
+
+    #[test]
+    fn single_flight_follower_recovers_after_leader_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let map: Mutex<HashMap<i64, Arc<Flight<i32>>>> = Mutex::new(HashMap::new());
+        let calls = AtomicUsize::new(0);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let leader = s.spawn(|| {
+                // leader 在 compute 中 panic（resume_unwind 不触发全局 panic hook，避免日志噪音）。
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    single_flight(&map, 9, || {
+                        calls.fetch_add(1, AOrd::SeqCst);
+                        let _ = started_tx.send(());
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                        std::panic::resume_unwind(Box::new("leader panic"))
+                    })
+                }));
+            });
+            started_rx.recv().unwrap();
+            // leader 正在 compute 中睡眠：follower 此时必然看到旧 Flight 并进入等待。
+            let follower = s.spawn(|| {
+                single_flight(&map, 9, || {
+                    calls.fetch_add(1, AOrd::SeqCst);
+                    7i32
+                })
+            });
+            assert_eq!(
+                follower.join().unwrap(),
+                7,
+                "leader panic 后 follower 应重新竞争并返回结果，而不是挂死"
+            );
+            leader.join().unwrap();
+        });
+        assert_eq!(calls.load(AOrd::SeqCst), 2, "leader 一次 + follower 重算一次");
+    }
+}
+
+#[cfg(test)]
 mod storage_tests {
     use super::{collect_storage, StorageStats};
     use std::path::PathBuf;
@@ -7522,6 +10620,16 @@ mod storage_tests {
             fonts_bytes: 0,
             db_bytes: 0,
             cache_bytes: 0,
+            parse_cache_bytes: 0,
+            freelist_bytes: 0,
+            db_dir_free_bytes: None,
+            temp_dir: String::new(),
+            temp_free_bytes: None,
+            temp_same_disk: false,
+            last_checkpoint_at: 0,
+            last_checkpoint_busy: false,
+            checkpoint_wal_before: 0,
+            checkpoint_wal_after: 0,
         };
         collect_storage(&data, &data, &mut s);
         assert_eq!(s.covers_bytes, 10);
@@ -7531,5 +10639,13 @@ mod storage_tests {
         // total = 10+20+30+40+5+1+7 = 113，分类字段互不重复但都包含在 total 内。
         assert_eq!(s.total_bytes, 113);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn prioritize_covers_only_md0() {
+        assert!(super::prioritize_eligible(0));
+        assert!(!super::prioritize_eligible(1));
+        assert!(!super::prioritize_eligible(2), "pathological/超时失败 md=2 不得再入队");
+        assert!(!super::prioritize_eligible(3), "处理中 md=3 不得再入队");
     }
 }

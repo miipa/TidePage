@@ -102,6 +102,8 @@ export function bindKeyMatches(stored: string, combo: string): boolean {
 }
 
 import type { ChapterTransition, PageTransition } from "./chapterTx";
+import { allowEventTrigger, shouldAutoSync } from "./autoSync";
+import { shouldAutoVacuum } from "./maintenance";
 
 export type TextAlign = "justify" | "left";
 /** 滚动模式的章节过渡档位（定义在 lib/chapterTx.ts，与过渡几何/解锁判据同源）。 */
@@ -149,6 +151,8 @@ export const STATUS_ITEM_IDS: Set<string> = new Set(STATUS_ITEM_DEFS.map((d) => 
 
 /** 阅读界面顶栏右侧可拖拽排序/可隐藏的按钮 id（默认顺序）。 */
 export const READER_TOPBAR_IDS = [
+  "pdfThumbs",
+  "pdfSearch",
   "webdav", "webdavDownload", "convert", "bookmarkAdd", "bookmarkList", "ttsPlay", "ttsStop",
   "highlight", "ai", "stats", "toc", "manga", "manager", "images", "css", "settings",
 ] as const;
@@ -186,7 +190,7 @@ export interface MangaConfig {
 export type ReaderTopbarId = (typeof READER_TOPBAR_IDS)[number];
 
 /** 书库顶栏可拖拽排序的图标按钮 id（默认顺序）。 */
-export const LIBRARY_TOPBAR_IDS = ["webdav", "random", "notes", "stats", "settings"] as const;
+export const LIBRARY_TOPBAR_IDS = ["webdav", "random", "notes", "dupes", "stats", "settings"] as const;
 export type LibraryTopbarId = (typeof LIBRARY_TOPBAR_IDS)[number];
 
 /** 书库顶栏顺序归一化：search→notes 原地迁移、过滤非法/重复 id、补齐缺失 id。
@@ -321,6 +325,22 @@ export interface WebdavBackupConfig {
   lastError?: string;
 }
 
+export interface WebdavDataSyncConfig {
+  /** 自动同步（主窗口每 5 分钟 tick，按 intervalHours 判断） */
+  enabled: boolean;
+  intervalHours: number;
+  /** 上次成功同步时间（毫秒） */
+  lastAt: number;
+  /** 最近一次自动同步失败原因（可读，不弹窗） */
+  lastError?: string;
+  /** 最近一次自动同步尝试时间（毫秒；用于退避） */
+  lastAttemptAt?: number;
+  /** 连续自动同步失败次数（成功/手动成功重置） */
+  failCount?: number;
+  /** 最近一次自动同步结果 */
+  lastResult?: "success" | "error" | "skipped" | "";
+}
+
 export interface WebdavConfig {
   enabled: boolean;
   base: string;
@@ -331,6 +351,14 @@ export interface WebdavConfig {
   downloadDir: string;
   /** 设置备份（手动 + 定期） */
   backup: WebdavBackupConfig;
+  /** D5：书签+划线笔记 */
+  syncNotes: boolean;
+  /** D5：标签 */
+  syncTags: boolean;
+  /** D5：智能书架 */
+  syncShelves: boolean;
+  /** D5：数据同步调度 */
+  dataSync: WebdavDataSyncConfig;
 }
 
 export type AiProvider = "openai" | "ollama" | "anthropic" | "gemini" | "azure-openai" | "dashscope";
@@ -755,6 +783,8 @@ export interface LibraryConfig {
   showCoverProgress: boolean;
   /** 封面扫描：auto = 后台为全部书籍生成封面；manual = 打开书籍时生成该本封面。 */
   coverScan: "auto" | "manual";
+  /** 重复书叠影：主书库重复卡显示叠影与份数（默认开启，不改变去重/文件）。 */
+  duplicateEffect: boolean;
 }
 
 /** 应用外壳界面配色（仅影响书库/设置/面板等外壳，与阅读正文完全独立）。 */
@@ -949,6 +979,15 @@ export function normLanguageSetting(v: unknown): "auto" | "zh-CN" | "en" {
   return v === "zh-CN" || v === "en" ? v : "auto";
 }
 
+export interface MaintenanceConfig {
+  /** 提醒关闭到期时间（毫秒；0=未关闭）。 */
+  reminderDismissedUntil: number;
+  autoVacuum: { enabled: boolean; idleMinutes: number };
+  /** 上次自动整理时间/结果（失败冷却用）。 */
+  lastAutoVacuumAt: number;
+  lastAutoVacuumResult: "success" | "error" | "skipped" | "";
+}
+
 export interface AppConfig {
   reader: ReaderConfig;
   library: LibraryConfig;
@@ -968,6 +1007,8 @@ export interface AppConfig {
   language: string;
   /** 设置面板分区（扁平列表）显示顺序；可在设置里拖拽排序。id 取 SETTINGS_TABS。 */
   settingsOrder: string[];
+  /** B10：维护提醒与空闲自动整理配置。 */
+  maintenance: MaintenanceConfig;
 }
 
 /** 设置面板全部分区 id（扁平列表默认顺序，去分组后的唯一顺序来源）。 */
@@ -1128,6 +1169,7 @@ p {
     topbarOrder: [...LIBRARY_TOPBAR_IDS],
     showCoverProgress: true,
     coverScan: "auto",
+    duplicateEffect: true,
   },
   webdav: {
     enabled: false,
@@ -1138,6 +1180,10 @@ p {
     uploadBooks: false,
     downloadDir: "",
     backup: { enabled: false, intervalHours: 24, lastAt: 0, lastSig: "", lastCheckAt: 0 },
+    syncNotes: true,
+    syncTags: true,
+    syncShelves: true,
+    dataSync: { enabled: false, intervalHours: 24, lastAt: 0, lastAttemptAt: 0, failCount: 0, lastResult: "" },
   },
   ai: {
     enabled: true,
@@ -1229,6 +1275,12 @@ p {
   readerSchemes: [],
   language: "auto",
   settingsOrder: [...SETTINGS_TABS],
+  maintenance: {
+    reminderDismissedUntil: 0,
+    autoVacuum: { enabled: false, idleMinutes: 15 },
+    lastAutoVacuumAt: 0,
+    lastAutoVacuumResult: "",
+  },
 };
 // 注：readerSchemes 默认空，由 load() 用内置方案补齐（见 builtinSchemes）。
 
@@ -1873,6 +1925,28 @@ function load(): AppConfig {
     if (typeof indent === "boolean") indent = indent ? "2em" : "0em";
     if (indent == null) indent = "1em";
     const migratedAi = migrateAi(saved.ai);
+    // B10：旧 localStorage 配置一次性迁入 AppConfig；缺失用默认值。
+    let maintenanceMigrated = saved.maintenance;
+    if (!maintenanceMigrated && typeof window !== "undefined") {
+      try {
+        const dismissed = Number(localStorage.getItem("tp.maintenance.dismissedUntil") || 0) || 0;
+        const auto = JSON.parse(localStorage.getItem("tp.maintenance.autoVacuum") || "{}") as { enabled?: boolean; idleMinutes?: number };
+        maintenanceMigrated = { reminderDismissedUntil: dismissed, autoVacuum: { enabled: auto.enabled === true, idleMinutes: [10, 15, 30].includes(Number(auto.idleMinutes)) ? Number(auto.idleMinutes) : 15 }, lastAutoVacuumAt: 0, lastAutoVacuumResult: "" };
+        localStorage.removeItem("tp.maintenance.dismissedUntil");
+        localStorage.removeItem("tp.maintenance.autoVacuum");
+      } catch { /* ignore */ }
+    }
+    const m = maintenanceMigrated || {};
+    const mv = {
+      ...DEFAULTS.maintenance,
+      ...(m || {}),
+      autoVacuum: { ...DEFAULTS.maintenance.autoVacuum, ...(m?.autoVacuum || {}) },
+    };
+    mv.reminderDismissedUntil = Math.max(0, Number(mv.reminderDismissedUntil) || 0);
+    mv.autoVacuum.enabled = mv.autoVacuum.enabled === true;
+    mv.autoVacuum.idleMinutes = [10, 15, 30].includes(Number(mv.autoVacuum.idleMinutes)) ? Number(mv.autoVacuum.idleMinutes) : 15;
+    mv.lastAutoVacuumAt = Math.max(0, Number(mv.lastAutoVacuumAt) || 0);
+    mv.lastAutoVacuumResult = mv.lastAutoVacuumResult === "success" || mv.lastAutoVacuumResult === "error" || mv.lastAutoVacuumResult === "skipped" ? mv.lastAutoVacuumResult : "";
     // 迁移：语音朗读由「扁平协议字段」改为「服务配置档案」；无 services 时需落盘一次。
     if (!Array.isArray(saved.tts?.services) || !saved.tts.services.length) ttsMigrationDirty = true;
     const merged: AppConfig = {
@@ -1898,6 +1972,13 @@ function load(): AppConfig {
         ...DEFAULTS.webdav,
         ...saved.webdav,
         backup: { ...DEFAULTS.webdav.backup, ...(saved.webdav?.backup || {}) },
+        dataSync: {
+          ...DEFAULTS.webdav.dataSync,
+          ...(saved.webdav?.dataSync || {}),
+          failCount: Math.max(0, Number(saved.webdav?.dataSync?.failCount) || 0),
+          lastAttemptAt: Math.max(0, Number(saved.webdav?.dataSync?.lastAttemptAt) || 0),
+          lastResult: saved.webdav?.dataSync?.lastResult === "success" || saved.webdav?.dataSync?.lastResult === "error" || saved.webdav?.dataSync?.lastResult === "skipped" ? saved.webdav.dataSync.lastResult : "",
+        },
       },
       ai: migratedAi,
       tts: migrateTts(saved.tts),
@@ -1909,6 +1990,7 @@ function load(): AppConfig {
       // i18n 接线：只认 auto / zh-CN / en，旧配置里的任意字符串（含早期空串）一律回落 auto。
       language: normLanguageSetting(saved.language),
       settingsOrder: normSettingsOrder(saved.settingsOrder),
+      maintenance: mv,
     };
     // 迁移：旧默认字体（微软雅黑）替换为书宋衬线字体，以贴近静读天下效果
     if (merged.reader.fontFamily === '"Microsoft YaHei", "Segoe UI", serif') {
@@ -2422,6 +2504,10 @@ export function applyConfigJson(json: string) {
       ...structuredClone(DEFAULTS.webdav.backup),
       ...((obj.webdav && obj.webdav.backup) || {}),
     };
+    obj.webdav.dataSync = {
+      ...structuredClone(DEFAULTS.webdav.dataSync),
+      ...((obj.webdav && obj.webdav.dataSync) || {}),
+    };
     obj.ai = { ...structuredClone(DEFAULTS.ai), ...obj.ai };
     obj.ai.proxy = normalizeAiProxy(obj.ai.proxy).proxy;
     // 跨窗同步/导入可能带来旧版每端点代理字段：须在 normalizeProfiles **之前**于原始 profile 上识别并
@@ -2629,12 +2715,131 @@ function webdavBackupTick() {
   }
 }
 
+
+/** D5：手动/自动数据同步共用入口（进程内互斥；自动同步失败只记 lastError）。 */
+let dataSyncRunning = false;
+export async function runWebdavDataSync(
+  resolve?: "local" | "remote",
+  choices?: { key: string; choice: "local" | "remote" }[],
+) {
+  if (dataSyncRunning) throw Object.assign(new Error("data_sync_running"), { code: "data_sync_running" });
+  const wd = config.webdav;
+  if (!wd.base.trim() || !wd.user.trim() || !wd.pass) {
+    throw Object.assign(new Error("data_sync_need_creds"), { code: "data_sync_need_creds" });
+  }
+  if (!wd.syncNotes && !wd.syncTags && !wd.syncShelves) {
+    throw Object.assign(new Error("data_sync_none"), { code: "data_sync_none" });
+  }
+  dataSyncRunning = true;
+  wd.dataSync.lastAttemptAt = Date.now();
+  try {
+    const device = await api.hostName().catch(() => "");
+    const s = await api.webdavSyncData(
+      wd.base,
+      wd.user,
+      wd.pass,
+      { syncNotes: wd.syncNotes, syncTags: wd.syncTags, syncShelves: wd.syncShelves },
+      resolve,
+      choices,
+      device,
+    );
+    wd.dataSync.lastAt = Date.now();
+    wd.dataSync.lastError = undefined;
+    wd.dataSync.failCount = 0;
+    wd.dataSync.lastResult = "success";
+    saveConfig();
+    return s;
+  } catch (e) {
+    wd.dataSync.lastAttemptAt = Date.now();
+    wd.dataSync.failCount = (wd.dataSync.failCount || 0) + 1;
+    wd.dataSync.lastError = String(e);
+    wd.dataSync.lastResult = "error";
+    saveConfig();
+    throw e;
+  } finally {
+    dataSyncRunning = false;
+  }
+}
+
+function webdavDataSyncTick() {
+  const wd = config.webdav;
+  const d = wd.dataSync;
+  if (!d.enabled) return;
+  if (!wd.base.trim() || !wd.user.trim() || !wd.pass) return;
+  if (!shouldAutoSync({
+    enabled: d.enabled,
+    intervalHours: d.intervalHours,
+    lastAt: d.lastAt || 0,
+    now: Date.now(),
+    failCount: d.failCount || 0,
+    lastAttemptAt: d.lastAttemptAt || 0,
+  })) return;
+  void runWebdavDataSync().catch(() => {});
+}
+
+// B9：可见/聚焦/网络恢复事件触发；同一窗口 30s 防抖，仍受启用/间隔/退避约束。
+let lastAutoEventAt = 0;
+function webdavDataSyncEventTick() {
+  const now = Date.now();
+  if (!allowEventTrigger(lastAutoEventAt, now)) return;
+  lastAutoEventAt = now;
+  webdavDataSyncTick();
+}
+
 if (typeof window !== "undefined") {
   // 仅主窗口跑调度，避免多个窗口同时触发重复备份。
   void import("@tauri-apps/api/webviewWindow")
     .then((m) => m.getCurrentWebviewWindow().label)
     .then((label) => {
-      if (label === "main") setInterval(webdavBackupTick, 5 * 60_000);
+      if (label === "main") {
+        setInterval(webdavBackupTick, 5 * 60_000);
+        setInterval(webdavDataSyncTick, 5 * 60_000);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "visible") webdavDataSyncEventTick();
+        });
+        window.addEventListener("focus", webdavDataSyncEventTick);
+        window.addEventListener("online", webdavDataSyncEventTick);
+
+        // B10：空闲自动整理（默认关闭；每会话最多一次；条件由纯函数判定）。
+        let autoVacuumDone = false;
+        let lastActivity = Date.now();
+        const touch = () => { lastActivity = Date.now(); };
+        for (const ev of ["pointerdown", "keydown", "wheel"]) window.addEventListener(ev, touch, { passive: true });
+        document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") touch(); });
+        setInterval(() => {
+          const m = config.maintenance;
+          if (!m.autoVacuum.enabled || autoVacuumDone) return;
+          const now = Date.now();
+          const idleMs = Math.max(1, m.autoVacuum.idleMinutes) * 60_000;
+          if (ui.view === "reader" || now - lastActivity < idleMs) return;
+          // 读取后端真实维护/扫描状态后再做完整条件判定，避免前端硬编码 false。
+          void api.maintenanceStatus().then((s) => {
+            if (!shouldAutoVacuum({
+              enabled: m.autoVacuum.enabled,
+              idleMinutes: m.autoVacuum.idleMinutes,
+              now: Date.now(),
+              lastActivity,
+              readerOpen: ui.view === "reader",
+              maintenanceRunning: s.maintenanceRunning,
+              scanRunning: s.scanRunning,
+              sessionDone: autoVacuumDone,
+              lastAutoVacuumAt: m.lastAutoVacuumAt,
+              lastAutoVacuumResult: m.lastAutoVacuumResult,
+            })) return;
+            autoVacuumDone = true;
+            // 后端在 maintenance 锁内做预检 + 逻辑备份 + VACUUM + 历史；失败只记录/不重试。
+            void api.vacuumDb(true).then(() => {
+              m.lastAutoVacuumAt = Date.now();
+              m.lastAutoVacuumResult = "success";
+              saveConfig();
+            }).catch(() => {
+              m.lastAutoVacuumAt = Date.now();
+              m.lastAutoVacuumResult = "error";
+              saveConfig();
+            });
+          }).catch(() => undefined);
+        }, 60_000);
+      }
     })
     .catch(() => {});
 }
@@ -2958,11 +3163,29 @@ export async function openBookInNewWindow(
   }
 }
 
-export const confirmBox = $state({ msg: "", active: false });
+/** 共享确认框的可选明细单元格：text 为显示文本；数字列可标 align:"end" 右对齐。 */
+export interface ConfirmDetailCell {
+  text: string;
+  align?: "start" | "end";
+}
+
+/** 共享确认框的一行明细：一个标签 + 若干单元格（各行单元格数量应一致，渲染端按网格对齐）。 */
+export interface ConfirmDetailRow {
+  label: string;
+  cells: ConfirmDetailCell[];
+}
+
+export const confirmBox = $state<{
+  msg: string;
+  active: boolean;
+  /** 可选结构化明细（如进度对比）；不传的调用方为 null，渲染与行为不变。 */
+  detail: ConfirmDetailRow[] | null;
+}>({ msg: "", active: false, detail: null });
 let confirmResolve: ((v: boolean) => void) | null = null;
 
-export function appConfirm(msg: string): Promise<boolean> {
+export function appConfirm(msg: string, opts?: { detail?: ConfirmDetailRow[] }): Promise<boolean> {
   confirmBox.msg = msg;
+  confirmBox.detail = opts?.detail ?? null;
   confirmBox.active = true;
   return new Promise((res) => {
     confirmResolve = res;

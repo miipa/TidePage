@@ -8,9 +8,11 @@
     ttsNext,
     ttsPauseResume,
     ttsPrev,
+    ttsSetBook,
     ttsState,
     ttsStop,
   } from "../lib/tts.svelte";
+  import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import type { FlatSegment, OnlineVoice } from "../lib/tts.svelte";
   import {
     IconClock,
@@ -23,7 +25,28 @@
     IconSettings,
   } from "@tabler/icons-svelte";
 
-  let { current = null as FlatSegment | null }: { current?: FlatSegment | null } = $props();
+  let {
+    current = null as FlatSegment | null,
+    bookId = null as number | null,
+  }: { current?: FlatSegment | null; bookId?: number | null } = $props();
+
+  // D8：按书记住音色/语速（localStorage，经 bookcfg）；未设置时回退全局。
+  $effect(() => {
+    ttsSetBook(bookId);
+  });
+  const bookOv = $derived<BookOverride>(bookId ? getBookOverride(bookId) : {});
+  function setBookVoice(v: string) {
+    if (!bookId) return;
+    setBookOverride(bookId, { ttsVoice: v ? v : undefined });
+  }
+  function setBookRate(v: number) {
+    if (!bookId) return;
+    setBookOverride(bookId, { ttsRate: v });
+  }
+  function resetBookTts() {
+    if (!bookId) return;
+    setBookOverride(bookId, { ttsVoice: undefined, ttsRate: undefined });
+  }
 
   // 不内置 OpenAI 别名预设（alloy/echo/…）：无固定说话人，不适用于克隆引擎。
   // 音色一律以服务端返回的列表为准。
@@ -60,6 +83,12 @@
     if (!min || !ttsState.playing) {
       sleepEnd = 0;
       sleepLeft = 0;
+      return;
+    }
+    // D8：-1 = 章末停止（不跑倒计时，只在条上提示）；Reader 的 onTtsChapterEnd 负责停。
+    if (min === -1) {
+      sleepEnd = 0;
+      sleepLeft = -1;
       return;
     }
     sleepEnd = Date.now() + min * 60000;
@@ -108,7 +137,9 @@
     {/if}
   </div>
 
-  {#if sleepLeft > 0}
+  {#if sleepLeft === -1}
+    <span class="tb-sleep" title={t("tts.sleepChapterEnd")}><IconClock /> {t("tts.sleepChapterEnd")}</span>
+  {:else if sleepLeft > 0}
     <span class="tb-sleep" title={t("tts.timerRemain")}><IconClock /> {fmtLeft(sleepLeft)}</span>
   {/if}
 
@@ -173,12 +204,43 @@
         <label>{t("tts.timerStop")}</label>
         <select data-testid="tts-sleep" bind:value={config.tts.sleepMinutes} onchange={saveConfig}>
           <option value={0}>{t("common.action.close")}</option>
+          <option value={-1}>{t("tts.sleepChapterEnd")}</option>
           <option value={5}>{t("tts.minutes", { n: 5 })}</option>
           <option value={10}>{t("tts.minutes", { n: 10 })}</option>
           <option value={15}>{t("tts.minutes", { n: 15 })}</option>
           <option value={30}>{t("tts.minutes", { n: 30 })}</option>
           <option value={60}>{t("tts.minutes", { n: 60 })}</option>
         </select>
+      </div>
+      <div class="tb-grid tb-book">
+        <label>{t("tts.bookVoice")}</label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          {#if config.tts.engine === "online"}
+            <select value={bookOv.ttsVoice ?? ""} onchange={(e) => setBookVoice(e.currentTarget.value)}>
+              <option value="">{t("tts.followGlobal")}</option>
+              {#each [...onlineVoiceProfiles, ...onlineVoiceOthers] as v (v.id)}
+                <option value={v.id}>{v.name || v.id}</option>
+              {/each}
+            </select>
+          {:else}
+            <select value={bookOv.ttsVoice ?? ""} onchange={(e) => setBookVoice(e.currentTarget.value)}>
+              <option value="">{t("tts.followGlobal")}</option>
+              {#each [...zhVoices, ...otherVoices] as v (v.voiceURI)}
+                <option value={v.name}>{v.name} · {v.lang}</option>
+              {/each}
+            </select>
+          {/if}
+          <button class="tb-mini" title={t("tts.restoreDefault")} onclick={resetBookTts}>↺</button>
+        </div>
+        <label>{t("tts.bookRate")} {(bookOv.ttsRate ?? config.tts.rate).toFixed(2)}</label>
+        <input
+          type="range"
+          min="0.5"
+          max="2"
+          step="0.05"
+          value={bookOv.ttsRate ?? config.tts.rate}
+          oninput={(e) => setBookRate(Number(e.currentTarget.value))}
+        />
       </div>
       <div class="tb-checks">
         <label><input type="checkbox" bind:checked={config.tts.highlight} onchange={saveConfig} /> {t("tts.highlightFollow")}</label>

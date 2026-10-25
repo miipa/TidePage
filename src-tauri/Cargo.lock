@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "tidepage"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

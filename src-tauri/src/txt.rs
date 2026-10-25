@@ -12,6 +12,20 @@ pub struct PlainDoc {
 /// （尤其英文/无「第X章」命名、整本进单章的书）首屏长时间无响应的根治点。
 pub const MAX_CHAPTER_CHARS: usize = 50_000;
 
+/// 大文件编码自动检测的采样上限（P7）：52MB GBK 整本跑三候选检测实测约 26.7s，
+/// 只对头部 512KB 判定、整本仅解码一次后，冷开降到秒级；误判由整本替换符占比兜底。
+pub const ENC_SAMPLE_BYTES: usize = 512 * 1024;
+/// 采样判定后整本解码的 U+FFFD 占比上限：超过即视为采样误判，回退整本三候选判定。
+const ENC_FULL_FFFD_LIMIT: f64 = 0.01;
+/// 候选（非汉字密度）路径的最低采样信息量：采样里非 ASCII 字节占比达到它、却判不出中文时，
+/// 说明采样看不出旧编码（例如头部以 ASCII 为主、正文才是 GBK/Big5）；候选多为单字节编码，
+/// 解码不会产生 U+FFFD，整本 FFFD 兜底发现不了误判，必须直接回退整本判定。
+const ENC_CANDIDATE_MIN_NON_ASCII: f64 = 0.02;
+/// 「明显是中文书」的常用汉字密度阈值（整本/采样判定共用）。
+const CJK_HIT: f64 = 0.15;
+/// chardetng 候选的替换符占比可接受上限（非明显中文时的 U+FFFD 策略）。
+const FFFD_OK: f64 = 0.001;
+
 /// 把 `[start, end)`（字节区间，相对 `text`）按 `MAX_CHAPTER_CHARS` 沿 `\n`（段落）
 /// 边界就近切成多个子 range。保证：
 ///  - 除「单行本身就超限」外，每段字符数 ≤ 上限；
@@ -138,13 +152,24 @@ pub fn decode_and_split(
     pattern: Option<&str>,
     forced: Option<&str>,
 ) -> Result<PlainDoc, String> {
+    decode_and_split_detect(path, pattern, forced).map(|(doc, _enc)| doc)
+}
+
+/// 解码并切分，同时返回**实际使用**的编码：load_txt 用它把自动判定写回 DB 缓存（P7）。
+/// 原 decode_and_split 保留为只关心文本的包装（convert.rs / preview_split 不用改）。
+pub fn decode_and_split_detect(
+    path: &str,
+    pattern: Option<&str>,
+    forced: Option<&str>,
+) -> Result<(PlainDoc, &'static str), String> {
     let data = std::fs::read(path).map_err(|e| format!("读取文件失败: {e}"))?;
-    let (text, _enc) = decode_bytes(&data, forced);
+    let (text, enc) = decode_bytes(&data, forced);
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    match pattern {
-        Some(p) if !p.trim().is_empty() => split_custom(&text, p),
-        _ => Ok(split_plain(&text)),
-    }
+    let doc = match pattern {
+        Some(p) if !p.trim().is_empty() => split_custom(&text, p)?,
+        _ => split_plain(&text),
+    };
+    Ok((doc, enc))
 }
 
 pub fn split_custom(text: &str, pattern: &str) -> Result<PlainDoc, String> {
@@ -235,12 +260,95 @@ pub fn decode_bytes(data: &[u8], forced: Option<&str>) -> (String, &'static str)
         return (s.to_string(), "utf-8");
     }
     // ---- 非 UTF-8 自动链 ----
-    // chardetng 对中文旧编码常误判:简体 GBK/GB18030 被猜成 Big5,而 Big5 能"零 U+FFFD"地
-    // 把这些字节解成繁体错字 —— 替换符数量无法区分简/繁(两者互相都能零替换符解对方字节)。
-    // 故改用「常用汉字密度」择优:
-    //   · 解 chardetng 候选 A、GB18030(G)、Big5(B) 三者;
-    //   · 若 G/B 的常用字命中率 max ≥ CJK_HIT(明显是中文书)→ 取命中率高者(并列取 GB18030,简体为主);
-    //   · 否则(西文/日文/韩文等非中文)→ 退回 U+FFFD 策略:A 替换符低则用 A,否则取三者替换符最少者。
+    // P7：只对文件头部采样判定编码、整本仅解码一次；整本替换符占比超阈值再回退整本三候选判定。
+    let (text, enc, _fell_back) = decode_auto_with_sample(data, ENC_SAMPLE_BYTES);
+    (text, enc)
+}
+
+/// 自动检测（采样 + 整本兜底）：先只用头部采样选编码，再用它把整本解码一次。
+/// 采样里没有非 ASCII 字节（无从判断旧编码）或整本替换符占比 > 1%（采样误判）时，
+/// 回退到整本三候选判定，保证判定正确性不退化。
+/// sample_len 只用于单测构造「采样与整本冲突」的输入；生产调用固定 ENC_SAMPLE_BYTES。
+fn decode_auto_with_sample(data: &[u8], sample_len: usize) -> (String, &'static str, bool) {
+    let sample = &data[..data.len().min(sample_len.max(1))];
+    let (enc, from_cjk_script) = detect_by_sample(sample);
+    // 候选路径的信息量守卫：采样里有可观的非 ASCII 字节（≥2%）却判不出中文 → 采样看不出旧编码
+    // （例如超长 ASCII 头 + 正文才是 GBK/Big5）。候选多为单字节编码、解码不产生 U+FFFD，
+    // 整本 FFFD 兜底发现不了这种误判，所以直接回退整本三候选判定。
+    if !from_cjk_script && sample_non_ascii_ratio(sample) >= ENC_CANDIDATE_MIN_NON_ASCII {
+        let (s, name) = detect_full(data);
+        return (s, name, true);
+    }
+    let (text, actual, _had_err) = enc.decode(data);
+    if sample_detection_reliable(sample, fffd_ratio(&text)) {
+        return (text.into_owned(), actual.name(), false);
+    }
+    let (s, name) = detect_full(data);
+    (s, name, true)
+}
+
+/// 采样判定是否可信：采样里必须出现非 ASCII 字节，且整本解码后的替换符占比不超过 1%。
+fn sample_detection_reliable(sample: &[u8], full_fffd: f64) -> bool {
+    sample.iter().any(|&b| b >= 0x80) && full_fffd <= ENC_FULL_FFFD_LIMIT
+}
+
+/// 采样里非 ASCII 字节的占比（非 ASCII 字节数 / 总字节数）；空样本记 0。
+fn sample_non_ascii_ratio(sample: &[u8]) -> f64 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    let hi = sample.iter().filter(|&&b| b >= 0x80).count();
+    hi as f64 / sample.len() as f64
+}
+
+/// 对一段字节按「常用汉字密度 + U+FFFD」三候选策略选出编码（与整本判定同一套打法）。
+/// 返回 (编码对象, 是否来自汉字密度路径)：候选路径的判定来源对调用方有不同可信度要求。
+fn detect_by_sample(sample: &[u8]) -> (&'static encoding_rs::Encoding, bool) {
+    let mut det = chardetng::EncodingDetector::new();
+    det.feed(sample, true);
+    let enc = det.guess(None, true);
+    let (s, _, _) = enc.decode(sample);
+    let (sg, _, _) = encoding_rs::GB18030.decode(sample);
+    let (sb, _, _) = encoding_rs::BIG5.decode(sample);
+    let g = cjk_common_score(&sg);
+    let b = cjk_common_score(&sb);
+    if g.max(b) >= CJK_HIT {
+        return (
+            if g >= b {
+                encoding_rs::GB18030
+            } else {
+                encoding_rs::BIG5
+            },
+            true,
+        );
+    }
+    // 非明显中文:沿用上一轮 U+FFFD 策略（判定来源 = 候选路径）。
+    if fffd_ratio(&s) <= FFFD_OK {
+        return (enc, false);
+    }
+    let ratio_a = fffd_ratio(&s);
+    let ratio_g = fffd_ratio(&sg);
+    let ratio_b = fffd_ratio(&sb);
+    let mut best_ratio = ratio_g;
+    let mut best = encoding_rs::GB18030;
+    if ratio_b < best_ratio {
+        best_ratio = ratio_b;
+        best = encoding_rs::BIG5;
+    }
+    if ratio_a < best_ratio {
+        best = enc;
+    }
+    (best, false)
+}
+
+/// 整本三候选判定（原自动链的完整逻辑）：采样不可信时兜底用。
+/// chardetng 对中文旧编码常误判:简体 GBK/GB18030 被猜成 Big5,而 Big5 能"零 U+FFFD"地
+/// 把这些字节解成繁体错字 —— 替换符数量无法区分简/繁(两者互相都能零替换符解对方字节)。
+/// 故改用「常用汉字密度」择优:
+///   · 解 chardetng 候选 A、GB18030(G)、Big5(B) 三者;
+///   · 若 G/B 的常用字命中率 max ≥ CJK_HIT(明显是中文书)→ 取命中率高者(并列取 GB18030,简体为主);
+///   · 否则(西文/日文/韩文等非中文)→ 退回 U+FFFD 策略:A 替换符低则用 A,否则取三者替换符最少者。
+fn detect_full(data: &[u8]) -> (String, &'static str) {
     let mut det = chardetng::EncodingDetector::new();
     det.feed(data, true);
     let enc = det.guess(None, true);
@@ -249,16 +357,12 @@ pub fn decode_bytes(data: &[u8], forced: Option<&str>) -> (String, &'static str)
     let (sb, _, _) = encoding_rs::BIG5.decode(data);
     let g = cjk_common_score(&sg);
     let b = cjk_common_score(&sb);
-    // 常用汉字密度阈值:达到即判定为中文书,进入简繁择优(西文/日文一般远低于此)。
-    const CJK_HIT: f64 = 0.15;
     if g.max(b) >= CJK_HIT {
         if g >= b {
             return (sg.into_owned(), encoding_rs::GB18030.name());
         }
         return (sb.into_owned(), encoding_rs::BIG5.name());
     }
-    // 非明显中文:沿用上一轮 U+FFFD 策略。
-    const FFFD_OK: f64 = 0.001;
     if fffd_ratio(&s) <= FFFD_OK {
         return (s.into_owned(), enc.name());
     }
@@ -584,5 +688,105 @@ mod tests {
         let (s, enc) = decode_bytes(&data, None);
         assert_eq!(enc, "utf-16be");
         assert_eq!(s, text);
+    }
+
+    // ---- P7 采样检测 ----
+
+    #[test]
+    fn sample_detection_picks_gb18030_and_big5() {
+        let (gb, _, _) = encoding_rs::GB18030.encode("第一章 你好世界,潮汐页。这是一段简体中文正文。");
+        let (enc_g, from_cjk_g) = detect_by_sample(&gb);
+        assert_eq!(enc_g, encoding_rs::GB18030, "GBK 采样应判 GB18030");
+        assert!(from_cjk_g, "中文采样应来自汉字密度路径");
+        let (b5, _, _) = encoding_rs::BIG5.encode("這裡是繁體中文測試內容,潮汐頁閱讀器。");
+        let (enc_b, from_cjk_b) = detect_by_sample(&b5);
+        assert_eq!(enc_b, encoding_rs::BIG5, "Big5 采样应判 Big5");
+        assert!(from_cjk_b, "中文采样应来自汉字密度路径");
+    }
+
+    #[test]
+    fn sample_reliability_requires_non_ascii_and_low_fffd() {
+        assert!(sample_detection_reliable(b"\xA4\xA4", 0.0), "含非 ASCII 且无替换符");
+        assert!(!sample_detection_reliable(b"abcdef", 0.0), "全 ASCII 采样无从判断旧编码");
+        assert!(!sample_detection_reliable(b"\xA4\xA4", 0.02), "整本替换符超 1% 视为误判");
+        assert!(sample_detection_reliable(b"\xA4\xA4", 0.01), "恰好 1% 仍可信（<=）");
+    }
+
+    #[test]
+    fn sample_misjudge_falls_back_to_full_detection() {
+        // 采样区（前 200 字节）是干净的 GBK 正文 → 采样判 GB18030；后半段拼 0xFF 垃圾字节，
+        // 整本按 GB18030 解出的替换符占比 > 1% → 必须回退整本三候选判定，且最终仍判 GB18030。
+        let (body, _, _) = encoding_rs::GB18030
+            .encode("第一章 你好世界,潮汐页。这是一段简体中文正文,用于验证编码检测。");
+        let mut data: Vec<u8> = Vec::new();
+        for _ in 0..10 {
+            data.extend_from_slice(&body);
+        }
+        data.extend(std::iter::repeat(0xFFu8).take(60));
+        let (text, name, fell_back) = decode_auto_with_sample(&data, 200);
+        assert!(fell_back, "整本替换符超阈值应回退整本判定");
+        assert_eq!(name, encoding_rs::GB18030.name(), "回退后仍应判 GB18030");
+        assert!(text.contains("你好世界"), "回退后正文应正确, 实得: {text}");
+    }
+
+    #[test]
+    fn sample_non_ascii_ratio_counts_high_bytes() {
+        assert_eq!(sample_non_ascii_ratio(b""), 0.0, "空样本记 0");
+        assert_eq!(sample_non_ascii_ratio(b"plain ascii"), 0.0, "全 ASCII 为 0");
+        assert_eq!(
+            sample_non_ascii_ratio(&[0x80, 0x81, b'A', b'B']),
+            0.5,
+            "一半高位字节应为 0.5"
+        );
+    }
+
+    #[test]
+    fn candidate_path_low_information_falls_back_to_full() {
+        // 前 150 字节纯 ASCII + 随后 GBK 中文正文：采样（前 200 字节）只含少量中文，
+        // 非 ASCII 占比 25%（≥2%），汉字密度达不到 0.15 → 走候选路；候选解码不产生 U+FFFD，
+        // 必须由信息量守卫直接回退整本判定，最终正确判 GB18030。
+        let (body, _, _) = encoding_rs::GB18030.encode("你好世界,潮汐页。这是一段简体中文正文。");
+        let mut data: Vec<u8> = vec![b'A'; 150];
+        for _ in 0..20 {
+            data.extend_from_slice(&body);
+        }
+        let (text, name, fell_back) = decode_auto_with_sample(&data, 200);
+        assert!(fell_back, "候选路信息量不足应回退整本判定");
+        assert_eq!(name, encoding_rs::GB18030.name(), "回退后应判 GB18030");
+        assert!(text.contains("你好世界"), "回退后正文应正确, 实得: {text}");
+    }
+
+    #[test]
+    fn candidate_path_stays_trusted_for_near_ascii_sample() {
+        // 采样几乎全是 ASCII（10/512 ≈ 1.95% < 2%）：新守卫不得触发，仍按候选路正常返回。
+        let mut data: Vec<u8> = vec![0xE9; 10]; // Latin-1 的 é（放在采样区内）
+        data.extend(std::iter::repeat(b'A').take(1000));
+        let (_text, _name, fell_back) = decode_auto_with_sample(&data, 512);
+        assert!(!fell_back, "近全 ASCII 采样不应因信息量守卫回退");
+        // 纯 ASCII 输入：结果必须原样（任何单字节候选都能还原 ASCII），不因守卫产生乱码。
+        let ascii = b"hello world, plain ascii only";
+        let (text, _name, _fell_back) = decode_auto_with_sample(ascii, 512);
+        assert_eq!(text.as_bytes(), ascii, "纯 ASCII 输入应原样返回");
+    }
+
+    #[test]
+    fn sample_chain_keeps_utf8_and_forced_priority() {
+        // UTF-8 快路径在采样链之前命中，编码名与文本都不变。
+        let (s, enc) = decode_bytes("第一章 中文".as_bytes(), None);
+        assert_eq!(enc, "utf-8");
+        assert_eq!(s, "第一章 中文");
+        // 强制编码优先于自动判定：同一份 GBK 字节被强制按 Big5 解，判定名必须是 Big5。
+        let (gb, _, _) = encoding_rs::GB18030.encode("第一章 你好世界");
+        let (_t, forced_enc) = decode_bytes(&gb, Some("big5"));
+        assert_eq!(forced_enc, encoding_rs::BIG5.name(), "强制编码必须优先于自动链");
+    }
+
+    #[test]
+    fn auto_detection_on_real_file_path_uses_sample() {
+        // 端到端：GBK 字节（非 UTF-8）经 decode_bytes 应走采样链并判 GB18030。
+        let (body, _, _) = encoding_rs::GB18030.encode("第一章 你好世界,潮汐页。");
+        let (s, enc) = decode_bytes(&body, None);
+        assert_eq!(enc, encoding_rs::GB18030.name());
+        assert!(s.contains("你好世界"));
     }
 }

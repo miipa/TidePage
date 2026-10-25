@@ -577,6 +577,128 @@ pub fn clean_same_stem(dir: &Path, stem: &str, keep: &str) -> usize {
     removed
 }
 
+
+/* ---------------- C15：封面审计/手动清理（只读统计 + 仅删无主封面） ---------------- */
+
+#[derive(serde::Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverAudit {
+    pub dir: String,
+    pub files: i64,
+    pub bytes: u64,
+    pub valid_named: i64,
+    pub protected_files: i64,
+    pub protected_bytes: u64,
+    /// custom-* 用户自选封面：一律保留，不计入孤儿/可回收。
+    pub custom_files: i64,
+    pub custom_bytes: u64,
+    pub orphan_files: i64,
+    pub orphan_bytes: u64,
+    pub missing_files: i64,
+    pub same_stem_groups: i64,
+    pub same_stem_bytes: u64,
+    pub recoverable_bytes: u64,
+    pub last_scan_at: i64,
+    pub examples: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverCleanResult {
+    pub deleted: i64,
+    pub failed: i64,
+    pub freed_bytes: u64,
+    pub errors: Vec<String>,
+}
+
+fn cover_registry(referenced: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+    referenced.iter().map(|s| s.to_lowercase()).collect()
+}
+
+/// C15 纯统计：一次 readdir + metadata；不写库、不删文件。
+/// referenced 是 books.cover_path 的文件名集合（调用方只 SELECT）。
+pub fn audit_covers(dir: &Path, referenced: &std::collections::HashSet<String>) -> CoverAudit {
+    let mut out = CoverAudit { dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+    let refs = cover_registry(referenced);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    let mut by_stem: std::collections::HashMap<String, Vec<(String, u64, bool)>> = std::collections::HashMap::new();
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if !ft.is_file() { continue; }
+        let name = e.file_name().to_string_lossy().to_string();
+        let lower = name.to_lowercase();
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        out.files += 1;
+        out.bytes += size;
+        let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !is_cover_stem(&stem) {
+            out.protected_files += 1;
+            out.protected_bytes += size;
+            continue;
+        }
+        out.valid_named += 1;
+        existing.insert(lower.clone());
+        if stem.starts_with("custom-") {
+            out.custom_files += 1;
+            out.custom_bytes += size;
+            continue; // 用户自选封面：即便无引用也保留
+        }
+        let is_ref = refs.contains(&lower);
+        by_stem.entry(stem).or_default().push((lower, size, is_ref));
+        if !is_ref {
+            out.orphan_files += 1;
+            out.orphan_bytes += size;
+            if out.examples.len() < 8 { out.examples.push(name); }
+        }
+    }
+    for r in &refs {
+        if r.is_empty() { continue; }
+        let legal_name = !r.contains('/') && !r.contains('\\') && !r.contains("..");
+        let legal_stem = Path::new(r).file_stem().map(|s| is_cover_stem(&s.to_string_lossy())).unwrap_or(false);
+        if !legal_name || !legal_stem || !existing.contains(r) { out.missing_files += 1; }
+    }
+    for (_, rows) in by_stem {
+        if rows.len() < 2 { continue; }
+        out.same_stem_groups += 1;
+        let ref_count = rows.iter().filter(|(_, _, r)| *r).count();
+        if ref_count == 1 {
+            for (_, size, r) in &rows {
+                if !*r { out.same_stem_bytes += *size; }
+            }
+        }
+    }
+    out.recoverable_bytes = out.orphan_bytes + out.same_stem_bytes;
+    out
+}
+
+/// C15 清理：只删 is_cover_stem 命名且无引用的孤儿；保留 default/bg/background 等；
+/// 不修改任何 DB/书籍记录；单个失败继续并记录。
+pub fn clean_cover_orphans(dir: &Path, referenced: &std::collections::HashSet<String>) -> CoverCleanResult {
+    let refs = cover_registry(referenced);
+    let mut out = CoverCleanResult::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => { out.errors.push(format!("目录读取失败: {e}")); return out; }
+    };
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if !ft.is_file() { continue; }
+        let name = e.file_name().to_string_lossy().to_string();
+        let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !is_cover_stem(&stem) || stem.starts_with("custom-") { continue; }
+        if refs.contains(&name.to_lowercase()) { continue; }
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(e.path()) {
+            Ok(_) => { out.deleted += 1; out.freed_bytes += size; }
+            Err(err) => { out.failed += 1; out.errors.push(format!("{name}: {err}")); }
+        }
+    }
+    out
+}
 /// 落盘一张封面：够用直出（原始字节 + 嗅探扩展名），否则解码缩放重编码为 PNG。
 /// 写入后清理同一 stem 的其它扩展名旧文件（保留刚写入的那个）。
 /// 返回 (文件名, 是否直出)。
@@ -840,6 +962,42 @@ mod tests {
         let author_h = if l.author.is_some() { l.font_size + 8 } else { 0 };
         let block_h = l.lines.len() * l.line_h + author_h;
         assert!(block_h <= l.area_h, "block {block_h} exceeds area {}", l.area_h);
+    }
+
+
+    #[test]
+    fn c15_cover_audit_and_clean_only_orphans() {
+        let dir = std::env::temp_dir().join(format!("tp-c15-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, size) in [("1.png", 1usize), ("1.webp", 2), ("2.jpg", 3), ("2.png", 4), ("custom-3.png", 5), ("custom-4.png", 8), ("default-cover.img", 6), ("background.img", 7)] {
+            std::fs::write(dir.join(name), vec![0u8; size]).unwrap();
+        }
+        let refs: std::collections::HashSet<String> = ["2.jpg", "custom-3.png", "9.png", "bad/../x.png"].iter().map(|s| s.to_string()).collect();
+        let a = audit_covers(&dir, &refs);
+        assert_eq!(a.files, 8);
+        assert_eq!(a.bytes, 36);
+        assert_eq!(a.valid_named, 6);
+        assert_eq!(a.protected_files, 2);
+        assert_eq!(a.custom_files, 2);
+        assert_eq!(a.custom_bytes, 13);
+        assert_eq!(a.orphan_files, 3);
+        assert_eq!(a.orphan_bytes, 7);
+        assert_eq!(a.missing_files, 2);
+        assert_eq!(a.same_stem_groups, 2);
+        assert_eq!(a.same_stem_bytes, 4); // 只算 2.png（组内正好一份被引用）
+        assert_eq!(a.recoverable_bytes, 11);
+        let r = clean_cover_orphans(&dir, &refs);
+        assert_eq!(r.deleted, 3);
+        assert_eq!(r.failed, 0);
+        assert!(dir.join("2.jpg").exists());
+        assert!(dir.join("custom-3.png").exists());
+        assert!(dir.join("custom-4.png").exists());
+        assert!(dir.join("default-cover.img").exists());
+        assert!(dir.join("background.img").exists());
+        assert!(!dir.join("1.png").exists());
+        assert!(!dir.join("2.png").exists());
+        assert!(audit_covers(&std::env::temp_dir().join("tp-c15-missing-definitely"), &refs).files == 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tidepage"
-version = "0.1.31"
+version = "0.1.32"
 description = "TidePage - a fast local reading app"
 authors = ["you"]
 edition = "2021"
@@ -8,6 +8,10 @@ edition = "2021"
 [lib]
 name = "tidepage_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# B8：仅显式开启时才编译 sanitize/MOBI 子阶段 profile 插桩，默认生产零开销。
+sanitize-profile = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -64,6 +68,8 @@ windows = { version = "0.61", features = [
     "Storage_Streams",
     "Graphics_Imaging",
     "Win32_System_WinRT",
+    # B3：VACUUM 前读取磁盘剩余空间（GetDiskFreeSpaceExW）
+    "Win32_Storage_FileSystem",
 ] }
 
 [profile.release]

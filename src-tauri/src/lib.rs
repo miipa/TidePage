@@ -4,7 +4,10 @@ mod bookmeta;
 mod convert;
 mod covers;
 mod dav;
+mod databackup;
+mod davsync;
 mod db;
+mod duplicates;
 mod epub;
 mod fonts;
 mod library;
@@ -13,6 +16,7 @@ mod pdfnative;
 mod pdfscan;
 mod mobi;
 mod models;
+mod parsecache;
 mod sanitize;
 mod secret;
 mod txt;
@@ -442,29 +446,10 @@ pub fn run() {
             let covers_dir = data_dir.join("covers");
             std::fs::create_dir_all(&covers_dir).ok();
             db::reset_epub_covers(&conn, &covers_dir);
-            // 封面自愈（每个进程最多一次）：cover_path 指向的文件已不存在时复位，交给扫描重建。
-            // 必须落在 create_dir_all 之后、ensure_scan_worker（下一步）之前：worker 一旦开始认领，
-            // 复位就会与在途的 meta_done=1 记录交叉（那本书会被当成"已完成"跳过，封面永远是空的）。
-            // manual 模式下整段跳过：不复位、也不写任何标记。
-            match db::get_setting(&conn, library::COVER_SCAN_MODE_KEY).as_deref() {
-                Some("manual") => {
-                    memlog::stage("setup:cover_heal_skipped_manual");
-                }
-                Some(_) => {
-                    let rep = db::heal_missing_covers(&conn, &covers_dir);
-                    library::mark_cover_heal_done();
-                    library::log_cover_heal(&rep);
-                    memlog::stage(&format!(
-                        "setup:cover_heal scanned={} reset={} custom={}",
-                        rep.scanned, rep.reset, rep.reset_custom
-                    ));
-                }
-                // 键还不存在（升级后第一次启动）：此时无法判断手动/自动，先不动；
-                // 前端启动时必定推一次 set_cover_scan，由那里补做（模式未知时不猜）。
-                None => {
-                    memlog::stage("setup:cover_heal_deferred");
-                }
-            }
+            // R11-3：封面自愈与封面扫描都推迟到「书库首屏就绪」之后（library_ready 命令）：
+            // 启动期不再做全库封面核对，也不启动扫描 worker，首屏不再被后台扫描抢占 I/O/内存。
+            // self-heal 的进程内一次性标记（COVER_HEAL_DONE）与崩溃保护语义保持不变。
+            memlog::stage("setup:cover_heal_deferred");
             memlog::stage("setup:covers_dir");
             // 共享 client 不再全局放宽 TLS：公网目标严格校验证书。按目标本机/私有
             // 选择 client 的逻辑集中在 ai::build_client（带缓存），此字段仅作通用兜底。
@@ -481,25 +466,38 @@ pub fn run() {
                 rules_ver: std::sync::atomic::AtomicU64::new(1),
                 txt_cache: Mutex::new(std::collections::HashMap::new()),
                 epub_cache: Mutex::new(std::collections::HashMap::new()),
+                epub_cache_order: Mutex::new(Vec::new()),
                 epub_stats_cache: Mutex::new(std::collections::HashMap::new()),
                 chapter_cache: Mutex::new(library::ChapterCache::new(80)),
                 image_cache: Mutex::new(std::collections::HashMap::new()),
                 http,
                 scan_running: std::sync::atomic::AtomicBool::new(false),
                 scan_stop: std::sync::atomic::AtomicBool::new(false),
+                library_ready: std::sync::atomic::AtomicBool::new(false),
+                scan_paused: std::sync::atomic::AtomicBool::new(false),
+                maintenance_running: std::sync::atomic::AtomicBool::new(false),
+                fts_optimize_running: std::sync::atomic::AtomicBool::new(false),
+                formats_cache: Mutex::new(None),
+                formats_epoch: std::sync::atomic::AtomicU64::new(0),
                 scan_start_count: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_done: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_total: std::sync::atomic::AtomicU64::new(0),
                 cover_scan_enabled: std::sync::atomic::AtomicBool::new(true),
                 cover_scan_ws_base: std::sync::atomic::AtomicU64::new(0),
                 cover_style_ver: std::sync::atomic::AtomicU64::new(1),
+                fts_index_running: std::sync::atomic::AtomicBool::new(false),
+                book_meta: Mutex::new(std::collections::HashMap::new()),
+                last_open_book: std::sync::atomic::AtomicI64::new(i64::MIN),
+                epub_stats_flights: Mutex::new(std::collections::HashMap::new()),
+                mobi_manifest_cache: Mutex::new(Vec::new()),
             });
             app.manage(state.clone());
 
             // 冷启动增量扫描：处理全部 `meta_done=0`（含存量与新增），逐本提交、扫完即静默。
             // 不再一次性把全部未处理 id 载入内存；worker 内部分批查询 + 限流（见 library::on_startup）。
+            // R11-3：这里不再启动扫描 worker；由前端首屏就绪后的 library_ready 命令拉起
+            //（见 library::library_ready：置 ready → 封面自愈 → ensure_scan_worker）。
             memlog::stage("setup:state_ready");
-            library::ensure_scan_worker(&app.handle().clone());
 
             {
                 let st = state.clone();
@@ -647,39 +645,45 @@ pub fn run() {
                     ),
                 }
             } else if let Some(raw) = path.strip_prefix("res/") {
-                // MOBI/AZW3 提取出的正文插图：res/<book_id>/<file>，路径固定两段。
-                // book_id 只接受纯数字目录名；文件名再走 resolve_under（只允许单一文件名）。
+                // MOBI/AZW3 正文插图：res/<book_id>/<file>，路径固定两段；book_id 只接受纯数字。
+                // R8-1：优先按需读取（Lazy 清单 → 源文件区间；旧 Files 目录 → 文件），
+                // 读取失败再回退现有 resolve_under 文件路径（安全校验不变，缺失时返回空 image/png）。
                 let decoded = percent_decode(raw);
                 let segs: Vec<&str> = decoded.split('/').collect();
-                let served = if segs.len() == 2
+                let mut served: Option<(String, Vec<u8>)> = None;
+                if segs.len() == 2
                     && !segs[0].is_empty()
                     && segs[0].bytes().all(|b| b.is_ascii_digit())
+                    && crate::mobi::is_res_image_name(segs[1])
                 {
-                    let base = dir.parent().unwrap_or(&dir).join("res").join(segs[0]);
-                    resolve_under(&base, segs[1])
-                        .and_then(|f| read_protocol_file(&f).map(|b| (f, b)))
-                } else {
-                    None
-                };
-                match served {
-                    Some((file, b)) => {
-                        let ext = file
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        let m = match ext.as_str() {
-                            "png" => "image/png",
-                            "jpg" | "jpeg" => "image/jpeg",
-                            "gif" => "image/gif",
-                            "webp" => "image/webp",
-                            "bmp" => "image/bmp",
-                            _ => "application/octet-stream",
-                        };
-                        (m.to_string(), b)
+                    let bid: i64 = segs[0].parse().unwrap_or(0);
+                    served = ctx
+                        .app_handle()
+                        .try_state::<std::sync::Arc<library::AppState>>()
+                        .and_then(|st| library::read_mobi_res_image(&st, bid, segs[1]));
+                    if served.is_none() {
+                        let base = dir.parent().unwrap_or(&dir).join("res").join(segs[0]);
+                        served = resolve_under(&base, segs[1]).and_then(|f| {
+                            read_protocol_file(&f).map(|b| {
+                                let ext = f
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("")
+                                    .to_lowercase();
+                                let m = match ext.as_str() {
+                                    "png" => "image/png",
+                                    "jpg" | "jpeg" => "image/jpeg",
+                                    "gif" => "image/gif",
+                                    "webp" => "image/webp",
+                                    "bmp" => "image/bmp",
+                                    _ => "application/octet-stream",
+                                };
+                                (m.to_string(), b)
+                            })
+                        });
                     }
-                    None => ("image/png".to_string(), Vec::new()),
                 }
+                served.unwrap_or_else(|| ("image/png".to_string(), Vec::new()))
             } else if let Some(raw) = path.strip_prefix("bg/") {
                 // 与 covers/res/epubimg 一致：空名、`..` 或含路径分隔的越界名一律拒绝，
                 // 规范化为纯文件名后再读取，避免任意文件读取。
@@ -746,6 +750,12 @@ pub fn run() {
             library::list_books_page,
             library::list_order_index,
             library::list_formats,
+            library::list_tags,
+            library::list_book_tags,
+            library::create_tag,
+            library::rename_tag,
+            library::delete_tag,
+            library::set_book_tags,
             library::set_read_state,
             library::list_books_by_ids,
             library::rescan,
@@ -766,6 +776,13 @@ pub fn run() {
             library::pick_folder,
             library::pick_save,
             library::export_ai,
+            library::write_text_file,
+            databackup::export_data_backup,
+            databackup::inspect_data_backup,
+            databackup::restore_data_backup,
+            davsync::webdav_sync_data,
+            duplicates::find_duplicate_books,
+            duplicates::cancel_duplicate_scan,
             library::set_mobi_encoding,
             library::set_custom_cover,
             library::read_book_bytes,
@@ -784,6 +801,9 @@ pub fn run() {
             library::set_book_cover_image,
             library::set_cover_scan,
             library::library_ready,
+            library::set_scan_paused,
+            library::boot_stage,
+            library::locate_epub_anchor,
             library::list_book_ids_page,
             library::pdf_books_missing_cover,
             library::set_pdf_page_text,
@@ -805,6 +825,11 @@ pub fn run() {
             library::get_setting_kv,
             library::app_data_dir,
             library::storage_stats,
+            library::cover_audit,
+            library::clean_cover_orphans,
+            duplicates::duplicate_display_hidden,
+            library::clear_parse_cache,
+            library::vacuum_db,
             library::clear_cache,
             library::meta_debug_stats,
             library::scan_progress,
@@ -817,6 +842,10 @@ pub fn run() {
             library::delete_bookmark,
             library::add_stats,
             library::get_stats,
+            library::get_reading_stats,
+            library::record_sync_tombstone,
+            library::maintenance_history,
+            library::maintenance_status,
             library::ai_chat,
             library::ai_test,
             library::tts_synth,

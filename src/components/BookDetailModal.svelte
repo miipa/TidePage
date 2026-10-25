@@ -1,8 +1,11 @@
 <script lang="ts">
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { onMount, onDestroy } from "svelte";
+  import { emit } from "@tauri-apps/api/event";
+  import type { TagInfo } from "../lib/api";
   import { api, coverUrl } from "../lib/api";
-  import { regeneratePdfCover } from "../lib/pdf";
+
+  import { COVER_FAIL_KEY } from "../lib/openError";
 import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   import { appConfirm, copyText, toast } from "../lib/stores.svelte";
   import { outDissolve, outFade } from "../lib/motion";
@@ -28,6 +31,9 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   let coverTick = $state(0);
   /** 从文件名识别出的建议（只展示，不自动保存/写库）。 */
   let suggestion = $state<{ title: string; author: string } | null>(null);
+  let allTags: TagInfo[] = $state([]);
+  let bookTags: TagInfo[] = $state([]);
+  let newTag = $state("");
 
   const cover = $derived(coverUrl(book) + (coverTick ? `&t=${coverTick}` : ""));
 
@@ -45,7 +51,42 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
     try { wc = await api.bookWordCount(book.id); } catch { /* ignore */ }
     try { progress = await api.loadProgress(book.id); } catch { /* ignore */ }
     try { suggestion = await api.suggestMeta(book.path); } catch { /* 建议失败不影响详情框 */ }
+    try {
+      allTags = await api.listTags();
+      bookTags = await api.listBookTags(book.id);
+    } catch { /* 标签读取失败不影响详情框 */ }
   });
+
+  async function saveBookTags(next: TagInfo[]) {
+    try {
+      await api.setBookTags(book.id, next.map((x) => x.id));
+      bookTags = next;
+      allTags = await api.listTags();
+      await emit("library-tags-changed");
+    } catch {
+      toast(t("toast.tags.saveFailed"), "error");
+    }
+  }
+
+  function toggleBookTag(tag: TagInfo) {
+    const has = bookTags.some((x) => x.id === tag.id);
+    void saveBookTags(has ? bookTags.filter((x) => x.id !== tag.id) : [...bookTags, tag]);
+  }
+
+  async function addNewTag() {
+    const name = newTag.trim();
+    if (!name) return;
+    try {
+      const tag = await api.createTag(name);
+      newTag = "";
+      allTags = await api.listTags();
+      if (!bookTags.some((x) => x.id === tag.id)) {
+        await saveBookTags([...bookTags, { ...tag, book_count: 0 }]);
+      }
+    } catch (e) {
+      toast(errText(e), "error");
+    }
+  }
   onDestroy(() => {
     if (keyHandler) window.removeEventListener("keydown", keyHandler, true);
   });
@@ -152,13 +193,14 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
 
   async function reextract() {
     try {
-      const name = book.format === "pdf" ? await regeneratePdfCover(book.id, 320) : await api.reextractCover(book.id);
+      const name = book.format === "pdf" ? await (await import("../lib/pdf")).regeneratePdfCover(book.id, 320) : await api.reextractCover(book.id);
       book.cover_path = name;
       book.cover_ver = (book.cover_ver ?? 0) + 1;
       coverTick = Date.now();
       toast(t("toast.library.coverReextracted"));
-    } catch (e) {
-      toast(errText(e), "error");
+    } catch {
+      // R13-A4：封面失败统一短文案，不暴露底层异常。
+      toast(t(COVER_FAIL_KEY), "error");
     }
   }
 </script>
@@ -230,7 +272,22 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
           </div>
         </div>
 
-        <div class="bd-sec">{t("bookDetail.history")}</div>
+        <div class="bd-field">
+      <div class="bd-sec">{t("bookDetail.tags")}</div>
+      <div class="bd-row" style="flex-wrap:wrap; gap:6px;">
+        {#each allTags as tag (tag.id)}
+          <button class="tag" class:active={bookTags.some((x) => x.id === tag.id)} onclick={() => toggleBookTag(tag)}>{tag.name}</button>
+        {:else}
+          <span class="tip">{t("bookDetail.noTags")}</span>
+        {/each}
+      </div>
+      <div class="bd-row">
+        <input placeholder={t("bookDetail.newTagPlaceholder")} bind:value={newTag} />
+        <button class="bd-suggest-apply" onclick={addNewTag}>{t("bookDetail.addTag")}</button>
+      </div>
+    </div>
+
+    <div class="bd-sec">{t("bookDetail.history")}</div>
         <div class="bd-summary">
           <div class="bd-s"><b>{fmtDur(totalSeconds)}</b><span>{t("bookDetail.stat.totalTime")}</span></div>
           <div class="bd-s"><b>{fmtChars(totalChars)}</b><span>{t("bookDetail.stat.readChars")}</span></div>

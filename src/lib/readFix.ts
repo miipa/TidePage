@@ -15,7 +15,7 @@
 //
 // 幂等：固定 id="__read_fix"，重复调用只替换 textContent，绝不 append。
 // 注入点不依赖 </head>：用 document.getElementById("chapter-content") 判空，
-// 为空时 console.warn("[fixfont] NO #chapter-content") 并返回，不静默。
+// 为空时返回 null（仅 DEV 下打一行 [fixfont] 警示）——生产构建不残留排版日志。
 
 export interface ReadFixOptions {
   /** 正文字体栈（CSS font-family 值） */
@@ -106,13 +106,13 @@ export function clearReadFix(): void {
 export function applyReadFix(o: ReadFixOptions): { stripped: number; html: number } | null {
   const root = document.getElementById("chapter-content");
   if (!root) {
-    console.warn("[fixfont] NO #chapter-content");
+    if (import.meta.env.DEV) console.warn("[fixfont] NO #chapter-content");
     return null;
   }
   const stripped = stripLegacyFontAttrs(root);
   const css = buildReadFixCss(o);
-  // 配置下发链路日志：最终 CSS 长度 + 前 120 字符（font-family 在首行，便于核对新值）
-  console.log("READ_CSS", `len=${css.length} head=${css.slice(0, 120)}`);
+  // 配置下发链路日志：最终 CSS 长度 + 前 120 字符（font-family 在首行，便于核对新值）；仅 DEV。
+  if (import.meta.env.DEV) console.log("READ_CSS", `len=${css.length} head=${css.slice(0, 120)}`);
   let tag = document.getElementById(READ_FIX_STYLE_ID) as HTMLStyleElement | null;
   if (!tag) {
     tag = document.createElement("style");
@@ -121,6 +121,6 @@ export function applyReadFix(o: ReadFixOptions): { stripped: number; html: numbe
   }
   tag.textContent = css;
   const html = root.innerHTML.length;
-  console.log(`[fixfont] injected, stripped=${stripped}, html=${html}`);
+  if (import.meta.env.DEV) console.log(`[fixfont] injected, stripped=${stripped}, html=${html}`);
   return { stripped, html };
 }

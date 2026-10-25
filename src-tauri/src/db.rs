@@ -1,6 +1,7 @@
 use crate::models::{BookRow, Progress};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,6 +138,28 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             body TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(book_id, chapter_index)
         );
+        -- TXT 编码自动判定缓存（P7）：带文件指纹，命中即跳过 chardetng/GB18030/Big5 三候选检测。
+        CREATE TABLE IF NOT EXISTS txt_encoding(
+            book_id INTEGER PRIMARY KEY,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0,
+            enc TEXT NOT NULL DEFAULT ''
+        );
+        -- EPUB 逐章字数统计缓存（P8）：带文件指纹，跨重启短路整本解析。
+        CREATE TABLE IF NOT EXISTS epub_stats(
+            book_id INTEGER PRIMARY KEY,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            pure INTEGER NOT NULL DEFAULT 0,
+            per_chapter TEXT NOT NULL DEFAULT '[]'
+        );
+        -- FTS 元信息（P12）：记录每本书已写入 fts 的行数，避免在 fts5 的 UNINDEXED book_id 上
+        -- 每次 count(*)/DELETE 全表扫描。meta 与实例不一致时仍以期望章数为准重建。
+        CREATE TABLE IF NOT EXISTS fts_meta(
+            book_id INTEGER PRIMARY KEY,
+            rows INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS stats(
             day TEXT NOT NULL,
             book_id INTEGER NOT NULL,
@@ -202,6 +225,23 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         .unwrap_or(false);
     if !has_hl_color {
         conn.execute("ALTER TABLE highlights ADD COLUMN color TEXT NOT NULL DEFAULT ''", [])
+            .ok();
+    }
+    // B9：条目标记 updated_at（幂等补列 + created_at 回填，0 保留 0）。
+    for table in ["bookmarks", "highlights", "tags"] {
+        let exists: bool = conn
+            .query_row(
+                &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name='updated_at'"),
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !exists {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"), [])
+                .ok();
+        }
+        conn.execute(&format!("UPDATE {table} SET updated_at=created_at WHERE updated_at=0"), [])
             .ok();
     }
     // last_read 一次性回填（新列/旧库）：= max(last_opened, 该书 progress.updated_at)。
@@ -275,9 +315,40 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         CREATE INDEX IF NOT EXISTS idx_books_lastread_id ON books(last_read DESC, id DESC);
         -- 「按文件大小」：与 ORDER BY size DESC, id DESC 逐列一致（反向可用索引回扫）。
         CREATE INDEX IF NOT EXISTS idx_books_size_id ON books(size DESC, id DESC);
+        -- R11-1：格式分组/统计（list_formats 的 GROUP BY）走覆盖索引；实测 75ms→8ms。
+        -- 注意：格式筛选子句用 +b.format（见 build_book_filter），避免规划器选它后丢排序索引、
+        -- 退化成「先按 format 搜再临时排序」（实测 3ms→99ms）。
+        CREATE INDEX IF NOT EXISTS idx_books_format ON books(format);
+        -- D3：标签与书籍关联（标签不写 books 表；删书路径显式清理 book_tags）。
+        CREATE TABLE IF NOT EXISTS tags(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            norm TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS book_tags(
+            book_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            PRIMARY KEY(book_id, tag_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_book_tags_tag ON book_tags(tag_id, book_id);
+        -- B9：同步删除墓碑（幂等；按 kind+稳定 key 记录删除时间，不推断缺失删除）。
+        CREATE TABLE IF NOT EXISTS sync_tombstones(
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            deleted_at INTEGER NOT NULL,
+            PRIMARY KEY(kind, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_tombstones_deleted ON sync_tombstones(deleted_at);
         CREATE INDEX IF NOT EXISTS idx_highlights_book ON highlights(book_id);
         CREATE INDEX IF NOT EXISTS idx_highlights_created ON highlights(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sessions_book ON reading_sessions(book_id);
+        -- A1：统计区间/小时聚合索引（幂等，无迁移）。
+        CREATE INDEX IF NOT EXISTS idx_sessions_day ON reading_sessions(day);
+        CREATE INDEX IF NOT EXISTS idx_sessions_started ON reading_sessions(started_at);
+        -- A2：path 前缀范围 + 排序不走 path-first 复合索引（范围列在前无法提供全局排序）；
+        -- 查询侧在 folder 生效时用 INDEXED BY 强制排序索引扫描，再过滤路径前缀（见 books_from_clause）。
         CREATE INDEX IF NOT EXISTS idx_progress_book ON progress(book_id);
         CREATE INDEX IF NOT EXISTS idx_progress_updated ON progress(updated_at DESC);
         -- 增量扫描的关键索引：让 `WHERE meta_done=0 ORDER BY id LIMIT 200`
@@ -337,7 +408,16 @@ pub fn migrate_book_ids(conn: &Connection) {
                 .execute("UPDATE books SET id=?1 WHERE id=?2", params![new_id, old_id])
                 .is_ok()
             {
-                for table in ["progress", "txt_cache", "bookmarks", "reading_sessions", "highlights"] {
+                for table in [
+                    "progress",
+                    "txt_cache",
+                    "bookmarks",
+                    "reading_sessions",
+                    "highlights",
+                    "txt_encoding",
+                    "epub_stats",
+                    "fts_meta",
+                ] {
                     conn.execute(
                         &format!("UPDATE {table} SET book_id=?1 WHERE book_id=?2"),
                         params![new_id, old_id],
@@ -359,18 +439,37 @@ pub fn migrate_book_ids(conn: &Connection) {
 /// 章节切分算法版本。改变 `txt.rs` 的切分策略（如引入 `MAX_CHAPTER_CHARS` 细分、
 /// toc/ranges 数量变化）后应递增此值，令按**旧 toc** 写入的搜索缓存（chapter_text）
 /// 与 FTS 索引作废，下次搜索/索引时按新 toc 懒重建，避免划词全文搜索定位到错误章节。
-pub const CHAPTER_SPLIT_VER: &str = "2";
+pub const CHAPTER_SPLIT_VER: &str = "4";
 
-/// 若存储的切分版本与当前不一致，一次性清空 chapter_text 与 fts（存在才清），再记下新版本。
-/// 幂等、可重入：清空后立即写版本号；重开应用再搜索时按新 toc 懒重建。
-/// 不触碰 progress（阅读进度存 chapter_index，切分变化带来的轻微偏移为可接受回退）。
+/// 若存储的切分版本与当前不一致，作废旧搜索缓存并记下新版本。幂等、可重入。
+///
+/// 关键约束：**启动期不能逐行 DELETE 大表**。真实库 1.88GB 上 DELETE FROM chapter_text
+/// （普通表逐行删）与 DELETE FROM fts（FTS5 虚拟表逐行删）会卡在建主窗口之前几十秒以上，
+/// 用户表现为窗口一直不出现（Responding=False）。因此按版本分两条路径：
+/// - "2"/"3"（前几批构建写入）：只写版本号，零删除。P11/R6-1 只改变「会被切分/自动切章
+///   的图片页书」的章号，普通书的 chapter_text/fts 仍然有效；切分书的旧缓存由 open_book
+///   按书懒清理。启动期绝不逐行 DELETE（真实库上会卡死窗口出现）。
+/// - 其它更旧值（缺失/"1" 等）：一次性作废整库缓存，但用 DROP/重建（O(索引) 级），
+///   仍不允许逐行 DELETE。
 pub fn migrate_chapter_split(conn: &Connection) {
-    if get_setting(conn, "chapter_split_ver").as_deref() == Some(CHAPTER_SPLIT_VER) {
+    let cur = get_setting(conn, "chapter_split_ver").unwrap_or_default();
+    if cur == CHAPTER_SPLIT_VER {
         return;
     }
-    conn.execute("DELETE FROM chapter_text", []).ok();
-    // fts 为虚拟表，可能尚未创建；存在才清。
-    let has_fts_tbl: bool = conn
+    if cur == "2" || cur == "3" {
+        // 零成本升级：只改版本号。切分/自动切章书的搜索缓存由 open_book 调
+        // invalidate_split_book_search_cache 按书懒清（见该函数说明）。
+        set_setting(conn, "chapter_split_ver", CHAPTER_SPLIT_VER);
+        return;
+    }
+    // 更旧库：整库作废。FTS 直接 DROP 后重建：
+    // - FTS5 的 delete-all 只适用于 contentless/external content 表，本表是普通 content 表，
+    //   执行会报错（实测 "'delete-all' may only be used with a contentless or external
+    //   content fts5 table"），写它只是死代码；
+    // - 逐行 DELETE FROM fts 在真实库 63,867 行上会卡启动（P11 卡死启动的根因）。
+    // DROP 是删整棵索引树（非逐行），实测仍明显快于逐行删除。
+    let t0 = std::time::Instant::now();
+    let fts_table_exists = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts'",
             [],
@@ -378,10 +477,64 @@ pub fn migrate_chapter_split(conn: &Connection) {
         )
         .map(|c| c > 0)
         .unwrap_or(false);
-    if has_fts_tbl {
-        conn.execute("DELETE FROM fts", []).ok();
+    if fts_table_exists {
+        conn.execute("DROP TABLE IF EXISTS fts", []).ok();
     }
+    let fts_drop_ms = t0.elapsed().as_millis();
+    // chapter_text 用 DROP + 按 init 的原 schema 重建：比逐行 DELETE 快几个数量级。
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS chapter_text;
+         CREATE TABLE IF NOT EXISTS chapter_text(
+            book_id INTEGER NOT NULL,
+            chapter_index INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(book_id, chapter_index)
+         );",
+    )
+    .ok();
+    // P12：fts 清空的同时清 meta，否则旧 meta 行数可能与新期望巧合相等而误判「已索引」。
+    conn.execute("DELETE FROM fts_meta", []).ok();
+    // 表被 DROP 过或原本不存在时重建，保证后续搜索/索引路径可用（已存在时是 no-op）。
+    ensure_fts(conn).ok();
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+        eprintln!(
+            "[db] migrate_chapter_split old path fts_drop={fts_drop_ms}ms total={}ms",
+            t0.elapsed().as_millis()
+        );
+    }
+    // 版本号最后写：中途失败下次重跑仍是幂等的清理。
     set_setting(conn, "chapter_split_ver", CHAPTER_SPLIT_VER);
+}
+
+/// P11 切分书的搜索缓存按书懒清理（open_book 在确认 split 后调用）。
+///
+/// 为什么不在启动期整库清：真实库 1.88GB 上逐行 DELETE 会卡死启动（见 migrate_chapter_split）。
+/// 这里只做三件廉价事：
+/// 1) DELETE FROM chapter_text WHERE book_id=?（PK 前缀，快）；
+/// 2) fts_meta 写负哨兵 -1（必然 != 期望章数，下次索引检查直接走重建，避免 count(*) 全表扫描）；
+/// 3) 写 marker（值 = 文件指纹，文件替换后允许重新清理）。
+/// **不执行 DELETE FROM fts WHERE book_id**：FTS5 的 book_id 是 UNINDEXED，会全表扫描；
+/// 而且 state.db.0 是全局 Mutex，后台大删除会卡住其它读写。旧 FTS 行由该书下次索引/重建时
+/// 已有的 DELETE 路径删掉；在此之前全局搜索可能短暂返回该书的旧行（一次性小瑕疵）。
+pub fn invalidate_split_book_search_cache(
+    conn: &Connection,
+    book_id: i64,
+    expected_chapters: i64,
+    stamp_value: &str,
+) {
+    let key = format!("epub.split_search_clean.{book_id}");
+    if get_setting(conn, &key).as_deref() == Some(stamp_value) {
+        return;
+    }
+    conn.execute("DELETE FROM chapter_text WHERE book_id=?1", params![book_id])
+        .ok();
+    conn.execute("DELETE FROM fts_meta WHERE book_id=?1", params![book_id])
+        .ok();
+    // 负哨兵必然 != 期望章数；用 expected_chapters 只为把语义写清楚（负数不可能出现）。
+    let sentinel = if expected_chapters >= 0 { -1 } else { -2 };
+    set_fts_meta(conn, book_id, sentinel);
+    set_setting(conn, &key, stamp_value);
 }
 
 pub fn reset_epub_covers(conn: &Connection, covers_dir: &std::path::Path) {
@@ -623,6 +776,102 @@ pub fn ensure_fts(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// B2：FTS 空闲 optimize 的阈值与判定。marker 无记录时仅在体积超阈值后自动执行一次；
+/// 有记录时超期（7 天）或体积超阈值且行数变化 >2% 才再次执行；运行中/暂停中一律不执行。
+pub const FTS_OPT_MIN_BYTES: i64 = 256 * 1024 * 1024;
+pub const FTS_OPT_INTERVAL_SECS: i64 = 7 * 24 * 3600;
+pub const FTS_OPT_ROW_DELTA_PCT: f64 = 2.0;
+
+#[allow(clippy::too_many_arguments)]
+pub fn should_optimize_fts(
+    now: i64,
+    last_at: i64,
+    last_bytes: i64,
+    last_rows: i64,
+    bytes: i64,
+    rows: i64,
+    running: bool,
+    paused: bool,
+) -> bool {
+    if running || paused || bytes < FTS_OPT_MIN_BYTES {
+        return false;
+    }
+    if last_at <= 0 {
+        return true; // 无 marker：体积已超阈值，自动执行一次（成功后写 marker）
+    }
+    if now.saturating_sub(last_at) >= FTS_OPT_INTERVAL_SECS {
+        return true;
+    }
+    if last_bytes > 0 {
+        let delta = (bytes - last_bytes).abs() as f64 / last_bytes as f64 * 100.0;
+        if delta > 10.0 {
+            return true;
+        }
+    }
+    if last_rows > 0 {
+        let delta = (rows - last_rows).abs() as f64 / last_rows as f64 * 100.0;
+        if delta > FTS_OPT_ROW_DELTA_PCT {
+            return true;
+        }
+    }
+    false
+}
+
+/// B2：FTS 相关表占用（dbstat 按 pgsize 求和）与总行数；dbstat 不可用时返回 None。
+pub fn fts_stats(conn: &Connection) -> Option<(i64, i64)> {
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name LIKE 'fts%'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fts", [], |r| r.get(0))
+        .unwrap_or(0);
+    Some((bytes, rows))
+}
+
+/// R11-4：FTS5 索引整理（只压缩索引、不删数据）。副本库实测：1.39GB FTS 耗时约 14.6s，
+/// fts_data 944.6MB→850.8MB（约 -94MB），MATCH 0.15ms→0.01ms；只在 rebuild_fts_inner
+/// 完成后调用，**启动期不执行**。
+pub fn optimize_fts(conn: &Connection) -> Result<(), String> {
+    conn.execute("INSERT INTO fts(fts) VALUES('optimize')", [])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 读取某本书的 FTS 元信息（已写入行数）。P12：一致性检查优先用它，避免 fts5 全表 count(*)。
+pub fn get_fts_meta(conn: &Connection, book_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT rows FROM fts_meta WHERE book_id=?1",
+        params![book_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap_or(None)
+}
+
+/// 写入/更新某本书的 FTS 元信息（upsert）。
+pub fn set_fts_meta(conn: &Connection, book_id: i64, rows: i64) {
+    conn.execute(
+        "INSERT INTO fts_meta(book_id, rows) VALUES(?1,?2)
+         ON CONFLICT(book_id) DO UPDATE SET rows=?2",
+        params![book_id, rows],
+    )
+    .ok();
+}
+
+/// 删除某本书的 FTS 元信息（重建前先删，崩溃后残留半成品不会被误判为已索引）。
+pub fn delete_fts_meta(conn: &Connection, book_id: i64) {
+    conn.execute("DELETE FROM fts_meta WHERE book_id=?1", params![book_id]).ok();
+}
+
+/// 清空全部 FTS 元信息（全库重建前调用）。
+pub fn clear_fts_meta(conn: &Connection) {
+    conn.execute("DELETE FROM fts_meta", []).ok();
+}
+
 pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| r.get(0))
         .optional()
@@ -758,13 +1007,16 @@ pub fn build_book_filter(
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
     folder: &Option<String>,
+    tags: &Option<Vec<String>>,
 ) -> (String, Vec<Value>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
     if let Some(fs) = formats {
         if !fs.is_empty() {
             let ph = std::iter::repeat("?").take(fs.len()).collect::<Vec<_>>().join(",");
-            conds.push(format!("b.format IN ({ph})"));
+            // R11-1：一元 + 让该条件不可走 idx_books_format（否则规划器会先按 format 搜、
+            // 再对全部命中行做临时排序：实测格式筛选+排序 3ms→99ms）。格式统计仍用该索引。
+            conds.push(format!("+b.format IN ({ph})"));
             for f in fs {
                 params.push(Value::Text(f.clone()));
             }
@@ -802,6 +1054,28 @@ pub fn build_book_filter(
             params.push(Value::Text(hi));
         }
     }
+    if let Some(ts) = tags {
+        let norms = normalize_tag_norms(ts);
+        if !norms.is_empty() {
+            // D3 优化：集合式（一次 GROUP BY 求出命中书集合），不要对每本书做相关子查询；
+            // 同一片段供 count/page/order_index/random 复用。多选 AND：COUNT(DISTINCT norm)=N。
+            // 不存在标签时子查询无行 → total=0；空 tags 参数不追加条件（语义不变）。
+            let ph = std::iter::repeat("?").take(norms.len()).collect::<Vec<_>>().join(",");
+            if norms.len() == 1 {
+                conds.push(format!(
+                    "b.id IN (SELECT bt.book_id FROM book_tags bt JOIN tags t ON t.id=bt.tag_id                      WHERE t.norm IN ({ph}))"
+                ));
+            } else {
+                conds.push(format!(
+                    "b.id IN (SELECT bt.book_id FROM book_tags bt JOIN tags t ON t.id=bt.tag_id                      WHERE t.norm IN ({ph}) GROUP BY bt.book_id                      HAVING COUNT(DISTINCT t.norm) = {})",
+                    norms.len()
+                ));
+            }
+            for n in norms {
+                params.push(Value::Text(n));
+            }
+        }
+    }
     (conds.join(" AND "), params)
 }
 
@@ -817,6 +1091,187 @@ pub fn list_formats(conn: &Connection) -> Vec<String> {
     stmt.query_map([], |r| r.get::<_, String>(0))
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+}
+
+
+/* ---------------- D3：标签 CRUD（不写 books 表/阅读进度） ---------------- */
+
+/// 标签名归一：trim + 连续空白折叠；长度按 UTF-8 字符数上限 32；空名拒绝。
+pub fn normalize_tag_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut prev_ws = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    let name = out.trim().to_string();
+    if name.is_empty() {
+        return Err("标签名不能为空".into());
+    }
+    if name.chars().count() > 32 {
+        return Err("标签名最多 32 个字符".into());
+    }
+    Ok(name)
+}
+
+/// 归一化标签名集合（小写 norm、去重、保持输入顺序）；调用方用于 AND 过滤。
+pub fn normalize_tag_norms(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in names {
+        if let Ok(name) = normalize_tag_name(raw) {
+            let norm = name.to_lowercase();
+            if !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    out
+}
+
+fn tag_norm(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// 全部标签（按名称排序）+ 每标签书籍数。
+pub fn list_tags(conn: &Connection) -> Vec<(i64, String, i64)> {
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.name, COUNT(bt.book_id) FROM tags t          LEFT JOIN book_tags bt ON bt.tag_id=t.id GROUP BY t.id ORDER BY t.name COLLATE NOCASE ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 某本书的标签。
+pub fn list_book_tags(conn: &Connection, book_id: i64) -> Vec<(i64, String)> {
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.name FROM book_tags bt JOIN tags t ON t.id=bt.tag_id          WHERE bt.book_id=?1 ORDER BY t.name COLLATE NOCASE ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![book_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 创建标签；同名（大小写/空白归一后）已存在则返回已有，幂等。
+pub fn create_tag(conn: &Connection, raw: &str) -> Result<(i64, String), String> {
+    let name = normalize_tag_name(raw)?;
+    let norm = tag_norm(&name);
+    if let Some((id, existing)) = conn
+        .query_row(
+            "SELECT id, name FROM tags WHERE norm=?1",
+            params![norm],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .unwrap_or(None)
+    {
+        return Ok((id, existing));
+    }
+    conn.execute(
+        "INSERT INTO tags(name, norm, created_at, updated_at) VALUES(?1,?2,?3,?4)",
+        params![name, norm, now_ms(), now_ms()],
+    )
+    .map_err(|e| format!("创建标签失败：{e}"))?;
+    let _ = remove_tombstone(conn, "tag", &norm);
+    Ok((conn.last_insert_rowid(), name))
+}
+
+/// 重命名标签；与其它标签重名返回可读错误。
+pub fn rename_tag(conn: &Connection, id: i64, raw: &str) -> Result<(), String> {
+    let name = normalize_tag_name(raw)?;
+    let norm = tag_norm(&name);
+    let clash: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE norm=?1 AND id<>?2",
+            params![norm, id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if clash > 0 {
+        return Err("已存在同名标签".into());
+    }
+    let n = conn
+        .execute(
+            "UPDATE tags SET name=?2, norm=?3, updated_at=?4 WHERE id=?1",
+            params![id, name, norm, now_ms()],
+        )
+        .map_err(|e| format!("重命名标签失败：{e}"))?;
+    if n == 0 {
+        return Err("标签不存在".into());
+    }
+    Ok(())
+}
+
+/// 删除标签并清理关联。
+pub fn delete_tag(conn: &Connection, id: i64) -> Result<(), String> {
+    let name = conn.query_row("SELECT norm FROM tags WHERE id=?1", params![id], |r| r.get::<_, String>(0)).ok();
+    conn.execute("DELETE FROM book_tags WHERE tag_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM tags WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    if let Some(n) = name {
+        let _ = record_tombstone(conn, "tag", &n, now_ms());
+    }
+    Ok(())
+}
+
+/// 替换某本书的标签集合；tag_ids 去重，必须全部存在。
+pub fn set_book_tags(conn: &mut Connection, book_id: i64, tag_ids: &[i64]) -> Result<(), String> {
+    let mut ids: Vec<i64> = tag_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if !ids.is_empty() {
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!("SELECT COUNT(*) FROM tags WHERE id IN ({placeholders})");
+        let found: i64 = conn
+            .query_row(&sql, params_from_iter(ids.iter()), |r| r.get(0))
+            .unwrap_or(0);
+        if found != ids.len() as i64 {
+            return Err("包含不存在的标签".into());
+        }
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let path: Option<String> = tx.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get(0)).ok();
+    let old_tags: Vec<String> = tx
+        .prepare("SELECT t.norm FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id=?1")
+        .and_then(|mut s| s.query_map(params![book_id], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).map_err(Into::into))
+        .unwrap_or_default();
+    tx.execute("DELETE FROM book_tags WHERE book_id=?1", params![book_id])
+        .map_err(|e| e.to_string())?;
+    let mut new_tags: Vec<String> = Vec::new();
+    for tag_id in &ids {
+        if let Ok(n) = tx.query_row("SELECT norm FROM tags WHERE id=?1", params![tag_id], |r| r.get::<_, String>(0)) {
+            new_tags.push(n);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO book_tags(book_id, tag_id) VALUES(?1,?2)",
+            params![book_id, tag_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(p) = path {
+        for n in old_tags.iter().filter(|n| !new_tags.contains(n)) {
+            let _ = record_tombstone(&tx, "book_tag", &book_tag_tomb_key(&p, n), now_ms());
+        }
+        for n in new_tags.iter().filter(|n| !old_tags.contains(n)) {
+            let _ = remove_tombstone(&tx, "book_tag", &book_tag_tomb_key(&p, n));
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// 手动设置阅读状态覆盖（Task F）：state=1 已读 / 2 未读 / 0 自动。仅写 read_state，不动 read_pct（真实进度不破坏）。
@@ -934,6 +1389,7 @@ pub fn order_by_clause(sort: &str, desc: bool) -> String {
 /// - folder 走 `build_book_filter` 的路径前缀范围下推；None = 全库。
 /// - sort 走白名单，绝不拼接用户输入；desc 决定主列与 tiebreaker 方向。
 /// - limit 上限保护 500，offset 非负。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn list_books_page(
     conn: &Connection,
     query: &str,
@@ -944,6 +1400,69 @@ pub fn list_books_page(
     states: &Option<Vec<String>>,
     desc: bool,
     folder: &Option<String>,
+) -> crate::models::BookPage {
+    list_books_page_opts(conn, query, sort, offset, limit, formats, states, desc, folder, true)
+}
+
+/// 兼容旧调用（无标签参数）：内部委托 tags 版本。
+#[allow(clippy::too_many_arguments)]
+pub fn list_books_page_opts(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    offset: i64,
+    limit: i64,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+    desc: bool,
+    folder: &Option<String>,
+    count_total: bool,
+) -> crate::models::BookPage {
+    list_books_page_opts_tags(
+        conn, query, sort, offset, limit, formats, states, desc, folder, count_total, &None,
+    )
+}
+
+/// R11-2：带「是否计数」选项的分页查询。count_total=false 时跳过全表 COUNT（LIKE 查询下
+/// 实测 33~54ms），total 返回 -1 哨兵；行数据与完整版逐行一致。滚动窗口取数用它，
+/// 查询/筛选变化后的首轮仍传 true。
+/// A2：folder 生效时强制排序索引扫描 + 路径前缀过滤（path 为范围条件，path-first 复合索引无法排序）。
+/// 未传 folder 时保持原查询不变；语义仍是「WHERE path 范围 + ORDER BY 白名单」。
+pub(crate) fn sort_index_name(sort: &str) -> &'static str {
+    match sort {
+        "lastread" => "idx_books_lastread_id",
+        "title" => "idx_books_title_nocase_id",
+        "recent" => "idx_books_mtime_id",
+        "size" => "idx_books_size_id",
+        _ => "idx_books_added_id",
+    }
+}
+
+fn folder_scope(folder: &Option<String>) -> bool {
+    folder.as_ref().map(|f| !f.trim_end_matches(['/', '\\']).is_empty()).unwrap_or(false)
+}
+
+fn books_from_clause(sort: &str, folder: &Option<String>) -> String {
+    if folder_scope(folder) {
+        format!("books b INDEXED BY {}", sort_index_name(sort))
+    } else {
+        "books b".to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn list_books_page_opts_tags(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    offset: i64,
+    limit: i64,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+    desc: bool,
+    folder: &Option<String>,
+    count_total: bool,
+    tags: &Option<Vec<String>>,
 ) -> crate::models::BookPage {
     let order = order_by_clause(sort, desc);
     let limit = limit.clamp(1, 500);
@@ -959,7 +1478,7 @@ pub fn list_books_page(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states, folder);
+    let (frag, fparams) = build_book_filter(formats, states, folder, tags);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -970,13 +1489,17 @@ pub fn list_books_page(
         format!(" WHERE {}", conds.join(" AND "))
     };
 
-    let total: i64 = {
+    // A2：count 不强制排序索引（会退化成 SCAN 排序索引）；让规划器走 path 覆盖索引。
+    let total: i64 = if count_total {
         let sql = format!("SELECT COUNT(*) FROM books b{where_sql}");
         conn.query_row(&sql, params_from_iter(params.iter()), |r| r.get(0))
             .unwrap_or(0)
+    } else {
+        -1 // 哨兵：调用方按「未计数」处理（缓存里已有总数时复用）。
     };
 
-    let sql = format!("SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT ? OFFSET ?");
+    let from = books_from_clause(sort, folder);
+    let sql = format!("SELECT {BOOK_COLS} FROM {from}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?");
     let mut page_params = params;
     page_params.push(Value::Integer(limit));
     page_params.push(Value::Integer(offset));
@@ -995,6 +1518,20 @@ pub fn list_books_page(
 
 /// 从「当前筛选结果」中随机取一本书（`query`/`sort`/`formats`/`states`/`folder` 与 `list_books_page` 同源）。
 /// 先 COUNT 满足条件的行数，再随机 offset + LIMIT 1，避免把整库/整份筛选结果载入内存。
+pub fn random_book_filtered_tags(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+    folder: &Option<String>,
+    tags: &Option<Vec<String>>,
+) -> Option<BookRow> {
+    random_book_filtered_impl(conn, query, sort, formats, states, folder, tags)
+}
+
+/// 兼容旧调用（无标签参数）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn random_book_filtered(
     conn: &Connection,
     query: &str,
@@ -1002,6 +1539,18 @@ pub fn random_book_filtered(
     formats: &Option<Vec<String>>,
     states: &Option<Vec<String>>,
     folder: &Option<String>,
+) -> Option<BookRow> {
+    random_book_filtered_impl(conn, query, sort, formats, states, folder, &None)
+}
+
+fn random_book_filtered_impl(
+    conn: &Connection,
+    query: &str,
+    sort: &str,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+    folder: &Option<String>,
+    tags: &Option<Vec<String>>,
 ) -> Option<BookRow> {
     // 随机与顺序无关，方向固定（列仍走白名单）；offset 均匀分布即可。
     let order = order_by_clause(sort, false);
@@ -1014,7 +1563,7 @@ pub fn random_book_filtered(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states, folder);
+    let (frag, fparams) = build_book_filter(formats, states, folder, tags);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -1025,6 +1574,7 @@ pub fn random_book_filtered(
         format!(" WHERE {}", conds.join(" AND "))
     };
     let total: i64 = {
+        // A2：count 用普通表扫描/路径索引，不强制排序索引。
         let sql = format!("SELECT COUNT(*) FROM books b{where_sql}");
         conn.query_row(&sql, params_from_iter(params.iter()), |r| r.get(0))
             .unwrap_or(0)
@@ -1033,7 +1583,8 @@ pub fn random_book_filtered(
         return None;
     }
     let offset = (rand::random::<u64>() % (total as u64)) as i64;
-    let sql = format!("SELECT {BOOK_COLS} FROM books b{where_sql} ORDER BY {order} LIMIT 1 OFFSET ?");
+    let from = books_from_clause(sort, folder);
+    let sql = format!("SELECT {BOOK_COLS} FROM {from}{where_sql} ORDER BY {order} LIMIT 1 OFFSET ?");
     let mut p = params;
     p.push(Value::Integer(offset));
     conn.query_row(&sql, params_from_iter(p.iter()), book_from_row).ok()
@@ -1062,6 +1613,7 @@ pub fn random_book_any(conn: &Connection) -> Option<BookRow> {
 /// - 不 JOIN progress；ORDER BY 片段为编译期字面量（禁止拼接用户输入）；
 /// - 边收集边计数：超过 `max_rows` 立即中止并返回 `Err("order_index_too_large:N")`（禁止静默截断），
 ///   避免为超大结果集构建巨大 Vec。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn order_index_ids(
     conn: &Connection,
     sort: &str,
@@ -1071,6 +1623,20 @@ pub fn order_index_ids(
     states: &Option<Vec<String>>,
     desc: bool,
     folder: &Option<String>,
+) -> Result<Vec<i64>, String> {
+    order_index_ids_tags(conn, sort, query, max_rows, formats, states, desc, folder, &None)
+}
+
+pub fn order_index_ids_tags(
+    conn: &Connection,
+    sort: &str,
+    query: &str,
+    max_rows: usize,
+    formats: &Option<Vec<String>>,
+    states: &Option<Vec<String>>,
+    desc: bool,
+    folder: &Option<String>,
+    tags: &Option<Vec<String>>,
 ) -> Result<Vec<i64>, String> {
     // 白名单 → 字面量 ORDER BY（与 list_books_page 同一函数，红线 3 同源）；未知一律回落 "added"。
     // 表别名 b 与 list_books_page 一致，令 build_book_filter 的 `b.format` 片段两处通用。
@@ -1085,7 +1651,7 @@ pub fn order_index_ids(
         params.push(Value::Text(pat.clone()));
         params.push(Value::Text(pat));
     }
-    let (frag, fparams) = build_book_filter(formats, states, folder);
+    let (frag, fparams) = build_book_filter(formats, states, folder, tags);
     if !frag.is_empty() {
         conds.push(frag);
         params.extend(fparams);
@@ -1095,7 +1661,8 @@ pub fn order_index_ids(
     } else {
         format!(" WHERE {}", conds.join(" AND "))
     };
-    let sql = format!("SELECT b.id FROM books b{where_sql} ORDER BY {order}");
+    let from = books_from_clause(sort, folder);
+    let sql = format!("SELECT b.id FROM {from}{where_sql} ORDER BY {order}");
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut ids: Vec<i64> = Vec::new();
     let mut rows = stmt.query(params_from_iter(params.iter())).map_err(|e| e.to_string())?;
@@ -1666,6 +2233,10 @@ pub fn delete_books_policy(
             "chapter_text",
             "bookmarks",
             "book_fingerprint",
+            "txt_encoding",
+            "epub_stats",
+            "fts_meta",
+            "book_tags",
         ] {
             let sql = format!("DELETE FROM {} WHERE book_id IN ({})", table, placeholders);
             conn.execute(&sql, params_from_iter(chunk.iter())).ok();
@@ -1755,6 +2326,59 @@ pub fn set_txt_cache(conn: &Connection, book_id: i64, offsets: &str, rules_hash:
     .ok();
 }
 
+/// TXT 编码自动判定缓存读取：返回 (size, mtime, enc)；指纹由调用方与磁盘比对。
+pub fn get_txt_encoding(conn: &Connection, book_id: i64) -> Option<(i64, i64, String)> {
+    conn.query_row(
+        "SELECT size, mtime, enc FROM txt_encoding WHERE book_id=?1",
+        params![book_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .unwrap_or(None)
+}
+
+/// TXT 编码自动判定缓存写入（upsert）：仅当拿到文件指纹时调用。
+pub fn set_txt_encoding(conn: &Connection, book_id: i64, size: i64, mtime: i64, enc: &str) {
+    conn.execute(
+        "INSERT INTO txt_encoding(book_id, size, mtime, enc) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(book_id) DO UPDATE SET size=?2, mtime=?3, enc=?4",
+        params![book_id, size, mtime, enc],
+    )
+    .ok();
+}
+
+/// EPUB 逐章字数统计缓存读取：返回 (size, mtime, total, pure, per_chapter_json)。
+pub fn get_epub_stats(
+    conn: &Connection,
+    book_id: i64,
+) -> Option<(i64, i64, i64, i64, String)> {
+    conn.query_row(
+        "SELECT size, mtime, total, pure, per_chapter FROM epub_stats WHERE book_id=?1",
+        params![book_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .optional()
+    .unwrap_or(None)
+}
+
+/// EPUB 逐章字数统计缓存写入（upsert）：仅当拿到文件指纹时调用。
+pub fn set_epub_stats(
+    conn: &Connection,
+    book_id: i64,
+    size: i64,
+    mtime: i64,
+    total: i64,
+    pure: i64,
+    per_chapter_json: &str,
+) {
+    conn.execute(
+        "INSERT INTO epub_stats(book_id, size, mtime, total, pure, per_chapter) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(book_id) DO UPDATE SET size=?2, mtime=?3, total=?4, pure=?5, per_chapter=?6",
+        params![book_id, size, mtime, total, pure, per_chapter_json],
+    )
+    .ok();
+}
+
 pub fn add_bookmark(
     conn: &Connection,
     book_id: i64,
@@ -1762,11 +2386,15 @@ pub fn add_bookmark(
     title: &str,
     excerpt: &str,
 ) -> Result<(), String> {
+    let t = now_ms();
     conn.execute(
-        "INSERT INTO bookmarks(book_id, chapter_index, title, excerpt, created_at) VALUES(?1,?2,?3,?4,?5)",
-        params![book_id, chapter_index, title, excerpt, now_ms()],
+        "INSERT INTO bookmarks(book_id, chapter_index, title, excerpt, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![book_id, chapter_index, title, excerpt, t, t],
     )
     .map_err(|e| e.to_string())?;
+    if let Some(path) = conn.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get::<_, String>(0)).ok() {
+        let _ = remove_tombstone(conn, "bookmark", &bookmark_tomb_key(&path, chapter_index, title, excerpt));
+    }
     Ok(())
 }
 
@@ -1785,8 +2413,18 @@ pub fn list_bookmarks(conn: &Connection, book_id: i64) -> Vec<(i64, i64, String,
 }
 
 pub fn delete_bookmark(conn: &Connection, id: i64) -> Result<(), String> {
+    let key = conn
+        .query_row(
+            "SELECT b.path, bm.chapter_index, bm.title, bm.excerpt FROM bookmarks bm JOIN books b ON b.id=bm.book_id WHERE bm.id=?1",
+            params![id],
+            |r| Ok(bookmark_tomb_key(&r.get::<_, String>(0)?, r.get(1)?, &r.get::<_, String>(2)?, &r.get::<_, String>(3)?)),
+        )
+        .ok();
     conn.execute("DELETE FROM bookmarks WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
+    if let Some(k) = key {
+        let _ = record_tombstone(conn, "bookmark", &k, now_ms());
+    }
     Ok(())
 }
 
@@ -1809,6 +2447,9 @@ pub fn add_highlight(
         params![book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, now_ms()],
     )
     .map_err(|e| e.to_string())?;
+    if let Some(path) = conn.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get::<_, String>(0)).ok() {
+        let _ = remove_tombstone(conn, "highlight", &highlight_tomb_key(&path, chapter_index, pos_start, pos_end, text));
+    }
     Ok(conn.last_insert_rowid())
 }
 
@@ -1869,8 +2510,18 @@ pub fn search_highlights(conn: &Connection, query: &str) -> Vec<crate::models::H
 }
 
 pub fn delete_highlight(conn: &Connection, id: i64) -> Result<(), String> {
+    let key = conn
+        .query_row(
+            "SELECT b.path, h.chapter_index, h.pos_start, h.pos_end, h.text FROM highlights h JOIN books b ON b.id=h.book_id WHERE h.id=?1",
+            params![id],
+            |r| Ok(highlight_tomb_key(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, &r.get::<_, String>(4)?)),
+        )
+        .ok();
     conn.execute("DELETE FROM highlights WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
+    if let Some(k) = key {
+        let _ = record_tombstone(conn, "highlight", &k, now_ms());
+    }
     Ok(())
 }
 
@@ -1882,8 +2533,8 @@ pub fn update_highlight(
     note: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE highlights SET style=?2, color=?3, note=?4 WHERE id=?1",
-        params![id, style, color, note],
+        "UPDATE highlights SET style=?2, color=?3, note=?4, updated_at=?5 WHERE id=?1",
+        params![id, style, color, note, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1949,6 +2600,167 @@ pub fn get_book_sessions(conn: &Connection, book_id: i64) -> Vec<(String, i64, i
     .unwrap_or_default()
 }
 
+
+/* ---------------- D2：阅读统计（只读汇总） ---------------- */
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyPoint {
+    pub day: String,
+    pub seconds: i64,
+    pub chars: i64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HourPoint {
+    pub hour: i64,
+    pub seconds: i64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompPoint {
+    pub label: String,
+    pub seconds: i64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentBookStat {
+    pub id: i64,
+    pub title: String,
+    pub author: String,
+    pub pct: f64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteStat {
+    pub text: String,
+    pub note: String,
+    pub book_title: String,
+    pub book_author: String,
+    pub created_at: i64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedBookStat {
+    pub id: i64,
+    pub title: String,
+    pub author: String,
+    pub cover_path: String,
+    pub cover_ver: i64,
+    pub seconds: i64,
+    pub highlight_count: i64,
+    pub last_read: i64,
+}
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingStats {
+    pub total_seconds: i64,
+    pub total_chars: i64,
+    pub session_count: i64,
+    pub active_days: i64,
+    pub prev_seconds: i64,
+    pub today_seconds: i64,
+    pub longest_session_seconds: i64,
+    pub read_speed_cpm: i64,
+    pub daily: Vec<DailyPoint>,
+    pub heatmap: Vec<DailyPoint>,
+    pub hourly: Vec<HourPoint>,
+    pub active_dates: Vec<String>,
+    pub finished_books: i64,
+    pub reading_books: i64,
+    pub current_book: Option<CurrentBookStat>,
+    pub highlights_total: i64,
+    pub notes_total: i64,
+    pub quote: Option<QuoteStat>,
+    pub composition: Vec<CompPoint>,
+    pub completed_books: Vec<CompletedBookStat>,
+}
+
+fn sum_seconds(conn: &Connection, start: &str, end: &str) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(SUM(seconds),0) FROM reading_sessions WHERE day>=?1 AND day<=?2",
+        params![start, end], |r| r.get(0)).unwrap_or(0)
+}
+
+pub fn get_reading_stats(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    prev_start: &str,
+    prev_end: &str,
+    heat_start: &str,
+    heat_end: &str,
+) -> ReadingStats {
+    let mut st = ReadingStats::default();
+    (st.total_seconds, st.total_chars, st.session_count) = conn.query_row(
+        "SELECT COALESCE(SUM(seconds),0), COALESCE(SUM(chars),0), COUNT(*) FROM reading_sessions WHERE day>=?1 AND day<=?2",
+        params![start, end], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap_or((0,0,0));
+    st.active_days = conn.query_row(
+        "SELECT COUNT(DISTINCT day) FROM reading_sessions WHERE day>=?1 AND day<=?2",
+        params![start, end], |r| r.get(0)).unwrap_or(0);
+    st.prev_seconds = sum_seconds(conn, prev_start, prev_end);
+    st.today_seconds = sum_seconds(conn, &today_string(conn), &today_string(conn));
+    st.longest_session_seconds = conn.query_row(
+        "SELECT COALESCE(MAX(seconds),0) FROM reading_sessions WHERE day>=?1 AND day<=?2",
+        params![start, end], |r| r.get(0)).unwrap_or(0);
+    st.read_speed_cpm = if st.total_chars > 0 && st.total_seconds > 0 {
+        (st.total_chars as f64 / (st.total_seconds as f64 / 60.0)).round() as i64
+    } else { 0 };
+    if let Ok(mut stmt) = conn.prepare("SELECT day, SUM(seconds), SUM(chars) FROM reading_sessions WHERE day>=?1 AND day<=?2 GROUP BY day ORDER BY day") {
+        if let Ok(rows) = stmt.query_map(params![start, end], |r| Ok(DailyPoint { day: r.get(0)?, seconds: r.get(1)?, chars: r.get(2).unwrap_or(0) })) {
+            st.daily = rows.flatten().collect();
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare("SELECT day, SUM(seconds), SUM(chars) FROM reading_sessions WHERE day>=?1 AND day<=?2 GROUP BY day ORDER BY day") {
+        if let Ok(rows) = stmt.query_map(params![heat_start, heat_end], |r| Ok(DailyPoint { day: r.get(0)?, seconds: r.get(1)?, chars: r.get(2).unwrap_or(0) })) {
+            st.heatmap = rows.flatten().collect();
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare("SELECT CAST(strftime('%H', started_at/1000, 'unixepoch', 'localtime') AS INTEGER) AS h, SUM(seconds) FROM reading_sessions WHERE day>=?1 AND day<=?2 GROUP BY h ORDER BY h") {
+        if let Ok(rows) = stmt.query_map(params![start, end], |r| Ok(HourPoint { hour: r.get(0)?, seconds: r.get(1)? })) {
+            st.hourly = rows.flatten().collect();
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT day FROM reading_sessions ORDER BY day") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            st.active_dates = rows.flatten().collect();
+        }
+    }
+    st.finished_books = conn.query_row("SELECT COUNT(*) FROM books WHERE COALESCE(read_pct,0)>=99.5", [], |r| r.get(0)).unwrap_or(0);
+    st.reading_books = conn.query_row("SELECT COUNT(*) FROM books WHERE COALESCE(read_pct,0)>0 AND COALESCE(read_pct,0)<99.5", [], |r| r.get(0)).unwrap_or(0);
+    // 当前在读：只认有真实进度（0<pct<99.5）的书，按进度更新时间倒序。
+    st.current_book = conn.query_row(
+        "SELECT b.id, b.title, COALESCE(b.author,''), COALESCE(p.pct,0)
+         FROM progress p JOIN books b ON b.id=p.book_id
+         WHERE p.pct>0 AND p.pct<99.5
+         ORDER BY p.updated_at DESC LIMIT 1",
+        [], |r| Ok(CurrentBookStat { id: r.get(0)?, title: r.get(1)?, author: r.get(2)?, pct: r.get(3)? })).ok();
+    st.highlights_total = conn.query_row("SELECT COUNT(*) FROM highlights", [], |r| r.get(0)).unwrap_or(0);
+    st.notes_total = conn.query_row("SELECT COUNT(*) FROM highlights WHERE note!=''", [], |r| r.get(0)).unwrap_or(0);
+    st.quote = conn.query_row(
+        "SELECT h.text, h.note, b.title, COALESCE(b.author,''), h.created_at FROM highlights h JOIN books b ON b.id=h.book_id ORDER BY RANDOM() LIMIT 1",
+        [], |r| Ok(QuoteStat { text: r.get(0)?, note: r.get(1)?, book_title: r.get(2)?, book_author: r.get(3)?, created_at: r.get(4)? })).ok();
+    if let Ok(mut stmt) = conn.prepare("SELECT b.format, SUM(rs.seconds) FROM reading_sessions rs JOIN books b ON b.id=rs.book_id WHERE rs.day>=?1 AND rs.day<=?2 GROUP BY b.format ORDER BY 2 DESC") {
+        if let Ok(rows) = stmt.query_map(params![start, end], |r| Ok(CompPoint { label: r.get(0)?, seconds: r.get(1)? })) {
+            st.composition = rows.flatten().collect();
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT b.id, b.title, COALESCE(b.author,''), COALESCE(b.cover_path,''), COALESCE(b.cover_ver,0),
+                COALESCE((SELECT SUM(seconds) FROM reading_sessions rs WHERE rs.book_id=b.id),0),
+                (SELECT COUNT(*) FROM highlights h WHERE h.book_id=b.id), COALESCE(b.last_read,0)
+         FROM books b WHERE COALESCE(b.read_pct,0)>=99.5 ORDER BY b.last_read DESC LIMIT 8") {
+        if let Ok(rows) = stmt.query_map([], |r| Ok(CompletedBookStat {
+            id: r.get(0)?, title: r.get(1)?, author: r.get(2)?, cover_path: r.get(3)?, cover_ver: r.get(4)?,
+            seconds: r.get(5)?, highlight_count: r.get(6)?, last_read: r.get(7)? })) {
+            st.completed_books = rows.flatten().collect();
+        }
+    }
+    st
+}
+
+fn today_string(conn: &Connection) -> String {
+    conn.query_row("SELECT date('now','localtime')", [], |r| r.get(0)).unwrap_or_default()
+}
 pub fn get_stats(conn: &Connection) -> Vec<(String, i64)> {
     let mut stmt = match conn.prepare(
         "SELECT day, SUM(seconds) FROM reading_sessions WHERE day >= date('now','localtime','-13 day') GROUP BY day ORDER BY day",
@@ -2119,13 +2931,18 @@ pub fn delete_book_with_policy(
     } else {
         conn.execute("DELETE FROM highlights WHERE book_id=?1", params![id]).ok();
     }
-    // 书本身与关联数据
+    // 书本身与关联数据（标签关联显式清理，不依赖 FK）
+    conn.execute("DELETE FROM book_tags WHERE book_id=?1", params![id]).ok();
     conn.execute("DELETE FROM books WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM progress WHERE book_id=?1", params![id]).ok();
     conn.execute("DELETE FROM txt_cache WHERE book_id=?1", params![id]).ok();
     conn.execute("DELETE FROM chapter_text WHERE book_id=?1", params![id]).ok();
     conn.execute("DELETE FROM bookmarks WHERE book_id=?1", params![id]).ok();
+    // 解析缓存（编码判定 / EPUB 字数）随书一起删：书没了，缓存也没有意义。
+    conn.execute("DELETE FROM txt_encoding WHERE book_id=?1", params![id]).ok();
+    conn.execute("DELETE FROM epub_stats WHERE book_id=?1", params![id]).ok();
+    conn.execute("DELETE FROM fts_meta WHERE book_id=?1", params![id]).ok();
     // 删除不可恢复：指纹一律删。
     conn.execute("DELETE FROM book_fingerprint WHERE book_id=?1", params![id]).ok();
     Ok(())
@@ -2198,7 +3015,7 @@ pub fn list_notes_of_book(conn: &Connection, book_id: i64) -> Vec<(i64, i64, Str
 
 /// 设置/追加某条划线的 note。
 pub fn set_highlight_note(conn: &Connection, id: i64, note: &str) -> Result<(), String> {
-    conn.execute("UPDATE highlights SET note=?2 WHERE id=?1", params![id, note])
+    conn.execute("UPDATE highlights SET note=?2, updated_at=?3 WHERE id=?1", params![id, note, now_ms()])
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2213,9 +3030,62 @@ pub fn append_highlight_note(conn: &Connection, id: i64, addition: &str) -> Resu
     } else {
         format!("{}\n\n{}", cur.trim_end(), addition.trim())
     };
-    conn.execute("UPDATE highlights SET note=?2 WHERE id=?1", params![id, next])
+    conn.execute("UPDATE highlights SET note=?2, updated_at=?3 WHERE id=?1", params![id, next, now_ms()])
         .map_err(|e| e.to_string())?;
     Ok(next)
+}
+
+
+/// B9：同步稳定 key 的路径归一（与 davsync 的 norm_path 一致）。
+pub fn sync_norm_path(p: &str) -> String {
+    p.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// B9：记录墓碑（幂等 upsert，保留较新删除时间）。
+pub fn record_tombstone(conn: &Connection, kind: &str, key: &str, deleted_at: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO sync_tombstones(kind,key,deleted_at) VALUES(?1,?2,?3)
+         ON CONFLICT(kind,key) DO UPDATE SET deleted_at=MAX(deleted_at, excluded.deleted_at)",
+        params![kind, key, deleted_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// B9：移除墓碑（条目重新创建/更新时用）。
+pub fn remove_tombstone(conn: &Connection, kind: &str, key: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM sync_tombstones WHERE kind=?1 AND key=?2", params![kind, key])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// B9：读取全部墓碑（kind, key, deleted_at）。
+pub fn list_tombstones(conn: &Connection) -> Vec<(String, String, i64)> {
+    let mut stmt = match conn.prepare("SELECT kind,key,deleted_at FROM sync_tombstones ORDER BY deleted_at") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// B9：GC 早于 before 的墓碑；返回删除条数。
+pub fn gc_tombstones(conn: &Connection, before: i64) -> Result<usize, String> {
+    conn.execute("DELETE FROM sync_tombstones WHERE deleted_at < ?1", params![before])
+        .map_err(|e| e.to_string())
+}
+
+pub fn bookmark_tomb_key(path: &str, chapter_index: i64, title: &str, excerpt: &str) -> String {
+    format!("{}\u{1}{}\u{1}{}\u{1}{}", sync_norm_path(path), chapter_index, title, excerpt)
+}
+
+pub fn highlight_tomb_key(path: &str, chapter_index: i64, pos_start: i64, pos_end: i64, text: &str) -> String {
+    format!("{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}", sync_norm_path(path), chapter_index, pos_start, pos_end, text)
+}
+
+pub fn book_tag_tomb_key(path: &str, tag_name: &str) -> String {
+    format!("{}\u{1}{}", sync_norm_path(path), tag_name.trim().to_lowercase())
 }
 
 #[cfg(test)]
@@ -3030,6 +3900,246 @@ mod consistency_tests {
             .unwrap();
         assert_eq!((size, mtime), (20, 200));
         assert_eq!(meta_done_of(&conn, id), Some(0), "内容换了必须重跑元数据");
+    }
+}
+
+
+#[cfg(test)]
+mod chapter_split_migration_tests {
+    use super::*;
+
+    /// 最小库：settings + chapter_text + fts_meta + fts 虚拟表。
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+             CREATE TABLE chapter_text(
+                book_id INTEGER NOT NULL,
+                chapter_index INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(book_id, chapter_index)
+             );
+             CREATE TABLE fts_meta(book_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        ensure_fts(&conn).unwrap();
+        conn
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn seed_search_cache(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(1,0,'t','b1'),(1,1,'t','b2'),(2,0,'t','b3')",
+            [],
+        )
+        .unwrap();
+        for (book, ch, body) in [(1i64, 0i64, "b1"), (1, 1, "b2"), (2, 0, "b3")] {
+            conn.execute(
+                "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,?2,'t',?3)",
+                params![book, ch, body],
+            )
+            .unwrap();
+        }
+        set_fts_meta(conn, 1, 2);
+        set_fts_meta(conn, 2, 1);
+    }
+
+    /// 版本 "2" -> 当前版本：只写版本号，搜索缓存一行都不删（真实库升级路径零成本）。
+    #[test]
+    fn v2_upgrade_is_metadata_only_and_idempotent() {
+        let conn = mem_db();
+        seed_search_cache(&conn);
+        set_setting(&conn, "chapter_split_ver", "2");
+        migrate_chapter_split(&conn);
+        assert_eq!(
+            get_setting(&conn, "chapter_split_ver").as_deref(),
+            Some(CHAPTER_SPLIT_VER)
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM chapter_text"),
+            3,
+            "P11 升级不得清普通书的 chapter_text"
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3, "P11 升级不得清 fts");
+        assert_eq!(get_fts_meta(&conn, 1), Some(2), "fts_meta 应保持");
+        migrate_chapter_split(&conn);
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "二次调用无副作用");
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3);
+    }
+
+    /// 版本 "3" -> "4"（R6-1 自动切章）：只写版本号，chapter_text/fts/fts_meta 一行不删；
+    /// 切分/自动切章书由 open_book 按书懒清理，不在启动期整库作废。
+    #[test]
+    fn v3_upgrade_is_metadata_only() {
+        let conn = mem_db();
+        seed_search_cache(&conn);
+        set_setting(&conn, "chapter_split_ver", "3");
+        migrate_chapter_split(&conn);
+        assert_eq!(
+            get_setting(&conn, "chapter_split_ver").as_deref(),
+            Some(CHAPTER_SPLIT_VER)
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "3→4 不得删数据");
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3, "3→4 不得清 fts");
+        assert_eq!(get_fts_meta(&conn, 1), Some(2), "fts_meta 应保持");
+        migrate_chapter_split(&conn);
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "二次调用无副作用");
+    }
+
+    /// 版本缺失 -> 当前版本：chapter_text 表重建且为空、fts 清空后仍可写可查、fts_meta 清空；二次调用幂等。
+    #[test]
+    fn missing_version_rebuilds_search_cache_fast_and_idempotent() {
+        let conn = mem_db();
+        seed_search_cache(&conn);
+        migrate_chapter_split(&conn);
+        assert_eq!(
+            get_setting(&conn, "chapter_split_ver").as_deref(),
+            Some(CHAPTER_SPLIT_VER)
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM chapter_text"),
+            0,
+            "chapter_text 应被重建为空表"
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 0, "fts 应被清空");
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts_meta"), 0, "fts_meta 应清空");
+        // 重建后的表仍可用：写入并查询。
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(1,0,'t','b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(1,0,'t','body')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 1);
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 1);
+        // 二次调用：版本已是最新，不得再清。
+        migrate_chapter_split(&conn);
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 1, "二次调用应幂等");
+        assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 1);
+    }
+
+    /// 按书懒清理：只删目标书的 chapter_text、fts_meta 置负哨兵、写 marker；别的书不受影响；
+    /// 同指纹二次调用 no-op，指纹变化（文件替换）后重新清理。
+    #[test]
+    fn invalidate_split_book_cleans_only_that_book_once() {
+        let conn = mem_db();
+        seed_search_cache(&conn);
+        invalidate_split_book_search_cache(&conn, 1, 17, "100-200");
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM chapter_text WHERE book_id=1"),
+            0,
+            "目标书的 chapter_text 应被清空"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM chapter_text WHERE book_id=2"),
+            1,
+            "其它书不得受影响"
+        );
+        assert_eq!(get_fts_meta(&conn, 1), Some(-1), "fts_meta 应写负哨兵，强制下次重建");
+        assert_eq!(get_fts_meta(&conn, 2), Some(1), "其它书 meta 不变");
+        assert_eq!(
+            get_setting(&conn, "epub.split_search_clean.1").as_deref(),
+            Some("100-200"),
+            "marker 应写入文件指纹"
+        );
+        // 同指纹二次调用：即使重新插回一行也不得再删（no-op）。
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(1,0,'t','again')",
+            [],
+        )
+        .unwrap();
+        invalidate_split_book_search_cache(&conn, 1, 17, "100-200");
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM chapter_text WHERE book_id=1"),
+            1,
+            "同指纹二次调用应为 no-op"
+        );
+        // 指纹变化：允许按新文件重新清理。
+        invalidate_split_book_search_cache(&conn, 1, 17, "101-201");
+        assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text WHERE book_id=1"), 0);
+        assert_eq!(
+            get_setting(&conn, "epub.split_search_clean.1").as_deref(),
+            Some("101-201")
+        );
+    }
+}
+
+
+
+#[cfg(test)]
+mod sync_tombstone_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn tmp(tag: &str) -> Connection {
+        let p = std::env::temp_dir().join(format!("tp_b9_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        init(&p).unwrap()
+    }
+
+    #[test]
+    fn migration_columns_backfill_and_tombstone_crud() {
+        let conn = tmp("mig");
+        // 已存在库二次 init 幂等
+        let _ = init(&std::env::temp_dir().join("unused"));
+        for table in ["bookmarks", "highlights", "tags"] {
+            let n: i64 = conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name='updated_at'"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1, "{table} 应有 updated_at");
+        }
+        let b = upsert_book(&conn, "C:\\x.epub", "书", "epub", 10, 1).unwrap();
+        add_bookmark(&conn, b, 1, "t", "e").unwrap();
+        let created: i64 = conn.query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0)).unwrap();
+        let updated: i64 = conn.query_row("SELECT updated_at FROM bookmarks LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(updated, created, "插入应写 updated_at=created_at");
+        record_tombstone(&conn, "shelf", "a", 100).unwrap();
+        record_tombstone(&conn, "shelf", "a", 50).unwrap();
+        assert_eq!(list_tombstones(&conn)[0].2, 100, "保留较新删除时间");
+        gc_tombstones(&conn, 101).unwrap();
+        assert!(list_tombstones(&conn).is_empty());
+    }
+
+    #[test]
+    fn delete_paths_write_tombstones() {
+        let conn = tmp("del");
+        let b = upsert_book(&conn, "C:\\x.epub", "书", "epub", 10, 1).unwrap();
+        add_bookmark(&conn, b, 2, "标题", "摘录").unwrap();
+        let bm_id: i64 = conn.query_row("SELECT id FROM bookmarks LIMIT 1", [], |r| r.get(0)).unwrap();
+        delete_bookmark(&conn, bm_id).unwrap();
+        assert!(list_tombstones(&conn).iter().any(|(k, _, _)| k == "bookmark"));
+        add_highlight(&conn, b, 1, "", 0, 5, "text", "underline", "", "").unwrap();
+        let hl_id: i64 = conn.query_row("SELECT id FROM highlights LIMIT 1", [], |r| r.get(0)).unwrap();
+        delete_highlight(&conn, hl_id).unwrap();
+        assert!(list_tombstones(&conn).iter().any(|(k, _, _)| k == "highlight"));
+        let (tag_id, _) = create_tag(&conn, "标签").unwrap();
+        delete_tag(&conn, tag_id).unwrap();
+        assert!(list_tombstones(&conn).iter().any(|(k, _, _)| k == "tag"));
+    }
+
+    #[test]
+    fn edit_paths_bump_updated_at() {
+        let conn = tmp("bump");
+        let b = upsert_book(&conn, "C:\\x.epub", "书", "epub", 10, 1).unwrap();
+        add_highlight(&conn, b, 1, "", 0, 5, "text", "underline", "", "").unwrap();
+        let id: i64 = conn.query_row("SELECT id FROM highlights LIMIT 1", [], |r| r.get(0)).unwrap();
+        let t0: i64 = conn.query_row("SELECT updated_at FROM highlights WHERE id=?1", params![id], |r| r.get(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        set_highlight_note(&conn, id, "note").unwrap();
+        let t1: i64 = conn.query_row("SELECT updated_at FROM highlights WHERE id=?1", params![id], |r| r.get(0)).unwrap();
+        assert!(t1 > t0);
+        let (tag_id, _) = create_tag(&conn, "旧").unwrap();
+        let tag_t0: i64 = conn.query_row("SELECT updated_at FROM tags WHERE id=?1", params![tag_id], |r| r.get(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        rename_tag(&conn, tag_id, "新").unwrap();
+        let tag_t1: i64 = conn.query_row("SELECT updated_at FROM tags WHERE id=?1", params![tag_id], |r| r.get(0)).unwrap();
+        assert!(tag_t1 > tag_t0);
     }
 }
 

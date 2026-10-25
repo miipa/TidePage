@@ -1,14 +1,39 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
-  import { regeneratePdfCover, renderCoverImage } from "../lib/pdf";
-  import { api, coverUrl, bumpCoverBust } from "../lib/api";
+  /** B7：PDF（含 pdfjs 主模块）按需加载，避免进入书库首屏包。 */
+  let pdfModPromise: Promise<typeof import("../lib/pdf")> | null = null;
+  function pdfMod(): Promise<typeof import("../lib/pdf")> {
+    return (pdfModPromise ??= import("../lib/pdf"));
+  }
+  import { COVER_FAIL_KEY } from "../lib/openError";
+  import {
+    createPdfCoverQueue,
+    enqueueIdle,
+    enqueueVisible,
+    pickIdleBatch,
+    takeNext,
+  } from "../lib/pdfCoverQueue";
+  import { api, coverUrl, bumpCoverBust, type TagInfo } from "../lib/api";
+  import { emit } from "@tauri-apps/api/event";
+  import {
+    deserializeShelves,
+    stampShelfUpdates,
+    serializeShelves,
+    shelfFilter,
+    shelfFromFilter,
+    uniqueShelfName,
+    type Shelf,
+  } from "../lib/libraryShelves";
   import { appConfirm, appChoose, config, convertState, libSession, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
+  import { shouldRemindMaintenance, estimateVacuumTemp, formatBytes } from "../lib/maintenance";
   import { updateState } from "../lib/update.svelte";
   import { dragSort } from "../lib/dragSort";
 import { reorderByDrop } from "../lib/reorder";
   import { BOOK_EXTENSIONS } from "../lib/bookExt";
   import { effectiveState, type ReadState } from "../lib/readState";
+  import { bookListKey, resolveListTotal, shouldCountTotal } from "../lib/bookList";
+  import { HIDDEN_CACHE_KEY, hiddenIdsFromGroups, parseHiddenCache, serializeHiddenCache, type DupDisplayGroup } from "../lib/dupHiddenCache";
   import { listen } from "@tauri-apps/api/event";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
   import {
@@ -32,10 +57,43 @@ import { reorderByDrop } from "../lib/reorder";
     IconLayoutGrid,
     IconLayoutList,
     IconBooks,
+    IconCopy,
     IconPlus,
     IconX,
   } from "@tabler/icons-svelte";
-  import BookDetailModal from "./BookDetailModal.svelte";
+  /** B7：详情弹窗按需加载（打开时/空闲预取），不进入书库首屏 chunk。 */
+  let maintReminder = $state<{ freelist: number; need: number } | null>(null);
+  let maintBusy = $state(false);
+  /** 横幅内直接整理数据库：复用维护页同一 vacuum 命令与确认文案；不改 7 天关闭逻辑。 */
+  async function vacuumFromBanner() {
+    const ok = await appConfirm(t("settings.maintenance.vacuumConfirm"));
+    if (!ok) return;
+    maintBusy = true;
+    try {
+      const freed = await api.vacuumDb();
+      toast(t("settings.maintenance.vacuumDone", { size: formatBytes(freed) }));
+      maintReminder = null;
+    } catch (e) {
+      toast(errText(e), "error");
+    } finally {
+      maintBusy = false;
+    }
+  }
+  $effect(() => {
+    const timer = setTimeout(() => {
+      void api.storageStats().then((s) => {
+        if (shouldRemindMaintenance(s.freelist_bytes, s.db_bytes, config.maintenance.reminderDismissedUntil, Date.now())) {
+          maintReminder = { freelist: s.freelist_bytes, need: estimateVacuumTemp(s.db_bytes, s.temp_same_disk).requiredBytes };
+        }
+      }).catch(() => undefined);
+    }, 3000);
+    return () => clearTimeout(timer);
+  });
+  let detailModPromise: Promise<typeof import("./BookDetailModal.svelte")> | null = null;
+  function detailMod(): Promise<typeof import("./BookDetailModal.svelte")> {
+    return (detailModPromise ??= import("./BookDetailModal.svelte"));
+  }
+  import DuplicateBooksModal from "./DuplicateBooksModal.svelte";
   import ProgressRing from "./ProgressRing.svelte";
   import { outDissolve, outFade } from "../lib/motion";
   import type { BookRow } from "../lib/types";
@@ -54,6 +112,89 @@ import { reorderByDrop } from "../lib/reorder";
   let total = $state(0);
   // idIndex 为普通（非响应式）变量：整块替换，避免 16 万元素的深层代理开销。
   let idIndex: BigInt64Array | null = null;
+  // 主书库默认视图去重（只影响显示，不删文件）：hidden 为每组除代表书外的 book id。
+  const cachedHidden = (() => {
+    try { return parseHiddenCache(localStorage.getItem(HIDDEN_CACHE_KEY)); } catch { return null; }
+  })();
+  function metaFromGroups(groups: DupDisplayGroup[]): Map<number, { copies: number }> {
+    const m = new Map<number, { copies: number }>();
+    for (const g of groups) for (const id of g.memberIds) m.set(id, { copies: g.copies });
+    return m;
+  }
+  let hiddenIds = new Set<number>(cachedHidden ? hiddenIdsFromGroups(cachedHidden.groups) : []);
+  let dupMetaById = $state<Map<number, { copies: number }>>(cachedHidden ? metaFromGroups(cachedHidden.groups) : new Map());
+  let dupRepIds = $state<Set<number>>(new Set(cachedHidden?.groups.map((g) => g.repId) ?? []));
+  let dupGroupCount = $state(cachedHidden?.groups.length ?? 0);
+  /** 「重复分组」筛选：只看有重复的书；无筛选时每组 1 本，有筛选时显示范围内全部副本。 */
+  let duplicateView = $state(false);
+  // 「重复」胶囊可隐藏（本地偏好，同步读取避免首屏闪烁）；空白右键可恢复。
+  const DUP_CHIP_HIDDEN_KEY = "tp.lib.dupChipHidden";
+  let dupChipHidden = $state((() => { try { return localStorage.getItem(DUP_CHIP_HIDDEN_KEY) === "1"; } catch { return false; } })());
+  let dupChipMenu = $state<{ x: number; y: number } | null>(null);
+
+  function saveDupChipHidden(v: boolean) {
+    dupChipHidden = v;
+    try { localStorage.setItem(DUP_CHIP_HIDDEN_KEY, v ? "1" : "0"); } catch { /* ignore */ }
+  }
+
+  function hideDupChip() {
+    saveDupChipHidden(true);
+    if (duplicateView) {
+      duplicateView = false;
+      reload();
+    }
+  }
+
+  function showDupChip() {
+    saveDupChipHidden(false);
+    dupChipMenu = null;
+  }
+
+  function openDupChipMenu(e: MouseEvent) {
+    if (!dupChipHidden || dupGroupCount <= 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".folder-chip")) return;
+    e.preventDefault();
+    dupChipMenu = {
+      x: Math.max(4, Math.min(e.clientX, window.innerWidth - 180)),
+      y: Math.max(4, Math.min(e.clientY, window.innerHeight - 52)),
+    };
+  }
+  let hiddenLoaded = false;
+  let hiddenPromise: Promise<void> | null = null;
+  let hiddenGen = 0;
+  function isDefaultListView(): boolean {
+    return !query.trim() && !selectedFolder && !hasFilter;
+  }
+  /** 取去重隐藏集合；失败退回显示全部，不阻断书库。库变更时 force 重新取。 */
+  function loadHidden(force = false): Promise<void> {
+    if (!force && hiddenLoaded) return Promise.resolve();
+    if (hiddenPromise) return hiddenPromise;
+    const gen = ++hiddenGen;
+    hiddenPromise = api.duplicateDisplayHidden()
+      .then((res) => {
+        if (gen !== hiddenGen) return;
+        hiddenIds = new Set(res.hiddenIds);
+        dupMetaById = metaFromGroups(res.groups);
+        dupRepIds = new Set(res.groups.map((g) => g.repId));
+        dupGroupCount = res.groups.length;
+        hiddenLoaded = true;
+        try { localStorage.setItem(HIDDEN_CACHE_KEY, serializeHiddenCache(res.groups, Date.now())); } catch { /* ignore */ }
+        if (indexMode && isDefaultListView() && idIndex) {
+          // hidden 晚于首屏索引到达：默认视图重建一次，让总数/列表按去重结果收敛。
+          void rebuildIndex(topAnchor());
+        }
+      })
+      .catch(() => {
+        if (gen !== hiddenGen) return;
+        // 失败保留旧 hiddenIds/缓存，不清空；下次库变更/刷新会重取。
+        hiddenLoaded = true;
+      })
+      .finally(() => {
+        if (gen === hiddenGen) hiddenPromise = null;
+      });
+    return hiddenPromise;
+  }
   // rowMap 为普通 Map（非响应式）；内容变化时 bump winVersion 触发模板重算 bookAt。
   let rowMap = new Map<number, BookRow | null>();
   let winVersion = $state(0);
@@ -192,6 +333,7 @@ import { reorderByDrop } from "../lib/reorder";
     { id: "random", labelKey: "library.topbar.random.label", titleKey: "library.topbar.random.title", icon: IconDice, run: () => openRandom() },
     // 顶栏不再放「全文搜索」按钮（阅读界面仍有全文搜索）；原位置给「笔记」，进入与书库同款的笔记书籍视图。
     { id: "notes", labelKey: "library.topbar.notes.label", titleKey: "library.topbar.notes.title", icon: IconNotebook, run: () => (ui.notesOpen = true) },
+    { id: "dupes", labelKey: "library.topbar.dupes.label", titleKey: "library.topbar.dupes.title", icon: IconCopy, run: () => (dupesOpen = true) },
     { id: "stats", labelKey: "library.topbar.stats.label", titleKey: "library.topbar.stats.title", icon: IconChartBar, run: () => (ui.statsOpen = true) },
     { id: "settings", labelKey: "library.topbar.settings.label", titleKey: "library.topbar.settings.title", icon: IconSettings, run: () => (ui.settingsOpen = true) },
   ];
@@ -272,21 +414,34 @@ import { reorderByDrop } from "../lib/reorder";
           states: Array.isArray(o.states)
             ? o.states.filter((x: unknown) => x === "unread" || x === "reading" || x === "read")
             : [],
+          tags: Array.isArray(o.tags) ? o.tags.filter((x: unknown) => typeof x === "string") : [],
         };
       }
     } catch { /* ignore */ }
-    return { formats: [] as string[], states: [] as string[] };
+    return { formats: [] as string[], states: [] as string[], tags: [] as string[] };
   })();
   let availableFormats = $state<string[]>([]);
   let filterFormats = $state<string[]>(_initFilter.formats);
   let filterStates = $state<string[]>(_initFilter.states as ReadState[]);
+  let filterTags = $state<string[]>(_initFilter.tags);
+  /** D3：标签列表 + 书籍标签筛选。 */
+  let tags: TagInfo[] = $state([]);
+  /** D3-3：智能书架（settings JSON，多窗口事件刷新）。 */
+  let shelves: Shelf[] = $state([]);
+  let shelfNameInput = $state("");
+  const SHELVES_KEY = "library.shelves.v1";
   let filterPanelOpen = $state(false);
   // 任一维度有选中即视为「已筛选」。空数组=不约束（回完整书库）。
-  const hasFilter = $derived(filterFormats.length > 0 || filterStates.length > 0);
+  const hasFilter = $derived(
+    filterFormats.length > 0 || filterStates.length > 0 || filterTags.length > 0,
+  );
 
   function saveFilter() {
     try {
-      localStorage.setItem("tidepage.lib.filter", JSON.stringify({ formats: filterFormats, states: filterStates }));
+      localStorage.setItem(
+        "tidepage.lib.filter",
+        JSON.stringify({ formats: filterFormats, states: filterStates, tags: filterTags }),
+      );
     } catch { /* ignore */ }
   }
 
@@ -330,20 +485,161 @@ import { reorderByDrop } from "../lib/reorder";
     saveFilter();
     reload();
   }
+  async function loadTags() {
+    try {
+      tags = await api.listTags();
+    } catch {
+      tags = [];
+    }
+  }
+
+  function toggleTag(name: string) {
+    exitSelect();
+    filterTags = filterTags.includes(name)
+      ? filterTags.filter((x) => x !== name)
+      : [...filterTags, name];
+    saveFilter();
+    invalidateListTotal();
+    reload();
+  }
+
+  async function loadShelves() {
+    try {
+      const raw = await api.getSetting(SHELVES_KEY);
+      shelves = deserializeShelves(raw);
+    } catch {
+      shelves = [];
+    }
+  }
+
+  async function persistShelves(next: Shelf[]) {
+    // B9：保存/重命名时按内容变化补 updatedAt（供同步按时间裁决）。
+    next = stampShelfUpdates(next, shelves, Date.now());
+    shelves = next;
+    try {
+      await api.setSetting(SHELVES_KEY, serializeShelves(next));
+      await emit("library-shelves-changed");
+    } catch {
+      toast(t("library.shelf.saveFailed"), "error");
+    }
+  }
+
+  function saveCurrentShelf() {
+    const name = shelfNameInput.trim();
+    if (!name) {
+      toast(t("library.shelf.nameRequired"), "error");
+      return;
+    }
+    const shelf = shelfFromFilter(
+      name,
+      {
+        folder: selectedFolder,
+        formats: filterFormats,
+        states: filterStates as string[],
+        tags: filterTags,
+        query,
+      },
+      shelves,
+    );
+    void persistShelves([...shelves, shelf]);
+    shelfNameInput = "";
+    toast(t("library.shelf.saved"));
+  }
+
+  function applyShelf(s: Shelf) {
+    const f = shelfFilter(s);
+    if (!f) return;
+    exitSelect();
+    selectedFolder = f.folder;
+    filterFormats = f.formats;
+    filterStates = f.states as ReadState[];
+    filterTags = f.tags;
+    libSession.queryInput = f.query;
+    saveFolder();
+    saveFilter();
+    invalidateListTotal();
+    reload();
+  }
+
+  async function removeShelf(s: Shelf) {
+    const ok = await appConfirm(t("library.shelf.deleteConfirm", { name: s.name }));
+    if (ok) {
+      // B9：书架删除写同步墓碑（归一名称与 D5 shelf key 一致），供跨设备传播删除。
+      void api.recordSyncTombstone("shelf", s.name.trim().toLowerCase(), Date.now()).catch(() => undefined);
+      void persistShelves(shelves.filter((x) => x.id !== s.id));
+    }
+  }
+
+  // D3：书架/标签的内联编辑（不用 window.prompt）。
+  let shelfRenameId = $state<string | null>(null);
+  let shelfRenameName = $state("");
+  function startShelfRename(s: Shelf) {
+    shelfRenameId = s.id;
+    shelfRenameName = s.name;
+  }
+  function confirmShelfRename(s: Shelf) {
+    const name = shelfRenameName.trim();
+    if (!name) {
+      toast(t("library.shelf.nameRequired"), "error");
+      return;
+    }
+    const others = shelves.filter((x) => x.id !== s.id);
+    const uniq = uniqueShelfName(name, others);
+    shelfRenameId = null;
+    void persistShelves(shelves.map((x) => (x.id === s.id ? { ...x, name: uniq } : x)));
+  }
+
+  let tagManageOpen = $state(false);
+  let tagEditId = $state<number | null>(null);
+  let tagEditName = $state("");
+  function startTagRename(tag: TagInfo) {
+    tagEditId = tag.id;
+    tagEditName = tag.name;
+  }
+  async function confirmTagRename(tag: TagInfo) {
+    const name = tagEditName.trim();
+    if (!name) {
+      toast(t("library.tags.nameRequired"), "error");
+      return;
+    }
+    try {
+      await api.renameTag(tag.id, name);
+      tagEditId = null;
+      await emit("library-tags-changed");
+    } catch (e) {
+      toast(errText(e), "error");
+    }
+  }
+  async function removeTagGlobal(tag: TagInfo) {
+    const ok = await appConfirm(
+      t("library.tags.deleteConfirm", { name: tag.name, count: tag.book_count }),
+    );
+    if (!ok) return;
+    try {
+      await api.deleteTag(tag.id);
+      await emit("library-tags-changed");
+    } catch (e) {
+      toast(errText(e), "error");
+    }
+  }
+
   function clearFilter() {
     if (!hasFilter) return;
     // 作用域变化：先退出多选，避免批量删除作用到当前不可见的旧选中书。
     exitSelect();
     filterFormats = [];
     filterStates = [];
+    filterTags = [];
     saveFilter();
     reload();
   }
 
   /** 拉取库内实际格式并动态生成标签；顺带清理「已选中但已不存在」的格式（失效清理）。 */
   async function loadFormats() {
+    void api.bootStage("formats_start");
     try {
       availableFormats = await api.listFormats();
+      void api.bootStage("formats_done");
       const set = new Set(availableFormats);
       const kept = filterFormats.filter((f) => set.has(f));
       if (kept.length !== filterFormats.length) {
@@ -419,6 +715,7 @@ import { reorderByDrop } from "../lib/reorder";
   let ctxEl: HTMLDivElement | undefined = $state();
   let ctxPos = $state({ left: 0, top: 0 });
   let detailBook: BookRow | null = $state(null);
+  let dupesOpen = $state(false);
 
   /** 右键菜单：先按鼠标位置显示，渲染后按菜单实际尺寸夹取到视口内（避免贴近底部/右侧被遮住）。 */
   function openCtx(e: MouseEvent, b: BookRow) {
@@ -818,6 +1115,11 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   function onLibKey(e: KeyboardEvent) {
+    if (e.key === "Escape" && dupChipMenu) {
+      e.preventDefault();
+      dupChipMenu = null;
+      return;
+    }
     if (e.key === "Escape" && selectMode) {
       e.preventDefault();
       exitSelect();
@@ -904,14 +1206,50 @@ import { reorderByDrop } from "../lib/reorder";
     });
   }
 
+  /** R11-2：回落档总数缓存——查询/筛选/文件夹/排序不变时，滚动窗口只取行（include_total=false），
+   *  不重复全表 COUNT；key 变化或 reload（库变更）时重新计数。 */
+  let listTotalKey = "";
+  let listTotalCached = -1;
+  function invalidateListTotal() {
+    listTotalKey = "";
+    listTotalCached = -1;
+  }
+
   async function loadRange(offset: number, limit = FETCH) {
     const seq = ++generation;
+    const listKey = bookListKey({
+      query,
+      sort: sortKey,
+      formats: filterFormats,
+      states: filterStates,
+      folder: selectedFolder,
+      desc,
+      tags: filterTags,
+    });
+    const needCount = shouldCountTotal(listTotalKey, listKey) || listTotalCached < 0;
     try {
-      const r = await api.listBooksPage(query, sortKey, offset, limit, filterFormats, filterStates, desc, selectedFolder ?? undefined);
+      const r = await api.listBooksPage(
+        query,
+        sortKey,
+        offset,
+        limit,
+        filterFormats,
+        filterStates,
+        desc,
+        selectedFolder ?? undefined,
+        needCount,
+        filterTags,
+      );
       if (seq !== generation) return;
-      total = r.total;
+      const resolved = resolveListTotal(r.total, listTotalCached);
+      if (needCount && r.total >= 0) {
+        listTotalCached = r.total;
+        listTotalKey = listKey;
+      }
+      total = resolved;
       rangeStart = offset;
-      booksWindow = r.rows;
+      // 回落档（超长结果/搜索）：同样按重复成员过滤窗口；总数仍取后端 total，状态栏可能偏大（报告说明）。
+      booksWindow = duplicateView && !isDefaultListView() ? r.rows.filter((b) => dupMetaById.has(b.id)) : r.rows;
     } catch (e) {
       if (seq === generation) toast(errText(e), "error");
     } finally {
@@ -1000,6 +1338,7 @@ import { reorderByDrop } from "../lib/reorder";
     pruneRowMap(s, e);
     winVersion++;
     // 首屏行已进 rowMap：向后端报一次「本轮启动走到了书库」（连续启动失败 → 下轮跳过封面重建）。
+    void api.bootStage("first_rows_done");
     signalLibraryReady();
     // ❌ 死 id 收敛：idIndex 是快照，删书后其 rank 会长期留 null（空行 + 滚动高度偏大 +
     // 为死 id 白请求封面 IO）。窗口内 null 过多或连续多窗出现 → 防抖重建（按锚点重定位）。
@@ -1124,9 +1463,34 @@ import { reorderByDrop } from "../lib/reorder";
     // 计时打点②：整库有序 id 索引重建（后端取序列 + 前端建 BigInt64Array + 锚点定位）耗时。
     console.time("[tidepage] rebuildIndex");
     try {
-      const buf = await api.listOrderIndex(sortKey, query, filterFormats, filterStates, desc, selectedFolder ?? undefined);
+      void api.bootStage("order_index_start");
+      const buf = await api.listOrderIndex(
+        sortKey,
+        query,
+        filterFormats,
+        filterStates,
+        desc,
+        selectedFolder ?? undefined,
+        filterTags,
+      );
       if (seq !== generation) return;
-      idIndex = new BigInt64Array(buf);
+      const raw = new BigInt64Array(buf);
+      const keep = (id: number): boolean => {
+        if (duplicateView) {
+          // 无筛选：每组只留代表；有搜索/目录/格式/状态/标签：显示该范围内全部重复副本。
+          return isDefaultListView() ? dupRepIds.has(id) : dupMetaById.has(id);
+        }
+        if (isDefaultListView() && hiddenIds.size > 0) return !hiddenIds.has(id);
+        return true;
+      };
+      if (duplicateView || (isDefaultListView() && hiddenIds.size > 0)) {
+        const kept: bigint[] = [];
+        for (let i = 0; i < raw.length; i++) if (keep(Number(raw[i]))) kept.push(raw[i]);
+        idIndex = BigInt64Array.from(kept);
+      } else {
+        idIndex = raw;
+      }
+      void api.bootStage("order_index_done");
       total = idIndex.length;
       rowMap = new Map();
       indexMode = true;
@@ -1182,6 +1546,7 @@ import { reorderByDrop } from "../lib/reorder";
   function reload() {
     loading = true;
     total = 0;
+    invalidateListTotal();
     resetScroll();
     void rebuildIndex();
   }
@@ -1198,59 +1563,125 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
-  /** PDF 后台补封面（仅「自动」模式）。
-   *  为什么需要它：后端封面扫描的 cover_source 只支持 epub/cbz/mobi，PDF 只能由前端用 pdf.js
-   *  栅格化；否则「PDF 不打开就没封面、其它书自动扫全库」。
-   *  串行、一次一本；每本渲染**前**都重查模式与 ui.view —— renderCoverPng 复用阅读器的 pdf.js
-   *  单例，用户一打开书（ui.view 变 reader）就必须立刻收手，否则会把阅读器正在用的文档释放掉。
-   *  tried 记本轮已试过的书：单本失败不能让它被反复选中（死循环）。 */
+  /** R12-1：PDF 后台补封面（仅「自动」模式）。
+   *  根因：旧实现 onMount 立即从全库缺封面 DB 顺序取前 120 本连续渲染，且 releaseAll 的
+   *  doc.destroy() 不等待 → pdf.js worker 堆积、启动首屏被抢占。
+   *  现在：可见区优先队列 + 串行 + 每本后 await 销毁完成 + 空闲小批次（间隔 1.5s）。 */
   let pdfCoverToken = 0;
   let pdfCoverRunning = false;
   let pdfCoverTimer: ReturnType<typeof setTimeout> | undefined;
-  /** 一轮最多补多少本：上限让「一轮」的内存与主线程占用都可预期；还有剩余就排下一轮。 */
-  const PDF_COVER_ROUND_MAX = 120;
-  /** 每补几本让出一次事件循环：给画布 / data URL / base64 字符串与 GC 回收的机会。 */
-  const PDF_COVER_YIELD_EVERY = 10;
-  /** 本次会话里已试过的书：失败的不再重挑。
-   *  为什么必须有：补封面失败的 PDF（例如 132 字节的空壳文件）不会从「缺封面」列表里消失，
-   *  没有这个集合就会「每轮重新挑同一批 → 永远失败 → 无限重试」。 */
+  /** 空闲补充批次大小（每批最多取这么多 id，处理完隔 1.5s 再取）。 */
+  const PDF_COVER_IDLE_BATCH = 12;
+  /** 空闲批次间隔 / 启动延后。 */
+  const PDF_COVER_IDLE_GAP_MS = 1500;
+  const PDF_COVER_START_DELAY_MS = 300;
+  /** 本次会话里已试过的书：失败的不再重挑（避免 132 字节空壳 PDF 无限重试）。 */
   const pdfCoverTried = new Set<number>();
+  const pdfCoverQueue = createPdfCoverQueue();
+
+  /** 当前是否允许继续补封面：auto、书库可见、窗口可见、令牌未被换书/卸载作废。 */
+  function pdfCoverAllowed(token: number): boolean {
+    return (
+      token === pdfCoverToken &&
+      config.library.coverScan === "auto" &&
+      ui.view === "library" &&
+      document.visibilityState === "visible"
+    );
+  }
+
+  /** R12-1 补丁：前 3 个失败在 DEV 下打 warn（bookId + 阶段 + 错误），便于 CDP 诊断。 */
+  let pdfCoverFailWarns = 0;
+  function warnPdfCoverFail(id: number, stage: string, e: unknown) {
+    if (pdfCoverFailWarns >= 3) return;
+    pdfCoverFailWarns++;
+    console.warn("[pdf-cover] failed", { bookId: id, stage, error: String(e) });
+  }
+
+  /** 最近一次补封面的书：队列收尾时据此按 bookId 守卫释放，避免无条件销毁 Reader 会话。 */
+  let lastPdfCoverBookId = -1;
+
+  /** 渲染一本并写回封面；返回是否成功。 */
+  async function processPdfCover(id: number): Promise<void> {
+    lastPdfCoverBookId = id;
+    let dataUrl = "";
+    let rendered = false;
+    try {
+      const pdf = await pdfMod();
+      dataUrl = await pdf.renderCoverImage(id, 320);
+      rendered = true;
+      const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+      dataUrl = ""; // 立刻放掉整幅 data URL（可能数 MB），只把 base64 段交给后端
+      if (b64) {
+        try {
+          await api.setBookCoverImage(id, b64);
+          pdf.pdfCoverStats.wrote++;
+        } catch (e) {
+          pdf.pdfCoverStats.failed++;
+          pdf.pdfCoverStats.lastError = "write: " + String(e);
+          warnPdfCoverFail(id, "setBookCoverImage", e);
+        }
+      }
+    } catch (e) {
+      /* 单本失败静默：封面是锦上添花，不弹错、也不拖住后面的书。
+       * renderCoverImage 包装层已经统计过 failed/lastError（含阶段前缀），这里不再重复计数。 */
+      dataUrl = "";
+      warnPdfCoverFail(id, rendered ? "write-prepare" : "renderCoverImage", e);
+    }
+    pdfCoverTried.add(id); // 无论成败都记账
+    // R12-1 补丁：不再无条件 release——用户可能刚打开一本 PDF（Reader 会话），
+    // 无条件 releaseAll 会销毁 Reader 的文档。串行场景下下一本 renderCoverImage→ensurePdf
+    // 已在打开前 releaseAll()+await pendingDestroy，自然等上一本销毁；最后一本留 1 个空闲 worker。
+    // 让出事件循环：canvas / PNG 字符串在这一拍后可回收。
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
   async function backfillPdfCovers() {
     if (pdfCoverRunning) return;
     const token = ++pdfCoverToken;
     pdfCoverRunning = true;
     let more = false;
     try {
-      // 一轮只取一次待补清单。旧实现把这次查询放在循环体里：每补一本就重取一遍全量 id，
-      // 1.1 万本 = 1.3 亿个 id 反复过 IPC + 每轮一个 N 长数组，是启动期内存暴涨的主因之一。
+      // ① 先清空可见区优先队列。
+      for (;;) {
+        if (!pdfCoverAllowed(token)) return;
+        const id = takeNext(pdfCoverQueue);
+        if (id === null) break;
+        if (pdfCoverTried.has(id)) continue; // 已试过/失败的 id 不再派发（attempted 不会重复增长）
+        await processPdfCover(id);
+      }
+      // ② 可见队列空：取一小批空闲补充（从全库缺封面列表，跳过 tried/已入队）。
+      if (!pdfCoverAllowed(token)) return;
       const ids = await api.pdfBooksMissingCover().catch(() => null);
-      if (!ids) return;
-      const queue = ids.filter((id) => !pdfCoverTried.has(id));
-      more = queue.length > PDF_COVER_ROUND_MAX;
-      let n = 0;
-      for (const id of queue.slice(0, PDF_COVER_ROUND_MAX)) {
-        if (token !== pdfCoverToken || config.library.coverScan !== "auto" || ui.view !== "library") return;
-        let dataUrl = "";
-        try {
-          dataUrl = await renderCoverImage(id, 320);
-          const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-          dataUrl = ""; // 立刻放掉整幅 data URL（可能数 MB），只把 base64 段交给后端
-          if (b64) await api.setBookCoverImage(id, b64);
-        } catch {
-          /* 单本失败静默：封面是锦上添花，不弹错、也不拖住后面的书 */
-          dataUrl = "";
+      if (!ids || !pdfCoverAllowed(token)) return;
+      const batch = pickIdleBatch(ids, pdfCoverTried, pdfCoverQueue.seen, PDF_COVER_IDLE_BATCH);
+      if (batch.length) {
+        enqueueIdle(pdfCoverQueue, batch);
+        more = ids.length > batch.length;
+        for (;;) {
+          if (!pdfCoverAllowed(token)) return;
+          const id = takeNext(pdfCoverQueue);
+          if (id === null) break;
+          if (pdfCoverTried.has(id)) continue;
+          await processPdfCover(id);
         }
-        pdfCoverTried.add(id); // 无论成败都记账：失败的本轮不再重挑（见 pdfCoverTried 的说明）
-        // 让出事件循环：渲染用的 canvas、PNG 字符串在这一拍之后就能被回收。
-        if (++n % PDF_COVER_YIELD_EVERY === 0) await new Promise((r) => setTimeout(r, 0));
       }
     } finally {
       if (token === pdfCoverToken) pdfCoverRunning = false;
     }
-    // 还有剩余：隔一下排下一轮（每轮仍有上限），用户无需干预，也不会出现一次冲刺。
-    if (more && token === pdfCoverToken && config.library.coverScan === "auto" && ui.view === "library") {
+    // 还有剩余：隔 1.5s 排下一轮（每次只补一小批，避免启动冲刺）。
+    if (more && pdfCoverAllowed(token)) {
       clearTimeout(pdfCoverTimer);
-      pdfCoverTimer = setTimeout(() => void backfillPdfCovers(), 1500);
+      pdfCoverTimer = setTimeout(() => void backfillPdfCovers(), PDF_COVER_IDLE_GAP_MS);
+      return;
+    }
+    // 收尾：队列已空/本轮结束，若当前会话仍是最后补封面那本且书库可见，按 bookId 守卫释放，
+    // 使 idle 后 active 回落到 0~1（不触碰 Reader 的其它书会话）。
+    if (pdfCoverAllowed(token) && lastPdfCoverBookId >= 0) {
+      try {
+        await (await pdfMod()).releasePdfSessionIfBook(lastPdfCoverBookId);
+      } catch {
+        /* ignore */
+      }
     }
   }
   /** 起一轮补封面（重复调用安全）；关闭/切手动后令牌失效，循环自行退出。 */
@@ -1258,6 +1689,14 @@ import { reorderByDrop } from "../lib/reorder";
     if (config.library.coverScan !== "auto") return;
     if (pdfCoverRunning) return;
     void backfillPdfCovers();
+  }
+  /** 首屏就绪后延后启动（requestIdleCallback 优先），不占首屏关键路径。 */
+  function schedulePdfCovers(delay = PDF_COVER_START_DELAY_MS) {
+    clearTimeout(pdfCoverTimer);
+    pdfCoverTimer = setTimeout(() => {
+      if (config.library.coverScan !== "auto" || ui.view !== "library") return;
+      kickPdfCovers();
+    }, delay);
   }
   // 离开书架（组件卸载）即停止：令牌 +1 让在跑的循环在下一次检查点退出。
   // 同时记下顶部锚点与滚动位置：进书后返回书库时据此还原视线。
@@ -1280,6 +1719,25 @@ import { reorderByDrop } from "../lib/reorder";
     });
   });
 
+  // R11-3：书库可见时恢复后台封面扫描；进入阅读/离开书库时暂停，避免与阅读抢 I/O。
+  onMount(() => {
+    void api.setScanPaused(false).catch(() => {});
+    // B7：空闲预取详情弹窗 chunk，点开时命中缓存；失败不影响书库。
+    const detailPrefetch = setTimeout(() => { void detailMod().catch(() => undefined); }, 2500);
+    const onVis = () => {
+      if (ui.view !== "library") return;
+      void api.setScanPaused(document.visibilityState !== "visible").catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearTimeout(detailPrefetch);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  });
+  onDestroy(() => {
+    void api.setScanPaused(true).catch(() => {});
+  });
+
   /** 首屏取到行后向后端报一次「已进入书库」：启动日志据此判定上一轮是否崩溃，
    *  连续启动失败时下一次启动自动跳过封面重建。只报一次。 */
   let readySignaled = false;
@@ -1287,6 +1745,8 @@ import { reorderByDrop } from "../lib/reorder";
     if (readySignaled) return;
     readySignaled = true;
     api.libraryReady().catch(() => {});
+    // R12-1：首屏关键路径之后再启动 PDF 封面队列（可见区优先由窗口 effect 入队）。
+    schedulePdfCovers(PDF_COVER_START_DELAY_MS);
   }
 
   // C1：路由重新进入本组件时 onMount 会重跑 reload()（本应用书库/阅读是 {#if} 切换，非 keep-alive）。
@@ -1315,10 +1775,14 @@ import { reorderByDrop } from "../lib/reorder";
   });
 
   // 方案 A：视口 index 区间变化时，把可见的未扫描书籍提升为高优先级扫描目标。
-  // 200ms 防抖；依赖仅为视口 index 区间（不依赖 booksWindow/rowMap，避免回环）。
+  // 200ms 防抖；依赖视口 index 区间 + 索引/窗口版本（排序/查询变化后重建索引也要补发优先项）。
   // ids 数量 = 渲染窗口行数（O(W)），与滚动位置无关（约束 2）。
   let prioTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
+    // R11-3：idIndex/winVersion 纳入依赖——rebuildIndex 后 total 可能不变、但索引内容变了，
+    // 不依赖它们会导致排序/查询变化后可见区优先项不再补发。
+    void idIndex;
+    void winVersion;
     if (total === 0) return;
     const start = view === "grid" ? gFirst * cols : lFirst;
     const end = view === "grid" ? gLast * cols : lLast;
@@ -1338,14 +1802,31 @@ import { reorderByDrop } from "../lib/reorder";
         }
       }
       if (ids.length) api.prioritizeCovers(ids).catch(() => {});
+      // R12-1：可见区 PDF（缺封面）插到补封面队首；滚动/窗口变化即优先处理。
+      const pdfIds: number[] = [];
+      for (let i = s; i < e; i++) {
+        const b = bookAt(i);
+        if (b && b.format === "pdf" && !b.cover_path) pdfIds.push(b.id);
+      }
+      if (pdfIds.length) {
+        enqueueVisible(pdfCoverQueue, pdfIds, pdfCoverTried);
+        if (config.library.coverScan === "auto" && ui.view === "library") {
+          schedulePdfCovers(0);
+        }
+      }
     }, 200);
   });
+
+  // R11-2：输入法组合输入期间不触发搜索；组合结束后再按防抖触发。
+  let searchComposing = $state(false);
 
   // 搜索 250ms 防抖后再请求（输入不触发全量过滤）。
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
     const q = queryInput;
+    void searchComposing;
     clearTimeout(searchTimer);
+    if (searchComposing) return;
     searchTimer = setTimeout(() => {
       if (q !== query) {
         // 搜索作用域变化：先退出多选，避免旧选中书被批量删除。
@@ -1396,8 +1877,10 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   async function loadFolders() {
+    void api.bootStage("folders_start");
     try {
       folders = await api.listFolders();
+      void api.bootStage("folders_done");
       foldersFailed = false;
       // 选中的文件夹已不存在（如上次会话移除 / 外部改动）→ 回到「全部」并重载。
       if (selectedFolder && !folders.includes(selectedFolder)) {
@@ -1446,6 +1929,8 @@ import { reorderByDrop } from "../lib/reorder";
     } else {
       pendingOpen.bookId = b.id;
       pendingOpen.nonce++;
+      // B7：点击开书即预加载 Reader chunk（与 idle 预取双保险），不阻塞当前帧。
+      void import("../components/Reader.svelte").catch(() => undefined);
       ui.view = "reader";
     }
   }
@@ -1517,6 +2002,7 @@ import { reorderByDrop } from "../lib/reorder";
         else toast(t("toast.library.refreshed", { added: r.added, removed: r.removed }));
         if (r.failed > 0) toast(t("toast.library.refreshPartial", { count: r.failed }), "error");
         await reloadWindow();
+        void loadHidden(true);
       }
     } finally {
       refreshing = false;
@@ -1563,7 +2049,14 @@ import { reorderByDrop } from "../lib/reorder";
 
   async function openRandom() {
     try {
-      const b = await api.randomBookFiltered(query, sortKey, filterFormats, filterStates, selectedFolder ?? undefined);
+      const b = await api.randomBookFiltered(
+      query,
+      sortKey,
+      filterFormats,
+      filterStates,
+      selectedFolder ?? undefined,
+      filterTags,
+    );
       if (b) tryOpenBook(b);
       else toast(t("toast.library.filterEmpty"));
     } catch (e) {
@@ -1647,12 +2140,13 @@ import { reorderByDrop } from "../lib/reorder";
 
   async function reextract(b: BookRow) {
     try {
-      const name = b.format === "pdf" ? await regeneratePdfCover(b.id, 320) : await api.reextractCover(b.id);
+      const name = b.format === "pdf" ? await (await pdfMod()).regeneratePdfCover(b.id, 320) : await api.reextractCover(b.id);
       // 换新对象身份（不就地改属性），令封面 <img> 重挂即时刷新。
       replaceBook(b.id, { cover_path: name, cover_ver: (b.cover_ver ?? 0) + 1 });
       toast(t("toast.library.coverReextracted"));
-    } catch (e) {
-      toast(errText(e), "error");
+    } catch {
+      // R13-A4：封面生成失败用统一短文案，不暴露底层异常名/路径。
+      toast(t(COVER_FAIL_KEY), "error");
     }
   }
 
@@ -1775,6 +2269,7 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   onMount(() => {
+    void api.bootStage("lib_mount");
     // 首屏提示条：读上次扫描的最终判定（多窗口同一份；重启后仍在）。
     void loadScanStale();
     // DEV 调试钩子：便于自动化验证删书弹窗（release 剥离）。
@@ -1795,6 +2290,9 @@ import { reorderByDrop } from "../lib/reorder";
     }
     loadFolders();
     loadFormats();
+    void loadTags();
+    void loadShelves();
+    void loadHidden(true);
     // 进书返回时若有保存的锚点或滚动位置：按锚点重建后复原视线；否则照旧全量重载回顶。
     if (libSession.anchor || libSession.scrollTop > 0) {
       loading = true;
@@ -1859,7 +2357,7 @@ import { reorderByDrop } from "../lib/reorder";
     } else {
       reload();
     }
-    kickPdfCovers(); // 进书库就补一轮缺封面的 PDF（手动模式内部直接返回）
+    // R12-1：启动期不再立即补 PDF 封面；首屏行就绪后由 signalLibraryReady 延后 300ms 启动。
     // 启动竞态修复：首次 `meta-progress` 常在 webview 挂载前发出而丢失，仅靠事件会让底栏空着。
     // 挂载后主动拉一次当前进度快照初始化（若已有事件先到则保留更新值；后续帧仍由 meta-progress 事件更新）。
     api
@@ -1874,6 +2372,22 @@ import { reorderByDrop } from "../lib/reorder";
     // library-changed 也会在换/恢复默认底图后触发：先 bump 缓存破坏版本号，
     // 保证无内嵌封面的书立即换用新底图（有内嵌封面书走各自 cover_path，不受影响）。
     // 注意：这里**不触发** metaProgress / 扫描进度状态，避免进度条回退或跳变。
+    const uTags = listen("library-tags-changed", () => {
+      void (async () => {
+        await loadTags();
+        // 标签被删除后，已选 filterTags 里可能残留旧名字：剔除并失效总数，避免空结果。
+        const alive = new Set(tags.map((x) => x.name));
+        const kept = filterTags.filter((n) => alive.has(n));
+        if (kept.length !== filterTags.length) {
+          filterTags = kept;
+          saveFilter();
+        }
+        invalidateListTotal();
+        if (indexMode) void rebuildIndex(topAnchor());
+        else void reloadWindow();
+      })();
+    });
+    const uShelves = listen("library-shelves-changed", () => void loadShelves());
     const u1 = listen("library-changed", () => {
       bumpCoverBust();
       // 防抖合并：移除大目录/批量删除时该事件可能与其它事件叠加，120ms 内只做一次全量刷新，
@@ -1881,10 +2395,14 @@ import { reorderByDrop } from "../lib/reorder";
       clearTimeout(libChangedTimer);
       libChangedTimer = setTimeout(() => {
         console.time("[tidepage] library-changed→refresh");
+        // R11-2：库变更（增删书）后总数缓存失效，回落档下一次取窗口要重新 COUNT。
+        invalidateListTotal();
         // 增删书改变 N 与顺序：索引档按锚点重建，回落档重拉窗口。
+        // 列表先刷新；hidden 后台更新，绝不阻塞 library-changed 刷新链路。
         void reloadWindow().finally(() => {
           console.timeEnd("[tidepage] library-changed→refresh");
         });
+        void loadHidden(true);
         // 格式可能新增/消失：刷新格式列表并清理失效选中。
         loadFormats();
         kickPdfCovers(); // 新导入的 PDF 也要能自动出封面（本组件只处理 pdf）
@@ -2060,10 +2578,17 @@ import { reorderByDrop } from "../lib/reorder";
       {/if}
     </div>
     <div class="search-wrap">
-      <input class="search" data-testid="lib-search" placeholder={t("library.toolbar.searchPlaceholder")} bind:value={libSession.queryInput} />
+      <input
+      class="search"
+      data-testid="lib-search"
+      placeholder={t("library.toolbar.searchPlaceholder")}
+      bind:value={libSession.queryInput}
+      oncompositionstart={() => (searchComposing = true)}
+      oncompositionend={() => (searchComposing = false)}
+    />
       {#if libSession.queryInput}
         <button
-          class="search-clear"
+          class="search-clear tp-x"
           data-testid="lib-search-clear"
           title={t("library.toolbar.clearSearch")}
           aria-label={t("library.toolbar.clearSearch")}
@@ -2090,8 +2615,8 @@ import { reorderByDrop } from "../lib/reorder";
         onclick={() => (filterPanelOpen = !filterPanelOpen)}
       >{t("library.toolbar.category")}{#if hasFilter} · {filterFormats.length + filterStates.length}{/if}</button>
       {#if hasFilter}
-        <button class="filter-chip" data-testid="lib-filter-chip" title={t("library.toolbar.clearFilterTip")} onclick={clearFilter}>
-          {t("library.toolbar.filtered")} <span class="fx"><IconX /></span>
+        <button class="filter-chip" data-testid="lib-filter-chip" title={t("library.toolbar.clearFilterTip")} aria-label={t("library.toolbar.clearFilterTip")} onclick={clearFilter}>
+          {t("library.toolbar.filtered")} <span class="fx tp-x" aria-hidden="true"><IconX size={14} stroke={1.8} /></span>
         </button>
       {/if}
     </div>
@@ -2118,6 +2643,21 @@ import { reorderByDrop } from "../lib/reorder";
     {/if}
   </div>
 
+  {#if maintReminder}
+    <div class="maint-banner" data-testid="lib-maint-reminder">
+      <div class="maint-text">
+        <span>{t("settings.maintenance.reminder", { size: formatBytes(maintReminder.freelist), need: formatBytes(maintReminder.need) })}</span>
+        <span class="maint-sub">{t("settings.maintenance.reminderHint")}</span>
+      </div>
+      <div class="maint-actions">
+        <button data-testid="lib-maint-vacuum" disabled={maintBusy} onclick={() => void vacuumFromBanner()}>
+          {maintBusy ? t("settings.maintenance.vacuumRunning") : t("settings.maintenance.reminderAction")}
+        </button>
+        <button disabled={maintBusy} onclick={() => { config.maintenance.reminderDismissedUntil = Date.now(); saveConfig(); maintReminder = null; }}>{t("settings.maintenance.dismiss7")}</button>
+      </div>
+    </div>
+  {/if}
+
   {#if filterPanelOpen}
     <div class="filter-panel" out:outFade={{ from: 0.98, up: false }}>
       <div class="fp-group">
@@ -2132,6 +2672,44 @@ import { reorderByDrop } from "../lib/reorder";
         </div>
       </div>
       <div class="fp-group">
+        <span class="fp-label">{t("library.filter.tags")}</span>
+        <div class="fp-tags">
+          {#each tags as tag (tag.id)}
+            <button class="tag" class:active={filterTags.includes(tag.name)} onclick={() => toggleTag(tag.name)}>
+              {tag.name}{#if tag.book_count}<span class="fp-count"> · {tag.book_count}</span>{/if}
+            </button>
+          {/each}
+          {#if !tags.length}<span class="fp-empty">{t("library.filter.noTags")}</span>{/if}
+          {#if tags.length}
+            <button class="tag" data-testid="lib-tag-manage" onclick={() => (tagManageOpen = !tagManageOpen)}>
+              {tagManageOpen ? t("library.tags.collapse") : t("library.tags.manage")}
+            </button>
+          {/if}
+        </div>
+        {#if tagManageOpen}
+          <div class="fp-tags" data-testid="lib-tag-manage-list">
+            {#each tags as tag (tag.id)}
+              <span class="tag">
+                {#if tagEditId === tag.id}
+                  <input
+                    class="search"
+                    style="max-width:120px"
+                    bind:value={tagEditName}
+                    onkeydown={(e) => { if (e.key === "Enter") void confirmTagRename(tag); if (e.key === "Escape") tagEditId = null; }}
+                  />
+                  <button class="tag" onclick={() => void confirmTagRename(tag)}>✓</button>
+                  <button class="tag" onclick={() => (tagEditId = null)}>×</button>
+                {:else}
+                  {tag.name}{#if tag.book_count}<span class="fp-count"> · {tag.book_count}</span>{/if}
+                  <button class="tag" title={t("library.tags.renameTip")} onclick={() => startTagRename(tag)}>✎</button>
+                  <button class="tag tp-x tp-x-sm" title={t("library.tags.deleteTip")} aria-label={t("library.tags.deleteTip")} onclick={() => void removeTagGlobal(tag)}><IconX size={12} stroke={1.8} /></button>
+                {/if}
+              </span>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <div class="fp-group">
         <span class="fp-label">{t("library.filter.readState")}</span>
         <div class="fp-tags">
           {#each ALL_STATES as s (s)}
@@ -2139,6 +2717,18 @@ import { reorderByDrop } from "../lib/reorder";
               {stateLabel(s)}
             </button>
           {/each}
+        </div>
+      </div>
+      <div class="fp-group">
+        <span class="fp-label">{t("library.shelf.title")}</span>
+        <div class="fp-tags">
+          <input
+            class="search"
+            style="max-width:180px"
+            placeholder={t("library.shelf.namePlaceholder")}
+            bind:value={shelfNameInput}
+          />
+          <button class="tag" onclick={saveCurrentShelf}>{t("library.shelf.saveCurrent")}</button>
         </div>
       </div>
       {#if hasFilter}
@@ -2162,8 +2752,8 @@ import { reorderByDrop } from "../lib/reorder";
     </div>
   {/if}
 
-  {#if folders.length || foldersFailed}
-    <div class="folders">
+  {#if folders.length || foldersFailed || dupGroupCount > 0}
+    <div class="folders" oncontextmenu={openDupChipMenu}>
       <button
         class="folder-chip"
         class:active={selectedFolder === null}
@@ -2171,6 +2761,30 @@ import { reorderByDrop } from "../lib/reorder";
         title={t("library.folder.allTip")}
         onclick={() => selectFolder(null)}
       >{t("library.folder.all")}</button>
+      {#if dupGroupCount > 0 && !dupChipHidden}
+        <span
+          class="folder-chip"
+          class:active={duplicateView}
+          role="button"
+          tabindex="0"
+          data-testid="lib-folder-duplicates"
+          title={t("library.folders.duplicatesTip")}
+          onclick={() => { duplicateView = !duplicateView; reload(); }}
+          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); duplicateView = !duplicateView; reload(); } }}
+        >
+          <IconCopy size={14} stroke={1.8} /> {t("library.folders.duplicates")} · {t("library.folders.duplicatesCount", { n: dupGroupCount })}
+          <button
+            class="x tp-x"
+            data-testid="lib-folder-duplicates-hide"
+            title={t("library.folders.hideDuplicates")}
+            aria-label={t("library.folders.hideDuplicates")}
+            onclick={(e) => { e.stopPropagation(); hideDupChip(); }}
+            onkeydown={(e) => e.stopPropagation()}
+            onkeyup={(e) => e.stopPropagation()}
+            onpointerdown={(e) => e.stopPropagation()}
+          ><IconX size={14} stroke={1.8} /></button>
+        </span>
+      {/if}
       {#each folders as f (f)}
         <span
           class="folder-chip"
@@ -2183,10 +2797,49 @@ import { reorderByDrop } from "../lib/reorder";
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFolder(f); } }}
         >
           <IconFolder /> {f}
-          <button class="x" title={t("library.folder.removeTip")} aria-label={t("library.folder.removeTip")} onclick={(e) => { e.stopPropagation(); removeFolder(f); }}><IconX /></button>
+          <button class="x tp-x" title={t("library.folder.removeTip")} aria-label={t("library.folder.removeTip")} onclick={(e) => { e.stopPropagation(); removeFolder(f); }}><IconX size={14} stroke={1.8} /></button>
         </span>
       {/each}
       {#if foldersFailed}<span class="fp-empty" data-testid="lib-folders-failed">{t("library.folders.failed")}</span>{/if}
+    </div>
+  {/if}
+  {#if dupChipMenu}
+    <div class="ctx-backdrop" out:outDissolve onclick={() => (dupChipMenu = null)} oncontextmenu={(e) => { e.preventDefault(); dupChipMenu = null; }}>
+      <div class="ctx ctx-menu" style="left:{dupChipMenu.x}px; top:{dupChipMenu.y}px;" out:outFade={{ from: 0.96 }}>
+        <button class="ctx-item" data-testid="lib-folder-duplicates-show" onclick={showDupChip}>{t("library.folders.showDuplicates")}</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if shelves.length}
+    <div class="folders" data-testid="lib-shelves">
+      {#each shelves as s (s.id)}
+        {#if shelfRenameId === s.id}
+          <span class="folder-chip">
+            <input
+              class="search"
+              style="max-width:140px"
+              bind:value={shelfRenameName}
+              onkeydown={(e) => { if (e.key === "Enter") confirmShelfRename(s); if (e.key === "Escape") shelfRenameId = null; }}
+            />
+            <button class="x" title={t("library.shelf.renameSave")} onclick={() => confirmShelfRename(s)}>✓</button>
+            <button class="x" title={t("library.shelf.renameCancel")} onclick={() => (shelfRenameId = null)}><IconX /></button>
+          </span>
+        {:else}
+          <span
+            class="folder-chip"
+            role="button"
+            tabindex="0"
+            title={t("library.shelf.applyTip", { name: s.name })}
+            onclick={() => applyShelf(s)}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); applyShelf(s); } }}
+          >
+            {s.name}
+            <button class="x" title={t("library.shelf.renameTip")} aria-label={t("library.shelf.renameTip")} onclick={(e) => { e.stopPropagation(); startShelfRename(s); }}>✎</button>
+            <button class="x" title={t("library.shelf.deleteTip")} aria-label={t("library.shelf.deleteTip")} onclick={(e) => { e.stopPropagation(); void removeShelf(s); }}><IconX /></button>
+          </span>
+        {/if}
+      {/each}
     </div>
   {/if}
 
@@ -2250,6 +2903,7 @@ import { reorderByDrop } from "../lib/reorder";
                   <div
                     class="card"
                     class:selected={sel}
+                    class:dup-card={dupMetaById.has(b.id) && config.library.duplicateEffect}
                     data-book-id={b.id}
                     style="max-width:{CARD_MAX}px;"
                     tabindex="0"
@@ -2262,19 +2916,28 @@ import { reorderByDrop } from "../lib/reorder";
                     oncontextmenu={(e) => openCtx(e, b)}
                   >
                     <div class="cover" style="height:{coverH}px;">
-                      <!-- 用 {#key cu} 让封面 URL 变化时 <img> 整体重挂（webview 对已挂载自定义协议 img 换 src 不可靠重绘）：
-                           换默认底图（仅无内嵌封面书的 URL 含 &db= 变化）或换/重提取封面（cover_ver 变化）即时生效；
-                           有内嵌封面书 URL 不变、不重挂、不闪白。 -->
-                      {#key cu}
-                        <img src={cu} alt={t("library.book.coverAlt", { title: b.title })} loading="lazy" decoding="async" draggable="false" />
-                      {/key}
-                      <span class="fmt">{b.format.toUpperCase()}</span>
-                      {#if selectMode}
-                        <span class="sel-badge" class:on={sel} aria-hidden="true">{#if sel}<IconCheck />{/if}</span>
+                      {#if dupMetaById.has(b.id) && config.library.duplicateEffect}
+                        <span class="dup-ghost g2" aria-hidden="true"><img src={cu} alt="" loading="lazy" decoding="async" draggable="false" /></span>
+                        <span class="dup-ghost g1" aria-hidden="true"><img src={cu} alt="" loading="lazy" decoding="async" draggable="false" /></span>
                       {/if}
-                      {#if ri.show && config.library.showCoverProgress}
-                        <ProgressRing pct={ri.pct} full={ri.full} />
-                      {/if}
+                      <div class="cover-frame">
+                        <!-- 用 {#key cu} 让封面 URL 变化时 <img> 整体重挂（webview 对已挂载自定义协议 img 换 src 不可靠重绘）：
+                             换默认底图（仅无内嵌封面书的 URL 含 &db= 变化）或换/重提取封面（cover_ver 变化）即时生效；
+                             有内嵌封面书 URL 不变、不重挂、不闪白。 -->
+                        {#key cu}
+                          <img src={cu} alt={t("library.book.coverAlt", { title: b.title })} loading="lazy" decoding="async" draggable="false" />
+                        {/key}
+                        <span class="fmt">{b.format.toUpperCase()}</span>
+                        {#if selectMode}
+                          <span class="sel-badge" class:on={sel} aria-hidden="true">{#if sel}<IconCheck />{/if}</span>
+                        {/if}
+                        {#if ri.show && config.library.showCoverProgress}
+                          <ProgressRing pct={ri.pct} full={ri.full} />
+                        {/if}
+                        {#if dupMetaById.has(b.id) && config.library.duplicateEffect}
+                          <span class="dup-badge" data-testid="dup-badge" title={t("library.duplicateBadgeTitle", { n: dupMetaById.get(b.id)?.copies ?? 0 })}>{t("library.duplicateCopies", { n: dupMetaById.get(b.id)?.copies ?? 0 })}</span>
+                        {/if}
+                      </div>
                     </div>
                     <div class="meta">
                       <div class="t" title={b.title}>{b.title}</div>
@@ -2326,7 +2989,7 @@ import { reorderByDrop } from "../lib/reorder";
                 {/if}
               </div>
               <div class="row-meta">
-                <div class="t" title={b.title}>{b.title}</div>
+                <div class="t" title={b.title}>{b.title}{#if dupMetaById.has(b.id) && config.library.duplicateEffect}<span class="dup-list-badge">{t("library.duplicateCopiesShort", { n: dupMetaById.get(b.id)?.copies ?? 0 })}</span>{/if}</div>
                 <div class="a" title={b.author}>{b.author}</div>
               </div>
               <!-- 纯视觉的进度条（信息与网格视图的进度环同源），故对读屏隐藏，不引入新文案键 -->
@@ -2393,7 +3056,7 @@ import { reorderByDrop } from "../lib/reorder";
     <div class="ctx-backdrop" out:outDissolve onclick={() => (ctxMenu = null)} oncontextmenu={(e) => { e.preventDefault(); ctxMenu = null; }}>
       <div class="ctx ctx-menu" bind:this={ctxEl} style="left:{ctxPos.left}px; top:{ctxPos.top}px;" out:outFade={{ from: 0.96 }}>
         <button class="ctx-item" data-testid="lib-ctx-open" onclick={() => { tryOpenBook(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconBook2 size={16} stroke={1.5} /></span>{t("library.ctx.open")}</button>
-        <button class="ctx-item" data-testid="lib-ctx-detail" onclick={() => { detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={16} stroke={1.5} /></span>{t("library.ctx.detail")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-detail" onclick={() => { void detailMod().catch(() => undefined); detailBook = ctxMenu!.book; ctxMenu = null; }}><span class="ci"><IconInfoCircle size={16} stroke={1.5} /></span>{t("library.ctx.detail")}</button>
         {#if ctxMenu.book.format === "txt"}
           <button class="ctx-item" data-testid="lib-ctx-convert" onclick={() => { openConvert(ctxMenu!.book); ctxMenu = null; }}><span class="ci"><IconArrowsExchange size={16} stroke={1.5} /></span>{t("library.ctx.convert")}</button>
         {/if}
@@ -2416,20 +3079,30 @@ import { reorderByDrop } from "../lib/reorder";
     </div>
   {/if}
 
+  {#if dupesOpen}
+    <DuplicateBooksModal onclose={() => (dupesOpen = false)} />
+  {/if}
+
   {#if detailBook}
-    <BookDetailModal
-      book={detailBook}
-      onclose={() => { detailBook = null; touchWindow(); }}
-      onupdated={(title, author) => {
-        const b = detailBook;
-        if (!b) return;
-        const next = { ...b, title, author };
-        detailBook = next;
-        rowMap.set(b.id, next);
-        winVersion++;
-        touchWindow();
-      }}
-    />
+    {#await detailMod()}
+      <div style="padding:16px;color:var(--fg2);text-align:center">{t("common.loading")}</div>
+    {:then { default: C }}
+      <C
+        book={detailBook}
+        onclose={() => { detailBook = null; touchWindow(); }}
+        onupdated={(title, author) => {
+          const b = detailBook;
+          if (!b) return;
+          const next = { ...b, title, author };
+          detailBook = next;
+          rowMap.set(b.id, next);
+          winVersion++;
+          touchWindow();
+        }}
+      />
+    {:catch}
+      <div style="padding:16px;color:var(--fg2);text-align:center">{t("boot.dynamicFailed")}</div>
+    {/await}
   {/if}
 </div>
 
@@ -2443,6 +3116,45 @@ import { reorderByDrop } from "../lib/reorder";
      - 阴影分层更柔：1px 极淡描边 + 轻阴影
      - 悬停 ≥8% 亮度差；禁用 40% 不透明
      ============================================================ */
+  .maint-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    gap: var(--sp-3);
+    margin: var(--sp-3) var(--sp-4) 0;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--panel);
+    color: var(--fg2);
+    font-size: var(--fs-xs);
+  }
+  .maint-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .maint-banner span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .maint-sub {
+    font-size: var(--fs-2xs);
+    color: var(--fg2);
+    opacity: 0.8;
+  }
+  .maint-actions {
+    display: flex;
+    gap: var(--sp-2);
+    flex: none;
+  }
+  .maint-banner button {
+    flex: none;
+    font-size: var(--fs-2xs);
+    white-space: nowrap;
+  }
   .library {
     height: 100%;
     display: flex;
@@ -2460,8 +3172,10 @@ import { reorderByDrop } from "../lib/reorder";
   /* ---------- 顶栏 ---------- */
   .toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--sp-2);
+    row-gap: var(--sp-2);
     padding: var(--sp-3) var(--sp-4);
     /* 右侧留出自绘窗口控制按钮（约 3×30 + 间距 + 右边距 ≈ 100px）的宽度并留自然间距 */
     padding-right: 112px;
@@ -2531,6 +3245,13 @@ import { reorderByDrop } from "../lib/reorder";
     flex: none;
   }
 
+  /* 中文按钮/下拉不允许逐字竖排：窄窗口靠 flex-wrap 折行，而不是压窄文字。 */
+  .toolbar button,
+  .toolbar .cat-btn,
+  .toolbar select {
+    white-space: nowrap;
+  }
+
   .spacer { flex: 1; }
 
   /* ---------- 分类筛选 ---------- */
@@ -2561,7 +3282,12 @@ import { reorderByDrop } from "../lib/reorder";
   .filter-chip .fx {
     font-weight: 700;
     line-height: 1;
-    opacity: 0.85;
+    opacity: 0.9;
+  }
+  .filter-chip .fx :global(svg) {
+    width: 14px;
+    height: 14px;
+    stroke-width: 1.8;
   }
   .filter-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 
@@ -2818,26 +3544,29 @@ import { reorderByDrop } from "../lib/reorder";
     animation: sk-shimmer 1.2s var(--ease) infinite;
   }
 
-  /* 封面：内芯容器，内层图片裁切；极淡描边营造嵌进托盘的实体感。 */
+  /* 封面外层：只负责尺寸与叠影溢出（不裁切）；内层 .cover-frame 承接圆角/描边/图片裁切。 */
   .cover {
     position: relative;
     width: 100%;
-    /* 同心圆角（double-bezel 的数学要求）：内芯圆角 = 外壳圆角 − 外壳内边距，
-       两条弧才是同一个圆心，嵌套读起来才像「一块嵌进托盘的内芯」而不是「贴了张图」。
-       .card 内边距是 --sp-2、圆角是 --radius-lg，故内芯取 calc(半径 − 8px)。 */
+    overflow: visible;
+    border-radius: calc(var(--radius-lg) - var(--sp-2));
+  }
+
+  /* 内芯：原 .cover 的圆角/描边/裁切/阴影移到这里，尺寸由外层决定。 */
+  .cover-frame {
+    position: relative;
+    width: 100%;
+    height: 100%;
     border-radius: calc(var(--radius-lg) - var(--sp-2));
     overflow: hidden;
     background: var(--panel2);
     outline: 1px solid var(--line);
     outline-offset: -1px;
-    /* 只留一层投影：封面自身已有 outline: 1px solid var(--line) 描边，
-       原先再叠的 inset 0 1px 0 rgba(255,255,255,.14) 是 app.css 明确记录为已被
-       --edge-hi 取代的反模式 —— 浅色下几乎看不见，暗色下是一道脏白边。 */
     box-shadow: var(--shadow-sm);
     transition: box-shadow var(--dur-lift) var(--ease-premium);
   }
 
-  .card:hover .cover {
+  .card:hover .cover-frame {
     box-shadow: var(--shadow-md);
   }
 
@@ -2851,6 +3580,62 @@ import { reorderByDrop } from "../lib/reorder";
 
   .card:hover .cover img {
     transform: scale(1.055);
+  }
+
+  /* ---------- 重复书叠影卡组 ---------- */
+  .dup-ghost {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    overflow: hidden;
+    background: var(--panel2);
+    outline: 1px solid var(--line);
+    outline-offset: -1px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.55;
+    filter: saturate(0.45) brightness(0.82);
+    transition: transform var(--dur-lift) var(--ease-premium), opacity var(--dur-lift) var(--ease-premium);
+  }
+  .dup-ghost img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .dup-ghost.g2 { transform: translate(4px, 4px) rotate(1.4deg); opacity: 0.3; }
+  .dup-ghost.g1 { transform: translate(2px, 2px) rotate(0.7deg); opacity: 0.45; }
+  .card.dup-card .cover-frame { z-index: 1; }
+  .card.dup-card:hover .dup-ghost.g2 { transform: translate(15px, 10px) rotate(2.4deg); opacity: 0.42; }
+  .card.dup-card:hover .dup-ghost.g1 { transform: translate(8px, 5px) rotate(1.2deg); opacity: 0.6; }
+  .card:hover .dup-ghost img { transform: none; }
+  .dup-badge {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    z-index: 2;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: var(--accent-fg, #fff);
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    line-height: 1.4;
+    pointer-events: none;
+    box-shadow: var(--shadow-sm);
+  }
+  .dup-list-badge {
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dup-ghost { transition: none; }
   }
 
   /* 格式角标：半透明深底 + 白色小字，10px 字距 +0.015em。
@@ -3212,6 +3997,7 @@ import { reorderByDrop } from "../lib/reorder";
     align-items: center;
     gap: var(--sp-1);
     position: relative;
+    margin-left: auto;
   }
 
   .lib-tb-btn {

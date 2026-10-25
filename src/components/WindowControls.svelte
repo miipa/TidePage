@@ -73,14 +73,16 @@
 </div>
 
 <style>
-  /* 固定右上角覆盖层：容器高度 = 当前窗口顶栏实际高度（--tp-titlebar-h，由承载顶栏的
-     组件测高写入），按钮在容器内垂直居中，使按钮中心线与顶栏图标中心线重合、自动对齐。
-     z-index 取层级表最高的 --z-window，保证任何时候（连设置弹窗打开时）都能操作窗口。 */
+  /* 固定右上角覆盖层：正常情况下容器高度 = 当前窗口顶栏实际高度（--tp-titlebar-h，由承载
+     顶栏的组件测高写入），按钮在容器内垂直居中，与顶栏图标中心线重合。窄窗口工具栏折行会
+     把 --tp-titlebar-h 抬到 130px+，若跟随就会让按钮中心下探、压住弹窗关闭按钮；因此高度
+     封顶 60px（首行高度），底部留 2px 安全分隔，窗口按钮始终固定在第一行。 */
   .win-ctl {
     position: fixed;
     top: 0;
     right: 0;
-    height: var(--tp-titlebar-h, 44px);
+    height: min(var(--tp-titlebar-h, 44px), 60px);
+    padding-bottom: 2px;
     z-index: var(--z-window);
     display: flex;
     align-items: center;

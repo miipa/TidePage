@@ -27,7 +27,7 @@ use crate::models::TocEntry;
 use mobi::headers::{Compression, Encryption, TextEncoding};
 use mobi::Mobi;
 use regex::{Captures, Regex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Default)]
@@ -944,12 +944,98 @@ pub fn extract_cover_seek(path: &str) -> Option<Vec<u8>> {
     .flatten()
 }
 
+const RES_MARKER: &str = ".cache_stamp";
+
+fn res_marker_path(out_dir: &Path) -> std::path::PathBuf {
+    out_dir.join(RES_MARKER)
+}
+
+/// 源文件指纹 (size, mtime_ms)；与 library.rs 的 file_stamp 同语义（取不到返回 None）。
+pub(crate) fn src_file_stamp(path: &str) -> Option<(i64, i64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((m.len() as i64, mtime))
+}
+
+/// 原子写 res 标记（tmp + rename）；失败只记日志，不影响本次解析结果。
+fn write_res_marker(out_dir: &Path, stamp: (i64, i64), count: u64) {
+    let _ = std::fs::create_dir_all(out_dir);
+    let path = res_marker_path(out_dir);
+    let tmp = out_dir.join(format!("{RES_MARKER}.tmp"));
+    let body = format!("{} {} {}\n", stamp.0, stamp.1, count);
+    if std::fs::write(&tmp, body).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        // Windows 上 rename 不覆盖已存在目标。
+        let _ = std::fs::remove_file(&path);
+        if std::fs::rename(&tmp, &path).is_err() {
+            eprintln!("[mobi] res 标记写入失败 dir={}", out_dir.display());
+        }
+    }
+}
+
+/// 解析 res 目录里的图片文件名 `r{记录号:05}.{ext}`；非法名/不支持的扩展名返回 None。
+pub(crate) fn parse_res_file_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix('r')?;
+    let (num, ext) = rest.split_once('.')?;
+    if num.len() != 5 || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !matches!(ext, "jpg" | "png" | "gif" | "webp" | "bmp") {
+        return None;
+    }
+    num.parse().ok()
+}
+
+/// 扫描 res 目录，按记录号升序返回 (记录号, 文件名)；标记文件/临时文件/非法名一律忽略。
+fn scan_res_files(out_dir: &Path) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rec) = parse_res_file_name(&name) else { continue };
+        if !e.path().is_file() {
+            continue;
+        }
+        out.push((rec, name));
+    }
+    out.sort_by_key(|(rec, _)| *rec);
+    out
+}
+
+/// 删除 res 目录里「本次没有写入」的旧图（只认 r{5位}.{允许扩展名} 的文件名）。
+/// 为什么需要：源文件被替换成「图片更少」的版本时，旧版本记录号更大的文件会残留；
+/// 而 res_dir_ready 用「目录扫描数 == 标记数」校验，残留会让该书永远无法命中解析缓存、
+/// 每次打开都重抽图。只按文件名精确匹配：.cache_stamp、临时文件、非该命名规则的文件
+/// 一律不动；删除失败忽略，不 panic。
+fn prune_unkept_res_files(out_dir: &Path, keep: &HashSet<String>) {
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if parse_res_file_name(&name).is_none() || keep.contains(&name) {
+            continue;
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
 /// 从 first_image 索引到 EOF 提取图片记录：嗅探魔数、写盘并建立
 /// (记录索引→URL)、(EXTH121 资源号→URL)、按序列表 三种映射。
 pub fn extract_images(
     mobi: &Mobi,
     out_dir: &Path,
     url_prefix: &str,
+    src_stamp: Option<(i64, i64)>,
 ) -> (HashMap<u32, String>, HashMap<u32, String>, Vec<String>) {
     let mut by_rec: HashMap<u32, String> = HashMap::new();
     let mut by_res: HashMap<u32, String> = HashMap::new();
@@ -957,22 +1043,48 @@ pub fn extract_images(
     let fi = mobi.metadata.mobi.first_image_index as usize;
     let recs = raw_records_safe(mobi);
     if fi == 0 || fi >= recs.len() {
+        // 无图（或头不可用）：仍写「0 张图」标记，让磁盘解析缓存可命中，否则这类书每次重启都重解析。
+        // 有源指纹时先清空旧图残留：否则 res_dir_ready 的「扫描数 == 标记数」永远不成立。
+        if let Some(stamp) = src_stamp {
+            prune_unkept_res_files(out_dir, &HashSet::new());
+            write_res_marker(out_dir, stamp, 0);
+        }
         return (by_rec, by_res, ordered);
     }
-    let _ = std::fs::create_dir_all(out_dir);
-    for r in recs.iter().skip(fi) {
-        let c = r.content;
-        if NON_IMAGE_MAGICS.iter().any(|m| c.starts_with(m)) {
-            continue;
+    let reuse = res_dir_ready(out_dir, src_stamp);
+    if !reuse {
+        let _ = std::fs::create_dir_all(out_dir);
+    }
+    if reuse {
+        // 复用已落盘图片：按文件名记录号升序重建（与当初抽取的写入顺序一致）。
+        for (rec, fname) in scan_res_files(out_dir) {
+            let url = format!("{url_prefix}{fname}");
+            by_rec.insert(rec, url.clone());
+            ordered.push(url);
         }
-        let Some(ext) = image_magic(c) else { continue };
-        let fname = format!("r{:05}.{ext}", r.index);
-        if std::fs::write(out_dir.join(&fname), c).is_err() {
-            continue;
+    } else {
+        // 本次实际写成功的文件名集合：写盘结束后据此清理旧版本残留（见 prune_unkept_res_files）。
+        let mut written: HashSet<String> = HashSet::new();
+        for r in recs.iter().skip(fi) {
+            let c = r.content;
+            if NON_IMAGE_MAGICS.iter().any(|m| c.starts_with(m)) {
+                continue;
+            }
+            let Some(ext) = image_magic(c) else { continue };
+            let fname = format!("r{:05}.{ext}", r.index);
+            if std::fs::write(out_dir.join(&fname), c).is_err() {
+                continue;
+            }
+            written.insert(fname.clone());
+            let url = format!("{url_prefix}{fname}");
+            by_rec.insert(r.index as u32, url.clone());
+            ordered.push(url);
         }
-        let url = format!("{url_prefix}{fname}");
-        by_rec.insert(r.index as u32, url.clone());
-        ordered.push(url);
+        if let Some(stamp) = src_stamp {
+            // 清理旧版本残留后再写标记：两者配合保证「扫描数 == 标记数」对得上，缓存才能命中。
+            prune_unkept_res_files(out_dir, &written);
+            write_res_marker(out_dir, stamp, by_rec.len() as u64);
+        }
     }
     if by_rec.is_empty() {
         return (by_rec, by_res, ordered);
@@ -994,6 +1106,411 @@ pub fn extract_images(
         }
     }
     (by_rec, by_res, ordered)
+}
+
+
+const RES_MANIFEST: &str = ".images";
+const RES_MANIFEST_MAGIC: &[u8; 4] = b"TPIM";
+const RES_MANIFEST_VER: u16 = 1;
+/// 协议层单张图片上限（与 lib.rs res/ 分支一致）。
+pub const RES_IMAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// res 图片目录三态：NotReady=无标记/指纹不符；Files=旧版本逐张写盘的目录；
+/// Lazy=只写清单、图片按需从源文件区间读取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResDirState {
+    NotReady,
+    Files,
+    Lazy,
+}
+
+/// 清单里的一条图片：记录号、扩展名、源文件区间（偏移+长度）。
+#[derive(Debug, Clone)]
+pub struct ResImageEntry {
+    pub rec: u32,
+    pub ext: String,
+    pub offset: u64,
+    pub len: u32,
+}
+
+impl ResImageEntry {
+    pub fn file_name(&self) -> String {
+        format!("r{:05}.{}", self.rec, self.ext)
+    }
+}
+
+/// 图片清单（res/<book_id>/.images）：源文件指纹 + 路径 + 每条图片的源文件区间。
+#[derive(Debug, Clone)]
+pub struct ResManifest {
+    pub size: i64,
+    pub mtime: i64,
+    pub source: String,
+    pub entries: Vec<ResImageEntry>,
+}
+
+fn res_manifest_path(out_dir: &Path) -> std::path::PathBuf {
+    out_dir.join(RES_MANIFEST)
+}
+
+/// 读 res 标记；第 4 段 "lazy" 表示清单模式，旧 3 段格式视为 Files 模式。
+fn read_res_marker_mode(out_dir: &Path) -> Option<(i64, i64, u64, bool)> {
+    let s = std::fs::read_to_string(res_marker_path(out_dir)).ok()?;
+    let mut it = s.split_whitespace();
+    let size: i64 = it.next()?.parse().ok()?;
+    let mtime: i64 = it.next()?.parse().ok()?;
+    let count: u64 = it.next()?.parse().ok()?;
+    let lazy = it.next() == Some("lazy");
+    Some((size, mtime, count, lazy))
+}
+
+/// 原子写 res 标记（tmp + rename）；lazy=true 时写 4 段格式。
+fn write_res_marker_mode(out_dir: &Path, stamp: (i64, i64), count: u64, lazy: bool) {
+    let _ = std::fs::create_dir_all(out_dir);
+    let path = res_marker_path(out_dir);
+    let tmp = out_dir.join(format!("{RES_MARKER}.tmp"));
+    let mode = if lazy { " lazy" } else { "" };
+    let body = format!("{} {} {}{}\n", stamp.0, stamp.1, count, mode);
+    if std::fs::write(&tmp, body).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&path);
+        if std::fs::rename(&tmp, &path).is_err() {
+            eprintln!("[mobi] res 标记写入失败 dir={}", out_dir.display());
+        }
+    }
+}
+
+fn encode_manifest(m: &ResManifest) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(64 + m.entries.len() * 24 + m.source.len());
+    out.extend_from_slice(RES_MANIFEST_MAGIC);
+    out.extend_from_slice(&RES_MANIFEST_VER.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // 对齐/保留
+    out.extend_from_slice(&m.size.to_le_bytes());
+    out.extend_from_slice(&m.mtime.to_le_bytes());
+    out.extend_from_slice(&(m.source.len() as u32).to_le_bytes());
+    out.extend_from_slice(m.source.as_bytes());
+    out.extend_from_slice(&(m.entries.len() as u32).to_le_bytes());
+    for e in &m.entries {
+        out.extend_from_slice(&e.rec.to_le_bytes());
+        out.push(e.ext.len() as u8);
+        out.extend_from_slice(e.ext.as_bytes());
+        out.extend_from_slice(&e.offset.to_le_bytes());
+        out.extend_from_slice(&e.len.to_le_bytes());
+    }
+    out
+}
+
+fn decode_manifest(b: &[u8]) -> Option<ResManifest> {
+    let mut p = 0usize;
+    let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+        if *p + n > b.len() {
+            return None;
+        }
+        let s = &b[*p..*p + n];
+        *p += n;
+        Some(s)
+    };
+    if take(&mut p, 4)? != RES_MANIFEST_MAGIC {
+        return None;
+    }
+    let ver = u16::from_le_bytes(take(&mut p, 2)?.try_into().ok()?);
+    if ver != RES_MANIFEST_VER {
+        return None;
+    }
+    let _pad = take(&mut p, 2)?;
+    let size = i64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
+    let mtime = i64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
+    let slen = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?) as usize;
+    let source = String::from_utf8_lossy(take(&mut p, slen)?).into_owned();
+    let count = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let rec = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+        let elen = take(&mut p, 1)?[0] as usize;
+        let ext = String::from_utf8_lossy(take(&mut p, elen)?).into_owned();
+        let offset = u64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
+        let len = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+        entries.push(ResImageEntry { rec, ext, offset, len });
+    }
+    Some(ResManifest { size, mtime, source, entries })
+}
+
+fn write_manifest(out_dir: &Path, m: &ResManifest) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let path = res_manifest_path(out_dir);
+    let tmp = out_dir.join(format!("{RES_MANIFEST}.tmp"));
+    std::fs::write(&tmp, encode_manifest(m))?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            std::fs::rename(&tmp, &path)
+        }
+    }
+}
+
+fn read_manifest(out_dir: &Path) -> Option<ResManifest> {
+    let b = std::fs::read(res_manifest_path(out_dir)).ok()?;
+    decode_manifest(&b)
+}
+
+/// res 目录三态判定（见 ResDirState 注释）；旧目录 Files 模式继续可用、不迁移。
+pub fn res_dir_state(out_dir: &Path, stamp: Option<(i64, i64)>) -> ResDirState {
+    let Some((size, mtime)) = stamp else {
+        return ResDirState::NotReady;
+    };
+    let Some((m_size, m_mtime, count, lazy)) = read_res_marker_mode(out_dir) else {
+        return ResDirState::NotReady;
+    };
+    if size != m_size || mtime != m_mtime {
+        return ResDirState::NotReady;
+    }
+    if lazy {
+        match read_manifest(out_dir) {
+            Some(m) if m.size == size && m.mtime == mtime && m.entries.len() as u64 == count => {
+                ResDirState::Lazy
+            }
+            _ => ResDirState::NotReady,
+        }
+    } else if scan_res_files(out_dir).len() as u64 == count {
+        ResDirState::Files
+    } else {
+        ResDirState::NotReady
+    }
+}
+
+/// res 图片目录是否可用（Files 或 Lazy 都算可用；保留旧函数名供现有调用方使用）。
+pub fn res_dir_ready(out_dir: &Path, stamp: Option<(i64, i64)>) -> bool {
+    res_dir_state(out_dir, stamp) != ResDirState::NotReady
+}
+
+/// Lazy 模式下按清单返回图片文件名（记录号升序）；非 Lazy 返回 None。
+pub fn res_image_names(out_dir: &Path) -> Option<Vec<String>> {
+    let (_, _, _, lazy) = read_res_marker_mode(out_dir)?;
+    if !lazy {
+        return None;
+    }
+    let m = read_manifest(out_dir)?;
+    Some(m.entries.iter().map(|e| e.file_name()).collect())
+}
+
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "jpg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/bmp",
+    }
+}
+
+/// 读 res 目录的图片清单（供 library 的进程内缓存复用）。
+pub fn read_res_manifest(out_dir: &Path) -> Option<ResManifest> {
+    read_manifest(out_dir)
+}
+
+/// 图片文件名对应的 MIME（只接受 res 图片命名规则）。
+pub fn res_mime_for_name(name: &str) -> Option<&'static str> {
+    let rest = name.strip_prefix('r')?;
+    let (_, ext) = rest.split_once('.')?;
+    Some(mime_for_ext(ext))
+}
+
+/// 文件名是否为合法 res 图片名（r{5位}.{jpg|png|gif|webp|bmp}）。
+pub fn is_res_image_name(name: &str) -> bool {
+    parse_res_file_name(name).is_some()
+}
+
+/// 直接按文件名读取 res 目录里的图片文件（旧 Files 目录/已落盘图片；不扫目录、不读清单）。
+pub fn read_res_image_file(out_dir: &Path, name: &str) -> Option<(String, Vec<u8>)> {
+    let _ = parse_res_file_name(name)?;
+    let mime = res_mime_for_name(name)?;
+    let b = std::fs::read(out_dir.join(name)).ok()?;
+    if b.len() > RES_IMAGE_MAX_BYTES {
+        return None;
+    }
+    Some((mime.to_string(), b))
+}
+
+/// 用已加载的清单读取图片（library 缓存清单后走这里，避免每张图重读清单）；
+/// fallback_source：manifest 记录的源路径不存在时，允许用 DB 当前路径（指纹必须与清单一致）。
+pub fn read_res_image_manifest(
+    m: &ResManifest,
+    name: &str,
+    fallback_source: Option<&str>,
+) -> Option<(String, Vec<u8>)> {
+    let rec = parse_res_file_name(name)?;
+    let entry = m
+        .entries
+        .iter()
+        .find(|e| e.rec == rec && e.file_name() == name)?;
+    if entry.len as usize > RES_IMAGE_MAX_BYTES {
+        return None;
+    }
+    let mut sources: Vec<&str> = vec![m.source.as_str()];
+    if let Some(f) = fallback_source {
+        if f != m.source.as_str() {
+            sources.push(f);
+        }
+    }
+    for src in sources {
+        let Ok(meta) = std::fs::metadata(src) else { continue };
+        let size = meta.len() as i64;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if size != m.size || mtime != Some(m.mtime) {
+            continue;
+        }
+        if entry.offset + entry.len as u64 > size as u64 {
+            continue;
+        }
+        let mut f = std::fs::File::open(src).ok()?;
+        use std::io::{Read, Seek, SeekFrom};
+        if f.seek(SeekFrom::Start(entry.offset)).is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; entry.len as usize];
+        if f.read_exact(&mut buf).is_ok() {
+            return Some((mime_for_ext(&entry.ext).to_string(), buf));
+        }
+    }
+    None
+}
+
+/// 由清单重建 by_rec/ordered（记录号升序，与 Files 模式扫描顺序一致）。
+fn manifest_maps(
+    m: &ResManifest,
+    url_prefix: &str,
+) -> (HashMap<u32, String>, Vec<String>) {
+    let mut by_rec = HashMap::with_capacity(m.entries.len());
+    let mut ordered = Vec::with_capacity(m.entries.len());
+    for e in &m.entries {
+        let url = format!("{url_prefix}{}", e.file_name());
+        by_rec.insert(e.rec, url.clone());
+        ordered.push(url);
+    }
+    (by_rec, ordered)
+}
+
+/// EXTH 121 资源号映射（recidx:residx，十六进制）；两种模式共用。
+fn build_res_map(
+    mobi: &Mobi,
+    by_rec: &HashMap<u32, String>,
+    first_image_index: u32,
+) -> HashMap<u32, String> {
+    let mut by_res: HashMap<u32, String> = HashMap::new();
+    if by_rec.is_empty() {
+        return by_res;
+    }
+    if let Some(list) = mobi.metadata.exth_record_at(121) {
+        for blob in list {
+            let s = String::from_utf8_lossy(blob).to_string();
+            for pair in s.split(|ch: char| {
+                ch == ',' || ch == ';' || ch == '\0' || ch == '\n' || ch.is_whitespace()
+            }) {
+                let Some((rec_s, res_s)) = pair.split_once(':') else { continue };
+                let Ok(rec_i) = u32::from_str_radix(rec_s.trim(), 16) else { continue };
+                let Ok(res_i) = u32::from_str_radix(res_s.trim(), 16) else { continue };
+                if let Some(u) = by_rec.get(&rec_i).cloned() {
+                    by_res.insert(res_i, u);
+                } else if let Some(u) = by_rec.get(&((first_image_index + rec_i) as u32)).cloned() {
+                    by_res.insert(res_i, u);
+                }
+            }
+        }
+    }
+    by_res
+}
+
+/// 按源文件区间构建图片清单（不写图片文件）。
+fn build_image_manifest(mobi: &Mobi, stamp: (i64, i64), source: &str) -> ResManifest {
+    let mut entries: Vec<ResImageEntry> = Vec::new();
+    let fi = mobi.metadata.mobi.first_image_index as usize;
+    let content = mobi.content.as_slice();
+    let recs = raw_records_safe_data(mobi, content);
+    if fi != 0 && fi < recs.len() {
+        let base = content.as_ptr() as usize;
+        for r in recs.iter().skip(fi) {
+            let c = r.content;
+            if NON_IMAGE_MAGICS.iter().any(|m| c.starts_with(m)) {
+                continue;
+            }
+            let Some(ext) = image_magic(c) else { continue };
+            let offset = (c.as_ptr() as usize).saturating_sub(base) as u64;
+            entries.push(ResImageEntry {
+                rec: r.index as u32,
+                ext: ext.to_string(),
+                offset,
+                len: c.len() as u32,
+            });
+        }
+    }
+    ResManifest {
+        size: stamp.0,
+        mtime: stamp.1,
+        source: source.to_string(),
+        entries,
+    }
+}
+
+/// R8-1：图片懒提取。Lazy 命中读清单不扫目录；Files 命中复用旧目录；
+/// NotReady 时只写清单 + lazy 标记并清掉旧图片残留；任一步失败回退 Files 全量写盘。
+pub fn extract_images_lazy(
+    mobi: &Mobi,
+    out_dir: &Path,
+    url_prefix: &str,
+    src_stamp: Option<(i64, i64)>,
+    src_path: &str,
+) -> (HashMap<u32, String>, HashMap<u32, String>, Vec<String>) {
+    let state = res_dir_state(out_dir, src_stamp);
+    match state {
+        ResDirState::Lazy => {
+            if let Some(m) = read_manifest(out_dir) {
+                let (by_rec, ordered) = manifest_maps(&m, url_prefix);
+                let fi = mobi.metadata.mobi.first_image_index;
+                let by_res = build_res_map(mobi, &by_rec, fi);
+                return (by_rec, by_res, ordered);
+            }
+            // 清单读取失败：回退全量写盘（保持正确性）。
+        }
+        ResDirState::Files => {
+            // 旧目录继续按文件服务，不迁移、不重抽图。
+            return extract_images(mobi, out_dir, url_prefix, src_stamp);
+        }
+        ResDirState::NotReady => {}
+    }
+    let Some(stamp) = src_stamp else {
+        return extract_images(mobi, out_dir, url_prefix, src_stamp);
+    };
+    let manifest = build_image_manifest(mobi, stamp, src_path);
+    if write_manifest(out_dir, &manifest).is_ok() {
+        // 清单与标记都成功后，清掉旧版本残留图片文件（旧 files 模式或上次失败写入）。
+        prune_unkept_res_files(out_dir, &HashSet::new());
+        write_res_marker_mode(out_dir, stamp, manifest.entries.len() as u64, true);
+        if res_dir_state(out_dir, src_stamp) == ResDirState::Lazy {
+            let (by_rec, ordered) = manifest_maps(&manifest, url_prefix);
+            let fi = mobi.metadata.mobi.first_image_index;
+            let by_res = build_res_map(mobi, &by_rec, fi);
+            return (by_rec, by_res, ordered);
+        }
+    }
+    // 构建/校验失败：回退现有全量写盘模式（慢但正确），并清掉可能残留的半成品清单。
+    let _ = std::fs::remove_file(res_manifest_path(out_dir));
+    if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
+        eprintln!("[mobi] lazy manifest failed, fallback to files dir={}", out_dir.display());
+    }
+    extract_images(mobi, out_dir, url_prefix, src_stamp)
+}
+
+/// R8-1 解析模式：Files=逐张写盘（既有测试/转换路径），Lazy=只写清单按需读取（生产打开）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResMode {
+    Files,
+    Lazy,
 }
 
 /// 重写 HTML 中的图片引用 → 本地资源 URL：
@@ -1239,6 +1756,48 @@ fn decode_entities_text(s: &str) -> (String, usize) {
 /// - 文本节点缓冲合并后选择性实体解码（`&amp;#N;` 双重转义、`&#N;`、命名实体），
 ///   并把解码出的 `<`/`>` 再转义防文本变标签
 /// - `<script>`/`<style>` 连内容丢弃；检测到未闭合 RAWTEXT 时改为"去标签留文本"（正文优先）
+
+/// B8 MOBI profile：TIDEPAGE_PARSE_PROFILE 开启时累计 flush 子阶段，生产零输出。
+#[cfg(feature = "sanitize-profile")]
+static M_PROFILE_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TIDEPAGE_PARSE_PROFILE").is_some());
+#[cfg(feature = "sanitize-profile")]
+static M_FLUSH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static M_ENTITY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static M_REPLACE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static M_REGEX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static M_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static M_PRINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "sanitize-profile")]
+struct MProf(Option<std::time::Instant>, &'static std::sync::atomic::AtomicU64);
+#[cfg(feature = "sanitize-profile")]
+impl MProf {
+    fn new(slot: &'static std::sync::atomic::AtomicU64) -> Self {
+        Self(if *M_PROFILE_ON { Some(std::time::Instant::now()) } else { None }, slot)
+    }
+}
+#[cfg(feature = "sanitize-profile")]
+impl Drop for MProf {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            self.1.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+#[cfg(feature = "sanitize-profile")]
+fn m_print_once() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !*M_PROFILE_ON || M_PRINTED.swap(1, Relaxed) != 0 { return; }
+    let ms = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1_000_000.0;
+    let (total, flush, entity, replace, regex) = (ms(&M_TOTAL_NS), ms(&M_FLUSH_NS), ms(&M_ENTITY_NS), ms(&M_REPLACE_NS), ms(&M_REGEX_NS));
+    eprintln!("[mobi-sanitize-profile] total={total:.1}ms flush={flush:.1}ms entity={entity:.1}ms replace={replace:.1}ms regex={regex:.1}ms");
+}
+
 pub fn decode_and_sanitize(html: &str) -> String {
     use crate::sanitize::{handle_dangerous_tag, is_dangerous_tag, serialize_safe_tag};
     use html5ever::tokenizer::{TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
@@ -1257,11 +1816,28 @@ pub fn decode_and_sanitize(html: &str) -> String {
     }
     impl St {
         fn flush(&mut self) {
+            #[cfg(feature = "sanitize-profile")]
+            let _mflush = MProf::new(&M_FLUSH_NS);
             if self.pending_text.is_empty() {
                 return;
             }
             let t = std::mem::take(&mut self.pending_text);
+            // R8-3 快速路径：纯文本节点（无实体、标签、引号、等号、替换字符）无需实体解码、
+            // 破碎标签正则与逐字符转义，直接输出。与慢路径逐字节等价（见单测），
+            // 危险字符过滤仍由随后的 clean_html 全量遍历负责。
+            if !t
+                .bytes()
+                .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'' | b'='))
+                && !t.contains('\u{FFFD}')
+            {
+                self.out.push_str(&t);
+                return;
+            }
+            #[cfg(feature = "sanitize-profile")]
+            let _mentity = MProf::new(&M_ENTITY_NS);
             let (d, _e) = decode_entities_text(&t);
+            #[cfg(feature = "sanitize-profile")]
+            drop(_mentity);
             // 源文件损坏产生的破碎标签以实体形态(&lt;b aid=&quot;x&quot;&gt;)混在正文里，
             // 浏览器会原样显示成源码。这里虚拟解码→剔除破碎标签/属性残留→再转义输出。
             static RE_BROKEN_TAG: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -1273,17 +1849,33 @@ pub fn decode_and_sanitize(html: &str) -> String {
             static RE_BROKEN_HEAD: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
                 Regex::new(r#"(?i)(?:aid|class|style|href|src|type|width|height|align|rel|valign|char|id|onclick|onload|target)\s*=\s*["']?"#).unwrap()
             });
-            let virtual_str = d
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&#39;", "'")
-                .replace("&amp;", "&");
-            let mut cleaned = RE_BROKEN_TAG.replace_all(&virtual_str, "").to_string();
-            let n1 = RE_BROKEN_TAG.find_iter(&virtual_str).count();
-            cleaned = RE_BROKEN_ATTR.replace_all(&cleaned, "").to_string();
-            let n2 = RE_BROKEN_ATTR.find_iter(&cleaned).count();
-            cleaned = RE_BROKEN_HEAD.replace_all(&cleaned, "").to_string();
+            // 只在确实存在对应实体时替换，避免无命中仍复制整段。
+            #[cfg(feature = "sanitize-profile")]
+            let _mreplace = MProf::new(&M_REPLACE_NS);
+            let mut virtual_str = d;
+            if virtual_str.contains("&lt;") { virtual_str = virtual_str.replace("&lt;", "<"); }
+            if virtual_str.contains("&gt;") { virtual_str = virtual_str.replace("&gt;", ">"); }
+            if virtual_str.contains("&quot;") { virtual_str = virtual_str.replace("&quot;", "\""); }
+            if virtual_str.contains("&#39;") { virtual_str = virtual_str.replace("&#39;", "'"); }
+            if virtual_str.contains("&amp;") { virtual_str = virtual_str.replace("&amp;", "&"); }
+            #[cfg(feature = "sanitize-profile")]
+            drop(_mreplace);
+            #[cfg(feature = "sanitize-profile")]
+            let _mregex = MProf::new(&M_REGEX_NS);
+            // replace_all 与计数同一遍扫描，不再 find_iter 二次扫描。
+            let mut n1 = 0usize;
+            let mut cleaned = if virtual_str.contains('<') && virtual_str.contains('>') {
+                RE_BROKEN_TAG.replace_all(&virtual_str, |_: &Captures| { n1 += 1; "" }).to_string()
+            } else { virtual_str };
+            let mut n2 = 0usize;
+            if cleaned.contains('=') && (cleaned.contains('"') || cleaned.contains('\'')) {
+                cleaned = RE_BROKEN_ATTR.replace_all(&cleaned, |_: &Captures| { n2 += 1; "" }).to_string();
+            }
+            if cleaned.contains('=') {
+                cleaned = RE_BROKEN_HEAD.replace_all(&cleaned, "").to_string();
+            }
+            #[cfg(feature = "sanitize-profile")]
+            drop(_mregex);
             self.drop_broken += n1 + n2;
             for ch in cleaned.chars() {
                 match ch {
@@ -1301,6 +1893,10 @@ pub fn decode_and_sanitize(html: &str) -> String {
     // MOBI 专属属性值转义：对比 EPUB 的 escape_attr_into 额外剔除 U+FFFD（属性内畸形实体
     // tokenizer 会规范产出 U+FFFD，无害化）。保留在 mobi.rs，不并入共享骨架。
     fn ser_attr_value(v: &str, out: &mut String) {
+        if !v.bytes().any(|b| matches!(b, b'&' | b'"')) && !v.contains('\u{FFFD}') {
+            out.push_str(v);
+            return;
+        }
         for c in v.chars() {
             match c {
                 '&' => out.push_str("&amp;"),
@@ -1368,6 +1964,8 @@ pub fn decode_and_sanitize(html: &str) -> String {
         drop_tags: 0,
         drop_broken: 0,
     }));
+    #[cfg(feature = "sanitize-profile")]
+    let _mtotal = MProf::new(&M_TOTAL_NS);
     let tok = Tokenizer::new(Sink(st.clone()), html5ever::tokenizer::TokenizerOpts::default());
     let q = html5ever::tokenizer::BufferQueue::default();
     q.push_back(html.into());
@@ -1375,6 +1973,8 @@ pub fn decode_and_sanitize(html: &str) -> String {
     tok.end();
     let mut b = st.borrow_mut();
     b.flush();
+    #[cfg(feature = "sanitize-profile")]
+    m_print_once();
     if std::env::var("MOBI_SANITIZE_DEBUG").is_ok() {
         eprintln!(
             "[sanitize] in={} out={} drop_tags={} drop_broken={} dangling={}",
@@ -1413,6 +2013,14 @@ fn has_dangling_rawtext(html: &str) -> bool {
 
 /// 字符级过滤（KF8 私有区标记/控制字符），在 DOM 清理与实体解码之后执行
 fn clean_html(s: &str) -> String {
+    // R8-3 快速路径：无 KF8 私有区字符/非法控制字符时整段返回，避免逐字符分配。
+    let has_bad = s.chars().any(|ch| {
+        let code = ch as u32;
+        (0xE000..=0xF8FF).contains(&code) || (code < 0x20 && !matches!(ch, '\n' | '\r' | '\t'))
+    });
+    if !has_bad {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let code = ch as u32;
@@ -1441,8 +2049,18 @@ pub fn parse_full(
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
 ) -> Result<MobiDoc, String> {
+    parse_full_mode(path, force_encoding, images, ResMode::Files)
+}
+
+/// R8-1：按资源模式解析（生产打开用 Lazy，测试/转换路径用 Files）。
+pub fn parse_full_mode(
+    path: &str,
+    force_encoding: Option<&str>,
+    images: Option<(&Path, &str)>,
+    res_mode: ResMode,
+) -> Result<MobiDoc, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_full_inner(path, force_encoding, images)
+        parse_full_inner(path, force_encoding, images, res_mode)
     })) {
         Ok(r) => r,
         Err(_) => Err(format!(
@@ -1451,8 +2069,9 @@ pub fn parse_full(
     }
 }
 
-/// 一次读取 + 一次解析，同时返回**原始文件字节**（用于正确切分记录）。
-fn read_and_parse_mobi_bytes(path: &str) -> Result<(Mobi, Vec<u8>), String> {
+/// 一次读取 + 一次解析；返回的 Mobi.content 已持有修复后的文件字节，原始缓冲不再返回。
+/// C13：修复 content 后立即释放原始 bytes，避免解析期同时常驻两份整文件。
+fn read_and_parse_mobi_bytes(path: &str) -> Result<Mobi, String> {
     // 快速失败路径：不整读文件即拦截 DRM/畸形头
     sniff_drm_file(path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
@@ -1467,13 +2086,13 @@ fn read_and_parse_mobi_bytes(path: &str) -> Result<(Mobi, Vec<u8>), String> {
             "AWZ3EncryptedError: MOBI 头 DRM 记录偏移域非空（存在 DRM 记录），请先解密后导入".to_string(),
         );
     }
-    // 修复 crate 的 content 前导置零：`Mobi::from_reader` 用 `vec![0; position]` 再
-    // `read_to_end` 追加，导致元数据区被置零，而 PDB 记录偏移是**绝对文件偏移**，
-    // 若不修复则 record0 内容全零、正文切分会错位（KF8/AZW3 尤其明显）。
+    // C13：修复 crate content 前导置零后立即释放原始 bytes；crate 的 from_reader 是私有 API，
+    // 无法在不复制外部 bytes 的前提下解析，峰值仍受 crate 限制（需自研读取器才能进一步降）。
     if mobi.content.len() == bytes.len() {
         mobi.content.copy_from_slice(&bytes);
     }
-    Ok((mobi, bytes))
+    drop(bytes);
+    Ok(mobi)
 }
 
 /// 元数据阶段专用：**一次读取、一次解析**同时拿到 `MobiDoc` 与封面字节，
@@ -1496,12 +2115,12 @@ pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>
 // staged: parse_with_cover 的 catch_unwind 内核（随其一同保留）。
 #[allow(dead_code)]
 fn parse_with_cover_inner(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
-    let (mobi, _data) = match read_and_parse_mobi_bytes(path) {
+    let mobi = match read_and_parse_mobi_bytes(path) {
         Ok(m) => m,
         Err(e) => return (Err(e), None),
     };
     let cover = extract_cover_bytes(&mobi);
-    match build_mobi_doc(path, &mobi, None, None) {
+    match build_mobi_doc(path, &mobi, None, None, ResMode::Files) {
         Ok(doc) => (Ok(doc), cover),
         Err(e) => (Err(e), None),
     }
@@ -1511,9 +2130,10 @@ fn parse_full_inner(
     path: &str,
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
+    res_mode: ResMode,
 ) -> Result<MobiDoc, String> {
-    let (mobi, _data) = read_and_parse_mobi_bytes(path)?;
-    build_mobi_doc(path, &mobi, force_encoding, images)
+    let mobi = read_and_parse_mobi_bytes(path)?;
+    build_mobi_doc(path, &mobi, force_encoding, images, res_mode)
 }
 
 /// 纯构建：解码/清洗正文、改写图片、切分章节（不做任何文件读取）。
@@ -1522,10 +2142,17 @@ fn build_mobi_doc(
     mobi: &Mobi,
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
+    res_mode: ResMode,
 ) -> Result<MobiDoc, String> {
+    // C3：环境变量开启的分段计时（默认零输出，不改变行为）；用于大书 profile 定位。
+    let prof = std::env::var("TIDEPAGE_PARSE_PROFILE").is_ok();
+    let prof_t0 = std::time::Instant::now();
     let (raw, extract_warn) = extract_records_and_decompress_limited(&mobi, MAX_RECORDS, MAX_HTML_BYTES)?;
+    let t_decompress = prof_t0.elapsed();
     // 一次性全局解码整个字节流（不在任何 Record 内做字符串解码）
+    let t_decode0 = std::time::Instant::now();
     let mut decoded = decode_html_bytes(&raw, mobi.text_encoding(), force_encoding);
+    let t_decode = t_decode0.elapsed();
     if decoded.warning.is_none() {
         decoded.warning = extract_warn;
     }
@@ -1535,9 +2162,25 @@ fn build_mobi_doc(
                 .to_string(),
         );
     }
+    let diag_on = std::env::var("TIDEPAGE_MOBI_DIAG").is_ok();
+    let raw_len = raw.len();
+    let text_lt = if diag_on { decoded.text.matches('<').count() } else { 0 };
+    drop(raw); // C2：解码后原始字节不再需要，尽早释放
     // NUL/控制字符必须在 tokenizer 之前剔除（tag-name 状态按规范会把 NUL 变成 U+FFFD 混进标签名）；
-    // 之后再清一次：实体解码可能还原出 PUA/控制字符
-    let mut html = clean_html(&decode_and_sanitize(&clean_html(&decoded.text)));
+    // 之后再清一次：实体解码可能还原出 PUA/控制字符。
+    // C2：三步串行并逐步释放中间 String，避免 clean_html/净化/再 clean 的中间结果同时常驻。
+    let t_clean0 = std::time::Instant::now();
+    let decoded_text = std::mem::take(&mut decoded.text);
+    let step1 = clean_html(&decoded_text);
+    drop(decoded_text);
+    let t_clean1 = t_clean0.elapsed();
+    let t_san0 = std::time::Instant::now();
+    let step2 = decode_and_sanitize(&step1);
+    drop(step1);
+    let t_san = t_san0.elapsed();
+    let mut html = clean_html(&step2);
+    drop(step2);
+    let t_clean2 = t_clean0.elapsed() - t_clean1 - t_san;
     // 根因1：图片重写会改变字符串长度，必须**先改图片再算章节区间**，
     // 否则 parts 是改写前的旧字节区间，safe_slice 会从标签/单词/URI 中间切开。
     let first_image_index = mobi.metadata.mobi.first_image_index;
@@ -1545,7 +2188,12 @@ fn build_mobi_doc(
     let mut res_map = 0usize;
     let mut rewrite_stats = RewriteStats::default();
     if let Some((dir, prefix)) = images {
-        let (by_rec, by_res, ordered) = extract_images(&mobi, dir, prefix);
+        let (by_rec, by_res, ordered) = match res_mode {
+            ResMode::Lazy => {
+                extract_images_lazy(&mobi, dir, prefix, src_file_stamp(path), path)
+            }
+            ResMode::Files => extract_images(&mobi, dir, prefix, src_file_stamp(path)),
+        };
         image_count = ordered.len();
         res_map = by_res.len();
         if image_count > 0 {
@@ -1556,8 +2204,24 @@ fn build_mobi_doc(
     }
     // res_urls 语义：成功重写为书内本地资源 URL 的图片引用数（验收指标之一）
     let res_urls = rewrite_stats.rewritten;
+    let t_split0 = std::time::Instant::now();
     let (toc, parts) = split_mobi_chapters(&html);
-    if std::env::var("TIDEPAGE_MOBI_DIAG").is_ok() {
+    let t_split = t_split0.elapsed();
+    if prof {
+        eprintln!(
+            "[parse-profile] decompress={}ms decode={}ms clean1={}ms sanitize={}ms clean2={}ms split={}ms total={}ms html={}B toc={}",
+            t_decompress.as_millis(),
+            t_decode.as_millis(),
+            t_clean1.as_millis(),
+            t_san.as_millis(),
+            t_clean2.as_millis(),
+            t_split.as_millis(),
+            prof_t0.elapsed().as_millis(),
+            html.len(),
+            toc.len()
+        );
+    }
+    if diag_on {
         let kf8 = detect_kf8(&mobi);
         let m = &mobi.metadata.mobi;
         let recs = raw_records_safe(&mobi);
@@ -1579,14 +2243,14 @@ fn build_mobi_doc(
             kf8.boundary_exth,
             kf8.is_kf8,
             kf8.header_kind,
-            decoded.text.matches('<').count(),
+            text_lt,
             toc.len(),
             html.len(),
             image_count,
             res_urls,
             res_map,
             rewrite_stats.placeholders,
-            raw.len(),
+            raw_len,
             decoded.warning,
         );
     }
@@ -2269,7 +2933,7 @@ mod tests {
         let mobi = Mobi::new(&b).unwrap();
         let dir = std::env::temp_dir().join(format!("tidepage-mobi-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://tidepage.localhost/res/1/");
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://tidepage.localhost/res/1/", None);
         assert_eq!(ordered.len(), 2, "应提取 2 张图");
         std::fs::remove_dir_all(&dir).ok();
         let html = String::from_utf8_lossy(&text).to_string();
@@ -2287,6 +2951,115 @@ mod tests {
         assert_eq!(st.total_imgs, 4);
         assert_eq!(st.rewritten, 3);
         assert_eq!(st.placeholders, 1);
+    }
+
+    #[test]
+    fn res_file_name_parse_and_scan_sorted() {
+        assert_eq!(parse_res_file_name("r00012.jpg"), Some(12));
+        assert_eq!(parse_res_file_name("r00012.webp"), Some(12));
+        for bad in ["r12.jpg", "r0001a.png", "r00012.txt", "cache.jpg", ".cache_stamp", "r00012"] {
+            assert!(parse_res_file_name(bad).is_none(), "非法名不应通过: {bad}");
+        }
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["r00007.png", "r00003.jpg", "bad.txt", ".cache_stamp"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let files = scan_res_files(&dir);
+        assert_eq!(files.iter().map(|(r, _)| *r).collect::<Vec<_>>(), vec![3, 7]);
+        assert_eq!(files[0].1, "r00003.jpg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_unkept_res_files_removes_only_stale_images() {
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["r00001.jpg", "r00002.jpg", ".cache_stamp", "notes.txt"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let mut keep: HashSet<String> = HashSet::new();
+        keep.insert("r00001.jpg".to_string());
+        prune_unkept_res_files(&dir, &keep);
+        assert!(dir.join("r00001.jpg").exists(), "本次写入的文件不得删除");
+        assert!(!dir.join("r00002.jpg").exists(), "本次未写入的旧图应被清掉");
+        assert!(dir.join(".cache_stamp").exists(), "标记文件不得删除");
+        assert!(dir.join("notes.txt").exists(), "非该命名规则的文件不得删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn res_marker_ready_requires_stamp_and_count() {
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r00001.jpg"), b"jpg").unwrap();
+        write_res_marker(&dir, (100, 200), 1);
+        assert!(res_dir_ready(&dir, Some((100, 200))), "指纹与数量一致应复用");
+        assert!(!res_dir_ready(&dir, Some((100, 201))), "指纹不同不得复用");
+        assert!(!res_dir_ready(&dir, None), "无指纹不得复用");
+        std::fs::write(dir.join("r00002.png"), b"png").unwrap();
+        assert!(!res_dir_ready(&dir, Some((100, 200))), "图片数对不上不得复用");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_reuses_ready_res_dir_without_rewrite() {
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpg.extend_from_slice(&[7u8; 128]);
+        let mut png = vec![0x89, b'P', b'N', b'G'];
+        png.extend_from_slice(&[9u8; 64]);
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: b"<p>a</p>".to_vec(),
+            images: vec![jpg, png],
+            res121: vec![b"0002:0001".to_vec()],
+            text_encoding: 65001,
+        }
+        .build();
+        let mobi = Mobi::new(&b).unwrap();
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stamp = (12345i64, 67890i64);
+        let (by_rec1, by_res1, ordered1) = extract_images(&mobi, &dir, "res/", Some(stamp));
+        assert_eq!(ordered1.len(), 2, "应提取 2 张图");
+        assert_eq!(by_res1.len(), 1);
+        // 篡改一张已落盘图片：复用分支不得重写，所以篡改内容会保留（证明没有重新抽图）。
+        let tampered = dir.join("r00002.jpg");
+        std::fs::write(&tampered, b"tampered").unwrap();
+        let (by_rec2, by_res2, ordered2) = extract_images(&mobi, &dir, "res/", Some(stamp));
+        assert_eq!(ordered2, ordered1, "复用重建的按序映射必须一致");
+        assert_eq!(by_rec2, by_rec1);
+        assert_eq!(by_res2, by_res1);
+        assert_eq!(std::fs::read(&tampered).unwrap(), b"tampered", "不应重新抽图写盘");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_without_images_writes_zero_marker() {
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: b"<p>only text</p>".to_vec(),
+            images: vec![],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let mobi = Mobi::new(&b).unwrap();
+        let dir = std::env::temp_dir().join(format!("tidepage-mobi-noimg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧版本残留的图片：无图分支必须清掉，否则「扫描数 == 标记数」永远不成立。
+        std::fs::write(dir.join("r00009.png"), b"stale").unwrap();
+        let (_by_rec, _by_res, ordered) = extract_images(&mobi, &dir, "res/", Some((1, 2)));
+        assert!(ordered.is_empty());
+        assert!(!dir.join("r00009.png").exists(), "无图分支应清掉旧图残留");
+        assert!(res_dir_ready(&dir, Some((1, 2))), "无图书也应写 0 张标记供磁盘缓存复用");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 根因2 回归：MOBI6 `recindex` 是相对 first_image_index 的 1 基序号，
@@ -2311,7 +3084,7 @@ mod tests {
         let mobi = Mobi::new(&b).unwrap();
         let dir = std::env::temp_dir().join(format!("tidepage-mobi-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/");
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/", None);
         std::fs::remove_dir_all(&dir).ok();
         let fi = mobi.metadata.mobi.first_image_index;
         assert_eq!(fi, 2);
@@ -2894,4 +3667,269 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    fn uniq_res_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("tp-mobi-r8-{tag}-{nanos}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_mobi_file(bytes: &[u8], tag: &str) -> (String, std::path::PathBuf) {
+        let d = uniq_res_dir(tag);
+        let p = d.join("book.mobi");
+        std::fs::write(&p, bytes).unwrap();
+        (p.to_string_lossy().into_owned(), d)
+    }
+
+    fn build_image_mobi() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpg.extend_from_slice(&[7u8; 128]);
+        let mut png = vec![0x89, b'P', b'N', b'G'];
+        png.extend_from_slice(&[9u8; 64]);
+        let text =
+            b"<p>a</p><img recindex=\"0002\"/><img src=\"kindle:embed:0001\"/>".to_vec();
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text,
+            images: vec![jpg.clone(), png.clone()],
+            res121: vec![b"0002:0001".to_vec()],
+            text_encoding: 65001,
+        }
+        .build();
+        (b, vec![jpg, png])
+    }
+
+    /// R8-1：清单写入/读取 roundtrip、指纹与条数校验、旧 files 标记兼容。
+    #[test]
+    fn res_manifest_roundtrip_and_state() {
+        let d = uniq_res_dir("manifest");
+        let m = ResManifest {
+            size: 11,
+            mtime: 22,
+            source: "C:/x.mobi".into(),
+            entries: vec![ResImageEntry { rec: 5, ext: "jpg".into(), offset: 100, len: 7 }],
+        };
+        write_manifest(&d, &m).unwrap();
+        let back = read_manifest(&d).unwrap();
+        assert_eq!(back.size, 11);
+        assert_eq!(back.mtime, 22);
+        assert_eq!(back.source, "C:/x.mobi");
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.entries[0].rec, 5);
+        assert_eq!(back.entries[0].file_name(), "r00005.jpg");
+        write_res_marker_mode(&d, (11, 22), 1, true);
+        assert_eq!(res_dir_state(&d, Some((11, 22))), ResDirState::Lazy);
+        assert_eq!(res_dir_state(&d, Some((11, 23))), ResDirState::NotReady, "指纹不符");
+        write_res_marker_mode(&d, (11, 22), 2, true);
+        assert_eq!(res_dir_state(&d, Some((11, 22))), ResDirState::NotReady, "条数不符");
+        // 旧 files 模式标记（3 段）继续识别为 Files。
+        let d2 = uniq_res_dir("files-state");
+        std::fs::write(d2.join("r00001.jpg"), b"x").unwrap();
+        write_res_marker_mode(&d2, (1, 2), 1, false);
+        assert_eq!(res_dir_state(&d2, Some((1, 2))), ResDirState::Files);
+        assert_eq!(res_dir_state(&d2, Some((1, 3))), ResDirState::NotReady);
+        assert_eq!(res_dir_state(&d2, None), ResDirState::NotReady);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// R8-1：Lazy 提取与 Files 模式映射一致；清单读出的字节与原图逐字节相同；重复调用命中清单。
+    #[test]
+    fn lazy_image_extraction_matches_files_and_reads_bytes() {
+        let (bytes, imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "lazy");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let lazy_dir = keep.join("res_lazy");
+        let (by_rec, by_res, ordered) =
+            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path);
+        assert_eq!(ordered.len(), 2, "两张图都进清单");
+        assert_eq!(res_dir_state(&lazy_dir, stamp), ResDirState::Lazy);
+        let names = res_image_names(&lazy_dir).expect("Lazy 应能列出图片名");
+        assert_eq!(names.len(), 2);
+        // Files 模式对照：三种映射必须完全一致。
+        let files_dir = keep.join("res_files");
+        let (f_rec, f_res, f_ordered) = extract_images(&mobi, &files_dir, "http://x/", stamp);
+        assert_eq!(by_rec, f_rec);
+        assert_eq!(by_res, f_res);
+        assert_eq!(ordered, f_ordered);
+        // 按需读取：字节与原图一致、MIME 正确。
+        let m = read_manifest(&lazy_dir).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            let (mime, b) = read_res_image_manifest(&m, name, None).expect("按需读图");
+            assert_eq!(&b, &imgs[i], "清单区间读出的字节必须与原图一致");
+            assert!(mime.starts_with("image/"), "MIME: {mime}");
+        }
+        // 非法名 / 扩展名不符 → None。
+        assert!(read_res_image_manifest(&m, "x.jpg", None).is_none());
+        assert!(read_res_image_manifest(&m, "r00001.bmp", None).is_none());
+        // 重复调用 Lazy 命中：映射不变、清单不重建。
+        let manifest_before = std::fs::read(res_manifest_path(&lazy_dir)).unwrap();
+        let (by_rec2, _, ordered2) =
+            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path);
+        assert_eq!(by_rec2, by_rec);
+        assert_eq!(ordered2, ordered);
+        let manifest_after = std::fs::read(res_manifest_path(&lazy_dir)).unwrap();
+        assert_eq!(manifest_before, manifest_after, "Lazy 命中不重写清单");
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// R8-1：NotReady 构建清单时清掉旧图片残留；源路径失效时可用当前书路径回退读取。
+    #[test]
+    fn lazy_extraction_prunes_stale_and_falls_back_source() {
+        let (bytes, _imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "prune");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let dir = keep.join("res");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r99999.jpg"), b"stale").unwrap();
+        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        assert!(!dir.join("r99999.jpg").exists(), "旧残留图片应被清理");
+        let mut m = read_manifest(&dir).unwrap();
+        m.source = "C:/definitely-missing-book.mobi".into();
+        let name = m.entries[0].file_name();
+        assert!(
+            read_res_image_manifest(&m, &name, Some(&path)).is_some(),
+            "manifest 源路径失效时可用当前书路径回退"
+        );
+        assert!(read_res_image_manifest(&m, &name, None).is_none());
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// R8-1：无图书也要写 count=0 的 Lazy 清单（保证解析缓存可命中）。
+    #[test]
+    fn lazy_no_image_book_writes_empty_manifest() {
+        let b = Builder {
+            compression: 1,
+            encryption: 0,
+            text: b"<p>hello</p>".to_vec(),
+            images: vec![],
+            res121: vec![],
+            text_encoding: 65001,
+        }
+        .build();
+        let (path, keep) = write_mobi_file(&b, "noimg");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let dir = keep.join("res");
+        let (by_rec, by_res, ordered) =
+            extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        assert!(by_rec.is_empty() && by_res.is_empty() && ordered.is_empty());
+        assert_eq!(res_dir_state(&dir, stamp), ResDirState::Lazy);
+        assert_eq!(res_image_names(&dir), Some(Vec::new()));
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// R8-3：净化器 flush 纯文本快速路径与慢路径输出一致（特殊字符仍走完整清理）。
+    #[test]
+    fn sanitize_flush_fast_path_matches_expected() {
+        for s in [
+            "普通正文一段",
+            "标点，。！？；：（）《》",
+            "数字123与英文abc",
+            "tab\t换行\n",
+        ] {
+            let html = format!("<p>{s}</p>");
+            let out = decode_and_sanitize(&html);
+            assert_eq!(out, html, "快速路径不应改动纯文本: {s:?}");
+        }
+        // 含 & < > " ' = 或 U+FFFD 的文本仍走慢路径，语义保持既有行为。
+        assert_eq!(decode_and_sanitize("<p>a&amp;b</p>"), "<p>a&amp;b</p>");
+        assert_eq!(
+            decode_and_sanitize("<p>&lt;b aid=&quot;x&quot;&gt;</p>"),
+            "<p></p>",
+            "破碎标签应剔除"
+        );
+        assert!(decode_and_sanitize("<p>x\u{FFFD}y</p>").contains("xy"), "替换字符应剔除");
+        assert!(decode_and_sanitize("<p>a=b</p>").starts_with("<p>"), "等号文本走慢路径");
+    }
+
+
+    /// R8 补丁：合法图片名判定 + 直接文件回退读取（不扫目录、拒绝隐藏/非图片文件）。
+    #[test]
+    fn res_image_name_validation_and_file_read() {
+        assert!(is_res_image_name("r00001.jpg"));
+        assert!(is_res_image_name("r99999.webp"));
+        assert!(!is_res_image_name(".images"));
+        assert!(!is_res_image_name(".cache_stamp"));
+        assert!(!is_res_image_name("r0001.jpg"), "记录号必须 5 位");
+        assert!(!is_res_image_name("r00001.JPG"), "扩展名只接受小写");
+        assert!(!is_res_image_name("r00001.txt"));
+        assert!(!is_res_image_name("r00001.jpg.tmp"));
+        let d = uniq_res_dir("file-read");
+        std::fs::write(d.join("r00007.png"), b"\x89PNG\r\n\x1a\nDATA").unwrap();
+        let (mime, b) = read_res_image_file(&d, "r00007.png").expect("直接文件读取应成功");
+        assert_eq!(mime, "image/png");
+        assert_eq!(b, b"\x89PNG\r\n\x1a\nDATA");
+        assert!(read_res_image_file(&d, ".images").is_none());
+        assert!(read_res_image_file(&d, "r00008.png").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// R8 补丁：res_image_names 只含合法图片名（不含 .images/.cache_stamp）；清单在内存中即可读图。
+    #[test]
+    fn res_image_names_excludes_marker_files_and_manifest_is_self_contained() {
+        let (bytes, imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "names");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let dir = keep.join("res");
+        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        let names = res_image_names(&dir).expect("Lazy 应列出图片名");
+        assert!(names.iter().all(|n| is_res_image_name(n)), "只能有合法图片名");
+        assert!(!names.iter().any(|n| n.starts_with('.')), "不得含隐藏标记/清单文件");
+        // 清单结构本身自包含：删掉 .images 文件后，已加载的清单仍能按区间读图（缓存命中不读盘）。
+        let m = read_manifest(&dir).unwrap();
+        std::fs::remove_file(res_manifest_path(&dir)).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            let (_mime, b) = read_res_image_manifest(&m, name, None).expect("清单内存读取");
+            assert_eq!(&b, &imgs[i]);
+        }
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// R8-1：目录不可写时回退 Files 模式也不 panic（返回空映射，与旧 Files 写盘失败一致）。
+    #[test]
+    fn lazy_extraction_falls_back_when_dir_unwritable() {
+        let (bytes, _imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "unwritable");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let blocker = keep.join("not_a_dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let dir = blocker.join("res");
+        let (by_rec, _, ordered) = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        assert!(by_rec.is_empty() && ordered.is_empty(), "不可写目录应安全返回空映射");
+        assert_eq!(res_dir_state(&dir, stamp), ResDirState::NotReady);
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// R8-1：旧 Files 目录直接复用（不迁移、不重抽图）；无指纹时回退 Files 模式且不写清单。
+    #[test]
+    fn lazy_extraction_reuses_legacy_files_dir() {
+        let (bytes, _imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "reuse");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let stamp = src_file_stamp(&path);
+        let dir = keep.join("res");
+        let (f_rec, _, f_ordered) = extract_images(&mobi, &dir, "http://x/", stamp);
+        assert_eq!(res_dir_state(&dir, stamp), ResDirState::Files);
+        let (by_rec, _, ordered) = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        assert_eq!(by_rec, f_rec);
+        assert_eq!(ordered, f_ordered);
+        assert_eq!(res_dir_state(&dir, stamp), ResDirState::Files, "旧目录保持 files 模式");
+        assert!(!res_manifest_path(&dir).exists(), "复用旧目录不写清单");
+        // 无指纹：无法建清单，直接回退 Files 写盘（不写清单）。
+        let dir2 = keep.join("res_nostamp");
+        extract_images_lazy(&mobi, &dir2, "http://x/", None, &path);
+        assert!(!res_manifest_path(&dir2).exists(), "无指纹不得写清单");
+        let _ = std::fs::remove_dir_all(&keep);
+    }
 }
+

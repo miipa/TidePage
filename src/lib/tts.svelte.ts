@@ -1,4 +1,24 @@
 import { activeTtsService, config, resolveEndpointProxy, saveConfig, toast } from "./stores.svelte";
+import { getBookOverride } from "./bookcfg.svelte";
+
+/* ---------------- D8：按书 TTS 覆盖 ---------------- */
+let ttsBookId: number | null = null;
+
+/** 当前朗读书 id（Reader/TtsBar 在开书与起读前调用）；覆盖值未设置时回退全局。 */
+export function ttsSetBook(id: number | null): void {
+  ttsBookId = id;
+}
+
+export function effectiveTtsVoice(): string {
+  const v = getBookOverride(ttsBookId).ttsVoice;
+  return v && v.trim() ? v : config.tts.voice ?? "";
+}
+
+export function effectiveTtsRate(): number {
+  const r = getBookOverride(ttsBookId).ttsRate;
+  const v = typeof r === "number" ? r : config.tts.rate || 1;
+  return Math.max(0.5, Math.min(4, v));
+}
 import { api } from "./api";
 import { aiErrDetail, t } from "./i18n/index.svelte";
 
@@ -142,7 +162,7 @@ export function isOnlineEngine(): boolean {
 function resolveVoice(): SpeechSynthesisVoice | null {
   const list = ttsState.voices;
   if (!list.length) return null;
-  const want = config.tts.voice;
+  const want = effectiveTtsVoice();
   if (want) {
     const hit = list.find((v) => v.name === want || v.voiceURI === want);
     if (hit) return hit;
@@ -171,7 +191,7 @@ function speakSystem(seg: FlatSegment, i: number, g: number) {
   } else {
     u.lang = config.tts.lang || "zh-CN";
   }
-  u.rate = Math.max(0.5, Math.min(2, config.tts.rate || 1));
+  u.rate = Math.max(0.5, Math.min(2, effectiveTtsRate()));
   u.pitch = Math.max(0, Math.min(2, config.tts.pitch ?? 1));
   u.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
   u.onend = () => {
@@ -227,6 +247,8 @@ function voiceLangMatches(voice: OnlineVoice, target: string): boolean {
 
 /** 本次请求实际要发送的音色（当前服务档案的音色；固定音色的选择在朗读前由 ensureFixedVoice 完成）。 */
 export function effectiveOnlineVoice(): string {
+  const ov = getBookOverride(ttsBookId).ttsVoice;
+  if (ov && ov.trim()) return ov.trim();
   return (activeTtsService()?.voice || "").trim();
 }
 
@@ -448,7 +470,7 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
     };
 
     audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
-    audioEl.playbackRate = Math.max(0.5, Math.min(4, config.tts.rate || 1));
+    audioEl.playbackRate = effectiveTtsRate();
     audioEl.src = url;
     audioEl.play().catch((e) => {
       if (g !== gen) {
@@ -569,7 +591,11 @@ function haltAudio() {
 
 export function ttsStart(index = 0) {
   if (!segments.length) return;
-  if (config.tts.engine === "system" && !supported) return;
+  if (config.tts.engine === "system" && !supported) {
+    // D8：无系统语音能力时给出可读提示，不再静默返回。
+    toast(t("tts.unsupportedSystem"));
+    return;
+  }
   window.speechSynthesis?.cancel();
   haltAudio();
   gen++;

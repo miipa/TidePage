@@ -43,13 +43,26 @@
     type ZoneKey,
     type StatusItemId,
     type ThemeKey,
+    type ConfirmDetailRow,
   } from "../lib/stores.svelte";
   import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import { dragSort } from "../lib/dragSort";
 import { reorderByDrop } from "../lib/reorder";
   import { dragOutHandle } from "../lib/windowSnap";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
+  import { planDavApply } from "../lib/davApply";
   import { clampMarginH } from "../lib/readLayout";
+  import { pageFromLeftPosition, pageFromRatio, ratioFromPage } from "../lib/pagination";
+  import { parseInternalHref, pickSameDocAnchorTarget } from "../lib/readerLinks";
+  import { displayChapterTitle, normalizeChapterTitle } from "../lib/chapterTitle";
+  import {
+    detectPagedStyleConflict,
+    tallBlockAction,
+    type TallBlockAction,
+    type PagedStyleFix,
+  } from "../lib/pagedBreak";
+  import { resolveLegacyChapterIndex } from "../lib/legacyJump";
+  import { openErrorKey } from "../lib/openError";
   import { SmoothScroller } from "../lib/smoothScroll";
   import {
     classifyPointerUp,
@@ -117,6 +130,7 @@ import {
     ttsNext,
     ttsPauseResume,
     ttsPrev,
+    ttsSetBook,
     ttsSetCallbacks,
     ttsSetSegments,
     ttsStart,
@@ -141,11 +155,13 @@ import {
     IconCloudUp,
     IconHighlight,
     IconLayoutColumns,
+    IconLayoutGrid,
     IconList,
     IconPalette,
     IconPhoto,
     IconPhotoOff,
     IconPlayerPause,
+    IconSearch,
     IconPlayerPlay,
     IconPlayerStop,
     IconSettings,
@@ -159,6 +175,10 @@ import {
   } from "@tabler/icons-svelte";
   import AiPanel from "./AiPanel.svelte";
   import TocPanel from "./TocPanel.svelte";
+  import PdfThumbPanel from "./PdfThumbPanel.svelte";
+  import PdfSearchPanel from "./PdfSearchPanel.svelte";
+  import { locateOccurrence, nodeRangeForOffsets, type PdfSearchHit } from "../lib/pdfSearch";
+  import { evictChapterCache } from "../lib/chapterCache";
   import BookStatsModal from "./BookStatsModal.svelte";
   import SelectionMenu from "./SelectionMenu.svelte";
   import BookSearchPopup from "./BookSearchPopup.svelte";
@@ -228,6 +248,14 @@ import {
   // 组件销毁是另一条不经过 close() 的出口（如「打开失败后返回」直接切 ui.view）；
   // PDF 文档与页位图必须在这里兜底释放，否则会跟着主窗口常驻。
   onDestroy(() => releaseAll());
+  onDestroy(() => {
+    // C13：关书/组件销毁清空章节缓存与图片临时引用；进度/书签状态不在此清。
+    chapterCache.clear();
+    inflight.clear();
+    bookImages = null;
+  });
+  // R13-A2：离开阅读器/换书时恢复翻页兜底写入的内联样式（DOM 即将销毁，这里保证不污染复用节点）。
+  onDestroy(() => restorePagedStyleFixes());
 
   // 顶栏实测高度写入全局 CSS 变量：供固定在右上角的 WindowControls 让自身高度=顶栏高度，
   // 按钮垂直居中即与顶栏图标中心线重合，自动对齐（Reader 顶栏比 Library 矮，靠此自适应）。
@@ -354,7 +382,10 @@ import {
   function isMangaMode(): boolean {
     if (isPdfBook()) return true;
     const o = bookOv();
-    return o.mangaMode ?? (config.reader.manga.autoDetect ? (book?.is_manga ?? false) : false);
+    return (
+      o.mangaMode ??
+      (config.reader.manga.autoDetect ? ((book?.is_manga ?? false) || (book?.image_pages ?? false)) : false)
+    );
   }
   /** 漫画横向（横向连续阅读）：漫画模式与 PDF 下的「横向」布局。 */
   function mangaHorizontal(): boolean {
@@ -441,6 +472,8 @@ import {
     { id: "ai", label: () => t("reader.toolbar.ai"), title: () => t("reader.toolbar.ai"), icon: () => IconSparkles, visible: () => true, run: () => toggleAiPanel() },
     { id: "stats", label: () => t("reader.toolbar.bookStats"), title: () => t("reader.toolbar.bookStats"), icon: () => IconChartBar, visible: () => true, run: () => setRight("stats") },
     { id: "toc", label: () => t("reader.toolbar.toc"), title: () => t("reader.toolbar.tocTitle"), icon: () => IconList, visible: () => true, run: () => toggleToc() },
+    { id: "pdfThumbs", label: () => t("reader.pdf.thumbs"), title: () => t("reader.pdf.thumbsTitle"), icon: () => IconLayoutGrid, visible: () => isPdfBook(), run: () => setRight("thumbs") },
+    { id: "pdfSearch", label: () => t("reader.pdf.search"), title: () => t("reader.pdf.searchTitle"), icon: () => IconSearch, visible: () => isPdfBook(), run: () => setRight("pdfsearch") },
     // PDF 恒为「图块/页面布局」渲染，切模式没有意义：同一个按钮对 PDF 改为打开「页面布局」面板，
     // 直接给出布局（瀑布流／横向=左右翻页）、阅读方向、图片间距、图片大小与适宽/适高。
     { id: "manga", label: () => (isPdfBook() ? t("reader.pdfLayout.title") : t("reader.toolbar.manga")), title: () => (isPdfBook() ? t("reader.pdfLayout.hint") : isMangaMode() ? t("reader.toolbar.mangaOnTitle") : t("reader.toolbar.mangaOffTitle")), icon: () => (isPdfBook() ? IconLayoutColumns : isMangaMode() ? IconBooks : IconBook2), on: () => (isPdfBook() ? pdfLayoutOpen : isMangaMode()), visible: () => true, run: () => (isPdfBook() ? togglePdfLayout() : toggleMangaMode()) },
@@ -708,7 +741,7 @@ import {
 
   let tocOpen = $state(false);
   // 右侧互斥面板的单一状态源（left:0 的目录 tocOpen 不参与）
-  let rightPanel = $state<null | "bookmarks" | "highlights" | "stats" | "ai">(null);
+  let rightPanel = $state<null | "bookmarks" | "highlights" | "stats" | "ai" | "thumbs" | "pdfsearch">(null);
   let bookmarksOpen = $derived(rightPanel === "bookmarks");
   let statsOpen = $derived(rightPanel === "stats");
   let aiDrawerOpen = $derived(rightPanel === "ai");
@@ -733,6 +766,8 @@ import {
 
   let highlights: HighlightRow[] = $state([]);
   let highlightsOpen = $derived(rightPanel === "highlights");
+  let thumbsOpen = $derived(rightPanel === "thumbs");
+  let pdfSearchOpen = $derived(rightPanel === "pdfsearch");
   let hlVersion = $state(0);
   let pendingHighlightJump: HighlightRow | null = null;
 
@@ -747,10 +782,13 @@ import {
    * 所有 toggle 只改 rightPanel，互斥自动成立（同侧任意时刻最多一个）。
    * 左侧目录 tocOpen（left:0）为独立 $state，不参与本互斥。
    * 抽屉显隐彻底不读 ui.aiOpen，也不再有任何监听 ui.aiOpen 的 $effect。 */
-  function setRight(panel: "bookmarks" | "highlights" | "stats" | "ai") {
+  function setRight(panel: "bookmarks" | "highlights" | "stats" | "ai" | "thumbs" | "pdfsearch") {
     // 互斥：打开任一右侧面板/AI 时，关闭顶栏浮层面板（管理/图片/已屏蔽/漫画引导）。
     closeTbPanels();
     rightPanel = rightPanel === panel ? null : panel;
+    if (panel === "thumbs") {
+      try { localStorage.setItem("tidepage.pdf.thumbsOpen", rightPanel === "thumbs" ? "1" : "0"); } catch { /* ignore */ }
+    }
   }
 
   /** 关闭全部「顶栏浮层面板」（顶栏按钮管理 / 本书图片 / WebDAV 同步菜单 / 已屏蔽图片 / 漫画引导 / PDF 页面布局）。 */
@@ -883,6 +921,103 @@ import {
   }
 
   /** 目录开合：打开目录时关闭顶栏浮层面板，互斥。 */
+  /** D6-3：当前搜索命中状态（页面文本层重建后可重放）。 */
+  let pdfSearchHitState = $state<{ page: number; query: string; occurrence: number; segments?: PdfSearchHit["segments"] } | null>(null);
+
+  function clearPdfSearchHighlight() {
+    try {
+      (CSS as unknown as { highlights?: Map<string, unknown> }).highlights?.delete("tp-pdf-search");
+    } catch { /* ignore */ }
+  }
+
+  /** 单页定位：返回 Range，不直接写 CSS.highlights（由聚合重绘统一 set）。 */
+  async function pdfSearchRangeForPage(page: number): Promise<Range | null> {
+    const st = pdfSearchHitState;
+    if (!st) return null;
+    if (st.page !== page && !st.segments?.some((s) => s.page === page)) return null;
+    let layer: HTMLElement | null = null;
+    for (let i = 0; i < 25; i++) {
+      layer = document.querySelector<HTMLElement>(`.pdf-page[data-pdf-page="${page}"] .textLayer`);
+      if (layer && layer.childNodes.length) break;
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    if (!layer) return null;
+    const nodes: Text[] = [];
+    const starts: number[] = [];
+    const lengths: number[] = [];
+    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+    let pos = 0;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const tn = n as Text;
+      nodes.push(tn);
+      starts.push(pos);
+      lengths.push(tn.data.length);
+      pos += tn.data.length;
+    }
+    // B11：内部页号统一 0 基；文本层与提取文本可能不一致：先 segment 原文偏移二分；
+    // 失败回退 query+页内 occurrence；仍失败不画。
+    const layerText = nodes.map((n) => n.data).join("");
+    const seg = st.segments?.find((s) => s.page === page);
+    let mapped = seg ? nodeRangeForOffsets(starts, lengths, seg.start, seg.end) : null;
+    if (!mapped) {
+      const occ = Math.max(0, Math.min(seg ? seg.occurrence : st.occurrence, 10_000));
+      let found = locateOccurrence(layerText, st.query, occ);
+      if (!found && occ !== 0) found = locateOccurrence(layerText, st.query, 0);
+      if (found) mapped = nodeRangeForOffsets(starts, lengths, found.start, found.end);
+    }
+    if (!mapped) return null;
+    const startNode = nodes[mapped.startIndex];
+    const endNode = nodes[mapped.endIndex];
+    if (!startNode || !endNode) return null;
+    try {
+      const range = document.createRange();
+      range.setStart(startNode, mapped.startOffset);
+      range.setEnd(endNode, mapped.endOffset);
+      return range;
+    } catch { return null; }
+  }
+
+  /** C15/OCR：一次收集当前命中所有已加载页（含跨页 segments）的 Range，只 set 一次，避免逐页覆盖。 */
+  let pdfPaintGeneration = 0;
+  async function repaintPdfSearchHighlights() {
+    const st = pdfSearchHitState;
+    if (!st) return;
+    const gen = ++pdfPaintGeneration;
+    const pages = new Set<number>([st.page, ...(st.segments?.map((s) => s.page) ?? [])]);
+    const ranges: Range[] = [];
+    for (const p of pages) {
+      if (!document.querySelector(`.pdf-page[data-pdf-page="${p}"] .textLayer`)) continue;
+      const r = await pdfSearchRangeForPage(p);
+      if (r) ranges.push(r);
+    }
+    if (gen !== pdfPaintGeneration) return;
+    clearPdfSearchHighlight();
+    if (!ranges.length) return;
+    try {
+      const api = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
+      const HighlightCtor = (globalThis as unknown as { Highlight?: new (...r: Range[]) => unknown }).Highlight;
+      if (!api || !HighlightCtor) return;
+      api.set("tp-pdf-search", new HighlightCtor(...ranges));
+    } catch { /* ignore */ }
+  }
+
+  /** 单页触发也走聚合重绘（跨页命中时同时保留起始页与后续页）。 */
+  async function paintPdfSearchHighlight(_page: number) {
+    await repaintPdfSearchHighlights();
+  }
+
+  async function pdfSearchJump(page: number, hit?: PdfSearchHit, query = "") {
+    // 基准约定：pdfSearchJump/paint/repaint/DOM data-pdf-page 一律 0 基；UI 显示才 +1。
+    if (import.meta.env.DEV) {
+      const hasDom = !!document.querySelector(`.pdf-page[data-pdf-page="${page}"] .textLayer`);
+      console.debug("[pdf-search] jump", { page, occurrence: hit?.occurrence, seg: hit?.segments?.map((s) => s.page), hasDom });
+    }
+    if (hit) pdfSearchHitState = { page, query, occurrence: hit.occurrence, segments: hit.segments };
+    await navTo(page, { at: "head", extra: 0 });
+    await tick();
+    if (hit) void paintPdfSearchHighlight(page);
+  }
+
   function toggleToc() {
     const willOpen = !tocOpen;
     closeTbPanels();
@@ -969,11 +1104,17 @@ import {
 
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let progressSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 后台建索引的轮询定时器（P2）：开书时调度，用户空闲/窗口隐藏时触发一次。 */
+  let indexTimer: ReturnType<typeof setInterval> | undefined;
+  /** 全书字数统计的轮询定时器（P8）：开书时调度，用户空闲/窗口隐藏时算一次。 */
+  let charTimer: ReturnType<typeof setInterval> | undefined;
   // 用户是否已在本次打开中「真实翻页/滚动」过：仅用户主动移动时置真，
   // 用于在保存真实进度时释放手动状态覆盖（read_state!==0）。初次打开的定位保存不置真，
   // 避免仅「打开」就把手动「未读/已读」覆盖误清除。
   let progressUserMoved = false;
   let measureRaf = 0;
+  /** measurePages「容器尺寸为 0」的重试帧数（P6）：上限 30 帧，避免无上限 rAF 空转。 */
+  let measureRetry = 0;
   let openError = $state("");
   let handledNonce = 0;
 
@@ -984,6 +1125,19 @@ import {
   let lastActivityTs = Date.now();
   // 计时是否暂停（窗口隐藏时停表）：tick 与 flushSession 据此跳过累加。
   let statsPaused = false;
+
+  // C13：正文渲染后给图片补 loading=lazy / decoding=async（保留已有属性与图片查看逻辑）。
+  $effect(() => {
+    void chapter?.html;
+    const el = contentEl;
+    if (!el) return;
+    queueMicrotask(() => {
+      for (const img of el.querySelectorAll<HTMLImageElement>("img")) {
+        if (!img.hasAttribute("loading")) img.setAttribute("loading", "lazy");
+        if (!img.hasAttribute("decoding")) img.setAttribute("decoding", "async");
+      }
+    });
+  });
 
   // ===== 章节缓存（LRU）+ 预取 + 竞态控制 =====
   // 目标：翻多快都即时显示——命中缓存零等待；未命中时先显示最接近的已缓存章节，
@@ -1014,6 +1168,8 @@ import {
       if (oldest === undefined || oldest === idx) break;
       chapterCache.delete(oldest);
     }
+    // C13：32MB HTML 字节预算，超预算淘汰最旧并保留当前章。
+    evictChapterCache(chapterCache, undefined, idx);
   }
 
   /** PDF 页可用的内容宽（CSS px）：flow 取瀑布流画布宽，横向取横向视口宽。 */
@@ -1132,6 +1288,7 @@ import {
   let sliceCheckRaf = 0;
   /** 本页文本是否可用于划词/搜索/朗读（乱码文件必须如实判否，不许假装能读）。 */
   let pdfTextOk = $state(false);
+  let pdfHasOutline = $state(false);
   /** 本书是否走系统原生渲染（超大 PDF）：这类文件没有文字层与注解，相关入口一并置灰。 */
   let pdfNative = $state(false);
   /** 文本上传游标：本轮打开到第几页（换书重置）。 */
@@ -1261,6 +1418,8 @@ import {
       // 旧 mark 随旧 .pdf-page 一起消失，且重建本身不触发重绘（hlVersion 没变、文本层那时还没装好），
       // 表现就是「点一下划线，划线不见了」而数据仍在。这里在文本层装好后补一次重绘把它画回去。
       if (res.usable && pageIdx === chapterNum) paintNow();
+      // D6-3：文本层重建后重放当前搜索命中。
+      if (pdfSearchHitState && (pdfSearchHitState.page === pageIdx || pdfSearchHitState.segments?.some((s) => s.page === pageIdx))) void paintPdfSearchHighlight(pageIdx);
     } catch {
       /* 文本层失败不影响看图 */
     } finally {
@@ -1415,7 +1574,11 @@ import {
         // 目录数组下标恒等于页号，所以合并只换标题，不改导航语义（页码=chapter_index）。
         const outline = await docOutline(book.book.id).catch(() => []);
         const base = buildPageToc(pdf.doc.numPages, (n) => t("reader.pdf.page", { n }));
-        book.toc = outline.length ? mergeOutlineTitles(base, outline, (n) => t("reader.pdf.page", { n })) : base;
+        pdfHasOutline = outline.length > 0;
+    book.toc = outline.length ? mergeOutlineTitles(base, outline, (n) => t("reader.pdf.page", { n })) : base;
+    try {
+      if (localStorage.getItem("tidepage.pdf.thumbsOpen") === "1") rightPanel = "thumbs";
+    } catch { /* ignore */ }
         api.setSetting("pdf.pages." + book.book.id, String(pdf.doc.numPages)).catch(() => {});
         // 目录标题存一份给「弹出目录」独立窗口：那扇窗不重新解析 PDF（省一次整文件读取）。
         api.setSetting("pdf.outline." + book.book.id, JSON.stringify(outline)).catch(() => {});
@@ -1428,35 +1591,20 @@ import {
       }
       // 全书总字数只在这里算一次（见 tocCharsTotal 处的说明）
       tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
-      // EPUB 快速解析不做全书逐章统计（toc.chars 全 0）→ 「全书总页数」估不出来，按需补算一次。
-      // 只在翻页模式、且总字数确实为 0 时调用：滚动/漫画模式用不到页数，几千章的完整解析可达数秒。
-      if (tocCharsTotal === 0 && !isPdfBook() && !scrollLayout() && !mangaHorizontal()) {
-        const wantId = book.book.id;
-        api
-          .bookCharCounts(wantId)
-          .then((counts) => {
-            // 回调可能晚于换书：书已换或目录条数对不上就整体丢弃。
-            if (!book || book.book.id !== wantId) return;
-            if (!counts.length || counts.length !== book.toc.length) return;
-            // 赋新数组而非就地改元素：绕开 Svelte 5 深层代理的依赖追踪疑虑。
-            book.toc = book.toc.map((t, i) => ({ ...t, chars: counts[i] || 0 }));
-            tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
-            // 当前章的 ChapterData 也要补上（EPUB 快速解析给的是 0）。
-            if (chapter && chapterNum >= 0 && chapterNum < counts.length) {
-              chapter.chars = counts[chapterNum] || 0;
-            }
-          })
-          .catch((err) => {
-            // 静默失败会让「全书总页数不显示」无从定位；DEV 下留一行痕迹，不影响用户。
-            if (import.meta.env.DEV) console.warn("[bookChars] failed", err);
-          });
+      // 换书先取消上一本的字数统计轮询（条件不满足时不再重新调度）。
+      cancelBookChars();
+      // EPUB 快速解析不做全书逐章统计（toc.chars 全 0）→「全书总页数」估不出来，需要时才补算。
+      // 条件：翻页模式 + 该状态项真的显示；并且延迟到空闲/隐藏（P8：整本统计实测 16s 级，
+      // 开书立即跑会把首屏和随后操作一起拖慢）。
+      if (tocCharsTotal === 0 && !isPdfBook() && !scrollLayout() && !mangaHorizontal() && bookPagesVisible()) {
+        scheduleBookChars(book.book.id);
       }
       ui.currentBookId = book.book.id;
       emitBookActive();
       // 弹出面板窗（目录/书签/划线/统计）的窗口 label 与书无关：换书后必须广播，
       // 让面板切到当前这本书（面板自己按 tidepage-book-changed 重载）。
       void emit("tidepage-book-changed", { bookId: book.book.id, title: book.book.title || "" });
-      if (book.encoding_warning) console.log(book.encoding_warning);
+      if (book.encoding_warning && import.meta.env.DEV) console.log(book.encoding_warning);
       // 漫画书首次引导：全局只提示一次（写入 config.reader.mangaGuideDone），
       // 之后打开任何漫画都不再弹出；拖动时实时预览（直接改全局 manga.imgScale）。
       blockPickMode = false;
@@ -1464,7 +1612,8 @@ import {
       tbManagerOpen = false;
       blockedListOpen = false;
       // 走 isMangaMode() 而不是裸 book.is_manga：关掉自动识别后不应再弹漫画引导。
-      if (isMangaMode() && !isPdfBook() && !config.reader.mangaGuideDone) {
+      // 图片页型书跳过「检测到漫画书籍」引导（扫描书的文案会误导），普通漫画/PDF 不变。
+      if (isMangaMode() && book?.image_pages !== true && !isPdfBook() && !config.reader.mangaGuideDone) {
         mangaGuideScale = config.reader.manga.imgScale;
         mangaGuideOpen = true;
       } else {
@@ -1481,19 +1630,8 @@ import {
       navTarget = chapterNum; // 初次定位：累积导航目标与落地章号对齐
       await loadChapter(chapterNum, restore ?? undefined);
       refreshHighlights();
-      {
-        const openedBookId = book.book.id;
-        // 延后到首屏稳定后再建索引：避免与首章渲染/预取争 CPU 与 DB 锁。
-        // index_book_fts 内部一次遍历同时写 fts 与 chapter_text；仅当无 FTS 能力（返回 0）时兜底补 chapter_text。
-        const runIndex = () => {
-          api
-            .indexBookFts(openedBookId)
-            .then((n) => { if (n === 0) api.ensureBookText(openedBookId).catch(() => {}); })
-            .catch(() => {});
-        };
-        if (typeof requestIdleCallback === "function") requestIdleCallback(runIndex, { timeout: 4000 });
-        else setTimeout(runIndex, 1500);
-      }
+      // 后台建索引改为「用户空闲 / 窗口隐藏 / 关书」时触发（P2）：开书后不再 4s 内与首屏阅读抢 DB 锁。
+      scheduleBookIndex(book.book.id);
       if (pendingHighlightJump && pendingHighlightJump.book_id === book.book.id) {
         const ph = pendingHighlightJump;
         pendingHighlightJump = null;
@@ -1519,13 +1657,15 @@ import {
       }
     } catch (e) {
       const s = String(e);
+      // R13-A4：DRM/解析超时保留既有准确文案；稳定的 PDF 大文件/原生通道错误码走文案表；
+      // 其余按 missing/permission/damaged/unsupported/unknown 分类，绝不把原始错误串放进 UI。
       const friendly = s.includes("AWZ3EncryptedError")
         ? t("reader.err.drm")
         : s.includes("ParseTimeoutOrCorrupted")
           ? t("reader.err.malformed")
-          : // 稳定错误码（pdf_too_large / pdf_native_failed / ...）走文案表；未知原样透传。
-            // String(e) 会带 "Error: " 前缀，展示前去掉。
-            errText(e).replace(/^Error:\s*/, "");
+          : /pdf_too_large|pdf_native_|pdf_no_text|pdf_no_direct|pdf_unsupported/.test(s)
+            ? errText(e).replace(/^Error:\s*/, "")
+            : t(openErrorKey(e));
       // 只落在页面内的失败态上：同一句话不再弹 toast（说明性文字只给一条）。
       openError = friendly;
       // 打开失败必须收掉加载态：否则骨架屏会一直挂着（失败态另有 openError 界面）。
@@ -1555,8 +1695,82 @@ import {
     }
   }
 
+  /** 取消后台建索引的轮询（换书/关书时调用）。 */
+  function cancelBookIndex() {
+    if (indexTimer !== undefined) clearInterval(indexTimer);
+    indexTimer = undefined;
+  }
+
+  /** 延迟建索引（P2/P9）：不在开书后立刻抢 DB/CPU，等用户空闲（60s 无输入）或窗口隐藏时建一次。
+   *  auto=true：后端按体积/章数上限只自动索引普通小书；超大书改由搜索弹窗按需建立。
+   *  期间换书直接作废（绝不把上一本的请求发到新书上）；后端有单实例闸门与不一致判据，
+   *  重复触发、中途退出留下的部分行都会安全收敛。 */
+  function scheduleBookIndex(bookId: number) {
+    cancelBookIndex();
+    indexTimer = setInterval(() => {
+      if (!book || book.book.id !== bookId) {
+        cancelBookIndex();
+        return;
+      }
+      if (Date.now() - lastActivityTs < 60_000 && document.visibilityState !== "hidden") return;
+      cancelBookIndex();
+      api.indexBookFts(bookId, true).catch(() => {});
+    }, 3000);
+  }
+
+  /** 「全书总页数」状态项是否真的显示：只有顶栏/底栏把它排进去且启用时才值得整本统计字数。 */
+  function bookPagesVisible(): boolean {
+    if (config.reader.statusItems.some((i) => i.id === "bookPages" && i.enabled)) return true;
+    return config.reader.footerLeft.includes("bookPages") || config.reader.footerRight.includes("bookPages");
+  }
+
+  /** 取消全书字数统计的轮询（换书/关书时调用）。 */
+  function cancelBookChars() {
+    if (charTimer !== undefined) clearInterval(charTimer);
+    charTimer = undefined;
+  }
+
+  /** 把全书逐章字数回填到 toc / 当前章（原 open() 内联回调提取，供延迟调度复用）。 */
+  function applyBookCharCounts(wantId: number, counts: number[]) {
+    // 回调可能晚于换书：书已换或目录条数对不上就整体丢弃。
+    if (!book || book.book.id !== wantId) return;
+    if (!counts.length || counts.length !== book.toc.length) return;
+    // 赋新数组而非就地改元素：绕开 Svelte 5 深层代理的依赖追踪疑虑。
+    book.toc = book.toc.map((t, i) => ({ ...t, chars: counts[i] || 0 }));
+    tocCharsTotal = book.toc.reduce((s, t) => s + (t.chars || 0), 0);
+    // 当前章的 ChapterData 也要补上（EPUB 快速解析给的是 0）。
+    if (chapter && chapterNum >= 0 && chapterNum < counts.length) {
+      chapter.chars = counts[chapterNum] || 0;
+    }
+  }
+
+  /** 全书字数统计延迟调度（P8）：整本统计实测 16s 级，开书立即跑会抢满 CPU；
+   *  改为用户空闲 10s 或窗口隐藏时算一次（结果回填后 estTotalPages 才能显示）。 */
+  function scheduleBookChars(bookId: number) {
+    cancelBookChars();
+    charTimer = setInterval(() => {
+      if (!book || book.book.id !== bookId) {
+        cancelBookChars();
+        return;
+      }
+      if (Date.now() - lastActivityTs < 10_000 && document.visibilityState !== "hidden") return;
+      cancelBookChars();
+      api
+        .bookCharCounts(bookId)
+        .then((counts) => applyBookCharCounts(bookId, counts))
+        .catch((err) => {
+          // 静默失败会让「全书总页数不显示」无从定位；DEV 下留一行痕迹，不影响用户。
+          if (import.meta.env.DEV) console.warn("[bookChars] failed", err);
+        });
+    }, 3000);
+  }
+
   export async function close() {
     stopTts();
+    // 关书：取消延迟建索引与字数统计。不再在关书时补建索引（P9：大书建索引 8~40s，
+    // 关书触发就是卡顿来源；未建索引的书由用户在搜索弹窗按需建立）。
+    cancelBookIndex();
+    cancelBookChars();
     webdavPush();
     await doSaveProgress();
     await flushSession(true);
@@ -1604,13 +1818,42 @@ import {
   async function webdavSync(localP: Progress | null): Promise<boolean> {
     if (!book) return false;
     const w = config.webdav;
+    const bid = book.book.id;
+    // 请求期间的「用户是否已开始阅读」靠这两个快照判断：webdav 往返可能几秒，
+    // 用户完全可能已经翻页/滚动。程序化 jumpTo 不触发 onSettled，不会误置 progressUserMoved。
+    const startChapter = chapterNum;
+    const startRatio = currentRatio();
     const remote = await api.webdavSyncProgress(
-      w.base, w.user, w.pass, book.book.id, book.book.path, localP,
+      w.base, w.user, w.pass, bid, book.book.path, localP,
     );
+    // 请求期间换了书/关了书：结果属于上一本，丢弃。
+    if (!book || book.book.id !== bid) return false;
+    const userMoved =
+      progressUserMoved ||
+      chapterNum !== startChapter ||
+      Math.abs(currentRatio() - startRatio) > 0.001;
+    const plan = planDavApply({
+      remote,
+      localUpdatedAt: localP?.updated_at ?? 0,
+      chapterCount: book.toc.length,
+      currentChapter: chapterNum,
+      currentRatio: currentRatio(),
+      userMoved,
+    });
     let restored = false;
-    if (remote.chapter_index !== chapterNum && remote.chapter_index < book.toc.length) {
-      await loadChapter(remote.chapter_index, remote);
-      restored = true;
+    if (remote) {
+      if (plan === "notify-only") {
+        // 用户已开始阅读：不自动跳转，只提示；可用「下载进度」手动应用。
+        toast(t("reader.toast.davRemoteNewer"));
+      } else if (plan === "same-chapter") {
+        // 同章内较新的进度：就地落位，不重载章节（P3）。
+        applyRatio(remote.chapter_ratio);
+        alignStatsBaseline(); // 自动落位也算跳转：对齐统计基准，避免被计为已读字数
+        restored = true;
+      } else if (plan === "load-chapter") {
+        await loadChapter(remote.chapter_index, remote);
+        restored = true;
+      }
     }
     if (config.webdav.uploadBooks) {
       api.webdavUploadBook(w.base, w.user, w.pass, book.book.path).catch(() => {});
@@ -1657,16 +1900,26 @@ import {
       return;
     }
     if (!remote) { toast(t("reader.toast.davNoRemote")); return; }
-    const ok = await appConfirm(
-      t("reader.confirm.davCompare", {
-        rc: remote.chapter_index + 1,
-        rp: remote.pct.toFixed(0),
-        rt: fmtProgressTime(remote.updated_at),
-        lc: chapterNum + 1,
-        lp: totalPct().toFixed(0),
-        lt: fmtProgressTime(Date.now()),
-      }),
-    );
+    // 结构化明细交给共享确认框按网格渲染：章号/百分比右对齐、时间左对齐，两行才能对齐。
+    const detail: ConfirmDetailRow[] = [
+      {
+        label: t("reader.confirm.davCloud"),
+        cells: [
+          { text: t("reader.confirm.davChapter", { c: remote.chapter_index + 1 }), align: "end" },
+          { text: remote.pct.toFixed(0) + "%", align: "end" },
+          { text: fmtProgressTime(remote.updated_at) },
+        ],
+      },
+      {
+        label: t("reader.confirm.davLocal"),
+        cells: [
+          { text: t("reader.confirm.davChapter", { c: chapterNum + 1 }), align: "end" },
+          { text: totalPct().toFixed(0) + "%", align: "end" },
+          { text: fmtProgressTime(Date.now()) },
+        ],
+      },
+    ];
+    const ok = await appConfirm(t("reader.confirm.davAsk"), { detail });
     if (!ok) return;
     try {
       if (remote.chapter_index < book.toc.length) {
@@ -1799,6 +2052,9 @@ import {
       await preloadReaderFonts();
     }
     if (gen !== loadGeneration && !placeholder) return;
+    // R10-1：章标题统一规范化（去文件名后缀、空/纯数字 → 本地化「第 N 节」），
+    // 保证状态栏/书签/AI 上下文/TTS 显示一致。
+    ch = { ...ch, title: displayChapterTitle(ch.title, idx, (n) => t("common.sectionN", { n })) };
     chapter = ch;
     chapterNum = idx;
     // 非事务期间（初次打开 / 换书 / 重排重载）让累积导航目标跟随落地章号；事务期间保留意图，
@@ -1825,6 +2081,9 @@ import {
       if (restore && restore.chapter_ratio > 0) {
         setTimeout(() => {
           if (gen !== loadGeneration) return;
+          // P4：首次落位后用户已经滚动过就不要再二次定位（否则 0.3s 后把人弹回旧位置）。
+          // 4px 容差吸收亚像素取整与回弹结束后的微小差异。
+          if (Math.abs(scrollRender - pos) > 4) return;
           measureScroll();
           const p2 = restore.chapter_ratio * maxScroll;
           scroller?.jumpTo(Math.max(0, Math.min(p2, maxScroll)), true);
@@ -1835,12 +2094,19 @@ import {
       }
     } else {
       measurePages();
-      let pg = restore ? Math.round(restore.chapter_ratio * Math.max(1, pageCount - 1)) : 0;
+      let pg = restore ? pageFromRatio(restore.chapter_ratio, pageCount) : 0;
       if (entry) pg = entry.at === "tail" ? Math.max(0, pageCount - 1) : 0;
       pendingPageRatio = restore && !entry ? restore.chapter_ratio : null;
-      gotoPage(Math.max(0, Math.min(pg, Math.max(0, pageCount - 1))), true);
+      const landPg = Math.max(0, Math.min(pg, Math.max(0, pageCount - 1)));
+      gotoPage(landPg, true);
       setTimeout(() => {
-        if (gen === loadGeneration) recheckPages();
+        if (gen !== loadGeneration) return;
+        // P4：0.35s 内用户已经翻到别的页：只丢弃待恢复比例，不再二次定位。
+        if (page !== landPg) {
+          pendingPageRatio = null;
+          return;
+        }
+        recheckPages();
       }, 350);
       if (entry?.at === "tail") {
         requestAnimationFrame(() => pinToEnd());
@@ -1875,14 +2141,15 @@ import {
 
   function recheckPages() {
     if (!pageWrap || scrollLayout()) return;
+    // R9：字体/图片延迟布局后元素高度会变，重算页数前再探测一次（幂等）。
+    markPagedBreakables();
     const before = pageCount;
     computePageCount();
     if (pageCount !== before) {
       // 字体/图片等延迟加载后页数变化：若在恢复进度，按原比例重新落到正确页，
       // 否则保持当前页（避免恢复章节时被夹到第 0 页）。
       if (pendingPageRatio != null) {
-        const target = Math.round(pendingPageRatio * Math.max(1, pageCount - 1));
-        gotoPage(Math.max(0, Math.min(target, pageCount - 1)), true);
+        gotoPage(pageFromRatio(pendingPageRatio, pageCount), true);
       } else {
         applyPage(true);
       }
@@ -1965,7 +2232,7 @@ import {
       return 0;
     }
     if (scrollLayout()) return maxScroll > 0 ? Math.min(1, scrollTop / maxScroll) : 0;
-    return pageCount > 1 ? Math.min(1, page / (pageCount - 1)) : 0;
+    return ratioFromPage(page, pageCount);
   }
 
   function totalPct(ratio = currentRatio()): number {
@@ -2913,6 +3180,14 @@ import {
   /** 待恢复的阅读比例：页数在首次测量后仍可能变化，用它把目标页重新落位。 */
   let pendingPageRatio: number | null = null;
 
+  /** 排版参数变化待消费标记（P1）：置位后下一次 relayout 在滚动模式下按当前阅读比例恢复位置。
+   *  字号/行距/段距/边距变化不改变 contentEl 的宽高，viewportChanged 不会触发；
+   *  图片/字体延迟加载只改内容高度，必须保持绝对位置，所以那些路径不置位。 */
+  let typoRelayoutAnchor = false;
+  /** 两条排版 $effect 的上一次键：首次只记录不置位，避免开书时触发无意义的比例重定位。 */
+  let lastTypoEffKey: string | null = null;
+  let lastTypoMarginKey: string | null = null;
+
   function computePageCount() {
     if (!pageWrap || !(colW > 0)) return;
     const totalCols = Math.max(1, Math.round((pageWrap.scrollWidth + gap) / (colW + gap)));
@@ -2979,7 +3254,104 @@ import {
     console.log("[layout]", s);
   }
 
-  function measurePages() {
+  /** R9：翻页模式超高元素探测——只给确实超过一页的元素打兜底类：
+   *  - .tp-page-break（非媒体超高块）允许内部断页；
+   *  - .tp-page-fit（超高媒体）缩到一页内。
+   *  正常图片由 CSS 限高，只有「适宽/缩放」可能超高时才纳入测量；类标记幂等、单次批量读写。 */
+  /** R13-A2：翻页模式下书内样式（含内联 !important）顶掉分页规则时的兜底。
+   *  只对「整块保留」的候选元素按需写入内联 important，并记录原值；每次重排前/离开翻页时恢复。 */
+  type PagedFixRecord = {
+    el: HTMLElement;
+    saved: { name: string; value: string; priority: string }[];
+  };
+  let pagedStyleFixes: PagedFixRecord[] = [];
+
+  function restorePagedStyleFixes() {
+    for (const rec of pagedStyleFixes) {
+      for (const s of rec.saved) {
+        if (s.value === "" && s.priority === "") rec.el.style.removeProperty(s.name);
+        else rec.el.style.setProperty(s.name, s.value, s.priority);
+      }
+    }
+    pagedStyleFixes = [];
+  }
+
+  function applyPagedStyleFix(el: HTMLElement, fix: PagedStyleFix) {
+    const saved: { name: string; value: string; priority: string }[] = [];
+    const set = (name: string, value: string) => {
+      saved.push({
+        name,
+        value: el.style.getPropertyValue(name),
+        priority: el.style.getPropertyPriority(name),
+      });
+      el.style.setProperty(name, value, "important");
+    };
+    if (fix.breakInside) set("break-inside", "avoid");
+    if (fix.breakAfter) set("break-after", "avoid");
+    if (fix.displayBlock) set("display", "block");
+    if (fix.floatNone) set("float", "none");
+    if (saved.length) pagedStyleFixes.push({ el, saved });
+  }
+
+  function markPagedBreakables() {
+    // 每次重排先恢复上一轮兜底（只影响本函数写入的项），再按当前样式重新探测。
+    restorePagedStyleFixes();
+    if (scrollLayout() || isMangaMode() || isPdfBook() || !pageWrap) return;
+    const root = contentRoot();
+    if (!root) return;
+    const pageH = pageWrap.clientHeight;
+    if (pageH <= 0) return;
+    const CAP = 2000;
+    const MEDIA_SEL = "img, svg, video";
+    // 候选：结构上需要整块保留的元素 + 代码块类名启发式容器。
+    const SEL =
+      "figure, figcaption, pre, table, tr, blockquote, h1, h2, h3, h4, h5, h6, " +
+      "p:has(>img,>svg,>video), div:has(>img,>svg,>video), " +
+      ':is(div,p)[class*="code" i], :is(div,p)[class*="highlight" i], :is(div,p)[class*="listing" i]';
+    const nodes: HTMLElement[] = [];
+    try {
+      for (const el of Array.from(root.querySelectorAll<HTMLElement>(SEL))) {
+        if (nodes.length >= CAP) break;
+        nodes.push(el);
+      }
+      if (effFitWidth() || effImgScale() !== 1) {
+        for (const el of Array.from(root.querySelectorAll<HTMLElement>(MEDIA_SEL))) {
+          if (nodes.length >= CAP) break;
+          nodes.push(el);
+        }
+      }
+    } catch {
+      return; // 选择器不被支持时保持原 CSS 行为
+    }
+    if (nodes.length >= CAP && import.meta.env.DEV) {
+      console.warn("[layout] markPagedBreakables 达到扫描上限", CAP);
+    }
+    const actions: Array<{ el: HTMLElement; action: TallBlockAction }> = [];
+    for (const el of nodes) {
+      const isMedia = el.matches(MEDIA_SEL);
+      actions.push({ el, action: tallBlockAction(el.getBoundingClientRect().height, pageH, isMedia) });
+    }
+    for (const { el, action } of actions) {
+      el.classList.toggle("tp-page-break", action === "fragment");
+      el.classList.toggle("tp-page-fit", action === "fit");
+    }
+    // R13-A2：整块保留（keep）的元素若被书内样式顶掉分页规则（break-inside:auto / 内联
+    // !important / display:inline / float），用内联 important 兜底；动作类元素本身允许断页/缩放，不处理。
+    for (const { el, action } of actions) {
+      if (action !== "keep") continue;
+      const cs = getComputedStyle(el);
+      const probe = {
+        breakInside: (cs as unknown as { breakInside?: string }).breakInside ?? "",
+        breakAfter: (cs as unknown as { breakAfter?: string }).breakAfter ?? "",
+        display: cs.display,
+        float: cs.float,
+      };
+      const fix = detectPagedStyleConflict(probe, /^H[1-6]$/.test(el.tagName));
+      if (fix) applyPagedStyleFix(el, fix);
+    }
+  }
+
+  function measurePages(retry = false) {
     if (!contentEl || !pageWrap || !chapter) return;
     const mv = effMarginV();
     const W = contentEl.clientWidth;
@@ -2988,9 +3360,15 @@ import {
     // 并把内容按错误步长平移出屏（页模式空白的直接原因）。等下一帧再试。
     if (W <= 0 || H <= 0) {
       cancelAnimationFrame(measureRaf);
-      measureRaf = requestAnimationFrame(() => measurePages());
+      // P6：按帧重试必须有上限——窗口隐藏/换书期间尺寸可能长期为 0，无上限的 rAF 链会一直空转。
+      // 外部直接调用重置计数并重新计一轮；超过 30 帧就停，后续 relayout/ResizeObserver/换章仍会再触发。
+      if (!retry) measureRetry = 0;
+      if (measureRetry >= 30) return;
+      measureRetry++;
+      measureRaf = requestAnimationFrame(() => measurePages(true));
       return;
     }
+    measureRetry = 0;
     gap = config.reader.colGap;
     screenCols = config.reader.duo ? 2 : 1;
     // 先夹取有效左右内缩：窄窗口 + 大边距时收窄边距，而不是让 .clip 比排版窄（正文被裁成竖排）。
@@ -3014,6 +3392,8 @@ import {
     st.height = `${vh}px`;
     st.columnWidth = `${colW}px`;
     st.columnGap = `${gap}px`;
+    // R9：样式落定后、算页数前先给超高元素打兜底类（分页边界因此更稳定）。
+    markPagedBreakables();
     cancelAnimationFrame(measureRaf);
     // 先同步算一次页数（读取 scrollWidth 会触发一次布局），保证恢复进度时
     // gotoPage 的夹取使用的是真实页数，而不是上一章的旧值/初始值 1。
@@ -4275,6 +4655,14 @@ import {
   let lastVpH = -1;
 
   function relayout() {
+    // R13-A2 补丁：从翻页切回滚动时 relayout 走滚动分支、不会再调 markPagedBreakables，
+    // 这里先恢复上一轮写入的分页兜底内联样式，保证兜底只在翻页模式生效；
+    // 仍在翻页时随后的 measurePages→markPagedBreakables 会重新探测并应用。
+    restorePagedStyleFixes();
+    // 排版参数变化标记在本次重排消费一次（各分支共用，早退路径也要清）：否则下一次由
+    // 图片/字体延迟加载触发的重排会误按比例重定位，破坏「保持绝对位置」。
+    const anchorTypo = typoRelayoutAnchor;
+    typoRelayoutAnchor = false;
     if (!chapter) return;
     if (import.meta.env.DEV) pdfHlTracePush("relayout");
     // 漫画横向：重测窗口尺寸。内容窗口宽度可能因图片加载/缩放/边距变化而改变，
@@ -4306,8 +4694,9 @@ import {
       const viewportChanged = vpW !== lastVpW || vpH !== lastVpH;
       lastVpW = vpW;
       lastVpH = vpH;
-      if (viewportChanged) {
-        // 可视区变化（窗口缩放）：按比例恢复，保持阅读位置。
+      if (viewportChanged || anchorTypo) {
+        // 可视区变化（窗口缩放）或排版参数变化（字号/行距/段距/边距）：按比例恢复，保持阅读位置。
+        // 比例必须在 measureScroll() 前取：它按旧的 maxScroll 换算当前位置。
         const ratio = currentRatio();
         measureScroll();
         scroller?.jumpTo(ratio * maxScroll, true);
@@ -4319,7 +4708,7 @@ import {
     } else {
       const ratio = currentRatio();
       measurePages();
-      gotoPage(Math.round(ratio * (pageCount - 1)), true);
+      gotoPage(pageFromRatio(ratio, pageCount), true);
     }
   }
 
@@ -4680,26 +5069,134 @@ import {
     runAction(e.button === 3 ? "prev" : "next");
   }
 
+  /** R10-3：在正文根里找第一个 id 精确匹配的锚点，其次 name；fragment 已解码。 */
+  function findAnchorElement(root: HTMLElement, fragment: string): HTMLElement | null {
+    if (!fragment) return null;
+    const esc = fragment.replace(/["\\]/g, "\\$&");
+    try {
+      const byId = root.querySelector<HTMLElement>(`[id="${esc}"]`);
+      if (byId) return byId;
+      return root.querySelector<HTMLElement>(`[name="${esc}"]`);
+    } catch {
+      return null;
+    }
+  }
+
+  /** R10-3：跳转到目标章（或当前章）的锚点；找到 → 滚动/翻页定位，找不到 → 章首。
+   *  跨章先等章节渲染与测量完成，避免用旧页数换算。 */
+  async function jumpToInternalAnchor(targetChapter: number, fragment: string, sameChapter: boolean) {
+    if (!book) return;
+    if (!fragment) return;
+    if (!sameChapter) {
+      await chapterTx(targetChapter, undefined, false);
+      await tick();
+    } else {
+      await tick();
+    }
+    // 翻页模式再等一帧，确保 measurePages 已按本章更新 pageCount/stepPx。
+    if (!scrollLayout()) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    const root = contentRoot();
+    if (!root) {
+      alignStatsBaseline();
+      return;
+    }
+    const el = findAnchorElement(root, fragment);
+    if (!el) {
+      // 跨章跳转本身已落章首；同章找不到 → 回章首。
+      if (sameChapter) {
+        if (scrollLayout()) scroller?.jumpTo(0, true);
+        else gotoPage(0, true);
+      }
+      alignStatsBaseline();
+      return;
+    }
+    if (mangaHorizontal() || isPdfBook()) {
+      alignStatsBaseline();
+      return;
+    }
+    if (scrollLayout()) {
+      if (!contentEl || !scroller) {
+        alignStatsBaseline();
+        return;
+      }
+      const contentRect = contentEl.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      const target = scrollRender + (r.top - contentRect.top) - contentRect.height * 0.3;
+      scroller.jumpTo(Math.max(0, Math.min(target, maxScroll)), true);
+    } else {
+      if (!pageWrap) {
+        alignStatsBaseline();
+        return;
+      }
+      const wrapRect = pageWrap.getBoundingClientRect();
+      const left = el.getBoundingClientRect().left - wrapRect.left;
+      gotoPage(pageFromLeftPosition(left, stepPx, pageCount), true);
+    }
+    alignStatsBaseline();
+  }
+
   function onBodyClick(e: MouseEvent) {
     const a = (e.target as HTMLElement | null)?.closest?.("a") as HTMLAnchorElement | null;
     if (!a) return;
     e.preventDefault();
     e.stopPropagation();
     const href = a.getAttribute("href") || "";
-    if (!href || href.startsWith("#")) return;
+    if (!href) return;
     if (/^https?:/i.test(href)) {
       copyText(href).then(() => toast(t("reader.toast.linkCopied")));
       return;
     }
-    const clean = decodeURIComponent(href.split("#")[0]);
-    const base = (clean.split(/[\\/]/).pop() || "").toLowerCase();
-    if (!base || !base.includes(".")) return;
-    const idx = book?.docs?.findIndex((d) => d.toLowerCase() === base) ?? -1;
-    if (idx >= 0) {
-      void navTo(idx, { at: "head", extra: 0 });
-    } else {
-      toast(t("reader.toast.jumpFailed", { target: base }));
+    const parsed = parseInternalHref(href);
+    if (!parsed) return;
+    // R10-3：同文档锚点（#top / #filepos...）→ 当前章内精确定位（旧行为是静默忽略）。
+    if (parsed.sameDoc) {
+      // R13-A1：P11 切分书同一 spine 文件对应多个虚拟章，同文件 #锚点可能属于另一个虚拟章。
+      // 先让后端按文件名+fragment 定位；无效/当前章则维持当前章内定位。
+      void (async () => {
+        const cur = chapterNum;
+        let target = cur;
+        try {
+          const bid = book?.book.id ?? -1;
+          const file = book?.docs?.[cur];
+          if (bid >= 0 && file && parsed.fragment && book?.book.format === "epub") {
+            const located = await api.locateEpubAnchor(bid, file.toLowerCase(), parsed.fragment);
+            target = pickSameDocAnchorTarget(cur, located);
+          }
+        } catch {
+          /* 定位失败：回退当前章 */
+        }
+        void jumpToInternalAnchor(target, parsed.fragment, target === chapterNum);
+      })();
+      return;
     }
+    const base = parsed.fileBase;
+    if (!base || !base.includes(".")) return; // 与旧行为一致：非文件链接不处理。
+    const idx = book?.docs?.findIndex((d) => d.toLowerCase() === base) ?? -1;
+    if (idx < 0) {
+      // 带锚点才提示失败；无 fragment 的旧行为保持静默。
+      if (parsed.fragment) toast(t("reader.toast.jumpFailed", { target: base }));
+      return;
+    }
+    if (!parsed.fragment) {
+      void navTo(idx, { at: "head", extra: 0 });
+      return;
+    }
+    // R12-3：切分书同一 spine 有多个虚拟章，book.docs 只按文件名匹配到首个。
+    // 先让后端按切分布局定位锚点所属虚拟章，返回 null 时回退首个匹配结果。
+    const bookId = book?.book.id ?? -1;
+    void (async () => {
+      let target = idx;
+      try {
+        const located = bookId >= 0 ? await api.locateEpubAnchor(bookId, base, parsed.fragment) : null;
+        if (located != null && located >= 0) target = located;
+      } catch {
+        /* 定位命令失败：回退 docs 匹配结果 */
+      }
+      const same = target === chapterNum && !!chapter;
+      void jumpToInternalAnchor(target, parsed.fragment, same);
+    })();
   }
 
   function goBack() {
@@ -5320,11 +5817,11 @@ import {
     const sw = mangaFlowCanvas ?? scrollWrap;
     const c = contentEl;
     if (!w && !sw && !c) return;
-    const ro = new ResizeObserver(() => scheduleRelayout());
+    const ro = new ResizeObserver(() => { scheduleRelayout(); requestAnimationFrame(() => repaintPdfSearchHighlights()); });
     if (c) ro.observe(c);
     if (w) ro.observe(w);
     if (sw) ro.observe(sw);
-    const onWin = () => scheduleRelayout();
+    const onWin = () => { scheduleRelayout(); requestAnimationFrame(() => repaintPdfSearchHighlights()); };
     window.addEventListener("resize", onWin);
     // 按需/懒加载图片在渲染后才解码，加载完成会改变排版：捕获阶段监听 img load 重新测量。
     // 漫画瀑布流走独立的 rAF 合并口：img load 的连续触发会把 160ms 防抖 scheduleRelayout 饿死，
@@ -5432,10 +5929,17 @@ import {
 `;
     // 漫画两种布局的图片规则统一在组件样式区的 .manga-h-* / .manga-flow-* 中定义
     // （固定视口层承载边距 + 内容变形层平移/滚动），不再依赖会随 transform 移动的 #chapter-content padding。
-    const hideTextRule = isMangaMode() && r.manga.hideText // i18n-allow:算法输入：下面模板里带中文的是注入样式表的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
+    // 图片页型书（自动识别）默认隐藏文字层：水印文字不应盖在扫描页上；用户把本书手动切回
+    // 文字模式（按书覆盖 mangaMode=false）后 isMangaMode() 为 false，规则与根 class 都不再生效。
+    // 排除 PDF：PDF 的 textLayer 承载划线与文字选择，不能被这条规则隐藏。
+    const hideTextOn =
+      !isPdfBook() && isMangaMode() && (r.manga.hideText || book?.image_pages === true);
+    const hideTextRule = hideTextOn
       ? `
-/* 漫画模式「仅图片」：隐藏不含图片的文本块 */
-.reader.manga #chapter-content :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
+/* 漫画/图片页「仅图片」：文本模式的 #chapter-content 与漫画窗口的 .manga-block 都要隐藏纯文本块；
+   含图片的容器本身保留（只隐藏不含 img/svg/video 的文本块）。 */
+.reader.hide-text #chapter-content :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
+.reader.hide-text .manga-block :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
 `
       : "";
     // i18n-allow:算法输入：注入样式表里的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
@@ -5453,6 +5957,8 @@ ${effCssExtra() || ""}
     const r = config.reader;
     void effOverrideCss();
     void isMangaMode();
+    void book?.image_pages;
+    void isPdfBook();
     void effCssExtra();
     void effFitHeight();
     void r.manga.hideText;
@@ -5521,6 +6027,18 @@ ${effCssExtra() || ""}
     r.highlightColor;
     r.highlightStyle;
     saveConfig();
+    // P1：仅三条边距实际变化才置位「按比例恢复滚动位置」（首次只记录键，不置位）。
+    // 字号/行距等改由下方 eff* effect 记键，避免同一变化重复置位。
+    const marginKey = [
+      config.reader.margins.scroll.h, config.reader.margins.scroll.v,
+      config.reader.margins.page.h, config.reader.margins.page.v,
+      config.reader.margins.duo.h, config.reader.margins.duo.v,
+    ].join("|");
+    if (lastTypoMarginKey === null) lastTypoMarginKey = marginKey;
+    else if (lastTypoMarginKey !== marginKey) {
+      lastTypoMarginKey = marginKey;
+      typoRelayoutAnchor = true;
+    }
     tick().then(scheduleRelayout);
   });
 
@@ -5602,6 +6120,17 @@ ${effCssExtra() || ""}
     void config.reader.manga.marginV;
     void config.reader.manga.imgGap;
     void config.reader.manga.layout;
+    // P1：仅影响文本排版的 eff* 变化才置位「按比例恢复滚动位置」；图片缩放/适宽/适高/显隐
+    // 与漫画独立边距不改变文本排版高度，维持既有的「保持绝对位置」行为。
+    const typoKey = [
+      effFontSize(), effLineHeight(), effParaSpacing(), effIndent(), effTextAlign(),
+      effFontWeight(), effFontFamily(), effLatinFont(), effCssExtra(),
+    ].join("|");
+    if (lastTypoEffKey === null) lastTypoEffKey = typoKey;
+    else if (lastTypoEffKey !== typoKey) {
+      lastTypoEffKey = typoKey;
+      typoRelayoutAnchor = true;
+    }
     tick().then(() => scheduleRelayout());
   });
 
@@ -5702,7 +6231,7 @@ ${effCssExtra() || ""}
       for (const [kk, tt] of pdfRebuildAt) if (tt < now - 5000) pdfRebuildAt.delete(kk);
     }
     loadGeneration++;
-    void loadMangaWindow(chapterNum);
+    void loadMangaWindow(chapterNum).then(() => { setTimeout(() => repaintPdfSearchHighlights(), 180); });
   }
 
   const bgImageUrl = $derived(
@@ -6215,6 +6744,40 @@ ${effCssExtra() || ""}
     await gotoNavPos(prev);
   }
 
+  /** R13-A3：旧布局书签点击——按旧标题/索引校正目标章，再按摘录精确落点；不写 DB。 */
+  async function jumpToBookmark(bm: { chapter_index: number; title: string; excerpt?: string | null }) {
+    if (!book) return;
+    const resolved = resolveLegacyChapterIndex(
+      bm.chapter_index,
+      bm.title ?? "",
+      book.toc,
+      (s) => normalizeChapterTitle(s),
+    );
+    const chapterChanged = resolved.index !== bm.chapter_index;
+    if (resolved.index !== chapterNum) {
+      await chapterTx(resolved.index, undefined, false);
+      await tick();
+    } else {
+      await tick();
+    }
+    paintNow();
+    const root = contentRoot();
+    let movedByExcerpt = false;
+    if (root && bm.excerpt) {
+      const range = findTextRange(root, bm.excerpt);
+      if (range) {
+        scrollRangeIntoView(range);
+        movedByExcerpt = true;
+      }
+    }
+    // 章号被校正且摘录找不到时不要静默停在章首：提示原位置可能已变化。
+    if (!resolved.corrected || (chapterChanged && !!bm.excerpt && !movedByExcerpt)) {
+      toast(t("reader.toast.legacyJumpAdjusted"));
+    }
+    alignStatsBaseline();
+    rightPanel = null;
+  }
+
   async function jumpToHighlight(h: HighlightRow) {
     if (rightPanel === "highlights") rightPanel = null;
     if (!book) return;
@@ -6223,8 +6786,15 @@ ${effCssExtra() || ""}
       requestOpenBook(h.book_id);
       return;
     }
-    if (h.chapter_index !== chapterNum) {
-      await chapterTx(h.chapter_index, undefined, false);
+    // R13-A3：旧布局切分/重排后 chapter_index 可能已变，先按旧标题校正（不写 DB）。
+    const resolved = resolveLegacyChapterIndex(
+      h.chapter_index,
+      h.chapter_title ?? "",
+      book.toc,
+      (s) => normalizeChapterTitle(s),
+    );
+    if (resolved.index !== chapterNum) {
+      await chapterTx(resolved.index, undefined, false);
       await tick();
     } else {
       await tick();
@@ -6232,9 +6802,21 @@ ${effCssExtra() || ""}
     paintNow();
     const root = contentRoot();
     if (!root) return;
-    const range = charRangeToRange(root, h.pos_start, h.pos_end);
+    const chapterChanged = resolved.index !== h.chapter_index;
+    let range: Range | null = null;
+    if (chapterChanged) {
+      // 旧章的 pos_start/pos_end 只对旧章有意义；换章后即使恰好落进新章文本范围也是错的，
+      // 因此不再用旧偏移，直接按划线文本找回。
+      range = h.text ? findTextRange(root, h.text) : null;
+      if (!range) toast(t("reader.toast.hlNotFound"));
+    } else {
+      range = charRangeToRange(root, h.pos_start, h.pos_end);
+      // 偏移失效时按划线文本找回（仅本次跳转，不写回 DB/旧值）。
+      if (!range && h.text) range = findTextRange(root, h.text);
+      if (!range) toast(t("reader.toast.hlNotFound"));
+    }
     if (range) scrollRangeIntoView(range);
-    else toast(t("reader.toast.hlNotFound"));
+    if (!resolved.corrected) toast(t("reader.toast.legacyJumpAdjusted"));
     alignStatsBaseline(); // 划线跳转落点：对齐统计基准
   }
 
@@ -6458,9 +7040,21 @@ ${effCssExtra() || ""}
     if (wasActive && book) void doSaveProgress(ratio);
   }
 
-  /** 本章读完：按设置自动续读下一章。 */
+  // D8：把当前书 id 告知 TTS 层，使按书音色/语速在首次朗读前即生效。
+  $effect(() => {
+    const id = book?.book.id;
+    if (id) ttsSetBook(id);
+  });
+
+  /** 本章读完：按设置自动续读下一章；章末停止模式只保存进度并停止。 */
   async function onTtsChapterEnd() {
-    if (!config.tts.autoNextChapter || !book) return;
+    if (!book) return;
+    if (config.tts.sleepMinutes === -1) {
+      void doSaveProgress(1);
+      toast(t("reader.toast.ttsChapterEnd"));
+      return;
+    }
+    if (!config.tts.autoNextChapter) return;
     // 本章已读完，先把进度记到章末，重开时不会退回本章开头。
     void doSaveProgress(1);
     if (chapterNum >= book.toc.length - 1) {
@@ -6489,6 +7083,8 @@ ${effCssExtra() || ""}
   }
 
   let progDrag = $state(false);
+  /** 拖动中的滑块预览比例（0–1，全书量程）：拖动期间只动滑块/填充，松手才真正跳转（P5）。 */
+  let progPreview = $state<number | null>(null);
   let progLastRatio = 0;
   let progBusy = false;
   let progReq = false;
@@ -6499,7 +7095,7 @@ ${effCssExtra() || ""}
       clampManga();
       applyMangaPan();
     } else if (scrollLayout()) scroller?.jumpTo(r * maxScroll, true);
-    else gotoPage(Math.round(r * (pageCount - 1)), true);
+    else gotoPage(pageFromRatio(r, pageCount), true);
   }
 
   function chapterFromRatio(ratio: number) {
@@ -6542,8 +7138,9 @@ ${effCssExtra() || ""}
 
   function progDown(e: PointerEvent) {
     progDrag = true;
+    // 按下只记录预览：拖动期间不加载章节，松手（progUp / buttons===0 兜底）才 seek。
+    progPreview = progFromEvent(e);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    progSeek(progFromEvent(e));
   }
 
   function progMove(e: PointerEvent) {
@@ -6553,11 +7150,14 @@ ${effCssExtra() || ""}
     // 也不把焦点留在滑块上（那会让 ←/→ 永久只 seek 不翻页）。
     if (e.buttons === 0) {
       progDrag = false;
+      const r = progPreview ?? progFromEvent(e);
+      progPreview = null;
+      void progSeek(r).then(() => saveProgressDebounced());
       (e.currentTarget as HTMLElement).blur();
-      saveProgressDebounced();
       return;
     }
-    progSeek(progFromEvent(e));
+    // 拖动期间只更新滑块预览；跨章加载与落位统一放到松手，避免整章反复加载。
+    progPreview = progFromEvent(e);
   }
 
   /** 进度条键盘操作：←/→ 微调 1%，Shift 加速 5%，Home/End 到首尾。 */
@@ -6659,7 +7259,7 @@ ${effCssExtra() || ""}
       case "bookTitle":
         return book.book.title || "";
       case "chapterName":
-        return chapter?.title || "";
+        return displayChapterTitle(chapter?.title ?? "", chapterNum, (n) => t("common.sectionN", { n }));
       case "chapterIndex":
         return t("common.chapterN", { n: chapterNum + 1 });
       case "chapterCount":
@@ -6728,7 +7328,10 @@ ${effCssExtra() || ""}
   function progUp(e: PointerEvent) {
     if (!progDrag) return;
     progDrag = false;
-    progSeek(progFromEvent(e)).then(() => saveProgressDebounced());
+    // 松手才真正 seek：拖动过程只改 progPreview，单击也走同一路径（松手即跳）。
+    const r = progPreview ?? progFromEvent(e);
+    progPreview = null;
+    void progSeek(r).then(() => saveProgressDebounced());
     // 指针交互结束即把焦点从滑块上摘掉，交还正文。
     // progKey 会让滑块吃掉 ←/→（避免「seek + 翻页」双动作），但 tabindex=0 的滑块在
     // pointerdown 时会被 Chromium 聚焦且不会自己失焦 —— 不摘焦点的话，点/拖过进度条之后
@@ -6749,7 +7352,7 @@ ${effCssExtra() || ""}
   class:manga={isMangaMode()}
   class:pdf={isPdfBook()}
   class:manga-h={mangaHorizontal()}
-  class:hide-text={isMangaMode() && config.reader.manga.hideText}
+  class:hide-text={!isPdfBook() && isMangaMode() && (config.reader.manga.hideText || book?.image_pages === true)}
   class:no-images={!effShowImages()}
   class:vfade={!isMangaMode() && config.reader.mode === "scroll" && effMarginV() > 0}
   class:has-bg={!!bgImageUrl}
@@ -7147,7 +7750,7 @@ ${effCssExtra() || ""}
           role="slider"
           tabindex="0"
           aria-label={t("reader.progress.aria")}
-          aria-valuenow={Math.round(totalPct())}
+          aria-valuenow={Math.round((progPreview ?? totalPct() / 100) * 100)}
           aria-valuemin={0}
           aria-valuemax={100}
           onpointerdown={progDown}
@@ -7156,8 +7759,8 @@ ${effCssExtra() || ""}
           onpointercancel={progUp}
           onkeydown={progKey}
         >
-          <div class="progress-fill" style="transform:scaleX({totalPct() / 100})"></div>
-          <div class="progress-knob" style="left:{totalPct()}%"></div>
+          <div class="progress-fill" style="transform:scaleX({progPreview ?? totalPct() / 100})"></div>
+          <div class="progress-knob" style="left:{(progPreview ?? totalPct() / 100) * 100}%"></div>
         </div>
         {#if rightFooterItems.length}
           <span
@@ -7178,7 +7781,7 @@ ${effCssExtra() || ""}
 
     {#if tocOpen && book}
       <div class="panel-slot" out:outSlideL>
-        <TocPanel toc={book.toc} current={chapterNum} onpick={(i) => { tocOpen = false; void navTo(i, { at: "head", extra: 0 }).then(alignStatsBaseline); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
+        <TocPanel toc={book.toc} current={chapterNum} note={isPdfBook() && !pdfHasOutline ? t("reader.pdf.noOutline") : undefined} onpick={(i) => { tocOpen = false; void navTo(i, { at: "head", extra: 0 }).then(alignStatsBaseline); }} onclose={() => (tocOpen = false)} onpopout={() => popOutPanel("toc")} />
       </div>
     {/if}
 
@@ -7188,8 +7791,8 @@ ${effCssExtra() || ""}
         <div class="sp-list">
           {#each bookmarks as bm (bm.id)}
             <div class="sp-item bm-item">
-              <div class="bm-main" onclick={() => { void navTo(bm.chapter_index, { at: "head", extra: 0 }).then(alignStatsBaseline); rightPanel = null; }}>
-                <div class="bm-title">{bm.title || t("common.untitled")}</div>
+              <div class="bm-main" onclick={() => { void jumpToBookmark(bm); }}>
+                <div class="bm-title">{displayChapterTitle(bm.title, bm.chapter_index, (n) => t("common.sectionN", { n }))}</div>
                 {#if bm.excerpt}<div class="bm-excerpt">{bm.excerpt}</div>{/if}
               </div>
               <button class="icon bm-del" data-testid="bm-del" title={t("reader.bookmarks.deleteTip")} onclick={() => deleteBookmark(bm.id)}><IconTrash /></button>
@@ -7206,11 +7809,36 @@ ${effCssExtra() || ""}
       <HighlightsPanel
         bookId={book.book.id}
         version={hlVersion}
+        bookTitle={book.book.title}
+        bookAuthor={book.book.author}
         onjump={jumpToHighlight}
         onclose={() => (rightPanel = null)}
         onchanged={refreshHighlights}
         onpopout={() => popOutPanel("highlights")}
       />
+      </div>
+    {/if}
+
+
+    {#if thumbsOpen && book}
+      <div class="panel-slot" out:outSlideR>
+        <PdfThumbPanel
+          bookId={book.book.id}
+          current={chapterNum}
+          total={book.toc.length}
+          onjump={(p) => { void pdfSearchJump(p); }}
+          onclose={() => (rightPanel = null)}
+        />
+      </div>
+    {/if}
+
+    {#if pdfSearchOpen && book}
+      <div class="panel-slot" out:outSlideR>
+        <PdfSearchPanel
+          bookId={book.book.id}
+          onjump={(page, hit, query) => { void pdfSearchJump(page, hit, query); }}
+          onclose={() => { pdfSearchHitState = null; clearPdfSearchHighlight(); rightPanel = null; }}
+        />
       </div>
     {/if}
 
@@ -7255,7 +7883,7 @@ ${effCssExtra() || ""}
     {/if}
 
     {#if ttsState.playing || ttsState.paused}
-      <TtsBar current={ttsCurrent} />
+      <TtsBar current={ttsCurrent} bookId={book?.book.id ?? null} />
     {/if}
 
     {#if ttsStartChoice}
@@ -7795,6 +8423,11 @@ ${effCssExtra() || ""}
   .reader.pdf :global(mark.tp-hl-box) {
     box-shadow: 0 0 0 1.5px var(--hl-color);
     border-radius: var(--radius-xs);
+  }
+
+  :global(::highlight(tp-pdf-search)) {
+    background: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: inherit;
   }
 
   /* PDF 高亮叠层：位图之上、文本层之下。**刻意不设 z-index / transform / opacity** ——
@@ -8389,6 +9022,64 @@ ${effCssExtra() || ""}
     text-wrap: pretty;
     orphans: 2;
     widows: 2;
+  }
+
+  /* ===== R9：翻页模式分页控制（仅 .col-page 内生效；滚动/PDF/漫画分支不命中） =====
+     目标：标题、图片、图注、表格、代码块、引用块不被栏/页边界切成两半；
+     超高块由 JS 打 .tp-page-break 允许内部断页，超高媒体打 .tp-page-fit 缩到一页内。
+     全部 !important：优先于书内 CSS；只作用于 #chapter-content（动态 HTML 需 :global）。 */
+  .reader .col-page #chapter-content :global(:is(h1, h2, h3, h4, h5, h6)) {
+    break-inside: avoid !important;
+    break-after: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(:is(img, svg, video)) {
+    break-inside: avoid !important;
+    break-after: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(figure),
+  .reader .col-page #chapter-content :global(figcaption) {
+    break-inside: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(p:has(> img, > svg, > video)),
+  .reader .col-page #chapter-content :global(div:has(> img, > svg, > video)) {
+    break-inside: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(table),
+  .reader .col-page #chapter-content :global(tr) {
+    break-inside: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(pre) {
+    break-inside: avoid !important;
+  }
+  /* 代码块类名启发式（技术书常见 <div class="code">/<p class="highlight">）：
+     与 pre 同样避免跨页；若整块超高，JS 会给它打 .tp-page-break 允许内部断页。 */
+  .reader .col-page #chapter-content :global(:is(div, p)[class*="code" i]),
+  .reader .col-page #chapter-content :global(:is(div, p)[class*="highlight" i]),
+  .reader .col-page #chapter-content :global(:is(div, p)[class*="listing" i]) {
+    break-inside: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(blockquote) {
+    break-inside: avoid !important;
+  }
+  .reader .col-page #chapter-content :global(p) {
+    orphans: 2 !important;
+    widows: 2 !important;
+  }
+  /* 超高兜底类（JS 添加）：允许内部断页，避免整块被推走/溢出。 */
+  .reader .col-page #chapter-content :global(.tp-page-break) {
+    break-inside: auto !important;
+    break-before: auto !important;
+  }
+  /* 超高媒体：缩到一页内（覆盖适宽/缩放造成的超高，仅兜底）。
+     zoom:1 取消本书图片放大（--rdr-img-scale > 1 时动态 CSS 会给 img 写 zoom:var(...) 且非
+     !important）；max-width:100% 防放大后横向溢出。正常不超高图片完全不受影响（类只会由 JS
+     打在确实超过一页的媒体上）。 */
+  .reader .col-page #chapter-content :global(.tp-page-fit) {
+    max-height: calc(var(--rdr-img-h, 80vh) - 1.6em) !important;
+    max-width: 100% !important;
+    width: auto !important;
+    object-fit: contain !important;
+    zoom: 1 !important;
   }
 
   #chapter-content :global(img) {

@@ -1,4 +1,4 @@
-import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport, TextLayer, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport, TextLayer, type PDFDocumentProxy, type PDFDocumentLoadingTask } from "pdfjs-dist/legacy/build/pdf.mjs";
 import workerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { api } from "./api";
 import { fullPageLruStep, pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
@@ -11,9 +11,56 @@ GlobalWorkerOptions.workerSrc = workerSrc;
 // 「哪些切片还贴着视口」，其余按 LRU 回收。避免两处各自 revoke 同一个 URL 把在屏内容弄白。
 
 /** 同一时刻只保留一本 PDF 的文档（换书先释放上一本）。 */
+/** R12-1 补丁：PDF 会话/封面队列诊断（DEV 可见，生产不输出）。
+ *  通过 window.__tpPdfCoverStats 读取；active=created-destroyed 反映仍存活的 pdf.js worker 数。 */
+export interface PdfCoverStats {
+  attempted: number;
+  rendered: number;
+  wrote: number;
+  failed: number;
+  created: number;
+  destroyed: number;
+  active: number;
+  lastError: string;
+}
+export const pdfCoverStats: PdfCoverStats = {
+  attempted: 0,
+  rendered: 0,
+  wrote: 0,
+  failed: 0,
+  created: 0,
+  destroyed: 0,
+  active: 0,
+  lastError: "",
+};
+/** R12-1 补丁：DEV 下追踪每个已创建但尚未终止的 pdf.js 加载任务（排查泄漏用）。
+ *  window.__tpPdfOpenTasks() 返回 [{seq, bookId, stage}]；销毁成功后从列表移除。 */
+interface OpenPdfTask {
+  seq: number;
+  bookId: number;
+  stage: string;
+  task: PDFDocumentLoadingTask;
+}
+let taskSeq = 0;
+const openPdfTasks: OpenPdfTask[] = [];
+function trackPdfTask(task: PDFDocumentLoadingTask, bookId: number, stage: string): void {
+  openPdfTasks.push({ seq: ++taskSeq, bookId, stage, task });
+}
+function untrackPdfTask(task: PDFDocumentLoadingTask): void {
+  const i = openPdfTasks.findIndex((r) => r.task === task);
+  if (i >= 0) openPdfTasks.splice(i, 1);
+}
+if (import.meta.env.DEV) {
+  (globalThis as unknown as { __tpPdfCoverStats?: PdfCoverStats }).__tpPdfCoverStats = pdfCoverStats;
+  (globalThis as unknown as { __tpPdfOpenTasks?: () => { seq: number; bookId: number; stage: string }[] }).__tpPdfOpenTasks = () =>
+    openPdfTasks.map((r) => ({ seq: r.seq, bookId: r.bookId, stage: r.stage }));
+}
+
 interface PdfSession {
   bookId: number;
   doc: PDFDocumentProxy;
+  /** pdf.js 的加载任务：销毁它才会真正终止 worker（doc.destroy 内部虽会转调，但显式保存更可控）。 */
+  task?: PDFDocumentLoadingTask;
   /** 走 range 分块时保留传输对象：换书/关书要 abort 掉在途请求。 */
   range?: PDFDataRangeTransport;
   /** 打开通道：`js` = pdf.js；`native` = 系统原生渲染；`direct` = 直读页面图（纯图扫描件）。
@@ -92,6 +139,8 @@ const PDF_NATIVE_MIN_BYTES = Math.round(1.9 * 1024 * 1024 * 1024);
 let nativeSession: { bookId: number; pages: number } | null = null;
 
 let session: PdfSession | null = null;
+/** R12-1：上一份 pdf.js 文档的销毁 Promise（换书/封面渲染时等待它完成，避免 worker 堆积）。 */
+let pendingDestroy: Promise<void> | null = null;
 let sessionBookId = -1;
 let sessionPromise: Promise<PdfSession> | null = null;
 /** 换代计数：换书/关书时 +1，用来丢弃上一代在途的渲染结果（否则旧书位图会塞进新书）。 */
@@ -106,6 +155,198 @@ const bitmaps = new Map<string, BitmapEntry>();
 /** 整页图（full# 前缀）token 的 LRU 顺序（旧 → 新）。与 bitmaps 分开存：同一张表里还混着切片，
  *  Map 的插入顺序没法同时表达两套淘汰策略。 */
 let fullOrder: string[] = [];
+
+/* ---------------- D6-2：独立缩略图缓存（不占整页图 LRU） ---------------- */
+const THUMB_CACHE_MAX = 100;
+let thumbCache = new Map<string, { url: string; page: number }>();
+let thumbOrder: string[] = [];
+let thumbChain: Promise<unknown> = Promise.resolve();
+
+export function releasePdfThumbs(): void {
+  for (const t of thumbCache.values()) revoke(t.url);
+  thumbCache.clear();
+  thumbOrder = [];
+}
+
+
+/** D6-2：直读通道的独立缩略图（不登记 bitmaps，缓存/释放只由 thumbCache 管）。 */
+async function directThumbUrl(bookId: number, page: number, width: number): Promise<string> {
+  const meta = await directMeta(bookId, page);
+  if (meta.kind === "unsupported") {
+    return placeholderUrl("本页暂不支持显示", width, Math.round(width * 1.3));
+  }
+  const bytes = await api.pdfScanPageBytes(bookId, page);
+  let source: CanvasImageSource;
+  let srcW = 1;
+  let srcH = 1;
+  let tmp: string | null = null;
+  if (meta.kind === "jpeg") {
+    const blob = new Blob([bytes], { type: "image/jpeg" });
+    tmp = URL.createObjectURL(blob);
+    const img = new Image();
+    img.src = tmp;
+    try { await img.decode(); } catch { /* 用自然尺寸兜底 */ }
+    source = img;
+    srcW = img.naturalWidth || Math.max(1, meta.width || width);
+    srcH = img.naturalHeight || Math.max(1, meta.height || width);
+  } else {
+    const inflated = await inflatePdfStream(bytes);
+    const full = rawToCanvas(meta, inflated);
+    source = full;
+    srcW = full.width;
+    srcH = full.height;
+  }
+  const h = Math.max(1, Math.round((width * srcH) / Math.max(1, srcW)));
+  const c = document.createElement("canvas");
+  c.width = width;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("canvas 上下文不可用");
+  ctx.drawImage(source, 0, 0, width, h);
+  if (tmp) revoke(tmp);
+  return URL.createObjectURL(
+    await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/jpeg", 0.8)),
+  );
+}
+/** D6-2：页面缩略图（独立小 LRU，容量 100；复用同一 ensurePdf 文档，不新建 worker）。 */
+export async function renderPdfThumb(bookId: number, page: number, width = 140): Promise<string> {
+  const s = await ensurePdf(bookId);
+  const gen = generation;
+  const w = Math.max(40, Math.min(400, Math.round(width)));
+  const token = `thumb#${page}@${w}`;
+  const hit = thumbCache.get(token);
+  if (hit) {
+    thumbOrder = thumbOrder.filter((t) => t !== token);
+    thumbOrder.push(token);
+    return hit.url;
+  }
+  // 独立串行链：缩略图不与正文切片抢 withSlot 并发额度。
+  const run = thumbChain.then(async () => {
+    if (gen !== generation) throw new Error("已切换书籍");
+    let url: string;
+    if (s.mode === "direct") {
+      // 独立直读缩略图：只读本页字节并生成小图，不引用主缓存 URL（否则会被 sweep 回收）。
+      url = await directThumbUrl(bookId, page, w);
+    } else if (s.native) {
+      const pt = await pageGeometry(bookId, page);
+      const h = Math.max(1, Math.round((w * pt.ptH) / Math.max(1, pt.ptW)));
+      url = await nativeFullUrl(bookId, page, pt.ptW, pt.ptH, w, h);
+    } else {
+      url = await pdfjsThumbUrl(s.doc, page, w);
+    }
+    if (gen !== generation) {
+      revoke(url);
+      throw new Error("已切换书籍");
+    }
+    thumbCache.set(token, { url, page });
+    thumbOrder.push(token);
+    while (thumbOrder.length > THUMB_CACHE_MAX) {
+      const old = thumbOrder.shift();
+      if (!old) break;
+      const e = thumbCache.get(old);
+      if (e) {
+        revoke(e.url);
+        thumbCache.delete(old);
+      }
+    }
+    return url;
+  });
+  thumbChain = run.catch(() => undefined);
+  return run;
+}
+
+async function pdfjsThumbUrl(doc: PDFDocumentProxy, page: number, width: number): Promise<string> {
+  const p = await doc.getPage(page + 1);
+  try {
+    const base = p.getViewport({ scale: 1 });
+    const scale = width / Math.max(1, base.width);
+    const vp = p.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.floor(vp.width));
+    canvas.height = Math.max(1, Math.floor(vp.height));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("canvas 上下文不可用");
+    await p.render({ canvasContext: ctx, viewport: vp }).promise;
+    const blob = await new Promise<Blob>((res, rej) =>
+      canvas.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/jpeg", 0.8),
+    );
+    return URL.createObjectURL(blob);
+  } finally {
+    p.cleanup();
+  }
+}
+
+/* ---------------- D6-3：整本 PDF 文本搜索（逐页 getTextContent，可取消） ---------------- */
+export interface PdfSearchResult {
+  usable: boolean;
+  hits: import("./pdfSearch").PdfSearchHit[];
+  /** B11：跨页合并结果（同页命中仍是同一条）。 */
+  groups: import("./pdfSearch").PdfSearchGroup[];
+  totalPages: number;
+  scannedPages: number;
+  /** 取文本失败的页（0 基页码）。 */
+  failedPages: number[];
+  failedCount: number;
+  /** 文本为空/不可用的页（0 基）。 */
+  emptyPages: number[];
+  truncated: boolean;
+}
+
+export async function searchPdfText(
+  bookId: number,
+  query: string,
+  opts: { signal?: AbortSignal; onProgress?: (done: number, total: number) => void; limit?: number } = {},
+): Promise<PdfSearchResult> {
+  const { findPdfMatches, groupPdfMatches, normalizePdfQuery } = await import("./pdfSearch");
+  const q = normalizePdfQuery(query);
+  const s = await ensurePdf(bookId);
+  const gen = generation;
+  const limit = Math.max(1, Math.min(2000, opts.limit ?? 500));
+  const hits: import("./pdfSearch").PdfSearchHit[] = [];
+  const pageTexts: { page: number; text: string }[] = [];
+  if (!q || s.mode !== "js" || !s.doc) {
+    return { usable: false, hits, groups: [], totalPages: s.doc?.numPages ?? 0, scannedPages: 0, failedPages: [], failedCount: 0, emptyPages: [], truncated: false };
+  }
+  const total = s.doc.numPages;
+  let scanned = 0;
+  let failed = 0;
+  let usable = false;
+  const failedPages: number[] = [];
+  const emptyPages: number[] = [];
+  for (let i = 1; i <= total; i++) {
+    if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    if (gen !== generation) throw new DOMException("book changed", "AbortError");
+    try {
+      const p = await s.doc.getPage(i);
+      try {
+        const tc = await p.getTextContent();
+        const text = tc.items.map((it) => (it as { str?: string }).str ?? "").join(" ");
+        if (pdfTextUsable(text)) {
+          usable = true;
+          pageTexts.push({ page: i - 1, text });
+          const found = findPdfMatches(text, q, i - 1, limit - hits.length);
+          for (const h of found) {
+            hits.push(h);
+            if (hits.length >= limit) break;
+          }
+        } else {
+          emptyPages.push(i - 1);
+        }
+      } finally {
+        p.cleanup();
+      }
+    } catch {
+      failed++;
+      failedPages.push(i - 1);
+    }
+    scanned++;
+    opts.onProgress?.(scanned, total);
+    if (hits.length >= limit) break;
+    if (scanned % 5 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
+  const groups = q ? groupPdfMatches(pageTexts, q, limit) : [];
+  return { usable, hits, groups, totalPages: total, scannedPages: scanned, failedPages, failedCount: failed, emptyPages, truncated: hits.length >= limit };
+}
 /** 仍贴着视口的切片 token：绝不回收。 */
 const pinnedTokens = new Set<string>();
 /** 页尺寸（pt）缓存：算显示尺寸要用，换书清空。 */
@@ -224,6 +465,13 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
   sessionBookId = bookId;
   const gen = generation;
   const p = (async (): Promise<PdfSession> => {
+    // R12-1：先等上一份文档销毁完成再打开新文档（封面连播时避免 worker 堆积）。
+    // 只清自己等待的那条链：等待期间若又追加了新链，不能把新链抹掉。
+    const waitDestroy = pendingDestroy;
+    if (waitDestroy) {
+      await waitDestroy.catch(() => {});
+      if (pendingDestroy === waitDestroy) pendingDestroy = null;
+    }
     // 小文件整读（往返少），大文件走 range 分块：pdf.js 只拉它真正需要的字节。
     // 注意：pdf.js 的 ChunkedStream 仍会按整份长度预留一块连续缓冲（pdf.worker.mjs:6406 的
     // new Uint8Array(length)）；看起来「内存很低」是操作系统把未触碰的页推迟提交 ——
@@ -337,36 +585,57 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
     }
     // range 只负责「更快打开 + 更低内存」；它一旦失败/超时，绝不能让用户「打不开这本书」，
     // 所以这里兜一层：range 异常即 abort 掉传输并退回整读重开，只有两条路都失败才报错。
-    let task = getDocument(opts as Parameters<typeof getDocument>[0]);
+    const openTask = (t: PDFDocumentLoadingTask, stage: string) => {
+      pdfCoverStats.created++;
+      pdfCoverStats.active = Math.max(0, pdfCoverStats.created - pdfCoverStats.destroyed);
+      trackPdfTask(t, bookId, stage);
+      return t;
+    };
+    let task = openTask(getDocument(opts as Parameters<typeof getDocument>[0]), "open");
     let doc: PDFDocumentProxy;
     try {
       doc = range ? await withTimeout(task.promise, PDF_RANGE_OPEN_TIMEOUT) : await task.promise;
     } catch (e) {
-      if (!range) throw e;
-      range.abort();
+      if (!range) {
+        // R12-1：打开失败也必须销毁 task，否则 worker 永久残留。
+        await destroyPdfTask(task);
+        throw e;
+      }
+      try {
+        range.abort();
+      } catch (e2) {
+        // abort 自身抛错不能跳过 task 销毁。
+        pdfCoverStats.lastError = "range-abort: " + String(e2);
+      }
       range = null;
-      task.destroy().catch(() => {});
+      await destroyPdfTask(task);
       if (import.meta.env.DEV) console.warn("[pdf] range 打开失败，回退整份读入：", e);
       // 超大文件不回退整读：宁可打不开，也不把几 GB 拉进内存（见 PDF_FULL_READ_MAX 注释）。
       if (len > PDF_FULL_READ_MAX) {
         throw pdfError("pdf_too_large", { mb: Math.round(len / 1048576) });
       }
       const buf = await api.readBookBytes(bookId);
-      task = getDocument({
+      task = openTask(getDocument({
         cMapUrl: "/pdfjs/cmaps/",
         cMapPacked: true,
         standardFontDataUrl: "/pdfjs/standard_fonts/",
         isEvalSupported: false,
         data: new Uint8Array(buf),
-      } as Parameters<typeof getDocument>[0]);
-      doc = await task.promise;
+      } as Parameters<typeof getDocument>[0]), "fallback");
+      try {
+        doc = await task.promise;
+      } catch (e) {
+        // fallback 的第二个 task 失败也必须销毁（此前直接 throw → 泄漏一个 worker）。
+        await destroyPdfTask(task);
+        throw e;
+      }
     }
     // 等待期间换了书：这份文档直接销毁，别留下无人引用的 worker。
     if (gen !== generation) {
-      await doc.destroy().catch(() => {});
+      await destroyPdfTask(task);
       throw new Error("已切换书籍");
     }
-      session = { bookId, doc, range: range ?? undefined, mode: "js", native: false };
+      session = { bookId, doc, task, range: range ?? undefined, mode: "js", native: false };
     return session;
   })();
   sessionPromise = p;
@@ -747,8 +1016,14 @@ async function pdfjsFullUrl(doc: PDFDocumentProxy, page: number, baseW: number, 
 /** 渲染第 1 页为封面图（WebP data URL），长边缩到 longEdge 像素。
  *  独立于切片缓存（分辨率不同、只渲染一次），失败时抛错由调用方静默处理。
  *  直接出最终缩略图尺寸：后端 setBookCoverImage 只落盘，不再解码缩放。 */
-export async function renderCoverImage(bookId: number, longEdge = 320): Promise<string> {
-  const s = await ensurePdf(bookId);
+async function renderCoverImageBase(bookId: number, longEdge: number): Promise<string> {
+  let s: PdfSession;
+  try {
+    s = await ensurePdf(bookId);
+  } catch (e) {
+    // 阶段前缀让 DEV stats/console.warn 能区分 ensurePdf 与后续渲染失败。
+    throw new Error("ensurePdf: " + String(e));
+  }
   const gen = generation;
   // 原生通道一律不补封面：走原生的是 >1.9GiB 的文件，系统渲染器要把整份文件映射进进程
   // （实测 3.31GiB 那册打开后宿主工作集 3.5GB），为一张缩略图付这个代价不值得，书库继续用默认封面。
@@ -758,12 +1033,22 @@ export async function renderCoverImage(bookId: number, longEdge = 320): Promise<
   if (s.mode === "native") throw pdfError("pdf_no_cover");
   if (s.mode === "direct") {
     return withSlot(async () => {
-      const m = await directMeta(bookId, 0);
+      let m: { pt_w: number; pt_h: number };
+      try {
+        m = await directMeta(bookId, 0);
+      } catch (e) {
+        throw new Error("directMeta: " + String(e));
+      }
       const target = Math.max(1, longEdge);
       const scale = Math.max(0.02, target / Math.max(1, Math.max(m.pt_w, m.pt_h)));
       const w = Math.max(1, Math.round(m.pt_w * scale));
       const h = Math.max(1, Math.round(m.pt_h * scale));
-      const url = await directFullUrl(bookId, 0, w, h);
+      let url: string;
+      try {
+        url = await directFullUrl(bookId, 0, w, h);
+      } catch (e) {
+        throw new Error("directRender: " + String(e));
+      }
       const img = new Image();
       img.src = url;
       try {
@@ -784,7 +1069,12 @@ export async function renderCoverImage(bookId: number, longEdge = 320): Promise<
     });
   }
   return withSlot(async () => {
-    const page = await s.doc.getPage(1);
+    let page;
+    try {
+      page = await s.doc.getPage(1);
+    } catch (e) {
+      throw new Error("getPage: " + String(e));
+    }
     // 画布在 try 外声明：finally 里要归还它的后备存储，块作用域里声明会取不到。
     const canvas = document.createElement("canvas");
     let url: string;
@@ -798,9 +1088,17 @@ export async function renderCoverImage(bookId: number, longEdge = 320): Promise<
       canvas.height = Math.max(1, Math.round(viewport.height));
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("canvas 上下文不可用");
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      try {
+        await page.render({ canvasContext: ctx, viewport }).promise;
+      } catch (e) {
+        throw new Error("render: " + String(e));
+      }
       // 直接出 WebP：后端只落盘、不再解码缩放（见 set_book_cover_image）。
-      url = canvas.toDataURL("image/webp", 0.9);
+      try {
+        url = canvas.toDataURL("image/webp", 0.9);
+      } catch (e) {
+        throw new Error("toDataURL: " + String(e));
+      }
     } finally {
       page.cleanup();
       // 立刻归还画布后备存储：整页位图是这条链路里最大的单笔占用，
@@ -811,6 +1109,20 @@ export async function renderCoverImage(bookId: number, longEdge = 320): Promise<
     if (gen !== generation) throw new Error("已切换书籍");
     return url;
   });
+}
+
+/** R12-1：封面渲染入口——统计 attempted/rendered/failed 与失败原因（DEV 可读）。 */
+export async function renderCoverImage(bookId: number, longEdge = 320): Promise<string> {
+  pdfCoverStats.attempted++;
+  try {
+    const url = await renderCoverImageBase(bookId, longEdge);
+    pdfCoverStats.rendered++;
+    return url;
+  } catch (e) {
+    pdfCoverStats.failed++;
+    pdfCoverStats.lastError = "render: " + String(e);
+    throw e;
+  }
 }
 
 /** 「重新提取封面」（PDF）：按目标缩略图尺寸重渲染并落盘，返回新的封面文件名。
@@ -1020,6 +1332,7 @@ export function releaseAll(): void {
   bitmaps.clear();
   pinnedTokens.clear();
   fullOrder = [];
+  releasePdfThumbs();
   geometry.clear();
   const s = session;
   session = null;
@@ -1030,5 +1343,80 @@ export function releaseAll(): void {
     // 原生通道没有 pdf.js 文档：显式让 Rust 侧释放文档句柄（换书/关书都要走这条）
     void api.pdfNativeClose().catch(() => {});
   }
-  if (s && !s.native) void s.doc.destroy().catch(() => {});
+  if (s && !s.native) {
+    // R12-1：显式销毁 loadingTask 并 await 到 worker 终止，再打开下一本。
+    // 串行链：连续两次 releaseAll 未 await 时，新的 pendingDestroy 会先等旧链完成，
+    // 避免旧 task 的销毁 Promise 被覆盖后无人 await（封面/换书/Reader 并发路径）。
+    const task = s.task;
+    const doc = s.doc;
+    const prev = pendingDestroy;
+    pendingDestroy = (async () => {
+      if (prev) await prev.catch(() => {});
+      if (task) {
+        await destroyPdfTask(task);
+      } else {
+        try {
+          await doc.destroy();
+        } catch (e) {
+          pdfCoverStats.lastError = "destroy: " + String(e);
+        } finally {
+          pdfCoverStats.destroyed++;
+          pdfCoverStats.active = Math.max(0, pdfCoverStats.created - pdfCoverStats.destroyed);
+        }
+      }
+    })();
+  }
+}
+
+/** R12-1：销毁 loadingTask 并等待 worker 终止；task.destroy() 失败/拒绝时强制终止 worker。 */
+async function terminatePdfTask(task: PDFDocumentLoadingTask): Promise<void> {
+  try {
+    await task.destroy();
+    return;
+  } catch (e) {
+    pdfCoverStats.lastError = "destroy: " + String(e);
+  }
+  // 兜底：pdf.js 的 PDFWorker 实例仍持有真实 worker；task.destroy 失败时必须显式终止，
+  // 否则计数显示已销毁、实际 worker 还在（lead 复测的 active6/worker6 即此形态）。
+  const rec = task as unknown as {
+    _worker?: { destroy?: () => Promise<void>; terminate?: () => void };
+    destroy?: () => Promise<void>;
+  };
+  try {
+    const w = rec._worker;
+    if (w?.destroy) await w.destroy();
+    else if (w?.terminate) w.terminate();
+    else await rec.destroy?.();
+  } catch (e2) {
+    pdfCoverStats.lastError = "destroy-fallback: " + String(e2);
+  }
+}
+
+async function destroyPdfTask(task: PDFDocumentLoadingTask): Promise<void> {
+  await terminatePdfTask(task);
+  untrackPdfTask(task);
+  pdfCoverStats.destroyed++;
+  pdfCoverStats.active = Math.max(0, pdfCoverStats.created - pdfCoverStats.destroyed);
+}
+
+/** R12-1 补丁：仅当当前会话属于指定书时释放并等待销毁（封面队列收尾用）。
+ *  Reader 持有其它书的会话时不动；调用方还需保证 ui.view=library（书库可见）。 */
+export async function releasePdfSessionIfBook(bookId: number): Promise<void> {
+  if (!session || session.bookId !== bookId) return;
+  releaseAll();
+  const d = pendingDestroy;
+  if (d) {
+    await d.catch(() => {});
+    if (pendingDestroy === d) pendingDestroy = null;
+  }
+}
+
+/** R12-1：释放当前 PDF 会话并等待销毁完成（封面串行渲染在每本之后调用，限制 worker 数）。 */
+export async function releasePdfSessionAndWait(): Promise<void> {
+  releaseAll();
+  const d = pendingDestroy;
+  if (d) {
+    await d.catch(() => {});
+    if (pendingDestroy === d) pendingDestroy = null;
+  }
 }

@@ -1,5 +1,15 @@
 <script lang="ts">
-  import { api } from "../lib/api";
+  import { onMount } from "svelte";
+  import { estimateVacuumTemp, maintenanceRecordView, shouldRemindMaintenance, shouldSuggestCoverCleanup, coverReclaimBytes, COVER_CACHE_HINT_BYTES } from "../lib/maintenance";
+  import { listen } from "@tauri-apps/api/event";
+  import { api, type DataBackupPreview, type CoverAudit } from "../lib/api";
+  import {
+    formatBackupDate,
+    isBackupEmpty,
+    matchStatus,
+    previewRows,
+  } from "../lib/dataBackup";
+  import { choicesFromSelections } from "../lib/davSyncApply";
   import {
     config,
     saveConfig,
@@ -45,6 +55,7 @@
     applySecrets,
     applyConfigJson,
     runSettingsBackup,
+    runWebdavDataSync,
     builtinSchemeNames,
     SEED_SCHEME_NAME_KEYS,
     resolveEndpointProxy,
@@ -456,9 +467,60 @@ let davState = $state<"" | "ok" | "bad">("");
     fonts_bytes: number;
     db_bytes: number;
     cache_bytes: number;
+    parse_cache_bytes: number;
+    freelist_bytes: number;
+    db_dir_free_bytes: number | null;
+    temp_dir: string;
+    temp_free_bytes: number | null;
+    temp_same_disk: boolean;
+    last_checkpoint_at: number;
+    last_checkpoint_busy: boolean;
+    checkpoint_wal_before: number;
+    checkpoint_wal_after: number;
   };
+  type MaintRecord = { at: number; result: string; error: string; freed: number; durationMs: number; backupPath?: string };
+  let maintHistory = $state<MaintRecord[]>([]);
+  function dismissFreelistReminder() {
+    config.maintenance.reminderDismissedUntil = Date.now();
+    saveConfig();
+  }
+  function saveAutoVac() {
+    config.maintenance.autoVacuum.enabled = config.maintenance.autoVacuum.enabled === true;
+    saveConfig();
+  }
   let storage = $state<StorageStats | null>(null);
+  let coverAudit = $state<CoverAudit | null>(null);
   let storageBusy = $state(false);
+  let maintenanceBusy = $state(false);
+  let vacuumRunning = $state(false);
+  /** B3：维护进度文本（VACUUM 不确定进度 / 解析缓存文件计数），由 maintenance-progress 事件驱动。 */
+  let maintenanceProgress = $state("");
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      phase: string;
+      state: string;
+      done?: number;
+      total?: number;
+      bytes?: number;
+    }>("maintenance-progress", (e) => {
+      const p = e.payload;
+      if (p.phase === "vacuum") {
+        maintenanceProgress = p.state === "start" ? t("settings.maintenance.vacuumRunning") : "";
+      } else if (p.phase === "parse_cache") {
+        if (p.state === "start") maintenanceProgress = t("settings.maintenance.parseStarting");
+        else if (p.state === "done") maintenanceProgress = "";
+        else
+          maintenanceProgress = t("settings.maintenance.parseProgress", {
+            done: p.done ?? 0,
+            total: p.total ?? 0,
+          });
+      }
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  });
 
   /* ---------- 默认封面底图设置 ---------- */
   let hasDefaultCover = $state(false);
@@ -532,6 +594,7 @@ let davState = $state<"" | "ok" | "bad">("");
     try {
       storage = await api.storageStats();
       if (storage?.data_dir) dataDir = storage.data_dir;
+      maintHistory = await api.maintenanceHistory().catch(() => []);
     } catch { /* ignore */ }
   }
 
@@ -548,6 +611,88 @@ let davState = $state<"" | "ok" | "bad">("");
       toast(String(e), "error");
     } finally {
       storageBusy = false;
+    }
+  }
+  /** B3：维护失败提示——优先展示后端可读原因（如磁盘空间不足）；空/异常栈类才用通用文案。 */
+  function maintenanceErrorText(e: unknown): string {
+    let raw = "";
+    try {
+      raw = errText(e);
+    } catch {
+      return t("settings.maintenance.failed");
+    }
+    const msg = raw.replace(/^Error:\s*/, "").trim();
+    if (!msg || /(^|\s)at\s+\S+\s+\(|\.rs:\d+|panicked|stack trace/i.test(msg)) {
+      return t("settings.maintenance.failed");
+    }
+    return msg;
+  }
+
+  /** B3：清理解析缓存（用户确认后执行）。 */
+  async function clearParseCache() {
+    if (!storage) return;
+    const ok = await appConfirm(
+      t("settings.maintenance.clearParseConfirm", { size: fmtBytes(storage.parse_cache_bytes) }),
+    );
+    if (!ok) return;
+    maintenanceBusy = true;
+    try {
+      const freed = await api.clearParseCache();
+      toast(t("settings.maintenance.parseCleared", { size: fmtBytes(freed) }));
+      await loadStorage();
+    } catch (e) {
+      toast(maintenanceErrorText(e), "error");
+    } finally {
+      maintenanceBusy = false;
+    }
+  }
+
+  /** C15：扫描封面目录（只读）；用于预览孤儿/失效/同 stem 冗余。 */
+  async function scanCovers() {
+    coverBusy = true;
+    try {
+      coverAudit = await api.coverAudit();
+      if (coverAudit && coverAudit.orphanFiles === 0 && coverAudit.sameStemGroups === 0) toast(t("settings.covers.none"));
+    } catch (e) {
+      toast(maintenanceErrorText(e), "error");
+    } finally {
+      coverBusy = false;
+    }
+  }
+
+  /** C15：二次确认后只删无主封面；不删被引用/受保护文件，不改书籍记录。 */
+  async function cleanCoverOrphans() {
+    if (!coverAudit) return;
+    const ok = await appConfirm(t("settings.covers.cleanConfirm", { n: coverAudit.orphanFiles, size: fmtBytes(coverAudit.orphanBytes) }));
+    if (!ok) return;
+    coverBusy = true;
+    try {
+      const r = await api.cleanCoverOrphans(true);
+      toast(t("settings.covers.cleaned", { n: r.deleted, size: fmtBytes(r.freedBytes) }));
+      if (r.failed > 0) toast(t("settings.covers.cleanFailed", { n: r.failed }), "error");
+      await Promise.all([loadStorage(), scanCovers()]);
+    } catch (e) {
+      toast(maintenanceErrorText(e), "error");
+    } finally {
+      coverBusy = false;
+    }
+  }
+
+  /** B3：数据库整理（VACUUM）；用户确认后执行，过程中提示可能耗时。 */
+  async function vacuumDb() {
+    const ok = await appConfirm(t("settings.maintenance.vacuumConfirm"));
+    if (!ok) return;
+    vacuumRunning = true;
+    maintenanceBusy = true;
+    try {
+      const freed = await api.vacuumDb();
+      toast(t("settings.maintenance.vacuumDone", { size: fmtBytes(freed) }));
+      await loadStorage();
+    } catch (e) {
+      toast(maintenanceErrorText(e), "error");
+    } finally {
+      vacuumRunning = false;
+      maintenanceBusy = false;
     }
   }
   let mobiEnc = $state("auto");
@@ -1001,6 +1146,80 @@ let davState = $state<"" | "ok" | "bad">("");
     }
   }
 
+  // ===== D4：完整备份 / 恢复 =====
+  let backupBusy = $state(false);
+  let dataBackupPreview = $state<DataBackupPreview | null>(null);
+  let dataBackupPath = $state("");
+  let backupOverwrite = $state(false);
+
+  function backupPreviewLabel(key: string): string {
+    return t(("settings.dataBackup.row." + key) as MessageKey);
+  }
+
+  async function exportFullBackup() {
+    try {
+      const today = new Date();
+      const stamp = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`;
+      const path = await api.pickSave(
+        t("settings.dataBackup.dialogTitle"),
+        "json",
+        `TidePage-backup-${stamp}.json`,
+      );
+      if (!path) return;
+      backupBusy = true;
+      const configJson = JSON.stringify(stripSecrets(config));
+      const s = await api.exportDataBackup(path, configJson);
+      const total = s.progress + s.bookmarks + s.highlights + s.tags + s.bookTags;
+      toast(t("settings.dataBackup.exported", { count: total, size: fmtBytes(s.sizeBytes) }));
+    } catch (e) {
+      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function pickRestoreBackup() {
+    try {
+      const path = await api.pickFile(t("settings.dataBackup.restoreTitle"), [
+        { name: "TidePage backup", exts: ["json"] },
+      ]);
+      if (!path) return;
+      backupBusy = true;
+      const p = await api.inspectDataBackup(path);
+      dataBackupPath = path;
+      dataBackupPreview = p;
+      backupOverwrite = false;
+      if (isBackupEmpty(p)) toast(t("settings.dataBackup.empty"));
+    } catch (e) {
+      dataBackupPreview = null;
+      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function confirmRestore() {
+    if (!dataBackupPath || !dataBackupPreview) return;
+    backupBusy = true;
+    try {
+      const r = await api.restoreDataBackup(dataBackupPath, backupOverwrite);
+      // 覆盖模式才应用备份配置；失败/取消不应用。
+      if (backupOverwrite && r.configJson) {
+        applyConfigJson(r.configJson);
+        saveConfigNow();
+      }
+      const total = r.progress + r.bookmarks + r.highlights + r.tags + r.bookTags;
+      toast(t("settings.dataBackup.restored", { count: total, skipped: r.skipped, conflicts: r.conflicts }));
+      dataBackupPreview = null;
+      dataBackupPath = "";
+      backupOverwrite = false;
+    } catch (e) {
+      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+    } finally {
+      backupBusy = false;
+    }
+  }
+
   async function rebuildIndex() {
     rebuildingFts = true;
     try {
@@ -1433,6 +1652,37 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     const i = arr.indexOf(k);
     if (i >= 0) arr.splice(i, 1);
     saveConfig();
+  }
+
+
+  // ===== D5：书签/划线/标签/书架同步 =====
+  type DataSyncResult = Awaited<ReturnType<typeof api.webdavSyncData>>;
+  let dataSyncBusy = $state(false);
+  let dataSyncResult = $state<DataSyncResult | null>(null);
+  let dataSyncStatus = $state("");
+  let dataSyncChoices = $state<Record<string, "local" | "remote">>({});
+
+  async function syncDataNow(
+    resolve?: "local" | "remote",
+    choices?: { key: string; choice: "local" | "remote" }[],
+  ) {
+    dataSyncBusy = true;
+    dataSyncStatus = t("settings.dataSync.syncing");
+    try {
+      const r = await runWebdavDataSync(resolve, choices);
+      dataSyncResult = r;
+      // 每条冲突默认保留本机；用户逐条改选后点「应用选择」。
+      const next: Record<string, "local" | "remote"> = {};
+      for (const c of r.conflictsPreview) next[c.key] = "local";
+      dataSyncChoices = next;
+      dataSyncStatus = t("settings.dataSync.done");
+      if (r.conflicts === 0) toast(t("settings.dataSync.done"));
+    } catch (e) {
+      dataSyncStatus = errText(e);
+      toast(t("settings.dataSync.failed", { err: errText(e) }), "error");
+    } finally {
+      dataSyncBusy = false;
+    }
   }
 
   async function testWebdav() {
@@ -2644,6 +2894,54 @@ let aiTestState = $state<"" | "ok" | "bad">("");
         <span class="status" style="padding:6px 0;display:block">{lastBackupText}{config.webdav.backup.lastError ? t("settings.dav.recentFail", { err: config.webdav.backup.lastError }) : ""}</span>
       </div>
     </div>
+
+    <p class="sec-title" style="margin-top:18px">{t("settings.dataSync.title")}</p>
+    <div class="checks" style="margin-bottom:8px">
+      <label><input type="checkbox" bind:checked={config.webdav.syncNotes} onchange={saveConfig} /> {t("settings.dataSync.notes")}</label>
+      <label><input type="checkbox" bind:checked={config.webdav.syncTags} onchange={saveConfig} /> {t("settings.dataSync.tags")}</label>
+      <label><input type="checkbox" bind:checked={config.webdav.syncShelves} onchange={saveConfig} /> {t("settings.dataSync.shelves")}</label>
+    </div>
+    <div class="row-inline" style="margin:6px 0 8px">
+      <button onclick={() => syncDataNow()} disabled={dataSyncBusy}>{dataSyncBusy ? t("settings.dataSync.syncing") : t("settings.dataSync.syncNow")}</button>
+      <label><input type="checkbox" bind:checked={config.webdav.dataSync.enabled} onchange={saveConfig} /> {t("settings.dataSync.auto")}</label>
+      <select bind:value={config.webdav.dataSync.intervalHours} onchange={saveConfig}>
+        <option value={6}>{t("common.hours", { n: 6 })}</option>
+        <option value={12}>{t("common.hours", { n: 12 })}</option>
+        <option value={24}>{t("common.hours", { n: 24 })}</option>
+        <option value={48}>{t("common.hours", { n: 48 })}</option>
+      </select>
+    </div>
+    <p class="tip">{t("settings.dataSync.hint")}</p>
+    <span class="status" style="display:block;padding:4px 0">
+      {config.webdav.dataSync.lastAt ? t("settings.dataSync.lastSync", { time: new Date(config.webdav.dataSync.lastAt).toLocaleString(dateLocale()) }) : t("settings.dataSync.never")}
+      {config.webdav.dataSync.lastResult ? " · " + t(("settings.dataSync.result." + config.webdav.dataSync.lastResult) as any) : ""}
+      {config.webdav.dataSync.lastError ? " · " + config.webdav.dataSync.lastError : ""}
+    </span>
+    {#if dataSyncStatus}<span class="status" style="display:block;padding:4px 0">{dataSyncStatus}</span>{/if}
+    {#if dataSyncResult}
+      <div class="storage-card" data-testid="data-sync-result">
+        <div class="st-row"><span class="st-label">{t("settings.dataSync.added")}</span><span class="st-val">{dataSyncResult.added}</span></div>
+        <div class="st-row"><span class="st-label">{t("settings.dataSync.updated")}</span><span class="st-val">{dataSyncResult.updated}</span></div>
+        <div class="st-row"><span class="st-label">{t("settings.dataSync.skipped")}</span><span class="st-val">{dataSyncResult.skipped}</span></div>
+        <div class="st-row"><span class="st-label">{t("settings.dataSync.conflicts")}</span><span class="st-val">{dataSyncResult.conflicts}</span></div>
+        {#if dataSyncResult.conflictsPreview.length}
+          <p class="tip">{t("settings.dataSync.conflictHint")}</p>
+          {#each dataSyncResult.conflictsPreview as c (c.key)}
+            <div class="row-inline" style="margin:4px 0">
+              <span class="tip flex1">· {c.kind} · {c.book} · {c.summary}</span>
+              <select bind:value={dataSyncChoices[c.key]} aria-label={t("settings.dataSync.choose")}>
+                <option value="local">{t("settings.dataSync.keepLocal")}</option>
+                <option value="remote">{t("settings.dataSync.useRemote")}</option>
+              </select>
+            </div>
+          {/each}
+          <div class="st-actions">
+            <button onclick={() => syncDataNow(undefined, choicesFromSelections(dataSyncResult!.conflictsPreview, dataSyncChoices))} disabled={dataSyncBusy}>{t("settings.dataSync.applyChoices")}</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+    <p class="tip">{t("settings.dataSync.unionHint")}</p>
   </div>
   <div class="set-pane" data-pane="ai" id="set-pane-ai" role="tabpanel" aria-labelledby="set-tab-ai" tabindex="-1" hidden={tab !== "ai"}>
     <div class="checks" style="margin-bottom:12px">
@@ -2974,6 +3272,14 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     </div>
 
     <div class="field">
+      <label class="check">
+        <input type="checkbox" data-testid="setting-duplicate-effect" bind:checked={config.library.duplicateEffect} onchange={saveConfig} />
+        {t("settings.prefs.duplicateEffect")}
+      </label>
+      <p class="tip">{t("settings.prefs.duplicateEffectTip")}</p>
+    </div>
+
+    <div class="field">
       <label for="set-cover-scan">{t("settings.prefs.coverScan")}</label>
       <select id="set-cover-scan" data-testid="pref-cover-scan" bind:value={config.library.coverScan} onchange={saveConfig}>
         <option value="auto">{t("settings.prefs.coverScanAuto")}</option>
@@ -3010,6 +3316,48 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           <span class="st-label">{t("settings.storage.db")}</span>
           <span class="st-val">{fmtBytes(storage.db_bytes)}</span>
         </div>
+        <div class="st-row">
+          <span class="st-label">{t("settings.storage.parseCache")}</span>
+          <span class="st-val">{fmtBytes(storage.parse_cache_bytes)}</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label">{t("settings.covers.title")}</span>
+          <span class="st-val">{coverAudit ? t("settings.covers.summary", { n: coverAudit.files, size: fmtBytes(coverAudit.bytes) }) : "—"}</span>
+        </div>
+        {#if coverAudit}
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.custom")}</span>
+            <span class="st-val">{t("settings.covers.countBytes", { n: coverAudit.customFiles, size: fmtBytes(coverAudit.customBytes) })}</span>
+          </div>
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.orphans")}</span>
+            <span class="st-val">{t("settings.covers.countBytes", { n: coverAudit.orphanFiles, size: fmtBytes(coverAudit.orphanBytes) })}</span>
+          </div>
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.missing")}</span>
+            <span class="st-val">{coverAudit.missingFiles}</span>
+          </div>
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.sameStem")}</span>
+            <span class="st-val">{t("settings.covers.countBytes", { n: coverAudit.sameStemGroups, size: fmtBytes(coverAudit.sameStemBytes) })}</span>
+          </div>
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.recoverable")}</span>
+            <span class="st-val strong">{fmtBytes(coverAudit.recoverableBytes)}</span>
+          </div>
+          <div class="st-row">
+            <span class="st-label">{t("settings.covers.lastScan")}</span>
+            <span class="st-val">{coverAudit.lastScanAt ? new Date(coverAudit.lastScanAt).toLocaleString() : "—"}</span>
+          </div>
+        {/if}
+        {#if shouldSuggestCoverCleanup(storage.cache_bytes, storage.covers_bytes)}
+          <p class="tip">{t("settings.covers.hint", { size: fmtBytes(COVER_CACHE_HINT_BYTES) })}</p>
+        {/if}
+        <p class="tip">{t("settings.covers.customTip")}</p>
+        <div class="st-actions">
+          <button onclick={scanCovers} disabled={coverBusy}>{coverBusy ? t("settings.covers.scanning") : t("settings.covers.scan")}</button>
+          <button class="danger" onclick={cleanCoverOrphans} disabled={coverBusy || !coverAudit || coverAudit.orphanFiles === 0}>{t("settings.covers.clean")}</button>
+        </div>
         <div class="st-actions">
           <span class="st-cache">{t("settings.storage.clearable", { size: fmtBytes(storage.cache_bytes) })}</span>
           <button onclick={() => clearCache("covers")} disabled={storageBusy}>{t("settings.storage.clearCovers")}</button>
@@ -3021,12 +3369,105 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       <p class="tip">{t("settings.storage.loading")}</p>
     {/if}
 
+    <p class="sec-title" style="margin-top:18px">{t("settings.maintenance.title")}</p>
+    <div class="storage-card">
+      <div class="st-row">
+        <span class="st-label">{t("settings.maintenance.parseLabel")}</span>
+        <span class="st-val">{storage ? fmtBytes(storage.parse_cache_bytes) : "—"}</span>
+      </div>
+      <div class="st-row">
+        <span class="st-label">{t("settings.maintenance.freelist")}</span>
+        <span class="st-val">{storage ? fmtBytes(storage.freelist_bytes) : "—"}</span>
+      </div>
+      <p class="tip">{t("settings.maintenance.needTemp", { need: fmtBytes((storage?.db_bytes ?? 0) + 64 * 1024 * 1024), disk: storage?.temp_dir || "—" })}</p>
+      {#if storage && shouldRemindMaintenance(storage.freelist_bytes, storage.db_bytes, config.maintenance.reminderDismissedUntil, Date.now())}
+        <div class="storage-card" data-testid="maintenance-reminder">
+          <p class="tip">{t("settings.maintenance.reminder", { size: fmtBytes(storage.freelist_bytes), need: fmtBytes(estimateVacuumTemp(storage.db_bytes, storage.temp_same_disk).requiredBytes) })}</p>
+          <button onclick={dismissFreelistReminder}>{t("settings.maintenance.dismiss7")}</button>
+        </div>
+      {/if}
+      <div class="st-actions">
+        <button onclick={clearParseCache} disabled={maintenanceBusy}>{t("settings.maintenance.clearParse")}</button>
+        <button class="danger" onclick={vacuumDb} disabled={maintenanceBusy}>{t("settings.maintenance.vacuum")}</button>
+      </div>
+      <p class="tip">{maintenanceProgress || (vacuumRunning ? t("settings.maintenance.vacuumRunning") : t("settings.maintenance.vacuumTip"))}</p>
+      <div class="st-row">
+        <span class="st-label">{t("settings.maintenance.checkpoint")}</span>
+        <span class="st-val">{storage?.last_checkpoint_at ? new Date(storage.last_checkpoint_at).toLocaleString() + (storage.last_checkpoint_busy ? " · busy" : "") : "—"}</span>
+      </div>
+      <div class="row-inline" style="margin:6px 0">
+        <label><input type="checkbox" bind:checked={config.maintenance.autoVacuum.enabled} onchange={saveAutoVac} /> {t("settings.maintenance.autoVac")}</label>
+        <select bind:value={config.maintenance.autoVacuum.idleMinutes} onchange={saveAutoVac}>
+          <option value={10}>10</option><option value={15}>15</option><option value={30}>30</option>
+        </select>
+      </div>
+      <p class="sec-title" style="margin-top:12px">{t("settings.maintenance.history")}</p>
+      {#if maintHistory.length}
+        {#each maintHistory as r, i (i)}
+          {@const v = maintenanceRecordView(r)}
+          <div class="st-row"><span class="st-val" style="font-size:var(--fs-xs)">
+            {v.at ? new Date(v.at).toLocaleString(dateLocale()) : "—"} · {t(("settings.maintenance.result." + v.result) as any)} · {t("settings.maintenance.freed", { size: fmtBytes(v.freed) })} · {v.durationMs}ms{#if v.result !== "success" && v.error} · {v.error}{/if}{#if v.backupPath} · {t("settings.maintenance.backupPath", { path: v.backupPath })}{/if}
+          </span></div>
+        {/each}
+      {:else}<span class="status">{t("settings.maintenance.historyEmpty")}</span>{/if}
+    </div>
+
     <p class="sec-title" style="margin-top:18px">{t("settings.backup.title")}</p>
     <div class="row-inline" style="margin-bottom:10px">
       <button onclick={exportConfig}>{t("settings.backup.copy")}</button>
       <button onclick={importConfig}>{t("settings.backup.paste")}</button>
       <button onclick={rebuildIndex} disabled={rebuildingFts}>{rebuildingFts ? t("settings.backup.rebuilding") : t("settings.backup.rebuild")}</button>
     </div>
+    <div class="row-inline" style="margin-bottom:10px">
+      <button onclick={exportFullBackup} disabled={backupBusy}>{t("settings.dataBackup.export")}</button>
+      <button onclick={pickRestoreBackup} disabled={backupBusy}>{t("settings.dataBackup.restore")}</button>
+    </div>
+    {#if dataBackupPreview}
+      <div class="storage-card" data-testid="data-backup-preview">
+        <div class="st-row">
+          <span class="st-label">{t("settings.dataBackup.version")}</span>
+          <span class="st-val">v{dataBackupPreview.version} · {dataBackupPreview.appVersion || "—"}</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label">{t("settings.dataBackup.createdAt")}</span>
+          <span class="st-val">{formatBackupDate(dataBackupPreview.createdAt) || "—"}</span>
+        </div>
+        {#each previewRows(dataBackupPreview) as row (row.key)}
+          <div class="st-row">
+            <span class="st-label">{backupPreviewLabel(row.key)}</span>
+            <span class="st-val">{row.value}</span>
+          </div>
+        {/each}
+        <div class="st-row">
+          <span class="st-label">{t("settings.dataBackup.contains")}</span>
+          <span class="st-val">
+            {dataBackupPreview.hasConfig ? t("settings.dataBackup.hasConfig") : t("settings.dataBackup.noConfig")}
+            · {dataBackupPreview.hasShelves ? t("settings.dataBackup.hasShelves") : t("settings.dataBackup.noShelves")}
+          </span>
+        </div>
+        <p class="tip">
+          {matchStatus(dataBackupPreview) === "none"
+            ? t("settings.dataBackup.matchNone")
+            : matchStatus(dataBackupPreview) === "partial"
+              ? t("settings.dataBackup.matchPartial", { matched: dataBackupPreview.matchedBooks, skipped: dataBackupPreview.skipped })
+              : t("settings.dataBackup.matchAll", { matched: dataBackupPreview.matchedBooks })}
+        </p>
+        {#if isBackupEmpty(dataBackupPreview)}
+          <p class="tip">{t("settings.dataBackup.empty")}</p>
+        {/if}
+        <label class="tip" style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+          <input type="checkbox" bind:checked={backupOverwrite} />
+          {t("settings.dataBackup.overwrite")}
+        </label>
+        {#if backupOverwrite}
+          <p class="tip">{t("settings.dataBackup.overwriteTip")}</p>
+        {/if}
+        <div class="st-actions">
+          <button class="danger" onclick={confirmRestore} disabled={backupBusy}>{t("settings.dataBackup.confirm")}</button>
+          <button onclick={() => { dataBackupPreview = null; dataBackupPath = ""; backupOverwrite = false; }} disabled={backupBusy}>{t("settings.dataBackup.cancel")}</button>
+        </div>
+      </div>
+    {/if}
 
     <p class="sec-title" style="margin-top:18px">MOBI / AZW3 / TXT</p>
     <div class="field" style="margin-bottom:10px">

@@ -3,10 +3,13 @@
 import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   import type { TocEntry } from "../lib/types";
   import { dragOutHandle } from "../lib/windowSnap";
+  import { displayChapterTitle } from "../lib/chapterTitle";
 
-  let { toc, current, onpick, onclose, onpopout }: {
+  let { toc, current, note, onpick, onclose, onpopout }: {
     toc: TocEntry[];
     current: number;
+    /** 可选提示（如 PDF 无内置目录时说明按页导航） */
+    note?: string;
     onpick: (index: number) => void;
     onclose?: () => void;
     onpopout?: () => void;
@@ -25,9 +28,13 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   // 「toc 数组下标」为准；TocEntry.index 是 spine 下标（EPUB 中常与数组下标不一致），
   // 不能拿它当章节号，否则会跳到错章、甚至越界渲染出空白章。
   const indexed = $derived(toc.map((t, pos) => ({ t, pos })));
+  // 自动切章（无锚点块级切分）的章标题是空字符串，统一用「第 N 节」兜底，绝不显示空白项。
+  function displayTitle(pos: number, title: string): string {
+    return displayChapterTitle(title, pos, (n) => t("common.sectionN", { n }));
+  }
   const filtered = $derived(
     query
-      ? indexed.filter(({ t }) => t.title.toLowerCase().includes(query.toLowerCase()))
+      ? indexed.filter(({ t, pos }) => displayTitle(pos, t.title).toLowerCase().includes(query.toLowerCase()))
       : indexed
   );
 
@@ -75,6 +82,7 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   <div class="sp-search">
     <input data-testid="toc-search" placeholder={t("reader.toc.searchPlaceholder")} bind:value={query} />
   </div>
+  {#if note}<div class="sp-empty" style="padding:6px 10px;font-size:12px" data-testid="toc-note">{note}</div>{/if}
   <div class="sp-list" bind:this={listEl} onscroll={onScroll}>
     {#if total === 0}
       <div class="sp-empty" data-testid="toc-empty">{t("toc.empty")}</div>
@@ -88,7 +96,7 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
             style="top:{i * ROW_H}px; height:{ROW_H}px; padding-left:{10 + (item.t.depth ?? 0) * 14}px;"
             onclick={() => onpick(item.pos)}
           >
-            {item.t.title}
+            {displayTitle(item.pos, item.t.title)}
           </button>
         {/each}
       </div>

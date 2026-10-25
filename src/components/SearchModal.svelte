@@ -3,14 +3,32 @@
   import { api } from "../lib/api";
   import { pendingOpen, ui, toast } from "../lib/stores.svelte";
   import type { SearchHit } from "../lib/types";
+  import { displayChapterTitle } from "../lib/chapterTitle";
 
   let query = $state("");
   let hits: SearchHit[] = $state([]);
   let searching = $state(false);
   let searched = $state(false);
   let indexBtn = $state("");
+  /** 本次弹窗是否已为当前书触发过索引（组件随弹窗挂载，重开即复位）。 */
+  let indexRequested = false;
+
+  /** 当前书在阅读中/关书时不再自动建索引（P9）：用户在搜索弹窗里搜一次，就按需建一次
+   *  （auto=false，不受体积/章数上限约束，大书也能建）。失败静默：搜索本身不依赖这一步。 */
+  function ensureCurrentBookIndex() {
+    const id = ui.currentBookId;
+    if (!id || indexRequested) return;
+    indexRequested = true;
+    api
+      .indexBookFts(id, false)
+      .then((n) => {
+        if (n > 0) toast(t("search.indexBuilt", { n }));
+      })
+      .catch(() => {});
+  }
 
   async function doSearch() {
+    ensureCurrentBookIndex();
     if (query.trim().length < 2) return;
     searching = true;
     try {
@@ -26,21 +44,9 @@
   async function rebuild() {
     indexBtn = t("search.rebuilding");
     try {
-      await api.rebuildFts();
-      toast(t("search.rebuildStarted"));
-      let n = 0;
-      // 分批按 id 遍历全库（每批 500）：listBooks 会把 17 万条整行物化并一次性序列化，
-      // 一次 IPC 就是几十 MB 的行对象 + JSON 文本；这里每批只有 500 个 i64，内存与书数无关。
-      const ID_BATCH = 500;
-      for (let offset = 0; ; offset += ID_BATCH) {
-        const ids = await api.listBookIdsPage(offset, ID_BATCH);
-        if (!ids.length) break;
-        for (const id of ids) {
-          try {
-            n += await api.indexBookFts(id);
-          } catch { /* skip */ }
-        }
-      }
+      // 后端 rebuild_fts 已返回全库重建的总章数；再逐本调 index_book_fts 会被单实例闸门
+      // 全部挡成 0（总数显示成 0），所以直接用返回值。
+      const n = await api.rebuildFts();
       toast(t("search.rebuildDone", { n }));
     } catch (e) {
       toast(errText(e), "error");
@@ -80,7 +86,7 @@
     <div class="hits">
       {#each hits as h (h.book_id + ":" + h.chapter_index + h.snippet)}
         <div class="hit" onclick={() => openHit(h)}>
-          <div class="hb">{h.book_title} <span class="hc">· {h.chapter_title || t("common.chapterN", { n: h.chapter_index + 1 })}</span></div>
+          <div class="hb">{h.book_title} <span class="hc">· {displayChapterTitle(h.chapter_title, h.chapter_index, (n) => t("common.sectionN", { n }))}</span></div>
           <div class="hs">{@html h.snippet.replaceAll('<mark>', '<mark class="mk">')}</div>
         </div>
       {/each}

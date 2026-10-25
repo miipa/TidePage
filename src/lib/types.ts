@@ -24,7 +24,7 @@ export interface BookRow {
   last_opened: number;
 }
 
-/** 分页返回：total 为过滤后总数，rows 为当前窗口。 */
+/** 分页返回：total 为过滤后总数（-1 表示本次未计数，见 api.listBooksPage includeTotal），rows 为当前窗口。 */
 export interface BookPage {
   total: number;
   rows: BookRow[];
@@ -74,6 +74,8 @@ export interface OpenResult {
   images?: BookImage[];
   /** 是否检测为漫画书籍（图片远多于文本；用于漫画图片大小默认值与首次引导） */
   is_manga?: boolean;
+  /** 图片页型书籍：自动按图片页式排版并默认隐藏文字层（与漫画同源布局） */
+  image_pages?: boolean;
 }
 
 export interface SearchHit {

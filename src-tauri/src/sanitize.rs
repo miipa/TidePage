@@ -11,6 +11,57 @@
 use html5ever::tokenizer::{Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer};
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(feature = "sanitize-profile")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "sanitize-profile")]
+use std::sync::LazyLock;
+#[cfg(feature = "sanitize-profile")]
+use std::time::Instant;
+
+/// B8 profile：仅当进程启动时设置 TIDEPAGE_PARSE_PROFILE 才累计；生产零输出。
+#[cfg(feature = "sanitize-profile")]
+static PROFILE_ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TIDEPAGE_PARSE_PROFILE").is_some());
+#[cfg(feature = "sanitize-profile")]
+static TOKENIZE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static SINK_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static SERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static ESCAPE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static URL_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static SERIALIZED_TAGS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static OUT_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sanitize-profile")]
+static PROFILE_PRINTED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "sanitize-profile")]
+fn profile_on() -> bool { *PROFILE_ON }
+#[cfg(feature = "sanitize-profile")]
+fn add_ns(slot: &AtomicU64, t: Instant) { slot.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+
+#[cfg(feature = "sanitize-profile")]
+struct ProfGuard { t: Option<Instant>, slot: &'static AtomicU64 }
+#[cfg(feature = "sanitize-profile")]
+impl ProfGuard {
+    fn new(slot: &'static AtomicU64) -> Self { Self { t: profile_on().then(Instant::now), slot } }
+}
+#[cfg(feature = "sanitize-profile")]
+impl Drop for ProfGuard {
+    fn drop(&mut self) { if let Some(t) = self.t { add_ns(self.slot, t); } }
+}
+
+#[cfg(feature = "sanitize-profile")]
+fn profile_print_once() {
+    if !profile_on() || PROFILE_PRINTED.swap(1, Ordering::Relaxed) != 0 { return; }
+    let ns = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let (tokenize, sink, serialize, escape, url) = (ns(&TOKENIZE_NS), ns(&SINK_NS), ns(&SERIALIZE_NS), ns(&ESCAPE_NS), ns(&URL_NS));
+    eprintln!("[sanitize-profile] tokenize={tokenize:.1}ms sink={sink:.1}ms serialize={serialize:.1}ms escape={escape:.1}ms url={url:.1}ms tags={} outBytes={}", SERIALIZED_TAGS.load(Ordering::Relaxed), OUT_BYTES.load(Ordering::Relaxed));
+}
+
 
 /// 危险标签：连同内容整体移除。
 pub fn is_dangerous_tag(name: &str) -> bool {
@@ -36,6 +87,7 @@ pub fn is_void_dangerous(name: &str) -> bool {
 }
 
 /// URL 类属性：值为危险协议时整条删除。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_url_attr(name: &str) -> bool {
     matches!(
         name,
@@ -55,18 +107,31 @@ pub fn is_url_attr(name: &str) -> bool {
 /// 值是否为危险协议（`javascript:` / `vbscript:` / 非图片 `data:`）。
 /// 先剔除空白与控制字符（浏览器解析 URL 时会忽略它们，如 `java\tscript:`）。
 pub fn is_dangerous_url(value: &str) -> bool {
-    let cleaned: String = value
-        .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_control())
-        .collect();
-    let low = cleaned.to_ascii_lowercase();
-    if low.starts_with("javascript:") || low.starts_with("vbscript:") {
+    #[cfg(feature = "sanitize-profile")]
+    let _g = ProfGuard::new(&URL_NS);
+    fn starts_ci(value: &str, prefix: &str) -> bool {
+        let mut it = value.chars().filter(|c| !c.is_whitespace() && !c.is_control());
+        for pc in prefix.chars() {
+            match it.next() {
+                Some(c) if c.eq_ignore_ascii_case(&pc) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+    if starts_ci(value, "javascript:") || starts_ci(value, "vbscript:") {
         return true;
     }
-    low.starts_with("data:") && !low.starts_with("data:image/")
+    starts_ci(value, "data:") && !starts_ci(value, "data:image/")
 }
 
 fn escape_attr_into(out: &mut String, v: &str) {
+    #[cfg(feature = "sanitize-profile")]
+    let _g = ProfGuard::new(&ESCAPE_NS);
+    if !v.bytes().any(|b| matches!(b, b'&' | b'"')) {
+        out.push_str(v);
+        return;
+    }
     for c in v.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -77,6 +142,12 @@ fn escape_attr_into(out: &mut String, v: &str) {
 }
 
 fn escape_text_into(out: &mut String, v: &str) {
+    #[cfg(feature = "sanitize-profile")]
+    let _g = ProfGuard::new(&ESCAPE_NS);
+    if !v.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
+        out.push_str(v);
+        return;
+    }
     for c in v.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -91,41 +162,57 @@ fn escape_text_into(out: &mut String, v: &str) {
 /// 自闭合写 `/>`、否则写 `>`。属性值转义器由调用方传入——EPUB 用 escape_attr_into，
 /// MOBI 用其 U+FFFD-剔除版——这是两路唯一差异，故两路输出逐字节不变。
 pub(crate) fn serialize_safe_tag(out: &mut String, tag: &Tag, escape_attr: impl Fn(&str, &mut String)) {
-    let name = tag.name.to_string();
+    #[cfg(feature = "sanitize-profile")]
+    let _g = ProfGuard::new(&SERIALIZE_NS);
+    #[cfg(feature = "sanitize-profile")]
+    SERIALIZED_TAGS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "sanitize-profile")]
+    let out_before = out.len();
+    let name = tag.name.as_ref();
     let is_end = matches!(tag.kind, TagKind::EndTag);
-    let mut s = String::with_capacity(name.len() + 8);
-    s.push('<');
+    out.push('<');
     if is_end {
-        s.push('/');
+        out.push('/');
     }
-    s.push_str(&name);
+    out.push_str(name);
     if !is_end {
         for a in tag.attrs.iter() {
-            let an = a.name.local.to_string();
-            let anl = an.to_ascii_lowercase();
-            if anl.starts_with("on") {
+            let an = a.name.local.as_ref();
+            if an.len() >= 2 && an.as_bytes()[0].eq_ignore_ascii_case(&b'o') && an.as_bytes()[1].eq_ignore_ascii_case(&b'n') {
                 continue;
             }
-            let v = a.value.to_string();
-            if is_url_attr(&anl) && is_dangerous_url(&v) {
+            let v = a.value.as_ref();
+            if is_url_attr_ci(an) && is_dangerous_url(v) {
                 continue;
             }
-            s.push(' ');
-            s.push_str(&an);
+            out.push(' ');
+            out.push_str(an);
             if !v.is_empty() {
-                s.push_str("=\"");
-                escape_attr(&v, &mut s);
-                s.push('"');
+                out.push_str("=\"");
+                escape_attr(v, out);
+                out.push('"');
             }
         }
         if tag.self_closing {
-            s.push_str("/>");
-            out.push_str(&s);
+            out.push_str("/>");
             return;
         }
     }
-    s.push('>');
-    out.push_str(&s);
+    out.push('>');
+    #[cfg(feature = "sanitize-profile")]
+    OUT_BYTES.fetch_add((out.len() - out_before) as u64, Ordering::Relaxed);
+}
+
+fn is_url_attr_ci(name: &str) -> bool {
+    #[cfg(feature = "sanitize-profile")]
+    let _g = ProfGuard::new(&URL_NS);
+    const URL_ATTRS: [&str; 10] = ["href", "src", "xlink:href", "action", "formaction", "poster", "background", "cite", "data", "srcset"];
+    URL_ATTRS.iter().any(|a| name.eq_ignore_ascii_case(a))
+}
+
+fn is_dangerous_tag_ci(name: &str) -> bool {
+    const DANGEROUS: [&str; 11] = ["script", "style", "iframe", "object", "embed", "applet", "form", "meta", "base", "link", "frame"];
+    DANGEROUS.iter().any(|a| name.eq_ignore_ascii_case(a))
 }
 
 /// 危险标签的 drop-stack 转移（EPUB/MOBI 共享）：结束标签向下截断同名；开始标签若非 void
@@ -163,12 +250,14 @@ impl TokenSink for Sink {
     type Handle = ();
 
     fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+        #[cfg(feature = "sanitize-profile")]
+        let _g = ProfGuard::new(&SINK_NS);
         let mut st = self.0.borrow_mut();
         match token {
             Token::TagToken(tag) => {
-                let ln = tag.name.to_string().to_ascii_lowercase();
                 let is_end = matches!(tag.kind, TagKind::EndTag);
-                if is_dangerous_tag(&ln) {
+                if is_dangerous_tag_ci(tag.name.as_ref()) {
+                    let ln = tag.name.as_ref().to_ascii_lowercase();
                     handle_dangerous_tag(&mut st.drop_stack, ln, is_end, tag.self_closing, false);
                     return TokenSinkResult::Continue;
                 }
@@ -199,9 +288,15 @@ pub fn sanitize_fragment(html: &str) -> String {
     );
     let q = html5ever::tokenizer::BufferQueue::default();
     q.push_back(html.into());
+    #[cfg(feature = "sanitize-profile")]
+    let t0 = profile_on().then(Instant::now);
     let _ = tok.feed(&q);
     tok.end();
+    #[cfg(feature = "sanitize-profile")]
+    if let Some(t) = t0 { add_ns(&TOKENIZE_NS, t); }
     let out = std::mem::take(&mut st.borrow_mut().out);
+    #[cfg(feature = "sanitize-profile")]
+    profile_print_once();
     out
 }
 
@@ -223,6 +318,53 @@ mod tests {
         assert!(!out.contains("onload"), "{out}");
         assert!(!out.contains("script"), "{out}");
         assert!(!out.contains("evil()"), "{out}");
+    }
+
+
+    #[test]
+    fn equivalence_case_attrs_urls_entities_selfclosing() {
+        // 大小写标签/属性
+        assert_eq!(cleaned(r#"<DIV CLASS="x">A</DIV>"#), r#"<div class="x">A</div>"#);
+        assert_eq!(cleaned(r#"<a HREF="javascript:alert(1)">x</a>"#), r#"<a>x</a>"#);
+        assert_eq!(cleaned(r#"<img SRC="data:image/png;base64,AA">"#), r#"<img src="data:image/png;base64,AA">"#);
+        // 空白/控制字符/大小写绕过
+        assert!(is_dangerous_url(" JaVa\tScRiPt:alert(1)"));
+        assert!(is_dangerous_url("\u{0}vbscript:msgbox"));
+        assert!(!is_dangerous_url("data:image/svg+xml;base64,AA"));
+        assert!(is_dangerous_url("data:text/html,x"));
+        // 实体转义
+        assert_eq!(cleaned(r#"a &amp; b < c > d"#), r#"a &amp; b &lt; c &gt; d"#);
+        assert_eq!(cleaned(r#"<p title="a&quot;b&c">t</p>"#), r#"<p title="a&quot;b&amp;c">t</p>"#);
+        // 自闭合/嵌套危险标签
+        assert_eq!(cleaned(r#"<br/><img src="x"/>"#), r#"<br/><img src="x"/>"#);
+        assert_eq!(cleaned(r#"<div><script><b>x</b></script><span>ok</span></div>"#), r#"<div><span>ok</span></div>"#);
+        assert_eq!(cleaned(r#"<style>p{}</style><meta charset=x>"#), "");
+    }
+
+
+    /// B8：合成 ~15MB HTML 的子阶段 profile（默认 ignore；需 TIDEPAGE_PARSE_PROFILE=1 运行）。
+    #[test]
+    #[ignore]
+    fn profile_synthetic_15mb() {
+        let mut html = String::with_capacity(16 * 1024 * 1024);
+        while html.len() < 15 * 1024 * 1024 {
+            html.push_str(r#"<p class="c" onclick="x()" title="a&amp;b">普通文本 text &amp; more <b>粗体</b> <a href="https://example.com/a?b=1&amp;c=2">链接</a></p>"#);
+            html.push('\n');
+        }
+        eprintln!("[sanitize-profile] inputBytes={}", html.len());
+        let out = sanitize_fragment(&html);
+        eprintln!("[sanitize-profile] resultBytes={}", out.len());
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn dangerous_url_no_alloc_semantics() {
+        for s in ["javascript:1", "JAVASCRIPT:1", " java\nscript:1", "vbscript:1", "data:text/html,1"] {
+            assert!(is_dangerous_url(s), "{s:?}");
+        }
+        for s in ["https://x", "data:image/png;base64,AA", "data:image/", "mailto:a@b", "/a:b"] {
+            assert!(!is_dangerous_url(s), "{s:?}");
+        }
     }
 
     #[test]
@@ -315,6 +457,18 @@ mod tests {
             sanitize_fragment("<p><img src=\"a.jpg\" alt=\"c\"/></p>"),
             "<p><img src=\"a.jpg\" alt=\"c\"/></p>"
         );
+    }
+
+    /// R10-3：正文 <a> 的 id/name 属性必须保留（内部锚点跳转依赖），危险属性照旧删除。
+    #[test]
+    fn preserves_anchor_id_and_name_attributes() {
+        let out = cleaned(
+            r##"<p><a id="top"></a><a name="sec2"></a><a id="x" href="#y" onclick="e()">t</a></p>"##,
+        );
+        assert!(out.contains(r#"id="top""#), "{out}");
+        assert!(out.contains(r#"name="sec2""#), "{out}");
+        assert!(out.contains(r##"href="#y""##), "{out}");
+        assert!(!out.contains("onclick"), "{out}");
     }
 
     // 固定 void 危险标签集：mobi.rs::decode_and_sanitize 复用此判定，
