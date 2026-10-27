@@ -106,3 +106,32 @@ describe("pdfSearch", () => {
     expect(searchProgress(5, 10)).toBe(50);
   });
 });
+
+describe("groupPdfMatches 页缺口（F16）", () => {
+  it("页号不连续（0,2）不跨缺口拼接：查询只命中单页内内容", () => {
+    const pages = [
+      { page: 0, text: "跨页开头" },
+      { page: 2, text: "另一页内容" },
+    ];
+    // 缺口处拼出「开头另一页」若仍合并会产生一条假命中；按 run 分组后不能命中。
+    const groups = groupPdfMatches(pages, "开头另一页");
+    expect(groups).toHaveLength(0);
+    // 单页内命中正常。
+    const hit = groupPdfMatches(pages, "另一页");
+    expect(hit).toHaveLength(1);
+    expect(hit[0].segments.map((s) => s.page)).toEqual([2]);
+  });
+  it("连续页（0,1）正常跨页合并成一条", () => {
+    const pages = [
+      { page: 0, text: "上半句在" },
+      { page: 1, text: "这里" },
+    ];
+    const groups = groupPdfMatches(pages, "在这里");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].segments.map((s) => s.page)).toEqual([0, 1]);
+  });
+  it("单页与空输入", () => {
+    expect(groupPdfMatches([{ page: 5, text: "命中" }], "命中")).toHaveLength(1);
+    expect(groupPdfMatches([], "命中")).toHaveLength(0);
+  });
+});

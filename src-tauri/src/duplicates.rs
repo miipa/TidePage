@@ -141,6 +141,41 @@ pub fn read_mid_digest(path: &Path, size: i64) -> Result<Vec<u8>, String> {
     f.read_exact(&mut mid).map_err(|e| e.to_string())?;
     Ok(sha256(&mid))
 }
+
+/// P0-2：候选文件全量流式 SHA-256（64KiB 缓冲，内存恒定）。
+/// 采样只用于候选筛选；exact 判定必须全文件内容一致。
+/// 生产路径用带取消标志的实现；Read 版供单测构造输入。
+#[allow(dead_code)]
+pub fn full_sha256_reader<R: Read>(mut r: R) -> Result<String, String> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf).map_err(|e| format!("读取文件失败：{e}"))?;
+        if n == 0 { break; }
+        h.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// P0-2：带取消标志的全文件 hash；取消返回 Ok(None)（不计错误）。
+pub fn full_sha256_cancellable(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("打开文件失败：{e}"))?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, f);
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let n = reader.read(&mut buf).map_err(|e| format!("读取文件失败：{e}"))?;
+        if n == 0 { break; }
+        h.update(&buf[..n]);
+    }
+    Ok(Some(format!("{:x}", h.finalize())))
+}
 /// A5 预筛（旧 helper，保留给测试/兼容）：≤24KB 全读；>24KB 只读首+尾 8KB。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sampled_prehash(path: &Path, size: i64) -> Result<String, String> {
@@ -637,13 +672,15 @@ pub async fn find_duplicate_books(
                 }
             }
         }
-        // 第二阶段：只读 mid 8KB 一次；最终 hash = SHA256(size || head_digest || mid_digest || tail_digest)。
-        // 受限并发 2（HDD 随机读，线程多会寻道放大）；取消标志共享。
+        // P0-2：第二阶段先按采样（size + 首/尾 + mid）筛候选，再对候选文件全量流式 SHA-256。
+        // 旧实现用「size+首+中+尾」摘要直接当 exact 判据，首/中/尾相同但其它区段不同的文件会被误判。
+        // 采样组（≤24KB 时为全文件 hash）只作为候选筛选，内存只保留候选行。
         let mut map: HashMap<(i64, String), Vec<(DuplicateBook, i64, String)>> = HashMap::new();
         let mut big: Vec<(i64, DuplicateBook, i64, String, EdgeDigest)> = Vec::new();
         for ((size, prehash), (ed, rows)) in pre {
             if rows.len() < 2 { continue; }
             if prehash.starts_with("f:") {
+                // ≤24KB 的小文件在 edge_digests 已整份读过（f: 含 size+全文），等同全量 hash。
                 let key = prehash.trim_start_matches("f:").to_string();
                 map.entry((size, key)).or_default().extend(rows);
                 continue;
@@ -653,7 +690,8 @@ pub async fn find_duplicate_books(
             }
         }
         let failed = AtomicUsize::new(0);
-        let compute = || -> Vec<(i64, DuplicateBook, i64, String, Option<String>)> {
+        // 2a：mid 摘要筛候选（采样相同才进入候选；不参与 exact 判定）。
+        let compute_mid = || -> Vec<(i64, DuplicateBook, i64, String, Option<String>)> {
             big.par_iter()
                 .map(|(size, book, mtime, path, ed)| {
                     if DUP_SCAN_CANCEL.load(Ordering::SeqCst) {
@@ -669,18 +707,57 @@ pub async fn find_duplicate_books(
                 })
                 .collect()
         };
-        let results = match rayon::ThreadPoolBuilder::new().num_threads(2).build() {
-            Ok(pool) => pool.install(compute),
-            Err(_) => compute(),
+        let mid_results = match rayon::ThreadPoolBuilder::new().num_threads(2).build() {
+            Ok(pool) => pool.install(compute_mid),
+            Err(_) => compute_mid(),
         };
         if DUP_SCAN_CANCEL.load(Ordering::SeqCst) {
             let _ = app2.emit("duplicate-progress", DuplicateProgress { running: false, phase: "done".into(), done, total, groups: 0, skipped });
             return Ok(DuplicateScanResult { cancelled: true, groups: vec![], scanned: done, skipped, elapsed_ms: t0.elapsed().as_millis() as i64 });
         }
         skipped += failed.load(Ordering::Relaxed) as i64;
-        for (size, book, mtime, path, hash) in results {
-            if let Some(hash) = hash {
-                map.entry((size, hash)).or_default().push((book, mtime, path));
+        let mut sample_groups: HashMap<(i64, String), Vec<(DuplicateBook, i64, String)>> = HashMap::new();
+        for (size, book, mtime, path, sample_hash) in mid_results {
+            if let Some(h) = sample_hash {
+                sample_groups.entry((size, h)).or_default().push((book, mtime, path));
+            }
+        }
+        // 2b：只对采样相同且 ≥2 的候选做全文件 hash；按 (size, full_sha256) 归组。
+        let candidates: Vec<(i64, DuplicateBook, i64, String)> = sample_groups
+            .into_iter()
+            .filter(|(_, rows)| rows.len() >= 2)
+            .flat_map(|((size, _hash), rows)| rows.into_iter().map(move |(b, m, p)| (size, b, m, p)))
+            .collect();
+        let full_compute = || -> Vec<(i64, DuplicateBook, i64, String, Option<String>)> {
+            candidates
+                .par_iter()
+                .map(|(size, book, mtime, path)| {
+                    if DUP_SCAN_CANCEL.load(Ordering::SeqCst) {
+                        return (*size, book.clone(), *mtime, path.clone(), None);
+                    }
+                    match full_sha256_cancellable(Path::new(path), &DUP_SCAN_CANCEL) {
+                        Ok(Some(h)) => (*size, book.clone(), *mtime, path.clone(), Some(h)),
+                        Ok(None) => (*size, book.clone(), *mtime, path.clone(), None),
+                        Err(_) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            (*size, book.clone(), *mtime, path.clone(), None)
+                        }
+                    }
+                })
+                .collect()
+        };
+        let full_results = match rayon::ThreadPoolBuilder::new().num_threads(2).build() {
+            Ok(pool) => pool.install(full_compute),
+            Err(_) => full_compute(),
+        };
+        if DUP_SCAN_CANCEL.load(Ordering::SeqCst) {
+            let _ = app2.emit("duplicate-progress", DuplicateProgress { running: false, phase: "done".into(), done, total, groups: 0, skipped });
+            return Ok(DuplicateScanResult { cancelled: true, groups: vec![], scanned: done, skipped, elapsed_ms: t0.elapsed().as_millis() as i64 });
+        }
+        skipped += failed.load(Ordering::Relaxed) as i64;
+        for (size, book, mtime, path, full_hash) in full_results {
+            if let Some(h) = full_hash {
+                map.entry((size, h)).or_default().push((book, mtime, path));
             }
         }
         let mut groups = build_groups(&map);
@@ -990,4 +1067,58 @@ mod tests {
         assert!(!file_meta_matches(&root.join("missing.bin"), 4, 0));
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// P0-2：采样相同（首/中/尾）但其它区段不同，全文件 SHA-256 必须不同 → 不得判 exact。
+    #[test]
+    fn full_hash_detects_difference_outside_samples() {
+        let root = tmp("full-hash-samples");
+        // 256KB 文件：首8K/中8K/尾8K 相同，只在 100KB 处不同。
+        let size = 256 * 1024usize;
+        let sample = 8 * 1024usize;
+        let mut a = vec![7u8; size];
+        let mut b = vec![7u8; size];
+        let mid_off = size / 2 - sample / 4;
+        a[mid_off + sample + 100] = 1;
+        b[mid_off + sample + 100] = 2;
+        let pa = root.join("a.bin");
+        let pb = root.join("b.bin");
+        std::fs::write(&pa, &a).unwrap();
+        std::fs::write(&pb, &b).unwrap();
+        let ea = edge_digests(&pa, size as i64).unwrap();
+        let eb = edge_digests(&pb, size as i64).unwrap();
+        let ma = read_mid_digest(&pa, size as i64).unwrap();
+        let mb = read_mid_digest(&pb, size as i64).unwrap();
+        // 采样摘要相同（旧实现据此会误判 exact）。
+        assert_eq!(
+            final_hash_with_mid(size as i64, &ea.head, &ma, &ea.tail),
+            final_hash_with_mid(size as i64, &eb.head, &mb, &eb.tail),
+            "首/中/尾采样应相同（构造前提）"
+        );
+        let fa = full_sha256_reader(std::fs::File::open(&pa).unwrap()).unwrap();
+        let fb = full_sha256_reader(std::fs::File::open(&pb).unwrap()).unwrap();
+        assert_ne!(fa, fb, "采样外内容不同，全量 hash 必须不同");
+        // 完全相同 → 全量 hash 相等。
+        let pa2 = root.join("a2.bin");
+        std::fs::write(&pa2, &a).unwrap();
+        assert_eq!(fa, full_sha256_reader(std::fs::File::open(&pa2).unwrap()).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P0-2：同 size 不同内容不 exact；取消标志让全量 hash 返回 None。
+    #[test]
+    fn full_hash_same_size_and_cancel() {
+        let root = tmp("full-hash-cancel");
+        let pa = root.join("x.bin");
+        let pb = root.join("y.bin");
+        std::fs::write(&pa, b"AAAA").unwrap();
+        std::fs::write(&pb, b"AAAB").unwrap();
+        let ha = full_sha256_reader(std::fs::File::open(&pa).unwrap()).unwrap();
+        let hb = full_sha256_reader(std::fs::File::open(&pb).unwrap()).unwrap();
+        assert_ne!(ha, hb, "同 size 不同内容不得 exact");
+        let cancel = AtomicBool::new(false);
+        assert_eq!(full_sha256_cancellable(&pa, &cancel).unwrap(), Some(ha));
+        cancel.store(true, Ordering::SeqCst);
+        assert!(full_sha256_cancellable(&pa, &cancel).unwrap().is_none(), "取消后应返回 None");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }

@@ -141,17 +141,25 @@ export function hourBuckets(hourly: { hour: number; seconds: number }[]): {
   };
 }
 
+/** 本地日历日序号（不依赖毫秒差，夏令时切换当天也能正确 +1）。 */
+function calendarDaySerial(d: Date): number {
+  return Math.round(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / DAY);
+}
+
 /** 当前/最长连续阅读天数（activeDates 为升序 YYYY-MM-DD）。 */
 export function computeStreak(activeDates: string[], today = new Date()): { current: number; longest: number } {
   const set = new Set(activeDates);
   let longest = 0;
   let run = 0;
-  let prev: Date | null = null;
+  let prevSerial: number | null = null;
   for (const s of [...set].sort()) {
     const d = new Date(s + "T00:00:00");
-    run = prev && (d.getTime() - prev.getTime()) === DAY ? run + 1 : 1;
+    // G19：最长连续按本地日历日序号判断，而不是固定 86400000ms——夏令时切换日
+    // 实际间隔 23/25 小时，用毫秒差会把连续阅读误判为中断。
+    const serial = calendarDaySerial(d);
+    run = prevSerial !== null && serial === prevSerial + 1 ? run + 1 : 1;
     longest = Math.max(longest, run);
-    prev = d;
+    prevSerial = serial;
   }
   let current = 0;
   for (let d = atMidnight(today), i = 0; i < 4000; i++, d = addDays(d, -1)) {

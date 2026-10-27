@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
+  import { dateLocale, errText, locale, t } from "../lib/i18n/index.svelte";
+  import { fmtDurationParts, formatCountShort } from "../lib/countFormat";
   import { onMount, onDestroy } from "svelte";
   import { emit } from "@tauri-apps/api/event";
   import type { TagInfo } from "../lib/api";
@@ -106,19 +107,26 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
   }
 
   function fmtDur(sec: number): string {
-    const h = Math.floor(sec / 3600);
-    const m = Math.round((sec % 3600) / 60);
+    // E14：整秒拆分，避免 3599.6s 显示成 1 小时 0 分（旧实现 m=60 与 s 并存）。
+    const { h, m, s: ss } = fmtDurationParts(sec);
     if (h) return t("common.dur.hm", { h, m });
+    if (m && ss) return t("common.dur.ms", { m, s: ss });
     if (m) return t("common.dur.mShort", { m });
-    return t("common.dur.s", { sec });
+    return t("common.dur.s", { sec: ss });
   }
 
   function fmtChars(n: number): string {
-    if (n >= 10000) return (n / 10000).toFixed(1) + t("common.unit.tenThousand");
-    return String(n);
+    // H22：中文「万」/英文「k」按 locale 走同一纯函数。
+    const unit = t("common.unit.tenThousand");
+    return formatCountShort(n, unit, unit, locale());
   }
 
   async function save() {
+    // E15：仅标题必填；作者允许为空（未知作者是合法状态）。
+    if (!title.trim()) {
+      toast(t("bookDetail.nameRequired"), "error");
+      return;
+    }
     saving = true;
     try {
       await api.updateBookMeta(book.id, title.trim(), author.trim());
@@ -134,6 +142,11 @@ import { IconCopy, IconFolderOpen, IconX } from "@tabler/icons-svelte";
 
   let writing = $state(false);
   async function saveToFile() {
+    // E15：写回文件同样只校验标题，作者可为空并原样写回。
+    if (!title.trim()) {
+      toast(t("bookDetail.nameRequired"), "error");
+      return;
+    }
     const ok = await appConfirm(
       t("bookDetail.writeBackConfirm", { path: book.path }),
     );

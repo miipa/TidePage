@@ -1,4 +1,5 @@
 import { activeTtsService, config, resolveEndpointProxy, saveConfig, toast } from "./stores.svelte";
+import { synthAttemptsAllowed, playbackAttemptsAllowed, sessionMatches, SYNTH_MAX_ATTEMPTS } from "./ttsRetry";
 import { getBookOverride } from "./bookcfg.svelte";
 
 /* ---------------- D8：按书 TTS 覆盖 ---------------- */
@@ -21,6 +22,7 @@ export function effectiveTtsRate(): number {
 }
 import { api } from "./api";
 import { aiErrDetail, t } from "./i18n/index.svelte";
+import { sleepDeadlineFromNow } from "./ttsSleep";
 
 export interface FlatSegment {
   /** 用于朗读的文本（已去首尾空白） */
@@ -118,7 +120,24 @@ export const ttsState = $state({
   onlineVoiceError: "",
   /** 在线语音：当前句音频尚未就绪（缓冲中） */
   buffering: false,
+  /** F5-H1：睡眠定时截止时间（毫秒，0=未启用）。放这里而不是 TtsBar 局部状态，
+   *  组件随 playing 卸载重挂时倒计时不会被重置。 */
+  sleepDeadline: 0,
+  /** 已起臂的分钟数（用于判断"设置时长变化/跨挂载相同不重臂"）。 */
+  sleepMinutesArmed: 0,
 });
+
+/** F5-H1：按当前时刻起臂睡眠定时（TtsBar 在 playing 时调用）。 */
+export function ttsArmSleep(minutes: number) {
+  ttsState.sleepMinutesArmed = minutes;
+  ttsState.sleepDeadline = sleepDeadlineFromNow(minutes, Date.now());
+}
+
+/** F5-H1：清除睡眠定时（停止朗读 / 关闭定时 / 章末停止时调用）。 */
+export function ttsClearSleep() {
+  ttsState.sleepMinutesArmed = 0;
+  ttsState.sleepDeadline = 0;
+}
 
 /** 非响应式：片段数组较大，避免深层代理开销 */
 let segments: FlatSegment[] = [];
@@ -396,6 +415,8 @@ function prefetchFrom(from: number, g: number) {
   if (config.tts.engine !== "online") return;
   prefetchGen = g;
   for (let k = 0; k < PREFETCH_DEPTH; k++) {
+    // P2-4：旧会话（gen 已变）不得继续预取；音频缓存写入本身可保留（按文本缓存，无会话状态）。
+    if (!sessionMatches(g, gen)) return;
     const j = from + k;
     if (j >= segments.length) break;
     getAudio(segments[j].text).catch(() => {});
@@ -403,7 +424,9 @@ function prefetchFrom(from: number, g: number) {
 }
 
 /** 释放当前 Audio 元素，防止 WebView2 中连续复用导致增益衰减/状态异常。 */
-function disposeAudio() {
+function disposeAudio(expected?: HTMLAudioElement | null) {
+  // P2-4：按所有者释放——旧会话迟到的 cleanup 不得停掉新会话正在用的 Audio。
+  if (expected && audioEl !== expected) return;
   if (!audioEl) return;
   try {
     audioEl.onended = null;
@@ -424,6 +447,8 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
   return new Promise((resolve, reject) => {
     disposeAudio();
     audioEl = new Audio();
+    // 捕获本会话自己的 Audio：cleanup 只能释放它，不能动之后新建的元素。
+    const myAudio = audioEl;
     usingAudio = true;
     ttsState.buffering = false;
 
@@ -431,24 +456,24 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
     const cleanup = () => {
       if (settled) return;
       settled = true;
-      disposeAudio();
+      disposeAudio(myAudio);
     };
 
-    audioEl.onloadedmetadata = () => {
-      if (g !== gen) {
+    myAudio.onloadedmetadata = () => {
+      if (!sessionMatches(g, gen)) {
         cleanup();
         resolve();
         return;
       }
-      const dur = audioEl?.duration ?? 0;
-      if (!audioEl || !isFinite(dur) || dur <= 0.05) {
+      const dur = myAudio.duration ?? 0;
+      if (!isFinite(dur) || dur <= 0.05) {
         cleanup();
         reject(new Error(t("err.audioZeroDuration")));
       }
     };
 
-    audioEl.onended = () => {
-      if (g !== gen) {
+    myAudio.onended = () => {
+      if (!sessionMatches(g, gen)) {
         cleanup();
         resolve();
         return;
@@ -458,8 +483,8 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
       resolve();
     };
 
-    audioEl.onerror = () => {
-      if (g !== gen) {
+    myAudio.onerror = () => {
+      if (!sessionMatches(g, gen)) {
         cleanup();
         resolve();
         return;
@@ -469,11 +494,11 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
       reject(new Error(t("err.audioDecode")));
     };
 
-    audioEl.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
-    audioEl.playbackRate = effectiveTtsRate();
-    audioEl.src = url;
-    audioEl.play().catch((e) => {
-      if (g !== gen) {
+    myAudio.volume = Math.max(0, Math.min(1, config.tts.volume ?? 1));
+    myAudio.playbackRate = effectiveTtsRate();
+    myAudio.src = url;
+    myAudio.play().catch((e) => {
+      if (!sessionMatches(g, gen)) {
         cleanup();
         resolve();
         return;
@@ -487,17 +512,19 @@ function playAudioUrl(url: string, seg: FlatSegment, i: number, g: number): Prom
 /** 拉取并缓存单句音频，失败自动重试（最多 3 次）。 */
 async function retryAudio(text: string, g: number): Promise<string | null> {
   let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (g !== gen) return null;
+  // P2-4：合成统一最多 SYNTH_MAX_ATTEMPTS 次；播放层另有独立重试，二者不叠乘。
+  for (let attempt = 0; synthAttemptsAllowed(attempt); attempt++) {
+    if (!sessionMatches(g, gen)) return null;
     try {
       return await getAudio(text);
     } catch (e) {
       lastErr = e;
-      if (g !== gen) return null;
+      if (!sessionMatches(g, gen)) return null;
+      if (!synthAttemptsAllowed(attempt + 1)) break;
       await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
     }
   }
-  if (g !== gen) return null;
+  if (!sessionMatches(g, gen)) return null;
   throw lastErr;
 }
 
@@ -533,23 +560,32 @@ async function playOnline(seg: FlatSegment, i: number, g: number) {
     if (g !== gen) return;
   }
   let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (g !== gen) return;
-    try {
-      const url = await retryAudio(seg.text, g);
-      if (g !== gen || !url) return;
-      await playAudioUrl(url, seg, i, g);
-      prefetchFrom(i + 1, g);
-      return;
-    } catch (e) {
-      lastErr = e;
-      if (g !== gen) return;
-      disposeAudio();
-      await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+  try {
+    const url = await retryAudio(seg.text, g);
+    if (!sessionMatches(g, gen) || !url) return;
+    // 合成已成功：播放/解码失败单独做有限重试（最多 PLAYBACK_MAX_ATTEMPTS 次），
+    // 不再回到外层的「整句重新合成」循环，避免 2×3 叠乘。
+    let played = false;
+    for (let attempt = 0; playbackAttemptsAllowed(attempt); attempt++) {
+      try {
+        await playAudioUrl(url, seg, i, g);
+        played = true;
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (!sessionMatches(g, gen)) return;
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      }
     }
+    if (!played) {
+      failOnline(lastErr);
+      return;
+    }
+    prefetchFrom(i + 1, g);
+  } catch (e) {
+    if (!sessionMatches(g, gen)) return;
+    failOnline(e);
   }
-  if (g !== gen) return;
-  failOnline(lastErr);
 }
 
 /* ---------------- 播放控制 ---------------- */
@@ -581,6 +617,8 @@ function stopState() {
   ttsState.paused = false;
   ttsState.index = -1;
   ttsState.buffering = false;
+  // F5-H1：真正停止时清掉睡眠定时（章末自动续读不经过这里，截止时间继续保留）。
+  ttsClearSleep();
   utter = null;
   onSegmentCb?.(null, -1);
 }

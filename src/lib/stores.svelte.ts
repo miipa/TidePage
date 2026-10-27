@@ -102,8 +102,20 @@ export function bindKeyMatches(stored: string, combo: string): boolean {
 }
 
 import type { ChapterTransition, PageTransition } from "./chapterTx";
+import { pickSchemeTypesetting } from "./readerScheme";
 import { allowEventTrigger, shouldAutoSync } from "./autoSync";
 import { shouldAutoVacuum } from "./maintenance";
+import { changedEndpointSecrets, type EndpointSecretChanges } from "./configHost";
+import { canWriteSecrets, shouldSuppressConfigWrite } from "./configSyncGuard";
+import { normalizeMaintenance } from "./maintenanceConfig";
+import { sanitizeEndpointUrl } from "./urlSecrets";
+
+/** 保存失败提示：延迟加载 i18n，避免 stores → i18n → stores 静态循环（i18n 初始化会读 config）。 */
+function notifySaveFailed(): void {
+  void import("./i18n/index.svelte")
+    .then(({ t }) => toast(t("toast.saveFailed"), "error"))
+    .catch(() => {});
+}
 
 export type TextAlign = "justify" | "left";
 /** 滚动模式的章节过渡档位（定义在 lib/chapterTx.ts，与过渡几何/解锁判据同源）。 */
@@ -1936,17 +1948,8 @@ function load(): AppConfig {
         localStorage.removeItem("tp.maintenance.autoVacuum");
       } catch { /* ignore */ }
     }
-    const m = maintenanceMigrated || {};
-    const mv = {
-      ...DEFAULTS.maintenance,
-      ...(m || {}),
-      autoVacuum: { ...DEFAULTS.maintenance.autoVacuum, ...(m?.autoVacuum || {}) },
-    };
-    mv.reminderDismissedUntil = Math.max(0, Number(mv.reminderDismissedUntil) || 0);
-    mv.autoVacuum.enabled = mv.autoVacuum.enabled === true;
-    mv.autoVacuum.idleMinutes = [10, 15, 30].includes(Number(mv.autoVacuum.idleMinutes)) ? Number(mv.autoVacuum.idleMinutes) : 15;
-    mv.lastAutoVacuumAt = Math.max(0, Number(mv.lastAutoVacuumAt) || 0);
-    mv.lastAutoVacuumResult = mv.lastAutoVacuumResult === "success" || mv.lastAutoVacuumResult === "error" || mv.lastAutoVacuumResult === "skipped" ? mv.lastAutoVacuumResult : "";
+    // F9：与 applyConfigJson 共用 normalizeMaintenance（旧实现两处各写一份，apply 缺默认）。
+    const mv = normalizeMaintenance(maintenanceMigrated, DEFAULTS.maintenance);
     // 迁移：语音朗读由「扁平协议字段」改为「服务配置档案」；无 services 时需落盘一次。
     if (!Array.isArray(saved.tts?.services) || !saved.tts.services.length) ttsMigrationDirty = true;
     const merged: AppConfig = {
@@ -2038,12 +2041,107 @@ function load(): AppConfig {
     // 加密写入 secret.config 并生成脱敏 localStorage）。
     if (Object.values(collectSecrets(merged)).some((v) => v !== "")) secretsMigrationDirty = true;
     return merged;
-  } catch {
+  } catch (e) {
+    // F9：配置损坏不能静默回默认；至少留下可诊断日志（不弹 toast，避免每次启动刷屏）。
+    console.error("[config] load failed, falling back to defaults:", e);
     return structuredClone(DEFAULTS);
   }
 }
 
 export const config = $state<AppConfig>(load());
+
+/* ===================== F9：便携/子窗配置同步保护 ===================== */
+// 便携模式下主窗用 data_directory 指定 WebView2 用户目录，但 JS 运行期创建的独立窗口
+// 走默认目录（wry 以 data_directory 为 key 缓存 WebContext）。后端 setup 通过
+// WEBVIEW2_USER_DATA_FOLDER 把默认目录固定到便携目录（双保险之一）；这里再做确定性兜底：
+// 子窗在拿到主窗配置前不得写 localStorage/secret、不得广播，否则会用默认配置整体覆写
+// 共享的 secret.config。任何情况下都只是「延迟写」，不会死锁（主窗关闭时子窗随主窗销毁）。
+const CONFIG_SYNC_REQUEST_EVENT = "tidepage-config-request";
+/** 本窗启动时 localStorage 是否已有配置（子窗分裂时通常没有）。 */
+const hasLocalConfig = (() => {
+  if (typeof window === "undefined") return false;
+  try {
+    return localStorage.getItem(KEY) !== null;
+  } catch {
+    return false;
+  }
+})();
+let isMainWindow = true;
+let labelResolved = false;
+let configSynced = hasLocalConfig;
+let pendingConfigWrite = false;
+let configSyncWarnTimer: ReturnType<typeof setTimeout> | undefined;
+let subWindowSyncRequested = false;
+
+function configSyncState() {
+  return { labelResolved, isMain: isMainWindow, hasLocalConfig, configSynced };
+}
+
+/** 被抑制的写入在同步完成后补执行（先配置/密钥、后真正落盘）。 */
+function flushPendingConfigWrite() {
+  if (!pendingConfigWrite) return;
+  if (shouldSuppressConfigWrite(configSyncState())) return;
+  pendingConfigWrite = false;
+  writeConfigNow();
+}
+
+/** 子窗向主窗请求配置；5s 内没收到则保持只读（DEV 提示一次）。 */
+function requestConfigFromMain() {
+  if (subWindowSyncRequested) return;
+  subWindowSyncRequested = true;
+  void import("@tauri-apps/api/event")
+    .then((m) => m.emit(CONFIG_SYNC_REQUEST_EVENT, null))
+    .catch(() => {});
+  configSyncWarnTimer = setTimeout(() => {
+    if (!configSynced && import.meta.env.DEV) {
+      console.warn("[tidepage] 配置尚未同步，暂缓保存");
+    }
+  }, 5000);
+}
+
+function enterSubWindowMode() {
+  isMainWindow = false;
+  if (hasLocalConfig) {
+    configSynced = true;
+    flushPendingConfigWrite();
+    return;
+  }
+  requestConfigFromMain();
+}
+
+if (typeof window !== "undefined") {
+  // 2s 超时兜底：label 解析异常时按「非主窗且未同步」保守处理，禁止写盘。
+  const labelTimer = setTimeout(() => {
+    labelResolved = true;
+    enterSubWindowMode();
+  }, 2000);
+  void import("@tauri-apps/api/webviewWindow")
+    .then((m) => m.getCurrentWebviewWindow().label)
+    .then((label) => {
+      clearTimeout(labelTimer);
+      labelResolved = true;
+      if (label === "main") {
+        isMainWindow = true;
+        flushPendingConfigWrite();
+      } else {
+        enterSubWindowMode();
+      }
+    })
+    .catch(() => {
+      clearTimeout(labelTimer);
+      labelResolved = true;
+      enterSubWindowMode();
+    });
+  // 主窗响应子窗的配置请求：复用现有脱敏广播通道（含端点列表，不含密钥）。
+  void import("@tauri-apps/api/event")
+    .then((m) =>
+      m.listen(CONFIG_SYNC_REQUEST_EVENT, () => {
+        if (!labelResolved || !isMainWindow) return;
+        void m.emit("tidepage-config", JSON.stringify(stripSecrets(config))).catch(() => {});
+      }),
+    )
+    .catch(() => {});
+}
 
 /* ===================== 凭据抽取 / 回填 / 脱敏 ===================== */
 
@@ -2059,12 +2157,21 @@ export function collectSecrets(cfg: AppConfig): Record<string, string> {
   const out: Record<string, string> = {};
   const wd = (cfg as any)?.webdav;
   if (wd) out["webdav:pass"] = typeof wd.pass === "string" ? wd.pass : "";
+  // F9：URL 内嵌凭据（userinfo / 凭据类 query）不写进持久化与广播副本；
+  // 仅当脱敏后与原文不同才收集原值（避免无凭据 URL 也塞密文），由 secret.config 加密保存。
+  if (wd && typeof wd.base === "string" && sanitizeEndpointUrl(wd.base) !== wd.base) {
+    out["webdav:baseRaw"] = wd.base;
+  }
   // 全局代理地址是敏感字段（可能含 账号:密码@host），与密钥同级单独加密。
   const ai = (cfg as any)?.ai;
   if (ai) out["ai:proxyUrl"] = typeof ai.proxy?.url === "string" ? ai.proxy.url : "";
   for (const p of ((cfg as any)?.ai?.profiles ?? []) as any[]) {
     if (!p) continue;
     out[`ai:${p.id}:apiKey`] = typeof p.apiKey === "string" ? p.apiKey : "";
+    // F9：端点 baseUrl 内嵌凭据同样加密保存原值（仅脱敏后不同才收集）。
+    if (typeof p.baseUrl === "string" && sanitizeEndpointUrl(p.baseUrl) !== p.baseUrl) {
+      out[`ai:${p.id}:baseUrlRaw`] = p.baseUrl;
+    }
     // 端点手动代理地址同样是敏感字段（可能含 账号:密码@host）。
     out[`ai:${p.id}:proxyUrl`] = typeof p.proxyUrl === "string" ? p.proxyUrl : "";
   }
@@ -2083,6 +2190,8 @@ export function applySecrets(cfg: AppConfig, map: Record<string, unknown> | null
   if (!map || typeof map !== "object") return;
   const wd = (cfg as any)?.webdav;
   if (wd && typeof map["webdav:pass"] === "string") wd.pass = map["webdav:pass"];
+  // F9：恢复 URL 原文（persisted 副本里只有脱敏地址）；显式出现且为字符串才回填。
+  if (wd && typeof map["webdav:baseRaw"] === "string") wd.base = map["webdav:baseRaw"];
   const ai = (cfg as any)?.ai;
   if (ai && typeof map["ai:proxyUrl"] === "string") {
     ai.proxy.url = map["ai:proxyUrl"];
@@ -2114,6 +2223,8 @@ export function applySecrets(cfg: AppConfig, map: Record<string, unknown> | null
     if (!p) continue;
     const ka = `ai:${p.id}:apiKey`;
     if (typeof map[ka] === "string") p.apiKey = map[ka];
+    const kb = `ai:${p.id}:baseUrlRaw`;
+    if (typeof map[kb] === "string") p.baseUrl = map[kb];
     // 新版端点手动代理地址回填（旧 schema 一次性迁移这一趟跳过，见上）。
     const kp = `ai:${p.id}:proxyUrl`;
     if (!adoptingLegacy && typeof map[kp] === "string") {
@@ -2140,12 +2251,17 @@ export function applySecrets(cfg: AppConfig, map: Record<string, unknown> | null
 export function stripSecrets(cfg: AppConfig): AppConfig {
   const copy = JSON.parse(JSON.stringify(cfg)) as AppConfig;
   const wd = (copy as any)?.webdav;
-  if (wd) wd.pass = "";
+  if (wd) {
+    wd.pass = "";
+    // F9：持久化/广播/导出只含脱敏 URL；原文在 secret.config，本机启动/跨窗由 applySecrets 回填。
+    if (typeof wd.base === "string") wd.base = sanitizeEndpointUrl(wd.base);
+  }
   const ai = (copy as any)?.ai;
   if (ai?.proxy) ai.proxy.url = "";
   for (const p of ((copy as any)?.ai?.profiles ?? []) as any[]) {
     p.apiKey = "";
     p.proxyUrl = "";
+    if (typeof p.baseUrl === "string") p.baseUrl = sanitizeEndpointUrl(p.baseUrl);
   }
   for (const s of ((copy as any)?.tts?.services ?? []) as any[]) {
     s.apiKey = "";
@@ -2212,10 +2328,16 @@ setTimeout(() => {
     } catch {
       /* 无加密设施 / 尚未写入时忽略，配置保持脱敏状态 */
     } finally {
+      secretsHydrated = true;
       // 采纳了旧密文键、或修正了 type/scheme 不一致：立刻落盘一次
       // （前者让新键 ai:proxyUrl 取代 ai:{id}:proxyUrl；后者把修正后的 type 写回）。
       if (legacyProxyAdopted || typeFixed) saveConfigNow();
       resolveSecretsReady();
+      // F9：回填前被跳过的 secret 写入现在补一次（writeConfigNow 会重新 collectSecrets 取当时值）。
+      if (pendingSecretsWrite) {
+        pendingSecretsWrite = false;
+        writeConfigNow();
+      }
     }
   })();
 }, 0);
@@ -2449,11 +2571,14 @@ export function deleteReaderScheme(id: string): void {
 export function applyReaderSchemeGlobal(id: string): void {
   const s = config.readerSchemes.find((x) => x.id === id);
   if (!s) return;
-  // 方案快照可能是旧结构（没有 margins / 只有标量 marginH/V）：先合并默认值再走 load 同一条归一化路径，
-  // 保证 config.reader.margins 一定完整（否则读 .h 直接炸）；播种取方案自己的旧边距，方案仍还原它原本的值。
-  const merged = { ...structuredClone(DEFAULTS.reader), ...JSON.parse(JSON.stringify(s.cfg)) };
+  // P2-5：方案只应用排版白名单字段，非排版设置（multiWindow/browserSearchUrl/conv/
+  // aiPanelWidth 等）保留当前值；旧实现整体替换 config.reader 会顺手重置它们。
+  // 方案快照可能是旧结构（没有 margins / 只有标量 marginH/V）：pick 后仍走 load 同一条
+  // 归一化路径，保证 config.reader.margins 完整。
+  const schemeCfg = JSON.parse(JSON.stringify(s.cfg)) as Partial<ReaderConfig>;
+  const merged = pickSchemeTypesetting(schemeCfg, config.reader, DEFAULTS.reader);
   normalizeReaderConfig(merged, s.cfg);
-  config.reader = merged as ReaderConfig;
+  config.reader = merged;
   saveConfig();
 }
 
@@ -2472,11 +2597,22 @@ if (
   void secretsReady.then(() => saveConfig());
 }
 
-export function applyConfigJson(json: string) {
+export function applyConfigJson(json: string): EndpointSecretChanges {
   try {
-    if (json === JSON.stringify(config)) return;
+    if (json === JSON.stringify(config)) return { webdav: false, profileIds: [] };
     const obj = JSON.parse(json);
-    if (!obj || typeof obj !== "object" || !obj.reader || !obj.ai) return;
+    if (!obj || typeof obj !== "object" || !obj.reader || !obj.ai) {
+      return { webdav: false, profileIds: [] };
+    }
+    // H13：应用前记下旧端点地址，用于判断 host 是否被备份改道。
+    const oldWebdavBase =
+      typeof (config as any).webdav?.base === "string" ? (config as any).webdav.base : "";
+    const oldProfiles = ((config as any).ai?.profiles ?? [])
+      .filter((p: any) => p && p.id !== undefined && p.id !== null)
+      .map((p: any) => ({
+        id: p.id,
+        baseUrl: typeof p.baseUrl === "string" ? p.baseUrl : "",
+      }));
     const rawReader = obj.reader;
     obj.reader = {
       ...structuredClone(DEFAULTS.reader),
@@ -2526,8 +2662,15 @@ export function applyConfigJson(json: string) {
     obj.uiSkinLight = resolveSkinId(obj.uiSkinLight, "light");
     obj.uiSkinDark = resolveSkinId(obj.uiSkinDark, "dark");
     obj.readerSchemes = normalizeSchemes(obj.readerSchemes);
+    // F9：广播/导入的配置可能缺 maintenance（旧备份）；不补默认会让 UI 读到 undefined。
+    obj.maintenance = normalizeMaintenance(obj.maintenance, DEFAULTS.maintenance);
     obj.language = normLanguageSetting(obj.language);
     obj.settingsOrder = normSettingsOrder(obj.settingsOrder);
+    // H13：host 变化的端点，其已存密文不得回填（见 configHost.ts 的威胁说明）。
+    const changes = changedEndpointSecrets(
+      { webdav: { base: oldWebdavBase }, ai: { profiles: oldProfiles } },
+      { webdav: { base: obj.webdav.base }, ai: { profiles: obj.ai.profiles } },
+    );
     // 跨窗广播/导出的都是「已脱敏 config」，敏感字段均为空。先记下本窗当前密钥，
     // 应用后对传入为空者回填，避免用空值覆盖已回填/待回填的凭据；
     // 真正的「清空密钥」由 tidepage-secrets-changed 信号（重读加密存储）兜底。
@@ -2538,16 +2681,55 @@ export function applyConfigJson(json: string) {
     const incoming = collectSecrets(config);
     const keep: Record<string, string> = {};
     for (const k of Object.keys(preservedSecrets)) {
-      if (preservedSecrets[k] !== "" && (incoming[k] ?? "") === "") keep[k] = preservedSecrets[k];
+      if (preservedSecrets[k] === "" || (incoming[k] ?? "") !== "") continue;
+      // H13：端点 host 变了 ⇒ 不保留对应密文（下次填写前该端点的请求会失败，而不是发往新主机）。
+      if (k === "webdav:pass" && changes.webdav) continue;
+      // F9：URL 原文只在「脱敏后的旧地址 === 备份里的当前地址」时保留 —— 说明非密文部分
+      // 完全一致、只是凭据不同；host/路径变了就不能用旧 URL 覆盖新地址。
+      if (k === "webdav:baseRaw") {
+        if (changes.webdav) continue;
+        if (sanitizeEndpointUrl(preservedSecrets[k]) !== String((config as any).webdav?.base ?? "")) continue;
+        keep[k] = preservedSecrets[k];
+        continue;
+      }
+      const rawM = /^ai:(.+):baseUrlRaw$/.exec(k);
+      if (rawM) {
+        if (changes.profileIds.includes(rawM[1])) continue;
+        const p = ((config as any).ai?.profiles ?? []).find((x: any) => x && String(x.id) === rawM[1]);
+        if (!p || sanitizeEndpointUrl(preservedSecrets[k]) !== String(p.baseUrl ?? "")) continue;
+        keep[k] = preservedSecrets[k];
+        continue;
+      }
+      const m = /^ai:(.+):apiKey$/.exec(k);
+      if (m && changes.profileIds.includes(m[1])) continue;
+      keep[k] = preservedSecrets[k];
     }
     applySecrets(config, keep);
+    // 备份/广播里若自带该端点的非空密文，同样清掉（覆盖上面 keep 之外的来源）。
+    dropChangedEndpointSecrets(changes);
     applyUiTheme();
     // 记录为“已保存”（脱敏形态，与广播/落盘一致），避免收到自身广播回声时重复 apply / 再次广播
     lastSavedJson = JSON.stringify(stripSecrets(config));
     // 跨窗同步/导入同样物理清除废弃的“关闭思考”键（stripReasoningArtifacts），
     // 保证两端内存与 localStorage 均不再出现这些键，行为恒为 auto。
-  } catch {
-    /* ignore */
+    return changes;
+  } catch (e) {
+    // F9：坏 JSON/结构异常可感知但不打断调用方；返回空 changes 表示未应用。
+    console.error("[config] applyConfigJson failed:", e);
+    return { webdav: false, profileIds: [] };
+  }
+}
+
+/**
+ * H13：把 host 变化端点的残留密文清空（覆盖「备份里自带密文」的路径，
+ * 防止下一次同步/对话把本机已存凭据发往备份里的新主机）。
+ */
+export function dropChangedEndpointSecrets(changes: EndpointSecretChanges): void {
+  if (!changes) return;
+  if (changes.webdav) (config as any).webdav.pass = "";
+  for (const id of changes.profileIds) {
+    const p = ((config as any).ai?.profiles ?? []).find((x: any) => x && String(x.id) === id);
+    if (p) p.apiKey = "";
   }
 }
 
@@ -2555,33 +2737,76 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let lastSavedJson = "";
 // 上次已写入加密存储的凭据快照：去重，避免每次保存都重复加密/广播敏感信号。
 let lastSavedSecretsJson: string | null = null;
+// F9：配置写失败的一次性提示标记（localStorage 与 secret 各自独立，避免互相吞掉提示）。
+let localWriteWarned = false;
+let secretWriteWarned = false;
+/** 加密凭据是否已回填完成（secretsReady 的 finally 置真）。 */
+let secretsHydrated = false;
+/** 回填完成前被跳过的 secret 写入。 */
+let pendingSecretsWrite = false;
 
-/** 立即写盘并广播（端点切换等需要“即时生效”的场景）。 */
+/** 立即写盘并广播（端点切换等需要“即时生效”的场景）。
+ *  F9：子窗未同步主窗配置前只登记 pending，禁止写 localStorage/secret 与广播。 */
 export function saveConfigNow() {
   clearTimeout(saveTimer);
+  if (shouldSuppressConfigWrite(configSyncState())) {
+    pendingConfigWrite = true;
+    return;
+  }
+  writeConfigNow();
+}
+
+/** 真正落盘+广播（内部函数；flushPendingConfigWrite 在同步完成后调用）。 */
+function writeConfigNow() {
+  // 凭据单独加密落盘；localStorage 与跨窗广播只保留脱敏配置（绝不含明文密钥）。
+  // F9：拆开每一步的 try —— 旧实现一个 try 包住全部，localStorage/secret 失败无感知。
+  let json: string;
+  let secretsJson: string;
   try {
-    // 凭据单独加密落盘；localStorage 与跨窗广播只保留脱敏配置（绝不含明文密钥）。
-    const secretsJson = JSON.stringify(collectSecrets(config));
-    const json = JSON.stringify(stripSecrets(config));
+    json = JSON.stringify(stripSecrets(config));
+    secretsJson = JSON.stringify(collectSecrets(config));
+  } catch (e) {
+    console.error("[config] serialize failed:", e);
+    return;
+  }
+  try {
     localStorage.setItem(KEY, json);
-    // 先广播脱敏 config（含新增/删除的端点列表），再发敏感信号：
-    // 保证其它窗口先拿到新的 profiles/services，随后才能按 id 正确回填其密钥。
-    if (json !== lastSavedJson) {
-      lastSavedJson = json;
-      void import("@tauri-apps/api/event")
-        .then((m) => m.emit("tidepage-config", json))
-        .catch(() => {});
+  } catch (e) {
+    console.error("[config] localStorage write failed:", e);
+    if (!localWriteWarned) {
+      localWriteWarned = true;
+      notifySaveFailed();
     }
-    if (secretsJson !== lastSavedSecretsJson) {
-      lastSavedSecretsJson = secretsJson;
-      void api.secretWrite(secretsJson).catch(() => {});
-      // 无载荷信号：各窗（含自身）收到后重读加密存储并回填。
-      void import("@tauri-apps/api/event")
-        .then((m) => m.emit("tidepage-secrets-changed", null))
-        .catch(() => {});
-    }
-  } catch {
-    /* ignore */
+  }
+  // 先广播脱敏 config（含新增/删除的端点列表），再发敏感信号：
+  // 保证其它窗口先拿到新的 profiles/services，随后才能按 id 正确回填其密钥。
+  if (json !== lastSavedJson) {
+    lastSavedJson = json;
+    void import("@tauri-apps/api/event")
+      .then((m) => m.emit("tidepage-config", json))
+      .catch(() => {});
+  }
+  // F9：密钥回填完成前 collectSecrets 是空的，此时写 secret 会把已存凭据整体覆盖成空。
+  // 先照常写脱敏配置/广播，只登记待补写；secretsReady 完成后重新取当时值补写。
+  if (!canWriteSecrets(secretsHydrated)) {
+    pendingSecretsWrite = true;
+    return;
+  }
+  if (secretsJson !== lastSavedSecretsJson) {
+    lastSavedSecretsJson = secretsJson;
+    void api
+      .secretWrite(secretsJson)
+      .catch((e: unknown) => {
+        console.error("[config] secret write failed:", e);
+        if (!secretWriteWarned) {
+          secretWriteWarned = true;
+          notifySaveFailed();
+        }
+      });
+    // 无载荷信号：各窗（含自身）收到后重读加密存储并回填。
+    void import("@tauri-apps/api/event")
+      .then((m) => m.emit("tidepage-secrets-changed", null))
+      .catch(() => {});
   }
 }
 
@@ -2596,6 +2821,16 @@ void import("@tauri-apps/api/event")
   .then((m) =>
     m.listen<string>("tidepage-config", (e) => {
       if (e.payload && e.payload !== lastSavedJson) applyConfigJson(e.payload);
+      // F9：子窗收到主窗配置即视为已同步，并补执行被抑制的写入。
+      if (!isMainWindow && labelResolved && !configSynced) {
+        configSynced = true;
+        if (configSyncWarnTimer) {
+          clearTimeout(configSyncWarnTimer);
+          configSyncWarnTimer = undefined;
+        }
+        // F9：先等本窗密钥回填（secretsReady）再补写，避免用空密钥覆盖共享的 secret.config。
+        void secretsReady.then(() => flushPendingConfigWrite());
+      }
     }),
   )
   .catch(() => {});
@@ -3122,12 +3357,34 @@ export async function listWindowLabels(): Promise<string[]> {
   }
 }
 
-export const pendingOpen = $state({ bookId: 0, nonce: 0 });
+/** F6：待打开书籍。jumpChapter 由搜索命中写入，Reader 在章节加载完成后消费（不再用固定延时）。 */
+export const pendingOpen = $state({ bookId: 0, nonce: 0, jumpChapter: null as number | null });
 
-export function requestOpenBook(bookId: number) {
+export function requestOpenBook(bookId: number, jumpChapter: number | null = null) {
   pendingOpen.bookId = bookId;
+  pendingOpen.jumpChapter = jumpChapter;
   pendingOpen.nonce++;
   ui.view = "reader";
+}
+
+/** F6-H2：独立笔记窗请求主窗打开原书的事件名（emitTo("main", ...)）。 */
+export const OPEN_BOOK_EVENT = "tidepage-open-book-request";
+
+/**
+ * F6-H2：从独立面板窗请求主窗打开原书。
+ * 面板窗没有阅读器，直接 requestOpenBook 只会在本窗改状态（静默无效）；
+ * 主窗不存在或事件发送失败返回 false，调用方给可见提示。
+ */
+export async function requestOpenBookFromPanel(bookId: number): Promise<boolean> {
+  try {
+    const wins = await getAllWebviewWindows();
+    if (!wins.some((w) => w.label === "main")) return false;
+    const { emitTo } = await import("@tauri-apps/api/event");
+    await emitTo("main", OPEN_BOOK_EVENT, { bookId });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function openBook(
@@ -3184,6 +3441,20 @@ export const confirmBox = $state<{
 let confirmResolve: ((v: boolean) => void) | null = null;
 
 export function appConfirm(msg: string, opts?: { detail?: ConfirmDetailRow[] }): Promise<boolean> {
+  // 确认框与多动作框互斥：两个弹窗同时 active 会在屏幕上叠成两层（删除重复书可选副本时可能连续触发）。
+  if (choiceResolve) {
+    const staleChoice = choiceResolve;
+    choiceResolve = null;
+    choiceBox.active = false;
+    staleChoice(null);
+  }
+  // F9：同一时刻只有一个确认框；旧的未决 Promise 必须先 resolve(false)，
+  // 否则旧调用方会永久挂起（新对话框覆盖了它的 resolve 引用）。
+  if (confirmResolve) {
+    const stale = confirmResolve;
+    confirmResolve = null;
+    stale(false);
+  }
   confirmBox.msg = msg;
   confirmBox.detail = opts?.detail ?? null;
   confirmBox.active = true;
@@ -3204,6 +3475,8 @@ export interface ConfirmAction {
   label: string;
   /** primary=主按钮 / danger=危险动作 / plain=普通。 */
   kind?: "primary" | "danger" | "plain";
+  /** true=放到弹窗底部操作行（如 全部删除/取消），不混在选项列表里。 */
+  footer?: boolean;
 }
 export const choiceBox = $state<{
   msg: string;
@@ -3214,6 +3487,19 @@ let choiceResolve: ((id: string | null) => void) | null = null;
 
 /** 弹出多动作确认框；返回被选动作 id，取消返回 null。 */
 export function appChoose(msg: string, actions: ConfirmAction[]): Promise<string | null> {
+  // 与 appConfirm 同理：打开多动作框前先结束未决的普通确认框，避免两层弹窗叠加。
+  if (confirmResolve) {
+    const staleConfirm = confirmResolve;
+    confirmResolve = null;
+    confirmBox.active = false;
+    staleConfirm(false);
+  }
+  // F9：同 appConfirm：旧选择框的调用方以 null 结束，不得悬挂。
+  if (choiceResolve) {
+    const stale = choiceResolve;
+    choiceResolve = null;
+    stale(null);
+  }
   choiceBox.msg = msg;
   choiceBox.actions = actions;
   choiceBox.active = true;

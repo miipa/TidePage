@@ -30,6 +30,13 @@ const MAGIC: &[u8; 4] = b"TPPC";
 const FORMAT_VERSION: u8 = 1;
 const FLAG_ZLIB: u8 = 1;
 const CACHE_EXT: &str = ".tpc";
+/// K28：解析缓存独立版本，与 txt rules_ver 解耦。
+/// txt rules_ver 会随编码/切分规则变化频繁递增；缓存格式/解析语义没变时不应该全量失效。
+/// 初值 1：本轮首次引入，旧缓存文件名里没有这个语义（等同失效一次）。
+/// 以后只有在缓存格式或解析结果语义不兼容时才递增；txt 规则变化只影响 L1 内存缓存。
+pub const CACHE_RULES_VER: u64 = 1;
+/// K27：陈旧临时文件阈值（1 天）。写缓存是原子 rename，超过该时长仍未 rename 的是异常残留。
+const TMP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// 解析缓存总预算（2GB）：单条就可能几百 MB，预算只防无限增长，不做精细配额。
 /// 写后扫描目录按 mtime 从旧到新淘汰；刚写入的那条不删（即使单条已超预算，避免写后即删的抖动）。
 pub const PARSE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -298,14 +305,16 @@ fn decode_cache_bytes(bytes: &[u8], key: CacheKey) -> Option<ParsedDoc> {
     if payload.len() as u64 != payload_len {
         return None;
     }
-    let raw: Vec<u8> = if flags & FLAG_ZLIB != 0 {
+    if flags & FLAG_ZLIB != 0 {
+        // 压缩命中：必须解压出一份缓冲；解压后直接借该缓冲解码，不再复制第二份。
         let mut out = Vec::new();
         ZlibDecoder::new(payload).read_to_end(&mut out).ok()?;
-        out
+        decode_payload(&out)
     } else {
-        payload.to_vec()
-    };
-    decode_payload(&raw)
+        // P2-7：未压缩命中直接借读文件缓冲解码，删除 payload.to_vec() 的整份复制
+        // （TXT 60~80MB 每次命中都多一份瞬时拷贝）；bytes 在函数内保持存活，借用安全。
+        decode_payload(payload)
+    }
 }
 
 /// 写解析缓存（先写 .tmp 再 rename 原子替换）；成功后清理同书旧文件并做预算淘汰。
@@ -352,8 +361,7 @@ pub fn write_cache(
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::rename(&tmp, &path)?;
     }
-    prune_stale(dir, key);
-    enforce_budget(dir, &path);
+    finish_cache_write(dir, key, &path);
     Ok(path)
 }
 
@@ -456,8 +464,7 @@ pub fn write_cache_uncompressed(
         }
         return Err(e);
     }
-    prune_stale(dir, key);
-    enforce_budget(dir, &path);
+    finish_cache_write(dir, key, &path);
     Ok(path)
 }
 
@@ -525,6 +532,7 @@ fn touch(path: &Path) {
 }
 
 /// 扫描目录里的解析缓存条目（忽略无法解析的文件名/读不到属性的文件）。
+#[allow(dead_code)]
 pub fn scan_entries(dir: &Path) -> Vec<CacheEntry> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -573,14 +581,85 @@ pub fn plan_evictions(entries: &[CacheEntry], budget: u64, keep: Option<&Path>) 
     out
 }
 
-/// 删除同一本书的其它缓存文件（kind+book_id 相同、文件名不同＝旧规则版本或旧指纹）。
+/// P2-8：一次 read_dir + 一次 metadata 完成「同书旧文件清理 + tmp 清理（K27 语义）+ 预算淘汰」，
+/// 供两条写路径共用。旧实现 prune_stale(read_dir) + enforce_budget(prune_stale_tmp read_dir +
+/// scan_entries read_dir + 每文件 metadata) 共 3 轮目录枚举。
+/// K27 等价：同书 tmp 一律删；非本 key 的 .tmp 仅超过 TMP_MAX_AGE_SECS 才删（活跃 tmp 保留）；
+/// 同书旧 kind/规则版本/指纹文件删；无关文件保留；当前刚写入文件参与预算但不淘汰。
+fn finish_cache_write(dir: &Path, key: CacheKey, written: &Path) {
+    let now = SystemTime::now();
+    let current = key.file_name();
+    let tmp_prefix = format!("{}-{}-", key.kind, key.book_id);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<CacheEntry> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") {
+            let Ok(md) = e.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let same_book = name.starts_with(&tmp_prefix);
+            let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            // 时钟回拨/未来时间戳不删（与 prune_stale_tmp 一致）。
+            let stale = now.duration_since(modified).unwrap_or_default().as_secs() > TMP_MAX_AGE_SECS;
+            if same_book || stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+            continue;
+        }
+        let Some(k) = parse_file_name(&name) else { continue };
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        if k.kind == key.kind && k.book_id == key.book_id && name != current {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        entries.push(CacheEntry {
+            path: e.path(),
+            size: md.len(),
+            modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+    // 当前刚写入文件必须参与预算统计：rename 后正常情况下已在 entries 里；
+    // 若目录枚举竞态漏掉它，按已写入路径补齐（keep 语义保证它不被删）。
+    if !entries.iter().any(|e| e.path == written) {
+        if let Ok(md) = std::fs::metadata(written) {
+            entries.push(CacheEntry {
+                path: written.to_path_buf(),
+                size: md.len(),
+                modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+    for p in plan_evictions(&entries, PARSE_CACHE_BUDGET_BYTES, Some(written)) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 删除同一本书的其它缓存文件（kind+book_id 相同、文件名不同＝旧规则版本或旧指纹），
+/// 以及同一本书遗留的 .tmp（写缓存中途崩溃/被杀留下的半成品）。
+#[allow(dead_code)]
 fn prune_stale(dir: &Path, key: CacheKey) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     let current = key.file_name();
+    let tmp_prefix = format!("{}-{}-", key.kind, key.book_id);
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") {
+            // 同书 tmp：无论年龄都删（本次写入自己的 tmp 还没 rename，但 name 前缀相同；
+            // 只删非当前进程正在写的？无法区分——写入方在 rename 前不会再调用 prune，故安全）。
+            if name.starts_with(&tmp_prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+            continue;
+        }
         if let Some(k) = parse_file_name(&name) {
             if k.kind == key.kind && k.book_id == key.book_id && name != current {
                 let _ = std::fs::remove_file(e.path());
@@ -589,26 +668,78 @@ fn prune_stale(dir: &Path, key: CacheKey) {
     }
 }
 
+/// K27：清理超过 TMP_MAX_AGE_SECS 的遗留 .tmp（mtime 阈值），返回删除数量。
+/// 活跃写入的 tmp 刚创建、mtime 新，不会被误删；统计 cache_bytes 只算 .tpc，tmp 不计入。
+pub fn prune_stale_tmp(dir: &Path, now: SystemTime) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        // 时钟回拨/未来时间戳不删，避免误删活跃文件。
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age.as_secs() > TMP_MAX_AGE_SECS && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[allow(dead_code)]
 fn enforce_budget(dir: &Path, keep: &Path) {
+    // K27：顺带清理一天前的遗留 tmp（失败不影响预算淘汰）。
+    let _ = prune_stale_tmp(dir, SystemTime::now());
     let entries = scan_entries(dir);
     for p in plan_evictions(&entries, PARSE_CACHE_BUDGET_BYTES, Some(keep)) {
         let _ = std::fs::remove_file(p);
     }
 }
 
-/// 删除某本书的全部解析缓存文件（删书/清理资源时调用）。
-pub fn cleanup_book(dir: &Path, book_id: i64) {
+/// 批量删除多本书的全部解析缓存文件（删书/清理资源时调用）。
+/// S1：只 read_dir 一次再按 book_id 集合判断——旧实现逐本调用 cleanup_book，
+/// 每次全目录扫描，批量删 N 本书就是 N 次 read_dir。
+pub fn cleanup_books(dir: &Path, ids: &[i64]) {
+    if ids.is_empty() {
+        return;
+    }
+    let targets: std::collections::HashSet<i64> = ids.iter().copied().collect();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") {
+            // K27：同书遗留 tmp 也一并清理（前缀 {kind}-{book_id}-）。
+            let hit = ids.iter().any(|id| {
+                name.starts_with(&format!("{KIND_TXT}-{id}-")) || name.starts_with(&format!("{KIND_MOBI}-{id}-"))
+            });
+            if hit {
+                let _ = std::fs::remove_file(e.path());
+            }
+            continue;
+        }
         if let Some(k) = parse_file_name(&name) {
-            if k.book_id == book_id {
+            if targets.contains(&k.book_id) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
     }
+}
+
+/// 删除某本书的全部解析缓存文件（单本入口保留兼容，内部走批量实现）。
+/// 生产路径已统一走 cleanup_books；保留单本入口供测试/未来调用。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn cleanup_book(dir: &Path, book_id: i64) {
+    cleanup_books(dir, &[book_id]);
 }
 
 #[cfg(test)]
@@ -859,4 +990,134 @@ mod tests {
         assert_eq!(bytes[6] & 1, 0, "异步写不压缩（flags bit0=0）");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// S1：批量清理只删目标书的全部缓存文件，保留无关文件；空 ids 不 panic。
+    #[test]
+    fn cleanup_books_batch_removes_only_target_books() {
+        let dir = tmp_dir("cleanup-batch");
+        let a1 = key(KIND_TXT, 21, 1, 10, 20);
+        let a2 = key(KIND_MOBI, 21, 2, 11, 21);
+        let b = key(KIND_TXT, 22, 1, 10, 20);
+        let c = key(KIND_MOBI, 23, 1, 10, 20);
+        write_cache(&dir, a1, "a1", &[(0, 2)], &[], None).unwrap();
+        write_cache(&dir, a2, "a2", &[(0, 2)], &[], None).unwrap();
+        write_cache(&dir, b, "b", &[(0, 1)], &[], None).unwrap();
+        write_cache(&dir, c, "c", &[(0, 1)], &[], None).unwrap();
+        let unrelated = dir.join("keep.txt");
+        std::fs::write(&unrelated, b"x").unwrap();
+        cleanup_books(&dir, &[21, 22]);
+        assert!(read_cache(&dir, a1).is_none(), "目标书旧指纹文件应删除");
+        assert!(read_cache(&dir, a2).is_none(), "目标书全部类型应删除");
+        assert!(read_cache(&dir, b).is_none(), "目标书 22 应删除");
+        assert!(read_cache(&dir, c).is_some(), "非目标书不得删除");
+        assert!(unrelated.exists(), "无关文件不得删除");
+        cleanup_books(&dir, &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// K27：超过 1 天的遗留 tmp 被清理，新创建的活跃 tmp 保留。
+    #[test]
+    fn prune_stale_tmp_removes_only_old() {
+        let dir = tmp_dir("tmp_old");
+        let old = dir.join("1-5-1-10-20.123.456.tmp");
+        let fresh = dir.join("1-6-1-10-20.123.456.tmp");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&fresh, b"x").unwrap();
+        let old_time = SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let fh = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        fh.set_modified(old_time).unwrap();
+        drop(fh);
+        let n = prune_stale_tmp(&dir, SystemTime::now());
+        assert_eq!(n, 1, "只清理陈旧 tmp");
+        assert!(!old.exists(), "陈旧 tmp 应被删除");
+        assert!(fresh.exists(), "活跃 tmp 不得误删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// K27：cleanup_books 连带清理同书遗留 tmp，不动其它书。
+    #[test]
+    fn cleanup_books_removes_same_book_tmp() {
+        let dir = tmp_dir("tmp_cleanup");
+        let same = dir.join("1-21-1-10-20.1.2.tmp");
+        let other = dir.join("1-22-1-10-20.1.2.tmp");
+        std::fs::write(&same, b"x").unwrap();
+        std::fs::write(&other, b"x").unwrap();
+        cleanup_books(&dir, &[21]);
+        assert!(!same.exists(), "同书 tmp 应删除");
+        assert!(other.exists(), "其它书 tmp 不得删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// K28：磁盘缓存版本与 txt 规则解耦；版本不同不命中，写新版清理旧文件；
+    /// 文件头版本被篡改按未命中处理并删除。
+    #[test]
+    fn disk_cache_version_is_independent() {
+        let dir = tmp_dir("cache_ver");
+        let k1 = key(KIND_TXT, 31, CACHE_RULES_VER, 10, 20);
+        write_cache(&dir, k1, "正文", &[(0, 6)], &[], None).unwrap();
+        assert!(read_cache(&dir, k1).is_some(), "同版本应命中");
+        let k2 = key(KIND_TXT, 31, CACHE_RULES_VER + 1, 10, 20);
+        assert!(read_cache(&dir, k2).is_none(), "不同版本不得命中");
+        write_cache(&dir, k2, "正文2", &[(0, 6)], &[], None).unwrap();
+        assert!(!dir.join(k1.file_name()).exists(), "写新版应清理同书旧版本文件");
+        // 篡改文件头里的 rules_ver（偏移 8..16）→ 未命中且文件被清理。
+        let p = dir.join(k2.file_name());
+        let mut b = std::fs::read(&p).unwrap();
+        b[8..16].copy_from_slice(&(CACHE_RULES_VER + 99).to_le_bytes());
+        std::fs::write(&p, &b).unwrap();
+        assert!(read_cache(&dir, k2).is_none(), "文件头版本不符必须拒绝");
+        assert!(!p.exists(), "版本不符文件应被清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-7：未压缩（flags=0）缓存命中仍能读回；写文件头 flags 为 0，命中路径走借用解码。
+    #[test]
+    fn uncompressed_cache_roundtrip_hit_path() {
+        let dir = tmp_dir("uncompressed");
+        let text = "第一章 未压缩缓存".to_string();
+        let ranges = vec![(0, text.len())];
+        let k = key(KIND_TXT, 3, 1, 100, 200);
+        let p = write_cache_uncompressed(&dir, k, &text, &ranges, &sample_toc(), None).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(bytes[6], 0, "未压缩写路径 flags 必须为 0");
+        let d = read_cache(&dir, k).expect("未压缩命中");
+        assert_eq!(d.text, text);
+        assert_eq!(d.ranges, ranges);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-8：单趟 finish_cache_write：同书旧文件/同书 tmp/超龄 tmp 删除，无关文件与活跃 tmp 保留。
+    #[test]
+    fn finish_cache_write_single_pass_semantics() {
+        let dir = tmp_dir("finish");
+        let text = "正文";
+        let ranges = vec![(0, text.len())];
+        let k_old = key(KIND_TXT, 7, 1, 10, 20);
+        let p_old = write_cache_uncompressed(&dir, k_old, text, &ranges, &[], None).unwrap();
+        assert!(p_old.exists());
+        // 无关书：不得被删。
+        let k_other = key(KIND_TXT, 99, 1, 10, 20);
+        let p_other = write_cache_uncompressed(&dir, k_other, text, &ranges, &[], None).unwrap();
+        // 同书 tmp：无论年龄都删。
+        let same_tmp = dir.join(format!("{}-7-1-1-1.tpc.tmp", KIND_TXT));
+        std::fs::write(&same_tmp, b"x").unwrap();
+        // 超龄无关 tmp：删；活跃无关 tmp：保留。
+        let stale_tmp = dir.join(format!("{}-55-1-1-1.tpc.tmp", KIND_TXT));
+        std::fs::write(&stale_tmp, b"x").unwrap();
+        let fh = std::fs::OpenOptions::new().write(true).open(&stale_tmp).unwrap();
+        fh.set_modified(SystemTime::now() - std::time::Duration::from_secs(TMP_MAX_AGE_SECS + 3600))
+            .unwrap();
+        let active_tmp = dir.join(format!("{}-66-1-1-1.tpc.tmp", KIND_TXT));
+        std::fs::write(&active_tmp, b"x").unwrap();
+        // 新指纹写入同一本书 → 同一趟清理。
+        let k_new = key(KIND_TXT, 7, 2, 10, 20);
+        let p_new = write_cache_uncompressed(&dir, k_new, text, &ranges, &[], None).unwrap();
+        assert!(!p_old.exists(), "同书旧指纹文件应删除");
+        assert!(p_new.exists(), "当前写入文件必须保留");
+        assert!(p_other.exists(), "无关书缓存不得删除");
+        assert!(!same_tmp.exists(), "同书 tmp 必须删除");
+        assert!(!stale_tmp.exists(), "超龄 tmp 必须删除");
+        assert!(active_tmp.exists(), "活跃 tmp 不得删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

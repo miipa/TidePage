@@ -80,19 +80,59 @@ enum Job {
         dest: (u32, u32),
         reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
     },
+    /// L30：按书关闭。worker 一进程一本，book_id 仅用于日志/语义（None=全部由命令层展开）。
     Close {
+        book_id: Option<i64>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
 
-/// 当前活跃的渲染线程槽位。`None` = 还没起过，或上一条已被判废弃。
+/// L30：每本书一条渲染线程（一进程一本 PdfDocument），最近 MAX_BOOK_SLOTS 本保留，
+/// 超限/超 TTL 淘汰时主动发 Close 并丢弃投递端，让旧线程关闭文档后自行退出。
+/// 为什么不共享单线程：两窗口交替看书会在每页渲染时重新加载整份 PDF（数百 MB 映射）。
 #[cfg(all(windows, not(target_arch = "x86")))]
 struct Slot {
     tx: Sender<Job>,
     id: u64,
+    last_used: std::time::Instant,
 }
 #[cfg(all(windows, not(target_arch = "x86")))]
-static SLOT: Mutex<Option<Slot>> = Mutex::new(None);
+#[derive(Default)]
+struct BookSlots {
+    map: std::collections::HashMap<i64, Slot>,
+    /// 最近使用顺序（旧→新）；仅作淘汰候选，实际是否存活以 map 为准。
+    order: std::collections::VecDeque<i64>,
+}
+#[cfg(all(windows, not(target_arch = "x86")))]
+static SLOTS: Mutex<Option<BookSlots>> = Mutex::new(None);
+/// 同时保留的文档数上限：2 本（活跃书 + 上一本），再淘汰最久未用的。
+#[cfg(all(windows, not(target_arch = "x86")))]
+const MAX_BOOK_SLOTS: usize = 2;
+/// 空闲 TTL：10 分钟没碰过的书回收，避免多窗口长期占内存。
+#[cfg(all(windows, not(target_arch = "x86")))]
+const SLOT_TTL_SECS: u64 = 600;
+
+/// L30：Close 的纯目标决策（None=全部存活槽位；Some(id)=仅该书，未打开则空）。
+fn close_target_ids(slot_ids: &[i64], target: Option<i64>) -> Vec<i64> {
+    match target {
+        Some(id) => {
+            if slot_ids.contains(&id) {
+                vec![id]
+            } else {
+                Vec::new()
+            }
+        }
+        None => slot_ids.to_vec(),
+    }
+}
+
+/// L30：淘汰候选（order 中最旧且仍存活的），未超上限返回 None。
+fn eviction_candidate(order: &[i64], alive: &[i64], current: usize, max: usize) -> Option<i64> {
+    if current < max {
+        return None;
+    }
+    order.iter().copied().find(|id| alive.contains(id))
+}
 /// 已判定废弃、任其挂住的线程数（进程内累计，不回收）。
 #[cfg(all(windows, not(target_arch = "x86")))]
 static ABANDONED: AtomicUsize = AtomicUsize::new(0);
@@ -106,6 +146,35 @@ const ABANDON_LIMIT: usize = 3;
 
 /// Close 的等待上限：线程卡在别的 WinRT 调用里时，关闭也必须立刻返回。
 const CLOSE_TIMEOUT_MS: u64 = 2_000;
+/// P0-5：命令层按 Job 类型分档看门狗。同步 WinRT 调用（PageCount/GetPage/Size/ReadBytes）
+/// 没有内层超时，worker 一旦卡死 rrx.await 就会永久挂起。
+/// - Geometry（同步查询）20s；
+/// - Open 45s（内部 load 有 30s LOAD 超时 + 15s 余量）；
+/// - Render 90s（内部 RENDER 60s + 30s 余量）。
+const CALL_TIMEOUT_QUERY_MS: u64 = 20_000;
+const CALL_TIMEOUT_OPEN_MS: u64 = 45_000;
+const CALL_TIMEOUT_RENDER_MS: u64 = 90_000;
+
+/// P0-5：Job 类型 → 命令层超时（纯函数便于单测）。
+fn job_timeout_ms(kind: &str) -> u64 {
+    match kind {
+        "open" => CALL_TIMEOUT_OPEN_MS,
+        "render" => CALL_TIMEOUT_RENDER_MS,
+        _ => CALL_TIMEOUT_QUERY_MS,
+    }
+}
+
+impl Job {
+    fn call_timeout_ms(&self) -> u64 {
+        match self {
+            Job::Open { .. } => job_timeout_ms("open"),
+            Job::Render { .. } => job_timeout_ms("render"),
+            Job::Geometry { .. } => job_timeout_ms("geometry"),
+            // Close 不走 call()（由 close 命令直接发并自有 CLOSE_TIMEOUT_MS）。
+            Job::Close { .. } => CLOSE_TIMEOUT_MS,
+        }
+    }
+}
 /// 超时错误的内部标记：命令层据此判定「这条线程必须废弃」，返回前会把标记去掉。
 const TIMEOUT_PREFIX: &str = "native_timeout:";
 
@@ -139,14 +208,15 @@ const ABANDONED_LIMIT: &str = "pdf_native_abandoned";
 /// 取（必要时起）渲染线程的投递端。
 /// 32 位 / 非 Windows：直接拒绝，不起线程（见 imp 门控）。
 #[cfg(not(all(windows, not(target_arch = "x86"))))]
-fn slot() -> Result<(Sender<Job>, u64), String> {
+fn slot(_book_id: i64) -> Result<(Sender<Job>, u64), String> {
     Err(UNSUPPORTED.to_string())
 }
 
 #[cfg(not(all(windows, not(target_arch = "x86"))))]
-fn slot_if_live() -> Option<(Sender<Job>, u64)> {
-    None
+fn live_targets(_book_id: Option<i64>) -> Vec<(Sender<Job>, u64)> {
+    Vec::new()
 }
+
 
 #[cfg(not(all(windows, not(target_arch = "x86"))))]
 fn abandon(_id: u64, _reason: &str) {}
@@ -160,10 +230,57 @@ fn trim_process_ws() {}
 fn start_trim_bg() {}
 
 #[cfg(all(windows, not(target_arch = "x86")))]
-fn slot() -> Result<(Sender<Job>, u64), String> {
-    let mut guard = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = guard.as_ref() {
+fn slot(book_id: i64) -> Result<(Sender<Job>, u64), String> {
+    let mut guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let slots = guard.get_or_insert_with(BookSlots::default);
+    // TTL 回收：过期书主动 Close 并移除（发送失败说明线程已退，直接丢槽位）。
+    let now = std::time::Instant::now();
+    let expired: Vec<i64> = slots
+        .map
+        .iter()
+        .filter(|(_, s)| now.duration_since(s.last_used).as_secs() > SLOT_TTL_SECS)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in expired {
+        if let Some(s) = slots.map.remove(&id) {
+            let (rtx, _rrx) = tokio::sync::oneshot::channel();
+            let _ = s.tx.send(Job::Close { book_id: Some(id), reply: rtx });
+            slots.order.retain(|x| *x != id);
+            memlog::stage_note("native:slot_ttl", &format!("book={id} ttl={SLOT_TTL_SECS}s"));
+        }
+    }
+    if let Some(s) = slots.map.get_mut(&book_id) {
+        s.last_used = now;
+        slots.order.retain(|x| *x != book_id);
+        slots.order.push_back(book_id);
         return Ok((s.tx.clone(), s.id));
+    }
+    // 容量淘汰：按 order 找最旧存活项，主动发 Close 并丢弃槽位（worker 收 Close 后关闭文档，
+    // 投递端全丢弃后线程 recv 结束自行退出）。
+    let alive: Vec<i64> = slots.map.keys().copied().collect();
+    while slots.map.len() >= MAX_BOOK_SLOTS {
+        let Some(old) = eviction_candidate(
+            &slots.order.iter().copied().collect::<Vec<_>>(),
+            &alive,
+            slots.map.len(),
+            MAX_BOOK_SLOTS,
+        ) else {
+            break;
+        };
+        if let Some(s) = slots.map.remove(&old) {
+            let (rtx, _rrx) = tokio::sync::oneshot::channel();
+            let _ = s.tx.send(Job::Close { book_id: Some(old), reply: rtx });
+            memlog::stage_note(
+                "native:slot_evict",
+                &format!("evict={old} for={book_id} max={MAX_BOOK_SLOTS}"),
+            );
+        }
+        slots.order.retain(|x| *x != old);
+        let alive: Vec<i64> = slots.map.keys().copied().collect();
+        if slots.map.len() < MAX_BOOK_SLOTS {
+            break;
+        }
+        let _ = alive;
     }
     let n_abandoned = ABANDONED.load(Ordering::Relaxed);
     if n_abandoned >= ABANDON_LIMIT {
@@ -188,15 +305,32 @@ fn slot() -> Result<(Sender<Job>, u64), String> {
             &format!("id={id} abandoned={n_abandoned}"),
         );
     }
-    *guard = Some(Slot { tx: tx.clone(), id });
+    slots.map.insert(
+        book_id,
+        Slot {
+            tx: tx.clone(),
+            id,
+            last_used: now,
+        },
+    );
+    slots.order.retain(|x| *x != book_id);
+    slots.order.push_back(book_id);
     Ok((tx, id))
 }
 
 /// 只取现存槽位，不起新线程（Close 用：没有活线程就该立刻成功）。
+/// None=全部书；Some(id)=仅该书。
 #[cfg(all(windows, not(target_arch = "x86")))]
-fn slot_if_live() -> Option<(Sender<Job>, u64)> {
-    let guard = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().map(|s| (s.tx.clone(), s.id))
+fn live_targets(book_id: Option<i64>) -> Vec<(Sender<Job>, u64)> {
+    let guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slots) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let ids = close_target_ids(&slots.map.keys().copied().collect::<Vec<_>>(), book_id);
+    ids.into_iter()
+        .filter_map(|id| slots.map.get(&id).map(|s| (id, s.tx.clone(), s.id)))
+        .map(|(_, tx, id)| (tx, id))
+        .collect()
 }
 
 /// 判定某条线程废弃：清掉槽位（下次请求另起新线程），并记账。
@@ -249,9 +383,17 @@ fn start_trim_bg() {
 #[cfg(all(windows, not(target_arch = "x86")))]
 fn abandon(id: u64, reason: &str) {
     {
-        let mut guard = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.as_ref().map(|s| s.id) == Some(id) {
-            *guard = None;
+        let mut guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slots) = guard.as_mut() {
+            let book = slots
+                .map
+                .iter()
+                .find(|(_, s)| s.id == id)
+                .map(|(b, _)| *b);
+            if let Some(book) = book {
+                slots.map.remove(&book);
+                slots.order.retain(|x| *x != book);
+            }
         }
     }
     let n = ABANDONED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -354,38 +496,69 @@ mod imp {
         ))
     }
 
+    /// 当前打开的原生文档 + 建立句柄时的文件指纹。
+    /// 同路径 PDF 被替换/重导/WebDAV 下载后 book_id 不变，只按 id 复用会一直显示旧内容。
+    struct CurDoc {
+        book_id: i64,
+        path: String,
+        stamp: Option<(i64, i64)>,
+        doc: PdfDocument,
+    }
+
+    /// 复用判定的纯逻辑：book_id、路径、文件指纹三者全同才复用。
+    /// 抽成不依赖 CurDoc 的形态，便于单测（PdfDocument 无法在单测里构造）。
+    fn same_doc_key(
+        cached: Option<(i64, &str, Option<(i64, i64)>)>,
+        book_id: i64,
+        path: &str,
+        stamp: Option<(i64, i64)>,
+    ) -> bool {
+        matches!(cached, Some((b, p, s)) if b == book_id && p == path && s == stamp)
+    }
+
     fn open_doc(
-        cur: &mut Option<(i64, PdfDocument)>,
+        cur: &mut Option<CurDoc>,
         book_id: i64,
         path: &Path,
     ) -> Result<u32, String> {
-        if cur.as_ref().map(|(b, _)| *b) != Some(book_id) {
+        let path_s = path.to_string_lossy().into_owned();
+        // 每次调用都现取指纹：文件被就地替换时必须丢弃旧句柄（旧内容、旧页树）。
+        let stamp = crate::library::file_stamp(&path_s);
+        let cached = cur
+            .as_ref()
+            .map(|c| (c.book_id, c.path.as_str(), c.stamp));
+        if !same_doc_key(cached, book_id, &path_s, stamp) {
             // PdfDocument 没有 IClosable::Close 投影：丢掉句柄即释放文档（页面位图从来不在这层缓存）
             cur.take();
             let doc = load(path)?;
             let n = doc.PageCount().map_err(|e| format!("读取页数失败：{e}"))?;
-            *cur = Some((book_id, doc));
+            *cur = Some(CurDoc {
+                book_id,
+                path: path_s,
+                stamp,
+                doc,
+            });
             return Ok(n);
         }
         cur.as_ref()
             .unwrap()
-            .1
+            .doc
             .PageCount()
             .map_err(|e| format!("读取页数失败：{e}"))
     }
 
     fn current<'a>(
-        cur: &'a Option<(i64, PdfDocument)>,
+        cur: &'a Option<CurDoc>,
         book_id: i64,
     ) -> Result<&'a PdfDocument, String> {
         match cur {
-            Some((b, d)) if *b == book_id => Ok(d),
+            Some(c) if c.book_id == book_id => Ok(&c.doc),
             _ => Err("原生文档未打开".to_string()),
         }
     }
 
     fn geometry(
-        cur: &mut Option<(i64, PdfDocument)>,
+        cur: &mut Option<CurDoc>,
         book_id: i64,
         path: &Path,
         page: u32,
@@ -407,9 +580,27 @@ mod imp {
         r
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// P1-1：前端裁切矩形（页面 pt）→ WinRT SourceRect 的页面 DIP。
+/// 负 x/y 钳到 0（页面外区域不渲染）；宽/高非正或非有限值返回可读错误。
+pub(super) fn pt_rect_to_dip(x: f32, y: f32, w: f32, h: f32) -> Result<(f32, f32, f32, f32), String> {
+    if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() {
+        return Err("裁切区域包含非法数值".into());
+    }
+    if w <= 0.0 || h <= 0.0 {
+        return Err(format!("裁切区域尺寸无效：{w}x{h}"));
+    }
+    const PT_TO_DIP: f32 = 96.0 / 72.0;
+    Ok((
+        (x * PT_TO_DIP).max(0.0),
+        (y * PT_TO_DIP).max(0.0),
+        w * PT_TO_DIP,
+        h * PT_TO_DIP,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
     fn render(
-        cur: &mut Option<(i64, PdfDocument)>,
+        cur: &mut Option<CurDoc>,
         book_id: i64,
         path: &Path,
         page: u32,
@@ -426,7 +617,9 @@ mod imp {
             .GetPage(page)
             .map_err(|e| format!("读取第 {} 页失败：{e}", page + 1))?;
         let out = (|| -> Result<Vec<u8>, String> {
-            let (x, y, w, h) = src;
+            // P1-1：frontend 传的是 pt（geometry 已 DIP→pt）；WinRT SetSourceRect 的坐标系是
+            // 页面 DIP。不转回 DIP 会把裁剪区域缩小 3/4、内容放大 33%。真机截图对比未验证。
+            let (x, y, w, h) = pt_rect_to_dip(src.0, src.1, src.2, src.3)?;
             let stream =
                 InMemoryRandomAccessStream::new().map_err(|e| format!("创建内存流失败：{e}"))?;
             let opts = PdfPageRenderOptions::new().map_err(|e| format!("创建渲染参数失败：{e}"))?;
@@ -489,14 +682,14 @@ mod imp {
         }
     }
 
-    fn close_doc(cur: &mut Option<(i64, PdfDocument)>) {
+    fn close_doc(cur: &mut Option<CurDoc>) {
         cur.take();
         trim_ws();
     }
 
     pub(super) fn run(rx: Receiver<Job>) {
         ensure_apartment();
-        let mut cur: Option<(i64, PdfDocument)> = None;
+        let mut cur: Option<CurDoc> = None;
         while let Ok(job) = rx.recv() {
             match job {
                 Job::Open { book_id, path, reply } => {
@@ -520,13 +713,62 @@ mod imp {
                 } => {
                     let _ = reply.send(render(&mut cur, book_id, &path, page, src, dest));
                 }
-                Job::Close { reply } => {
+                Job::Close { book_id, reply } => {
+                    // L30：本 worker 只服务一本书；book_id 仅用于诊断日志。
+                    memlog::stage_note(
+                        "native:close_doc",
+                        &format!("worker book={book_id:?}"),
+                    );
                     close_doc(&mut cur);
                     let _ = reply.send(Ok(()));
                 }
             }
         }
         close_doc(&mut cur);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::same_doc_key;
+
+        /// book_id、路径、指纹任一不同（或旧句柄缺失/指纹取不到）都必须重新加载。
+        #[test]
+        fn same_doc_key_requires_identity_path_and_stamp() {
+            let cached = Some((7i64, "C:\\books\\a.pdf", Some((1024i64, 1_700_000_000_000i64))));
+            assert!(same_doc_key(cached, 7, "C:\\books\\a.pdf", Some((1024, 1_700_000_000_000))));
+            // 换书
+            assert!(!same_doc_key(cached, 8, "C:\\books\\a.pdf", Some((1024, 1_700_000_000_000))));
+            // 换路径
+            assert!(!same_doc_key(cached, 7, "C:\\books\\b.pdf", Some((1024, 1_700_000_000_000))));
+            // 文件被替换：size 或 mtime 变化
+            assert!(!same_doc_key(cached, 7, "C:\\books\\a.pdf", Some((1025, 1_700_000_000_000))));
+            assert!(!same_doc_key(cached, 7, "C:\\books\\a.pdf", Some((1024, 1_700_000_000_001))));
+            // 当前文件取不到指纹 / 尚无句柄
+            assert!(!same_doc_key(cached, 7, "C:\\books\\a.pdf", None));
+            assert!(!same_doc_key(None, 7, "C:\\books\\a.pdf", Some((1024, 1_700_000_000_000))));
+        }
+
+        use crate::pdfnative::{close_target_ids, eviction_candidate, job_timeout_ms};
+
+        /// L30：Close 目标决策与淘汰候选（纯函数）。
+        #[test]
+        fn close_and_eviction_targets() {
+            assert_eq!(close_target_ids(&[1, 2], Some(1)), vec![1]);
+            assert!(close_target_ids(&[1, 2], Some(3)).is_empty());
+            assert_eq!(close_target_ids(&[1, 2], None), vec![1, 2]);
+            assert_eq!(eviction_candidate(&[1], &[1], 1, 2), None);
+            assert_eq!(eviction_candidate(&[5, 6], &[5, 6], 2, 2), Some(5));
+            assert_eq!(eviction_candidate(&[3, 4], &[4], 1, 1), Some(4));
+        }
+
+        /// P0-5：Job→超时映射与内层超时的关系（纯函数；真实挂死无法单测）。
+        #[test]
+        fn job_timeout_mapping() {
+            assert_eq!(job_timeout_ms("open"), 45_000);
+            assert_eq!(job_timeout_ms("render"), 90_000);
+            assert_eq!(job_timeout_ms("geometry"), 20_000);
+            assert_eq!(job_timeout_ms("other"), 20_000, "未知类型按查询档保守处理");
+        }
     }
 }
 
@@ -559,7 +801,7 @@ async fn call_for_book<T, F>(book_id: i64, build: F) -> Result<T, String>
 where
     F: FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> Job,
 {
-    let r = call(build).await;
+    let r = call(book_id, build).await;
     if let Err(e) = &r {
         // 只有"超时/线程已退出"这类**引擎级**失败才判死；文件损坏之类的普通错误不判死
         // （那是确定性失败，前端会照常展示错误，不需要记忆）。
@@ -574,20 +816,24 @@ where
     r
 }
 
-async fn call<T, F>(build: F) -> Result<T, String>
+async fn call<T, F>(book_id: i64, build: F) -> Result<T, String>
 where
     F: FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> Job,
 {
-    let (tx, id) = slot()?;
+    let (tx, id) = slot(book_id)?;
     let (rtx, rrx) = tokio::sync::oneshot::channel();
-    if tx.send(build(rtx)).is_err() {
+    let job = build(rtx);
+    // P0-5：Job 类型决定看门狗时长；与 wait_op 的内层超时是两层保护（内层先到按普通
+    // 错误返回；内层被同步 COM 调用卡住时，这里到点放弃线程，保证命令层不永久挂起）。
+    let timeout_ms = job.call_timeout_ms();
+    if tx.send(job).is_err() {
         // 投递失败 = 线程已不在收件：当作废弃，下一次请求自会另起新线程。
         abandon(id, "send-failed");
         return Err("原生渲染线程已退出".to_string());
     }
-    match rrx.await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => {
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rrx).await {
+        Ok(Ok(Ok(v))) => Ok(v),
+        Ok(Ok(Err(e))) => {
             if let Some(rest) = e.strip_prefix(TIMEOUT_PREFIX) {
                 memlog::stage_note("native:timeout", &format!("id={id} err={rest}"));
                 abandon(id, "timeout");
@@ -596,9 +842,29 @@ where
                 Err(e)
             }
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             abandon(id, "reply-dropped");
             Err("原生渲染线程已退出".to_string())
+        }
+        Err(_) => {
+            memlog::stage_note(
+                "native:call_timeout",
+                &format!(
+                    "id={id} book={book_id} timeout={timeout_ms}ms ws={}MB",
+                    memlog::ws_mb()
+                ),
+            );
+            // best-effort Close：线程大概率卡在同步 COM 调用里，Close 不会立即生效；
+            // 这里只保证「槽位被放弃、后续请求快速失败/另起线程」，不等待回复。
+            let (ctx, _crx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Job::Close {
+                book_id: Some(book_id),
+                reply: ctx,
+            });
+            abandon(id, "call-timeout");
+            Err(format!(
+                "原生渲染超时（{timeout_ms}ms），已放弃该文档，请重试"
+            ))
         }
     }
 }
@@ -687,30 +953,60 @@ pub async fn pdf_native_render_page(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// 关闭当前原生文档（关书/换书时调用）。
-/// 没有活线程时直接成功：从未打开过，或上一条线程已被判废弃 —— 此时文档句柄随那条挂住的
-/// 线程一起丢弃，调用方不该等任何人。等待也带上限：线程卡住时关闭必须立刻返回。
+/// L30：关闭原生文档（关书/换书时调用）。
+/// book_id=None 保持旧行为：关闭全部已打开文档（兼容旧前端无参 invoke）；
+/// Some(id) 只关对应书，双窗口互不影响。没有对应活线程时直接成功。
 #[tauri::command]
-pub async fn pdf_native_close() -> Result<(), String> {
-    let (tx, id) = match slot_if_live() {
-        Some(v) => v,
-        None => {
-            memlog::stage_note("cmd:pdf_native_close", "skipped: no live worker");
-            return Ok(());
-        }
-    };
-    let (rtx, rrx) = tokio::sync::oneshot::channel();
-    if tx.send(Job::Close { reply: rtx }).is_err() {
-        abandon(id, "send-failed");
+pub async fn pdf_native_close(book_id: Option<i64>) -> Result<(), String> {
+    let targets = live_targets(book_id);
+    if targets.is_empty() {
+        memlog::stage_note("cmd:pdf_native_close", "skipped: no live worker");
         return Ok(());
     }
-    match tokio::time::timeout(std::time::Duration::from_millis(CLOSE_TIMEOUT_MS), rrx).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(e))) => Err(e),
-        _ => {
-            memlog::stage_note("native:timeout", &format!("id={id} err=close"));
-            abandon(id, "close-timeout");
-            Ok(())
+    for (tx, id) in targets {
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        if tx.send(Job::Close { book_id, reply: rtx }).is_err() {
+            abandon(id, "send-failed");
+            continue;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(CLOSE_TIMEOUT_MS), rrx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => eprintln!("[pdf-native] close id={id} book={book_id:?} failed: {e}"),
+            _ => {
+                memlog::stage_note("native:timeout", &format!("id={id} err=close"));
+                abandon(id, "close-timeout");
+            }
+        }
+    }
+    Ok(())
+
+}
+
+#[cfg(test)]
+mod r11_rect_tests {
+    #[cfg(windows)]
+    use super::imp::pt_rect_to_dip;
+
+    /// P1-1：pt→DIP 换算与非法值防护。
+    #[cfg(windows)]
+    #[test]
+    fn pt_rect_to_dip_boundaries() {
+        let (x, y, w, h) = pt_rect_to_dip(0.0, 0.0, 612.0, 792.0).unwrap();
+        assert!((x - 0.0).abs() < 1e-3 && (y - 0.0).abs() < 1e-3);
+        assert!((w - 816.0).abs() < 1e-2, "w={w}");
+        assert!((h - 1056.0).abs() < 1e-2, "h={h}");
+        // 负 x/y 钳到 0；极薄条保留正值。
+        let (x, y, w, h) = pt_rect_to_dip(-5.0, -8.0, 1.0, 792.0).unwrap();
+        assert_eq!((x, y), (0.0, 0.0));
+        assert!(w > 0.0 && h > 0.0);
+        // 宽高为 0/负、NaN/Inf 必须 Err（不 panic）。
+        for (x, y, w, h) in [
+            (0.0, 0.0, 0.0, 10.0),
+            (0.0, 0.0, 10.0, -1.0),
+            (f32::NAN, 0.0, 10.0, 10.0),
+            (0.0, f32::INFINITY, 10.0, 10.0),
+        ] {
+            assert!(pt_rect_to_dip(x, y, w, h).is_err(), "{x},{y},{w},{h}");
         }
     }
 }

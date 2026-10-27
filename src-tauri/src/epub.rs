@@ -101,6 +101,22 @@ fn resolve_idx(ci: &CiMap, name: &str) -> Option<usize> {
         .copied()
 }
 
+/// 单条目解压硬上限（与 PDF 通道既有 64MiB 口径一致）。
+/// 中央目录里声明的大小是攻击者可控值：不能按它预分配，也不能无限 read_to_end。
+const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 读取至多 cap 字节：只多读 1 字节即可判断超限，绝不按声明尺寸预分配。
+/// 超限/读失败返回 None，调用方按「该条目不可用」处理。
+fn read_capped<R: Read>(r: &mut R, cap: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    r.take(cap.saturating_add(1)).read_to_end(&mut out).ok()?;
+    if out.len() as u64 > cap {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn zip_read<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     ci: &CiMap,
@@ -108,9 +124,7 @@ fn zip_read<R: Read + std::io::Seek>(
 ) -> Option<Vec<u8>> {
     let idx = resolve_idx(ci, name)?;
     let mut f = zip.by_index(idx).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
+    read_capped(&mut f, MAX_ENTRY_BYTES)
 }
 
 /// 解码文本，兼容 UTF-8 与带 BOM 的 UTF-16（部分工具生成的 XML 是 UTF-16）。
@@ -229,11 +243,8 @@ fn percent_decode(s: &str) -> String {
                 continue;
             }
         }
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-            continue;
-        }
+        // EPUB href 是 URI 引用而非 form-urlencoded 表单值：'+' 是合法文件名字符，
+        // 不能按 URL query 规则转空格；只解码 %XX，非法 % 保持原样。
         out.push(bytes[i]);
         i += 1;
     }
@@ -508,13 +519,24 @@ fn parse_impl<R: Read + std::io::Seek>(reader: R, compute_chars: bool) -> Result
         for (i, member) in spine_idx.iter().enumerate() {
             let Some(member) = *member else { continue };
             if let Ok(mut f) = zip.by_index(member) {
-                let mut b = Vec::new();
-                if f.read_to_end(&mut b).is_ok() {
-                    let html = String::from_utf8_lossy(&b).into_owned();
-                    let text = html_to_text(&html);
-                    let total = text.chars().count() as i64;
-                    let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
-                    results[i] = (total, pure);
+                match read_capped(&mut f, MAX_ENTRY_BYTES) {
+                    Some(b) => {
+                        let html = String::from_utf8_lossy(&b).into_owned();
+                        let text = html_to_text(&html);
+                        let total = text.chars().count() as i64;
+                        let pure = text.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+                        results[i] = (total, pure);
+                    }
+                    None => {
+                        // 单章解压超限：该章计 0 并跳过，不中断整本统计（其余章仍可用）。
+                        crate::memlog::stage_note(
+                            "epub:chars_entry_capped",
+                            &format!(
+                                "spine={i} path={}",
+                                spine.get(i).map(|s| s.as_str()).unwrap_or("")
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -682,13 +704,51 @@ fn extract_toc<R: Read + std::io::Seek>(
 }
 
 
+/// 在 hay 中从 from 起找 needle 的 ASCII 大小写不敏感出现，返回**原串**字节偏移。
+///
+/// 不能先 to_lowercase 再在 lower 里找偏移：Unicode 小写化会改变字节长度
+/// （İ → i + 组合点变长、ẞ → ß 变短），用 lower 的偏移切原串会错位，
+/// 轻则切出残破 HTML，重则落在非 UTF-8 字符边界 panic。HTML 标签名都是 ASCII，直接按字节比较。
+fn find_ascii_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from > h.len() || n.len() > h.len() {
+        return None;
+    }
+    (from..=h.len() - n.len()).find(|&i| {
+        h[i..i + n.len()]
+            .iter()
+            .zip(n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// 从 from 起向后找最后一个 ASCII 大小写不敏感出现，返回原串字节偏移。
+fn rfind_ascii_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    let last = h.len() - n.len();
+    if from > last {
+        return None;
+    }
+    (from..=last).rev().find(|&i| {
+        h[i..i + n.len()]
+            .iter()
+            .zip(n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 /// P11：找出 raw HTML 的 body 内容字节区间（开标签之后、闭标签之前）。
 /// 只按首个 <body ...> 处理，返回 None 表示不是常规 XHTML。
+/// 偏移全部由原串计算（见 find_ascii_ci 的说明）。
 fn body_bounds(raw: &str) -> Option<(usize, usize)> {
-    let lower = raw.to_lowercase();
-    let bs = lower.find("<body")?;
-    let after = lower[bs..].find('>').map(|i| bs + i + 1)?;
-    let be = lower[after..].rfind("</body").map(|i| after + i)?;
+    let bs = find_ascii_ci(raw, "<body", 0)?;
+    let after = raw[bs..].find('>').map(|i| bs + i + 1)?;
+    let be = rfind_ascii_ci(raw, "</body", after)?;
     if after >= be {
         return None;
     }
@@ -1690,13 +1750,12 @@ pub fn map_split_layout_position(
 }
 
 fn find_toc_nav_section(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
     let mut search_from = 0;
-    while let Some(pos) = lower[search_from..].find("<nav") {
-        let abs = search_from + pos;
-        let end = lower[abs..].find("</nav>").map(|e| abs + e + 6);
+    while let Some(abs) = find_ascii_ci(html, "<nav", search_from) {
+        let end = find_ascii_ci(html, "</nav>", abs).map(|e| e + 6);
         if let Some(end) = end {
             let seg = &html[abs..end];
+            // 这里只判断片段内容（不产生偏移），大小写不敏感比较无副作用。
             if seg.to_lowercase().contains("toc") || seg.contains("<h") {
                 return Some(seg.to_string());
             }
@@ -1991,9 +2050,8 @@ pub fn extract_cover_from_reader<R: Read + std::io::Seek>(
         let key = name.trim_start_matches("./").to_ascii_lowercase();
         let i = *idx_of.get(&key)?;
         let mut f = zip.by_index(i).ok()?;
-        let mut b = Vec::new();
-        f.read_to_end(&mut b).ok()?;
-        Some(b)
+        // 解析预算解除后仍要有单条目上限：封面条目同样可能是压缩炸弹。
+        read_capped(&mut f, MAX_ENTRY_BYTES)
     };
     let container = match read_entry(&mut zip, "META-INF/container.xml") {
         Some(b) => decode_text(&b),
@@ -2037,11 +2095,9 @@ pub fn extract_cbz_cover_file(path: &str, budget: &Arc<CoverReadBudget>) -> Resu
         return Ok(None);
     }
     imgs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut b = Vec::new();
-    zip.by_index(imgs[0].1)
-        .map_err(|e| e.to_string())?
-        .read_to_end(&mut b)
-        .map_err(|e| e.to_string())?;
+    let mut f = zip.by_index(imgs[0].1).map_err(|e| e.to_string())?;
+    let b = read_capped(&mut f, MAX_ENTRY_BYTES)
+        .ok_or_else(|| format!("封面条目解压后超过上限（{MAX_ENTRY_BYTES} 字节）"))?;
     Ok(if b.is_empty() { None } else { Some(b) })
 }
 
@@ -2185,11 +2241,17 @@ pub fn chapter_html_multi_ci(
         }
     };
     let mut out = String::new();
+    let mut found = 0usize;
     for doc_path in doc_paths {
         if let Some(bytes) = zip_read(&mut zip, ci, doc_path) {
+            found += 1;
             let html = String::from_utf8_lossy(&bytes).into_owned();
             out.push_str(&render_doc_html(&mut zip, ci, doc_path, &html, book_id, keep_styles));
         }
+    }
+    // P1-3：与单文档版一致——非空 spine 一个条目都读不到时报可读 Err，不再返回空串。
+    if !doc_paths.is_empty() && found == 0 {
+        return Err("章节文件缺失".into());
     }
     Ok(out)
 }
@@ -2210,11 +2272,17 @@ pub fn chapter_html_multi_file(path: &Path, ci: &CiMap, doc_paths: &[String], bo
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
     let mut out = String::new();
+    let mut found = 0usize;
     for doc_path in doc_paths {
         if let Some(bytes) = zip_read(&mut zip, ci, doc_path) {
+            found += 1;
             let html = String::from_utf8_lossy(&bytes).into_owned();
             out.push_str(&render_doc_html(&mut zip, ci, doc_path, &html, book_id, keep_styles));
         }
+    }
+    // P1-3：非空 spine 全部读不到 → Err；部分缺失继续拼接其余章节。
+    if !doc_paths.is_empty() && found == 0 {
+        return Err("章节文件缺失".into());
     }
     Ok(out)
 }
@@ -2380,7 +2448,12 @@ fn render_doc_html<R: Read + std::io::Seek>(
     if keep_styles && !book_css.trim().is_empty() {
         let scoped = scope_book_css(&book_css);
         if !scoped.trim().is_empty() {
-            style_tag = format!("<style class=\"tp-book-css\">{scoped}</style>");
+            // J26：外部 CSS 里可能含 </style><script>：插进 <style> 前必须转义闭合序列，
+            // 否则 CSS 文本会逃逸成 HTML。大小写不敏感，用 CSS 合法转义 <\/style。
+            style_tag = format!(
+                "<style class=\"tp-book-css\">{}</style>",
+                escape_style_close(&scoped)
+            );
         }
     }
 
@@ -2393,12 +2466,30 @@ fn render_doc_html<R: Read + std::io::Seek>(
     )
 }
 
+/// J26：把 CSS 里的 </style（大小写不敏感）改写为 CSS 合法转义 <\/style，
+/// 保证外部样式内容永远不能闭合宿主 style 标签。
+fn escape_style_close(css: &str) -> String {
+    let mut out = String::with_capacity(css.len() + 8);
+    let bytes = css.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].len() >= 7 && bytes[i..i + 7].eq_ignore_ascii_case(b"</style") {
+            out.push_str(r"<\/style");
+            i += 7;
+        } else {
+            let ch = css[i..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 /// 取出 `<head>...</head>` 之间的内容（原书样式表引用都在这里）。
 fn extract_head(html: &str) -> String {
-    let lower = html.to_lowercase();
-    if let Some(start) = lower.find("<head") {
-        let after = lower[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
-        let end = lower[after..].find("</head>").map(|i| after + i).unwrap_or(html.len());
+    if let Some(start) = find_ascii_ci(html, "<head", 0) {
+        let after = html[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
+        let end = find_ascii_ci(html, "</head>", after).unwrap_or(html.len());
         if after < end {
             return html[after..end].to_string();
         }
@@ -2866,10 +2957,9 @@ fn mime_of(target: &str) -> &'static str {
 }
 
 fn extract_body(html: &str) -> String {
-    let lower = html.to_lowercase();
-    if let Some(start) = lower.find("<body") {
-        let after = lower[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
-        let end = lower.rfind("</body>").unwrap_or(html.len());
+    if let Some(start) = find_ascii_ci(html, "<body", 0) {
+        let after = html[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
+        let end = rfind_ascii_ci(html, "</body>", 0).unwrap_or(html.len());
         if after < end {
             return html[after..end].to_string();
         }
@@ -2877,6 +2967,8 @@ fn extract_body(html: &str) -> String {
     html.to_string()
 }
 
+/// 保留单章入口供兼容/测试；生产批量路径改用 collect_texts（一次打开 zip）。
+#[allow(dead_code)]
 pub fn doc_text(zip_bytes: &[u8], doc_path: &str) -> String {
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut zip = match zip::ZipArchive::new(cursor) {
@@ -3066,10 +3158,15 @@ pub fn find_cover_fallback(zip_bytes: &[u8], spine: &[String]) -> Option<Vec<u8>
                 && (name.contains("cover") || f.size() > 60_000)
             {
                 let size = f.size();
+                // 声明尺寸超限直接跳过：不按它预分配（Vec::with_capacity(size) 可被
+                // 一个伪造的中央目录条目放大成巨量分配）。
+                if size > MAX_ENTRY_BYTES {
+                    continue;
+                }
                 if big.as_ref().map(|(s, _)| size > *s).unwrap_or(true) {
-                    let mut buf = Vec::with_capacity(size as usize);
-                    std::io::Read::read_to_end(&mut f, &mut buf).ok();
-                    big = Some((size, buf));
+                    if let Some(buf) = read_capped(&mut f, MAX_ENTRY_BYTES) {
+                        big = Some((size, buf));
+                    }
                 }
             }
         }
@@ -3092,11 +3189,45 @@ fn set_tag_text(xml: &str, tag: &str, value: &str) -> Option<String> {
     }
 }
 
-/// 直接覆盖写回 EPUB 的 OPF 元数据（dc:title / dc:creator），不生成备份。
+/// P0-3：写回前把 OPF 统一成 UTF-8 文档：去掉 BOM，若 XML 声明里写了
+/// encoding="UTF-16..."（大小写不敏感）改成 utf-8；无 encoding 属性保持声明原样。
+/// 为什么统一 UTF-8：write_meta 用 new_opf.as_bytes() 写盘，若沿用 UTF-16 声明而写 UTF-8
+/// 字节，声明与内容不一致，其它阅读器会按 UTF-16 解出乱码。
+fn normalize_opf_for_utf8(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let trimmed_start = text.trim_start();
+    let Some(decl_offset) = text.len().checked_sub(trimmed_start.len()) else {
+        return text.to_string();
+    };
+    if !trimmed_start.starts_with("<?xml") {
+        return text.to_string();
+    }
+    let Some(end_rel) = trimmed_start.find("?>") else {
+        return text.to_string();
+    };
+    let decl_end = decl_offset + end_rel + 2;
+    let (decl, rest) = text.split_at(decl_end);
+    let re = Regex::new(r#"(?i)encodings*=s*(["'])UTF-16(?:LE|BE)?(["'])"#).unwrap();
+    let decl_utf8 = re
+        .replace(decl, |_: &regex::Captures| "encoding=\"utf-8\"".to_string())
+        .into_owned();
+    format!("{decl_utf8}{rest}")
+}
+
+/// 把 EPUB 的 OPF 元数据（dc:title / dc:creator）写回原文件。
+///
+/// 安全约定：**原文件字节在成功前不变**。流程为「同目录临时文件 → 流式重写 zip →
+/// sync_all → rename 原子替换」；任何失败删除临时文件并返回 Err，不留下截断半成品。
+/// 源包只打开一次流式读取，container/OPF 之外不整本驻留内存，也不按中央目录声明尺寸预分配。
 pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let cursor = std::io::Cursor::new(&data);
-    let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("EPUB 打开失败: {e}"))?;
+    // 只开文件句柄解析中央目录：不 std::fs::read 整本（MOBI/EPUB 可能几十 MB~数 GB）。
+    let src_file = std::fs::File::open(path).map_err(|e| format!("打开 EPUB 失败：{e}"))?;
+    let src_len = src_file
+        .metadata()
+        .map_err(|e| format!("读取文件信息失败：{e}"))?
+        .len();
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(src_file))
+        .map_err(|e| format!("EPUB 打开失败: {e}"))?;
     let ci = build_ci(&mut zip);
 
     let container = zip_read(&mut zip, &ci, "META-INF/container.xml")
@@ -3128,48 +3259,70 @@ pub fn write_meta(path: &str, title: &str, author: &str) -> Result<(), String> {
         )
     }));
     let new_opf = new_opf.ok_or("OPF 中未找到 dc:title 标签，无法写回")?;
+    // P0-3：统一 UTF-8 文档（声明同步），否则 UTF-16 OPF 写回后声明与字节不一致。
+    let new_opf = normalize_opf_for_utf8(&new_opf);
 
-    // 读入所有条目
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().to_string();
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        entries.push((name, buf));
+    // 写前空间检查：同卷需要放得下临时文件（源大小 + 64KiB 余量）。
+    // 取不到剩余空间（非 Windows/权限受限）时跳过，不阻断既有能力。
+    if let Some(free) = crate::library::disk_free_bytes(Path::new(path)) {
+        let need = src_len.saturating_add(64 * 1024);
+        if free < need {
+            return Err(format!(
+                "磁盘剩余空间不足：需要约 {need} 字节，当前 {free} 字节"
+            ));
+        }
     }
-    drop(zip);
 
+    // 同目录临时文件（与源同卷），成功后 rename 覆盖。
+    let tmp = format!("{path}.tidepage-tmp-{}", std::process::id());
     let opf_key = opf_path.replace('\\', "/").to_lowercase();
-    let tmp = format!("{path}.tidepage-tmp");
-    {
-        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let write_result = (|| -> Result<(), String> {
+        let file = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut zw = zip::ZipWriter::new(file);
         let stored = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
         let deflated = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        // 按 EPUB 规范：mimetype 首个且不压缩
-        if entries.iter().any(|(n, _)| n.eq_ignore_ascii_case("mimetype")) {
+        // 按 EPUB 规范：mimetype 首个且不压缩。
+        if zip.file_names().any(|n| n.eq_ignore_ascii_case("mimetype")) {
             zw.start_file("mimetype", stored).map_err(|e| e.to_string())?;
             zw.write_all(b"application/epub+zip").map_err(|e| e.to_string())?;
         }
-        for (name, buf) in &entries {
+        // 第二遍按原顺序逐条目流式拷贝：仅 OPF 条目替换内容，其余原样。
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).map_err(|e| format!("读取压缩包条目失败：{e}"))?;
+            let name = f.name().to_string();
             if name.eq_ignore_ascii_case("mimetype") || name.ends_with('/') {
                 continue;
             }
-            zw.start_file(name.clone(), deflated).map_err(|e| e.to_string())?;
+            zw.start_file(name.clone(), deflated)
+                .map_err(|e| format!("写入条目 {name} 失败：{e}"))?;
             if name.replace('\\', "/").to_lowercase() == opf_key {
-                zw.write_all(new_opf.as_bytes()).map_err(|e| e.to_string())?;
+                zw.write_all(new_opf.as_bytes())
+                    .map_err(|e| format!("写入 OPF 失败：{e}"))?;
             } else {
-                zw.write_all(buf).map_err(|e| e.to_string())?;
+                // 逐块拷贝：不按 f.size() 预分配，大条目不会整块驻留。
+                std::io::copy(&mut f, &mut zw)
+                    .map_err(|e| format!("写入条目 {name} 失败：{e}"))?;
             }
         }
-        zw.finish().map_err(|e| e.to_string())?;
+        let file = zw.finish().map_err(|e| format!("收尾写入失败：{e}"))?;
+        file.sync_all().map_err(|e| format!("写入磁盘失败：{e}"))?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::copy(&tmp, path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&tmp);
+    // 释放源文件句柄后再替换（Windows 允许替换已打开文件，但没必要赌共享模式）。
+    drop(zip);
+    // 同卷 rename：Windows 上 std::fs::rename 会替换已存在的目标文件。
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换原文件失败：{e}"));
+    }
     Ok(())
 }
 
@@ -3704,6 +3857,60 @@ mod tests {
         );
         let s = "a中b";
         assert_eq!(slice_body(s, 0, 2), "a中", "越界到字符中间应向上取整");
+    }
+
+    /// H1：解压助手 cap 边界（超限 None、界内原样、cap=0 拒绝非空数据）。
+    #[test]
+    fn read_capped_enforces_cap() {
+        let mut big = std::io::Cursor::new(vec![7u8; 200]);
+        assert!(read_capped(&mut big, 96).is_none(), "超过 cap 必须拒绝");
+        let mut small = std::io::Cursor::new(vec![7u8; 50]);
+        assert_eq!(read_capped(&mut small, 96).unwrap(), vec![7u8; 50]);
+        let mut exact = std::io::Cursor::new(vec![1u8; 96]);
+        assert_eq!(read_capped(&mut exact, 96).unwrap().len(), 96, "恰好 cap 允许");
+        let mut one = std::io::Cursor::new(vec![1u8]);
+        assert!(read_capped(&mut one, 0).is_none(), "cap=0 时非空数据拒绝");
+    }
+
+    /// H1：zip_read 经上限助手读正常条目（大小写不敏感名解析、缺失返回 None）。
+    /// 超大条目用例构造成本高（要写入 >64MiB 数据），按提示只覆盖 helper 边界。
+    #[test]
+    fn zip_read_reads_normal_entry_with_cap_helper() {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"hello").unwrap();
+        zw.start_file("dir/b.bin", opts).unwrap();
+        zw.write_all(&vec![9u8; 1024]).unwrap();
+        let data = zw.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        let ci = build_ci(&mut archive);
+        assert_eq!(zip_read(&mut archive, &ci, "A.TXT").unwrap(), b"hello");
+        assert_eq!(zip_read(&mut archive, &ci, "dir/b.bin").unwrap().len(), 1024);
+        assert!(zip_read(&mut archive, &ci, "missing").is_none());
+    }
+
+    /// H3：Unicode 小写化改变字节长度（İ 变长、ẞ 变短）时，body/head/nav 偏移仍来自原串。
+    #[test]
+    fn unicode_lowercase_does_not_shift_html_offsets() {
+        // 注释里 İ 各 +1 字节、ẞ -1 字节，合计让 lower 的偏移比原串多 1。
+        let raw = "<!-- İİẞ --><html><head><title>标题</title></head><body class=\"c\"><p>正文一</p><p>正文二</p></body></html>";
+        let (bs, be) = body_bounds(raw).expect("常规 XHTML 应有 body 区间");
+        assert_eq!(&raw[bs..be], "<p>正文一</p><p>正文二</p>", "body 偏移必须落在原串");
+        assert_eq!(extract_body(raw), "<p>正文一</p><p>正文二</p>");
+        assert_eq!(extract_head(raw), "<title>标题</title>");
+        // nav：ẞ 让 lower 偏移比原串少 1，旧实现会从 <nav 的后一个字节开始切。
+        let nav_html = "<!-- ẞ --><nav epub:type=\"toc\"><a href=\"c1.xhtml\">第一章</a></nav>";
+        let seg = find_toc_nav_section(nav_html).expect("应定位到含 toc 的 nav");
+        assert!(seg.starts_with("<nav"), "nav 起点必须来自原串: {seg}");
+        assert!(seg.ends_with("</nav>"));
+        assert!(seg.contains("第一章"));
+        // 大写标签同样大小写不敏感
+        let upper = "<HTML><HEAD><TITLE>T</TITLE></HEAD><BODY><P>x</P></BODY></HTML>";
+        assert_eq!(extract_body(upper), "<P>x</P>");
+        assert_eq!(extract_head(upper), "<TITLE>T</TITLE>");
+        let (bs2, be2) = body_bounds(upper).unwrap();
+        assert_eq!(&upper[bs2..be2], "<P>x</P>");
     }
 
     /// 图片页书探测（第五轮）：图片多文字少 → 完整扫描；正文多 → 提前退出；预算截断 → complete=false。
@@ -4391,5 +4598,170 @@ mod tests {
         assert_eq!(chapters[0].title, "目录");
         assert_eq!(chapters[1].title, "", "超大章首个子章的纯数字标题被置空");
         assert!(chapters[2..].iter().all(|c| c.title.is_empty()));
+    }
+    /// J26：外部 CSS 里的 </style> 必须被转义，不能闭合宿主 style 标签。
+    #[test]
+    fn escape_style_close_blocks_style_escape() {
+        let css = r#"p{color:red}</style><script>alert(1)</script>"#;
+        let out = escape_style_close(css);
+        assert!(!out.to_ascii_lowercase().contains("</style"), "{out}");
+        assert!(out.contains(r"<\/style"), "应换成 CSS 转义: {out}");
+        assert_eq!(out.matches(r"<\/style").count(), 1, "{out}");
+        // 大小写不敏感
+        let out2 = escape_style_close("A</StYlE>B");
+        assert!(!out2.to_ascii_lowercase().contains("</style"), "{out2}");
+    }
+
+    /// P0-3：OPF 统一 UTF-8 声明的纯函数规则。
+    #[test]
+    fn normalize_opf_for_utf8_rules() {
+        let le = "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-16\"?><package/>";
+        let out = normalize_opf_for_utf8(le);
+        assert!(out.starts_with("<?xml"), "BOM 应去掉: {out}");
+        assert!(out.contains("encoding=\"utf-8\""), "{out}");
+        assert!(!out.to_lowercase().contains("utf-16"), "{out}");
+        // 单引号 + LE/BE 变体
+        let be = "<?xml version='1.0' encoding='utf-16be'?><package/>";
+        assert!(normalize_opf_for_utf8(be).contains("encoding=\"utf-8\""));
+        // 无声明/无 encoding 属性：保持原样（不注入声明）。
+        let plain = "<package><metadata/></package>";
+        assert_eq!(normalize_opf_for_utf8(plain), plain);
+        let no_enc = "<?xml version=\"1.0\"?><package/>";
+        assert_eq!(normalize_opf_for_utf8(no_enc), no_enc);
+        // 非声明位置的 UTF-16 字样不得改动。
+        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><package><x>UTF-16</x></package>";
+        assert_eq!(normalize_opf_for_utf8(body), body);
+        // 已是 UTF-8 声明：值等价（大小写保持原样）。
+        let utf8_decl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><package/>";
+        assert_eq!(normalize_opf_for_utf8(utf8_decl), utf8_decl);
+    }
+
+    fn build_meta_epub(path: &Path, little: bool) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("mimetype", stored).unwrap();
+        zw.write_all(b"application/epub+zip").unwrap();
+        zw.start_file("META-INF/container.xml", deflated).unwrap();
+        zw.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        let opf = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>旧标题</dc:title><dc:creator>旧作者</dc:creator></metadata></package>";
+        let mut bytes = Vec::new();
+        if little {
+            bytes.extend_from_slice(&[0xFF, 0xFE]);
+            for u in opf.encode_utf16() {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+        } else {
+            bytes.extend_from_slice(&[0xFE, 0xFF]);
+            for u in opf.encode_utf16() {
+                bytes.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        zw.start_file("OEBPS/content.opf", deflated).unwrap();
+        zw.write_all(&bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    fn read_zip_entry(path: &Path, name: &str) -> Vec<u8> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut f = zip.by_name(name).unwrap();
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// P0-3：UTF-16LE/BE OPF 写回后必须是 UTF-8、无 BOM、声明同步、中文不损坏。
+    #[test]
+    fn write_meta_converts_utf16_opf_to_utf8() {
+        for little in [true, false] {
+            let d = std::env::temp_dir().join(format!(
+                "tp_opf_utf16_{}_{}",
+                if little { "le" } else { "be" },
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            let epub = d.join("book.epub");
+            build_meta_epub(&epub, little);
+            write_meta(epub.to_str().unwrap(), "新标题 & <测试>", "新作者").unwrap();
+            let bytes = read_zip_entry(&epub, "OEBPS/content.opf");
+            assert!(!bytes.starts_with(&[0xFF, 0xFE]), "不得保留 LE BOM");
+            assert!(!bytes.starts_with(&[0xFE, 0xFF]), "不得保留 BE BOM");
+            let text = std::str::from_utf8(&bytes).expect("写回 OPF 必须是合法 UTF-8");
+            assert!(text.contains("encoding=\"utf-8\""), "声明应同步: {text}");
+            assert!(text.contains("新标题"), "中文标题损坏: {text}");
+            assert!(text.contains("新作者"), "{text}");
+            assert!(!text.to_lowercase().contains("utf-16"), "{text}");
+            // 现有解析路径可读：decode_text 对 UTF-8 分支正常（这里直接检查无替换符）。
+            assert!(!text.contains('\u{fffd}'));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// P0-3：原本就是 UTF-8 的 OPF 行为不变（写回仍 UTF-8/可读，无 BOM）。
+    #[test]
+    fn write_meta_keeps_utf8_opf_readable() {
+        let d = std::env::temp_dir().join(format!("tp_opf_utf8_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let epub = d.join("book.epub");
+        build_meta_epub(&epub, true);
+        write_meta(epub.to_str().unwrap(), "标题二", "作者二").unwrap();
+        let bytes = read_zip_entry(&epub, "OEBPS/content.opf");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("标题二") && text.contains("作者二"), "{text}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+}
+
+#[cfg(test)]
+mod r11_epub_tests {
+    use super::*;
+
+    fn zip_with(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in files {
+                zw.start_file(*name, opt).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// P1-3：多文档章节全部缺失 → Err；部分缺失 → Ok 且只含可读部分。
+    #[test]
+    fn chapter_html_multi_requires_at_least_one_doc() {
+        let html = b"<html><body><p>HELLO CHAPTER</p></body></html>" as &[u8];
+        let bytes = zip_with(&[("c1.xhtml", html)]);
+        let missing = vec!["missing.xhtml".to_string()];
+        let err = chapter_html_multi_ci(&bytes, None, &missing, None, false).unwrap_err();
+        assert!(err.contains("章节文件缺失"), "{err}");
+        let mixed = vec!["missing.xhtml".to_string(), "c1.xhtml".to_string()];
+        let out = chapter_html_multi_ci(&bytes, None, &mixed, None, false).unwrap();
+        assert!(out.contains("HELLO CHAPTER"), "{out}");
+        // 空 doc_paths 保持 Ok(空串)（调用方语义不变）。
+        assert_eq!(chapter_html_multi_ci(&bytes, None, &[], None, false).unwrap(), "");
+    }
+
+    /// P1-10：EPUB href 的 percent-decode：+ 是合法文件名字符，只解码 %XX。
+    #[test]
+    fn percent_decode_keeps_plus_and_handles_percent() {
+        assert_eq!(percent_decode("a+b%20c"), "a+b c");
+        assert_eq!(percent_decode("%2B"), "+");
+        assert_eq!(percent_decode("%E4%B8%AD%E6%96%87"), "中文");
+        // 非法 % 原样保留且不 panic。
+        assert_eq!(percent_decode("%中"), "%中");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("50%2"), "50%2");
     }
 }

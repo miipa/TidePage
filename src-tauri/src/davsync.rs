@@ -3,6 +3,7 @@
 use crate::databackup::{BookIdent, BookIndex};
 use crate::db;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -178,16 +179,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn norm_path(p: &str) -> String {
-    p.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase()
-}
-
 fn norm(s: &str) -> String {
     s.trim().to_lowercase()
-}
-
-fn key(parts: &[&str]) -> String {
-    parts.join("\u{1}")
 }
 
 /// 书架容器解析：本机 settings 是 {"v":1,"shelves":[...]}，远端 sync.json 沿用数组；
@@ -326,16 +319,89 @@ fn shelf_same_content(a: &Value, b: &Value) -> bool {
         .all(|f| a.get(*f).cloned().unwrap_or(Value::Null) == b.get(*f).cloned().unwrap_or(Value::Null))
 }
 
+/// H20：书籍同步身份（路径无关：归一化 title+author+size；无书名回退旧路径身份）。
+fn book_identity_of(b: &BookIdent) -> String {
+    db::book_sync_identity(&b.book_title, &b.book_author, b.book_size, &b.book_path)
+}
+
 fn bm_key(b: &SyncBookmark) -> String {
-    key(&[&norm_path(&b.book.book_path), &b.chapter_index.to_string(), &b.title, &b.excerpt])
+    db::bookmark_sync_key(&book_identity_of(&b.book), b.chapter_index, &b.title, &b.excerpt)
+}
+
+/// 旧路径 key：历史墓碑与旧客户端沿用，比较/输出时与新 key 并行。
+fn bm_legacy_key(b: &SyncBookmark) -> String {
+    db::bookmark_tomb_key(&b.book.book_path, b.chapter_index, &b.title, &b.excerpt)
 }
 
 fn hl_key(h: &SyncHighlight) -> String {
-    key(&[&norm_path(&h.book.book_path), &h.chapter_index.to_string(), &h.pos_start.to_string(), &h.pos_end.to_string(), &h.text])
+    db::highlight_sync_key(
+        &book_identity_of(&h.book),
+        h.chapter_index,
+        h.pos_start,
+        h.pos_end,
+        &h.text,
+    )
+}
+
+fn hl_legacy_key(h: &SyncHighlight) -> String {
+    db::highlight_tomb_key(&h.book.book_path, h.chapter_index, h.pos_start, h.pos_end, &h.text)
 }
 
 fn bt_key(b: &SyncBookTag) -> String {
-    key(&[&norm_path(&b.book.book_path), &norm(&b.tag_name)])
+    db::book_tag_sync_key(&book_identity_of(&b.book), &b.tag_name)
+}
+
+fn bt_legacy_key(b: &SyncBookTag) -> String {
+    db::book_tag_tomb_key(&b.book.book_path, &b.tag_name)
+}
+
+/// 墓碑是否应作用于该条目（删除/过滤）：
+/// - legacy 路径 key 命中：保持旧行为，直接生效（不套碰撞守卫）；
+/// - 新身份 key 命中：本机同身份书不唯一时保守跳过，宁可保留也不误删。
+fn tomb_hits_guarded(
+    conn: &Connection,
+    tombs: &HashMap<(String, String), i64>,
+    kind: &str,
+    new_key: &str,
+    legacy_key: &str,
+    item_time: i64,
+    book: &BookIdent,
+) -> bool {
+    if tomb_should_delete(tombs, kind, legacy_key, item_time) {
+        return true;
+    }
+    tomb_should_delete(tombs, kind, new_key, item_time) && identity_unique(conn, book)
+}
+
+/// book_tag 无条目时间：墓碑存在即生效；新身份 key 同样套碰撞守卫。
+fn tomb_exists_guarded(
+    conn: &Connection,
+    tombs: &HashMap<(String, String), i64>,
+    kind: &str,
+    new_key: &str,
+    legacy_key: &str,
+    book: &BookIdent,
+) -> bool {
+    if tombs.contains_key(&(kind.to_string(), legacy_key.to_string())) {
+        return true;
+    }
+    tombs.contains_key(&(kind.to_string(), new_key.to_string())) && identity_unique(conn, book)
+}
+
+/// H20 身份碰撞保守策略：同 title+author+size 的本机书不止一本时无法唯一确定目标，
+/// 远端身份墓碑不得删除任何一本的条目（宁可保留，不误删）。legacy 路径 key 路径唯一，不受此限。
+fn identity_unique(conn: &Connection, b: &BookIdent) -> bool {
+    if b.book_title.trim().is_empty() {
+        return true;
+    }
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM books WHERE lower(trim(title))=lower(trim(?1)) AND lower(trim(COALESCE(author,'')))=lower(trim(?2)) AND COALESCE(size,0)=?3",
+            params![b.book_title, b.book_author, b.book_size],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    n <= 1
 }
 
 fn ident_with_local(conn: &Connection, rec: &BookIdent, id: i64) -> BookIdent {
@@ -369,12 +435,18 @@ pub(crate) fn should_read_v1(v2_found: bool, migrated: bool) -> bool {
 }
 
 pub fn parse_sync(bytes: &[u8]) -> Result<SyncData, String> {
-    let d: SyncData = serde_json::from_slice(bytes).map_err(|e| format!("同步文件 JSON 损坏或字段缺失：{e}"))?;
+    // G18：稳定错误码前缀（前端 ERR_CODES 映射成文案）；冒号后的中文仅供日志/诊断，
+    // errText 按前缀命中后会整句替换，不会把内部细节上屏。
+    let d: SyncData = serde_json::from_slice(bytes)
+        .map_err(|e| format!("dataSync.jsonBroken：同步文件 JSON 损坏或字段缺失：{e}"))?;
     if d.format != FORMAT {
-        return Err("不是 TidePage 数据同步文件".into());
+        return Err("dataSync.notFile：不是 TidePage 数据同步文件".into());
     }
     if d.version != 1 && d.version != VERSION {
-        return Err(format!("同步文件版本 {} 不受支持（当前支持 1/{}）", d.version, VERSION));
+        return Err(format!(
+            "dataSync.versionUnsupported：同步文件版本 {} 不受支持（当前支持 1/{}）",
+            d.version, VERSION
+        ));
     }
     Ok(d)
 }
@@ -403,7 +475,14 @@ pub(crate) fn merge_local_remote(
     // B9：远端墓碑 > 本地条目时间 → 删除本地，不上传旧条目。
     // 关闭笔记同步时不得写本地/删本地，只原样输出远端类别。
     if opts.sync_notes {
-        let bm_tomb: Vec<String> = bm_map.iter().filter(|(k, l)| tomb_should_delete(&remote_tombs, "bookmark", k, eff(l.updated_at, l.created_at))).map(|(k, _)| k.clone()).collect();
+        let bm_tomb: Vec<String> = bm_map
+            .iter()
+            .filter(|(k, l)| {
+                let lk = bm_legacy_key(l);
+                tomb_hits_guarded(&tx, &remote_tombs, "bookmark", k, &lk, eff(l.updated_at, l.created_at), &l.book)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         for k in bm_tomb {
             if let Some(l) = bm_map.remove(&k) {
                 let _ = tx.execute("DELETE FROM bookmarks WHERE book_id IN (SELECT id FROM books WHERE COALESCE(path,'')=?1) AND chapter_index=?2 AND title=?3 AND excerpt=?4",
@@ -422,9 +501,11 @@ pub(crate) fn merge_local_remote(
             let mut r = rec.clone();
             r.book = ident;
             let k = bm_key(&r);
+            let lk = bm_legacy_key(&r);
             // B9：本地墓碑 > 远端条目 → 不上传旧条目；远端同 key 墓碑 > 远端旧条目 → 丢弃，避免删后又重加。
-            if tomb_should_delete(&local_tombs, "bookmark", &k, eff(r.updated_at, r.created_at)) { continue; }
-            if tomb_should_delete(&remote_tombs, "bookmark", &k, eff(r.updated_at, r.created_at)) { continue; }
+            // H20：同时查新身份 key 与 legacy 路径 key；新 key 命中时套身份唯一性守卫。
+            if tomb_hits_guarded(&tx, &local_tombs, "bookmark", &k, &lk, eff(r.updated_at, r.created_at), &r.book) { continue; }
+            if tomb_hits_guarded(&tx, &remote_tombs, "bookmark", &k, &lk, eff(r.updated_at, r.created_at), &r.book) { continue; }
             match bm_map.get(&k) {
                 Some(l) => {
                     let (lt, rt) = (eff(l.updated_at, l.created_at), eff(r.updated_at, r.created_at));
@@ -478,7 +559,14 @@ pub(crate) fn merge_local_remote(
     let mut hl_map: HashMap<String, SyncHighlight> = HashMap::new();
     for l in &local.highlights { hl_map.insert(hl_key(l), l.clone()); }
     if opts.sync_notes {
-        let hl_tomb: Vec<String> = hl_map.iter().filter(|(k, l)| tomb_should_delete(&remote_tombs, "highlight", k, eff(l.updated_at, l.created_at))).map(|(k, _)| k.clone()).collect();
+        let hl_tomb: Vec<String> = hl_map
+            .iter()
+            .filter(|(k, l)| {
+                let lk = hl_legacy_key(l);
+                tomb_hits_guarded(&tx, &remote_tombs, "highlight", k, &lk, eff(l.updated_at, l.created_at), &l.book)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         for k in hl_tomb {
             if let Some(l) = hl_map.remove(&k) {
                 let _ = tx.execute("DELETE FROM highlights WHERE book_id IN (SELECT id FROM books WHERE COALESCE(path,'')=?1) AND chapter_index=?2 AND pos_start=?3 AND pos_end=?4 AND text=?5",
@@ -493,8 +581,10 @@ pub(crate) fn merge_local_remote(
             let (ident, id) = match matched { Some(id) => (ident_with_local(&tx, &rec.book, id), Some(id)), None => (rec.book.clone(), None) };
             let mut r = rec.clone(); r.book = ident;
             let k = hl_key(&r);
-            if tomb_should_delete(&local_tombs, "highlight", &k, eff(r.updated_at, r.created_at)) { continue; }
-            if tomb_should_delete(&remote_tombs, "highlight", &k, eff(r.updated_at, r.created_at)) { continue; }
+            let lk = hl_legacy_key(&r);
+            // H20：新身份 key 与 legacy 路径 key 并行比对；新 key 命中时套身份唯一性守卫。
+            if tomb_hits_guarded(&tx, &local_tombs, "highlight", &k, &lk, eff(r.updated_at, r.created_at), &r.book) { continue; }
+            if tomb_hits_guarded(&tx, &remote_tombs, "highlight", &k, &lk, eff(r.updated_at, r.created_at), &r.book) { continue; }
             match hl_map.get(&k) {
                 Some(l) => {
                     let (lt, rt) = (eff(l.updated_at, l.created_at), eff(r.updated_at, r.created_at));
@@ -608,9 +698,11 @@ pub(crate) fn merge_local_remote(
     if opts.sync_tags {
         for l in &local.book_tags {
             let k = bt_key(l);
+            let lk = bt_legacy_key(l);
             // C15/OCR：book_tag 无条目时间，墓碑优先；命中本地/远端墓碑的本地关联必须删除且不进输出。
-            let dead = local_tombs.contains_key(&("book_tag".to_string(), k.clone()))
-                || remote_tombs.contains_key(&("book_tag".to_string(), k.clone()));
+            // H20：新身份 key 套身份唯一性守卫，legacy 路径 key 保持旧行为。
+            let dead = tomb_exists_guarded(&tx, &local_tombs, "book_tag", &k, &lk, &l.book)
+                || tomb_exists_guarded(&tx, &remote_tombs, "book_tag", &k, &lk, &l.book);
             if dead {
                 if let Some(id) = idx.resolve(&l.book) {
                     if let Some((tag_id, _)) = tag_map.get(&norm(&l.tag_name)) {
@@ -630,9 +722,10 @@ pub(crate) fn merge_local_remote(
             let Some((tag_id, _)) = tag_map.get(&tn) else { summary.skipped += 1; continue };
             let mut r = rec.clone(); r.book = ident;
             let k = bt_key(&r);
+            let lk = bt_legacy_key(&r);
             // book_tag 无条目时间：存在同 kind+key 远端墓碑时视为已删除，丢弃远端关联。
-            if local_tombs.contains_key(&("book_tag".to_string(), k.clone())) { continue; }
-            if remote_tombs.contains_key(&("book_tag".to_string(), k.clone())) { continue; }
+            if tomb_exists_guarded(&tx, &local_tombs, "book_tag", &k, &lk, &r.book) { continue; }
+            if tomb_exists_guarded(&tx, &remote_tombs, "book_tag", &k, &lk, &r.book) { continue; }
             if seen_bt.contains(&k) { continue; }
             tx.execute("INSERT OR IGNORE INTO book_tags(book_id, tag_id) VALUES(?1,?2)", params![id, tag_id]).map_err(|e| e.to_string())?;
             seen_bt.insert(k);
@@ -720,17 +813,29 @@ pub(crate) fn merge_local_remote(
                 .or_insert(t.deleted_at);
         }
     }
-    let bm_times: HashMap<String, i64> = bm_out.iter().map(|b| (bm_key(b), eff(b.updated_at, b.created_at))).collect();
-    let hl_times: HashMap<String, i64> = hl_out.iter().map(|h| (hl_key(h), eff(h.updated_at, h.created_at))).collect();
+    // H20：条目复活/墓碑滞留判定同时用新身份 key 与 legacy 路径 key 建表（两种 key 都识别）。
+    let bm_times_new: HashMap<String, i64> = bm_out.iter().map(|b| (bm_key(b), eff(b.updated_at, b.created_at))).collect();
+    let bm_times_legacy: HashMap<String, i64> = bm_out.iter().map(|b| (bm_legacy_key(b), eff(b.updated_at, b.created_at))).collect();
+    let hl_times_new: HashMap<String, i64> = hl_out.iter().map(|h| (hl_key(h), eff(h.updated_at, h.created_at))).collect();
+    let hl_times_legacy: HashMap<String, i64> = hl_out.iter().map(|h| (hl_legacy_key(h), eff(h.updated_at, h.created_at))).collect();
     let tag_times: HashMap<String, i64> = tag_out.iter().map(|t| (norm(&t.name), eff(t.updated_at, t.created_at))).collect();
-    let bt_keys: HashSet<String> = bt_out.iter().map(bt_key).collect();
+    let bt_keys_new: HashSet<String> = bt_out.iter().map(bt_key).collect();
+    let bt_keys_legacy: HashSet<String> = bt_out.iter().map(bt_legacy_key).collect();
     let shelf_times: HashMap<String, i64> = shelf_array(&Some(serde_json::json!(shelves_upload.clone()))).iter().map(|s| (norm(&shelf_name(s)), shelf_time(s))).collect();
     tmap.retain(|(kind, key), at| {
         let newer = match kind.as_str() {
-            "bookmark" => bm_times.get(key).map(|&t| t >= *at).unwrap_or(false),
-            "highlight" => hl_times.get(key).map(|&t| t >= *at).unwrap_or(false),
+            "bookmark" => bm_times_new
+                .get(key)
+                .or_else(|| bm_times_legacy.get(key))
+                .map(|&t| t >= *at)
+                .unwrap_or(false),
+            "highlight" => hl_times_new
+                .get(key)
+                .or_else(|| hl_times_legacy.get(key))
+                .map(|&t| t >= *at)
+                .unwrap_or(false),
             "tag" => tag_times.get(key).map(|&t| t >= *at).unwrap_or(false),
-            "book_tag" => bt_keys.contains(key),
+            "book_tag" => bt_keys_new.contains(key) || bt_keys_legacy.contains(key),
             "shelf" => shelf_times.get(key).map(|&t| t >= *at).unwrap_or(false),
             _ => false,
         };
@@ -756,6 +861,33 @@ pub(crate) fn merge_local_remote(
 }
 
 /* ---------------- Tauri 命令 ---------------- */
+/// S7：条件上传冲突状态：If-Match 不匹配（412）或 If-None-Match 已存在（409）。
+fn upload_conflict_status(status: u16) -> bool {
+    matches!(status, 409 | 412)
+}
+
+/// 冲突重试决策：只在「冲突且尚未重试」时重试一次，其余一律失败（有界重试）。
+#[derive(Debug, PartialEq, Eq)]
+enum UploadAction {
+    Retry,
+    Fail,
+}
+
+fn upload_retry_decision(conflict: bool, retried: bool) -> UploadAction {
+    if conflict && !retried {
+        UploadAction::Retry
+    } else {
+        UploadAction::Fail
+    }
+}
+
+/// 无 ETag 退化路径的内容比对（sha256），避免把「服务器已接受但内容被他人覆盖」当成功。
+fn same_upload_content(a: &[u8], b: &[u8]) -> bool {
+    let ha = Sha256::digest(a);
+    let hb = Sha256::digest(b);
+    ha == hb
+}
+
 #[tauri::command]
 pub async fn webdav_sync_data(
     state: State<'_, Arc<crate::library::AppState>>,
@@ -770,7 +902,7 @@ pub async fn webdav_sync_data(
     if !options.any() {
         return Err("未启用任何数据同步类型".into());
     }
-    let client = crate::dav::DavClient::new(&base, &user, &pass);
+    let client = crate::dav::DavClient::new(&base, &user, &pass)?;
     client.ensure_dir("TidePage").await.ok();
     client.ensure_dir("TidePage/data").await.ok();
     // B9：优先 v2；仅首次迁移（标记未设）且 v2 缺失时读 v1 一次，避免 v2 被删后把旧 v1 数据复活。
@@ -778,41 +910,110 @@ pub async fn webdav_sync_data(
         let conn = state.db.0.lock().unwrap();
         db::get_setting(&conn, "webdav.sync.v2_migrated").is_some()
     };
-    let raw_v2 = client.get(REMOTE_PATH_V2).await?;
-    let raw_v1 = if should_read_v1(raw_v2.is_some(), v2_migrated) { client.get(REMOTE_PATH).await? } else { None };
-    let (remote, remote_found) = match raw_v2.as_ref().or(raw_v1.as_ref()) {
-        Some(bytes) => (parse_sync(bytes)?, true),
-        None => (SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() }, false),
+    const REMOTE_MAX: u64 = 16 * 1024 * 1024;
+    // S7：v2 读同时拿 ETag 用于条件上传；v1 仍是普通 get。
+    let initial_v2 = client.get_with_etag(REMOTE_PATH_V2, REMOTE_MAX).await?;
+    let (mut raw_v2, mut etag_v2) = match initial_v2 {
+        Some((bytes, tag)) => (Some(bytes), tag),
+        None => (None, None),
     };
+    let raw_v1 = if should_read_v1(raw_v2.is_some(), v2_migrated) { client.get(REMOTE_PATH).await? } else { None };
+    let mut remote_bytes: Option<Vec<u8>> = raw_v2.clone().or(raw_v1.clone());
     let st = state.inner().clone();
     let policy = parse_policy(resolve.as_deref());
     let choices: Option<HashMap<String, String>> = resolve_choices.map(|v| {
         v.into_iter().map(|c| (c.key, c.choice)).collect::<HashMap<_, _>>()
     });
-    let upload_json = tauri::async_runtime::spawn_blocking(move || {
-        let mut conn = st.db.0.lock().unwrap();
-        let local = collect_local(&conn, &options)?;
-        let (merged, mut summary) = merge_local_remote(&mut conn, local, &remote, &options, policy, choices.as_ref())?;
-        summary.remote_found = remote_found;
-        summary.path = REMOTE_PATH_V2.to_string();
-        let json = serde_json::to_vec(&merged).map_err(|e| format!("序列化同步文件失败：{e}"))?;
-        Ok::<_, String>((json, summary))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let (json, mut summary) = upload_json;
-    client.put(REMOTE_PATH_V2, Arc::new(json)).await?;
-    if !v2_migrated {
-        let conn = state.db.0.lock().unwrap();
-        let _ = db::set_setting(&conn, "webdav.sync.v2_migrated", "1");
+    let mut retried = false;
+    loop {
+        let remote_opt = remote_bytes.clone();
+        let st2 = st.clone();
+        let options_c = options.clone();
+        let choices_c = choices.clone();
+        let (json, mut summary) = tauri::async_runtime::spawn_blocking(move || {
+            let mut conn = st2.db.0.lock().unwrap();
+            let local = collect_local(&conn, &options_c)?;
+            let remote = match remote_opt.as_deref() {
+                Some(bytes) => parse_sync(bytes)?,
+                None => SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() },
+            };
+            let (merged, mut summary) =
+                merge_local_remote(&mut conn, local, &remote, &options_c, policy, choices_c.as_ref())?;
+            summary.remote_found = remote_opt.is_some();
+            summary.path = REMOTE_PATH_V2.to_string();
+            let json = serde_json::to_vec(&merged).map_err(|e| format!("序列化同步文件失败：{e}"))?;
+            Ok::<_, String>((json, summary))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let existing_v2 = raw_v2.is_some();
+        let status = client
+            .put_if_match(
+                REMOTE_PATH_V2,
+                Arc::new(json.clone()),
+                if existing_v2 { etag_v2.as_deref() } else { None },
+                !existing_v2,
+            )
+            .await?;
+        if upload_conflict_status(status) {
+            match upload_retry_decision(true, retried) {
+                UploadAction::Retry => {
+                    retried = true;
+                    let fetched = client.get_with_etag(REMOTE_PATH_V2, REMOTE_MAX).await?;
+                    let (b, e) = match fetched {
+                        Some((bytes, tag)) => (Some(bytes), tag),
+                        None => (None, None),
+                    };
+                    raw_v2 = b;
+                    etag_v2 = e;
+                    remote_bytes = raw_v2.clone().or(raw_v1.clone());
+                    continue;
+                }
+                UploadAction::Fail => {
+                    return Err("云端同步数据在同步期间被修改，请重试".into());
+                }
+            }
+        }
+        if !(200..=299).contains(&status) {
+            return Err(format!("上传同步数据失败：HTTP {status}"));
+        }
+        // S7：服务器不回 ETag（或本次是 create）时，PUT 成功后回读比对内容；
+        // 不同说明期间被他人覆盖，按冲突走一次重试（提交前再合并一次）。
+        if etag_v2.is_none() || !existing_v2 {
+            if let Some((body, _)) = client.get_with_etag(REMOTE_PATH_V2, REMOTE_MAX).await? {
+                if !same_upload_content(&body, &json) {
+                    match upload_retry_decision(true, retried) {
+                        UploadAction::Retry => {
+                            retried = true;
+                            let fetched = client.get_with_etag(REMOTE_PATH_V2, REMOTE_MAX).await?;
+                            let (b, e) = match fetched {
+                                Some((bytes, tag)) => (Some(bytes), tag),
+                                None => (None, None),
+                            };
+                            raw_v2 = b;
+                            etag_v2 = e;
+                            remote_bytes = raw_v2.clone().or(raw_v1.clone());
+                            continue;
+                        }
+                        UploadAction::Fail => {
+                            return Err("云端同步数据在同步期间被修改，请重试".into());
+                        }
+                    }
+                }
+            }
+        }
+        if !v2_migrated {
+            let conn = state.db.0.lock().unwrap();
+            let _ = db::set_setting(&conn, "webdav.sync.v2_migrated", "1");
+        }
+        summary.uploaded = true;
+        use tauri::Emitter;
+        let app = state.app.clone();
+        let _ = app.emit("notes-changed", ());
+        let _ = app.emit("library-tags-changed", ());
+        let _ = app.emit("library-shelves-changed", ());
+        return Ok(summary);
     }
-    summary.uploaded = true;
-    use tauri::Emitter;
-    let app = state.app.clone();
-    let _ = app.emit("notes-changed", ());
-    let _ = app.emit("library-tags-changed", ());
-    let _ = app.emit("library-shelves-changed", ());
-    Ok(summary)
 }
 
 /* ---------------- 测试 ---------------- */
@@ -944,7 +1145,7 @@ mod tests {
         // book_tag：远端旧关联 + 远端墓碑 → 不进入输出。
         let mut remote3 = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
         let bt = SyncBookTag { book: ident(&sp), tag_name: "标签".into() };
-        let bt_key = key(&[&norm_path(&bt.book.book_path), &norm(&bt.tag_name)]);
+        let bt_key = db::book_tag_tomb_key(&bt.book.book_path, &bt.tag_name);
         remote3.book_tags.push(bt);
         remote3.tags.push(SyncTag { name: "标签".into(), created_at: 1, updated_at: 0 });
         remote3.tombstones.push(SyncTombstone { kind: "book_tag".into(), key: bt_key, deleted_at: 1 });
@@ -1256,4 +1457,214 @@ mod tests {
         assert!(s.updated >= 1);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// H19 衔接：恢复的笔记写了新 updated_at，下次同步不能被更旧的远端墓碑再删一次。
+    #[test]
+    fn restored_notes_survive_sync_with_old_remote_tombstone() {
+        let root = tmp_root("h19-sync");
+        let (mut conn, id, sp) = setup(&root);
+        db::add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        let bk = root.join("bk.json").to_string_lossy().into_owned();
+        crate::databackup::export_backup_to_file(&conn, &bk, None).unwrap();
+        let created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute("DELETE FROM bookmarks", []).unwrap();
+        let ident_key = db::book_sync_identity("书", "", 10, &sp);
+        let tomb_at = created + 1000;
+        db::record_tombstone(&conn, "bookmark", &db::bookmark_tomb_key(&sp, 0, "t", "e"), tomb_at).unwrap();
+        db::record_tombstone(&conn, "bookmark", &db::bookmark_sync_key(&ident_key, 0, "t", "e"), tomb_at).unwrap();
+        let restored = crate::databackup::restore_backup_file(&mut conn, &bk, false).unwrap();
+        assert_eq!(restored.bookmarks, 1);
+        // 墓碑时间取「恢复后实际 updated_at」：旧实现只写 created_at=0 updated_at，
+        // eff=created_at < tomb → 会被删；修复后 eff=updated_at==tomb（严格大于才删）→ 保留。
+        let restored_updated: i64 = conn
+            .query_row("SELECT updated_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(restored_updated > created);
+        let local = collect_local(&conn, &opts()).unwrap();
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.bookmarks.push(SyncBookmark { book: ident(&sp), chapter_index: 0, title: "t".into(), excerpt: "e".into(), created_at: created, updated_at: 0 });
+        remote.tombstones.push(SyncTombstone {
+            kind: "bookmark".into(),
+            key: db::bookmark_tomb_key(&sp, 0, "t", "e"),
+            deleted_at: restored_updated,
+        });
+        let (merged, _) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert_eq!(merged.bookmarks.len(), 1, "恢复后的笔记不得被旧墓碑再删");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H20①：远端墓碑用新身份 key（路径不同）也能删除本地书签/划线，并在输出里继续传播。
+    #[test]
+    fn remote_identity_tombstone_deletes_across_paths() {
+        let root = tmp_root("h20-cross");
+        let (mut conn, id, _sp) = setup(&root);
+        db::add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        db::add_highlight(&conn, id, 1, "ch", 1, 2, "hl", "underline", "", "n").unwrap();
+        let bm_created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let hl_created: i64 = conn
+            .query_row("SELECT created_at FROM highlights LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let local = collect_local(&conn, &opts()).unwrap();
+        // 另一台设备上的路径（不同），身份相同。
+        let remote_ident = db::book_sync_identity("书", "", 10, "D:/另一台/书.epub");
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.tombstones.push(SyncTombstone {
+            kind: "bookmark".into(),
+            key: db::bookmark_sync_key(&remote_ident, 0, "t", "e"),
+            deleted_at: bm_created + 1000,
+        });
+        remote.tombstones.push(SyncTombstone {
+            kind: "highlight".into(),
+            key: db::highlight_sync_key(&remote_ident, 1, 1, 2, "hl"),
+            deleted_at: hl_created + 1000,
+        });
+        let (merged, _s) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert!(merged.bookmarks.is_empty(), "跨路径身份墓碑应删除本地书签");
+        assert!(merged.highlights.is_empty(), "跨路径身份墓碑应删除本地划线");
+        assert!(merged.tombstones.iter().any(|t| t.kind == "bookmark"), "墓碑应继续输出");
+        let bm: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap();
+        let hl: i64 = conn.query_row("SELECT COUNT(*) FROM highlights", [], |r| r.get(0)).unwrap();
+        assert_eq!((bm, hl), (0, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H20②：本地与远端同书不同路径的记录按身份合并为一条，不重复 added。
+    #[test]
+    fn same_book_different_paths_merge_into_one_row() {
+        let root = tmp_root("h20-dedupe");
+        let (mut conn, id, _sp) = setup(&root);
+        db::add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        let created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let local = collect_local(&conn, &opts()).unwrap();
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.bookmarks.push(SyncBookmark {
+            book: BookIdent { book_path: "D:/另一台/书.epub".into(), book_title: "书".into(), book_author: "".into(), book_size: 10 },
+            chapter_index: 0,
+            title: "t".into(),
+            excerpt: "e".into(),
+            created_at: created,
+            updated_at: 0,
+        });
+        let (out, s) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert_eq!(out.bookmarks.len(), 1, "同书不同路径应合并为一条: {s:?}");
+        assert_eq!(s.added, 0);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H20③：legacy 路径墓碑同路径仍生效，且输出里的 key 逐字未变。
+    #[test]
+    fn legacy_tombstone_key_deletes_and_is_preserved_verbatim() {
+        let root = tmp_root("h20-legacy");
+        let (mut conn, id, sp) = setup(&root);
+        db::add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        let created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let legacy_key = db::bookmark_tomb_key(&sp, 0, "t", "e");
+        let local = collect_local(&conn, &opts()).unwrap();
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.tombstones.push(SyncTombstone { kind: "bookmark".into(), key: legacy_key.clone(), deleted_at: created + 1000 });
+        let (merged, _) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert!(merged.bookmarks.is_empty(), "legacy 同路径墓碑仍应删除");
+        let out_key = merged
+            .tombstones
+            .iter()
+            .find(|t| t.kind == "bookmark")
+            .map(|t| t.key.clone())
+            .expect("墓碑应继续输出");
+        assert_eq!(out_key, legacy_key, "legacy 墓碑 key 必须逐字保留");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H20④：身份不同的书不误删。
+    #[test]
+    fn identity_tombstone_does_not_delete_different_book() {
+        let root = tmp_root("h20-other");
+        let (mut conn, id, _sp) = setup(&root);
+        db::add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        let created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let other = db::book_sync_identity("另一本书", "", 99, "D:/x.epub");
+        let local = collect_local(&conn, &opts()).unwrap();
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.tombstones.push(SyncTombstone {
+            kind: "bookmark".into(),
+            key: db::bookmark_sync_key(&other, 0, "t", "e"),
+            deleted_at: created + 1000,
+        });
+        let (merged, _) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert_eq!(merged.bookmarks.len(), 1, "身份不同的书不得被误删");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H20⑤：身份碰撞（本机两本同 title+author+size）无法唯一确定 → 身份墓碑不得删除任何一本的笔记。
+    #[test]
+    fn identity_collision_keeps_notes_conservative() {
+        let root = tmp_root("h20-collision");
+        let (conn, id1, sp1) = setup(&root);
+        let p2 = root.join("b.epub");
+        std::fs::write(&p2, b"y").unwrap();
+        let sp2 = p2.to_string_lossy().into_owned();
+        let id2 = db::upsert_book(&conn, &sp2, "书", "epub", 10, 2).unwrap();
+        db::add_bookmark(&conn, id1, 0, "t", "e1").unwrap();
+        db::add_bookmark(&conn, id2, 0, "t", "e2").unwrap();
+        let created: i64 = conn
+            .query_row("SELECT created_at FROM bookmarks WHERE book_id=?1", [id1], |r| r.get(0))
+            .unwrap();
+        let mut conn = conn;
+        let ident_remote = db::book_sync_identity("书", "", 10, "D:/另一台/书.epub");
+        let local = collect_local(&conn, &opts()).unwrap();
+        let mut remote = SyncData { format: FORMAT.into(), version: VERSION, ..Default::default() };
+        remote.tombstones.push(SyncTombstone {
+            kind: "bookmark".into(),
+            key: db::bookmark_sync_key(&ident_remote, 0, "t", "e1"),
+            deleted_at: created + 1000,
+        });
+        let (merged, _) = merge_local_remote(&mut conn, local, &remote, &opts(), Policy::Unresolved, None).unwrap();
+        assert_eq!(merged.bookmarks.len(), 2, "身份碰撞时必须保守保留全部条目");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "不得删除任何一本的笔记");
+        let _ = sp1;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// S7：条件上传冲突判定与重试上限（纯函数）。
+    #[test]
+    fn upload_conflict_status_and_retry_decision() {
+        assert!(upload_conflict_status(409));
+        assert!(upload_conflict_status(412));
+        assert!(!upload_conflict_status(200));
+        assert!(!upload_conflict_status(403));
+        assert_eq!(upload_retry_decision(true, false), UploadAction::Retry, "首次冲突重试一次");
+        assert_eq!(upload_retry_decision(true, true), UploadAction::Fail, "重试后仍冲突必须失败");
+        assert_eq!(upload_retry_decision(false, false), UploadAction::Fail);
+        assert_eq!(upload_retry_decision(false, true), UploadAction::Fail);
+        // 无 ETag 退化：内容一致才算成功。
+        assert!(same_upload_content(b"abc", b"abc"));
+        assert!(!same_upload_content(b"abc", b"abd"));
+    }
+
+    /// G18：三类解析错误都带稳定码前缀（前端 errText 映射）。
+    #[test]
+    fn parse_sync_errors_have_stable_codes() {
+        let e = parse_sync(b"not json").unwrap_err();
+        assert!(e.starts_with("dataSync.jsonBroken"), "{e}");
+        let e = parse_sync(br#"{"format":"other","version":1}"#).unwrap_err();
+        assert!(e.starts_with("dataSync.notFile"), "{e}");
+        let e = parse_sync(br#"{"format":"tidepage-data-sync","version":9}"#).unwrap_err();
+        assert!(e.starts_with("dataSync.versionUnsupported"), "{e}");
+    }
+
 }

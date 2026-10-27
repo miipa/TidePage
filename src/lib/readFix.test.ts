@@ -3,6 +3,7 @@ import {
   READ_FIX_BG_SELECTOR,
   READ_FIX_TEXT_SELECTOR,
   buildReadFixCss,
+  sanitizeCssText,
 } from "./readFix";
 
 // 任务二：荧光笔（mark.tp-hl-background）的底色必须活过 __read_fix 的背景 !important。
@@ -72,5 +73,105 @@ describe("buildReadFixCss — 背景规则必须放过划线标记及其后代",
     for (const r of rules(css).filter(hasBackground)) {
       expect(r.body).toContain(`background: ${O.background} !important;`);
     }
+  });
+});
+
+describe("buildReadFixCss — F7 CSS 值白名单", () => {
+  const fontOf = (css: string) => /font-family: ([^;]+) !important;/.exec(css)?.[1];
+  const colorOf = (css: string) => /color: ([^;]+) !important;/.exec(css)?.[1];
+  const sizeOf = (css: string) => /font-size: ([^;]+) !important;/.exec(css)?.[1];
+  const lhOf = (css: string) => /line-height: ([^;]+) !important;/.exec(css)?.[1];
+  const bgOf = (css: string) => /html, body { background: ([^;]+) !important; }/.exec(css)?.[1];
+
+  it("合法字体栈逐字节不变（默认值不回退）", () => {
+    const css = buildReadFixCss(O);
+    expect(fontOf(css)).toBe('"Noto Serif SC", serif');
+    expect(css).toContain('font-family: Consolas, "Courier New", monospace !important;');
+  });
+
+  it("自定义等宽字体栈合法时保留", () => {
+    const css = buildReadFixCss({ ...O, monoFont: 'Consolas, "Courier New", monospace' });
+    expect(css).toContain('font-family: Consolas, "Courier New", monospace !important;');
+  });
+
+  it("合法颜色值逐字节保留", () => {
+    for (const v of ["#abc", "#abcd", "#aabbcc", "#aabbccdd", "transparent", "rgb(0, 0, 0)", "rgba(1, 2, 3, 0.5)", "hsl(0, 0%, 0%)", "hsla(0, 0%, 0%, 0.3)", "red", "RED"]) {
+      const css = buildReadFixCss({ ...O, color: v, background: v });
+      expect(colorOf(css), v).toBe(v);
+      expect(bgOf(css), v).toBe(v);
+    }
+  });
+
+  it("注入型颜色/背景回退默认（不做转义改写）", () => {
+    for (const bad of [
+      "red; } body { background: url(https://evil.example/x) }",
+      "url(x)",
+      "rgb(0,0,0);",
+      "expression(alert(1))",
+      "var(--x)",
+      "#12 #34",
+    ]) {
+      const css = buildReadFixCss({ ...O, color: bad, background: bad });
+      expect(colorOf(css), bad).toBe("#1a1a1a");
+      expect(bgOf(css), bad).toBe("transparent");
+    }
+  });
+
+  it("字体栈含 ;{}() 或 url 子串或反斜杠时回退 serif", () => {
+    for (const bad of [
+      'Arial; } body { background: red',
+      "Arial(url)",
+      "url(x)",
+      "Arial{}",
+      "Arial()",
+      "Arial\\\\Backslash",
+      "Arial: x",
+    ]) {
+      const css = buildReadFixCss({ ...O, fontFamily: bad, monoFont: bad });
+      expect(fontOf(css), bad).toBe("serif");
+      expect(css).toContain("font-family: Consolas");
+    }
+    // 空字体栈也回退。
+    expect(fontOf(buildReadFixCss({ ...O, fontFamily: "" }))).toBe("serif");
+  });
+
+  it("Unicode 自定义字体族名逐字节通过（第 5 轮回归）", () => {
+    const cases = [
+      '"思源宋体", serif',
+      '"源ノ明朝", serif',
+      '"Noto Serif SC", 思源宋体, serif',
+      "思源宋体",
+    ];
+    for (const v of cases) {
+      const css = buildReadFixCss({ ...O, fontFamily: v, monoFont: v });
+      expect(fontOf(css), v).toBe(v);
+      expect(css, v).toContain('font-family: ' + v + ' !important;');
+    }
+  });
+
+  it("Unicode 字体名中的危险字符仍回退默认", () => {
+    for (const bad of ['思源宋体; } body {', '思源宋体(url)', '思源宋体{}', '思源宋体\\x', '思源宋体()', '思源 宋体\u00a0x']) {
+      const css = buildReadFixCss({ ...O, fontFamily: bad });
+      expect(fontOf(css), bad).toBe("serif");
+    }
+  });
+
+  it("fontSize / lineHeight 非法回退", () => {
+    for (const bad of [Number.NaN, -1, 0, Number.POSITIVE_INFINITY]) {
+      expect(sizeOf(buildReadFixCss({ ...O, fontSize: bad })), String(bad)).toBe("32px");
+    }
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: Number.NaN }))).toBe("1.5");
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: 0 }))).toBe("1.5");
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: -0.5 }))).toBe("1.5");
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: "1.75" }))).toBe("1.75");
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: "1.75abc" }))).toBe("1.5");
+    expect(lhOf(buildReadFixCss({ ...O, lineHeight: "0" }))).toBe("1.5");
+  });
+
+  it("sanitizeCssText 去控制字符与结构字符，成对引号不被改写", () => {
+    expect(sanitizeCssText('"Noto Serif SC"')).toBe('"Noto Serif SC"');
+    expect(sanitizeCssText("a\tb\nc")).toBe("a b c");
+    expect(sanitizeCssText("x{};<>y")).toBe("xy");
+    expect(sanitizeCssText("A\u0000B")).toBe("AB");
   });
 });

@@ -11,6 +11,8 @@
  * 自测入口（跑反例不必改仓库、不产生提交）
  *   node scripts/check-legacy-name.mjs --identities "<name>|<email>|<cname>|<cemail>"
  *   只检查这一组身份，不扫文件与提交信息；判定规则与退出码与本模式一致。
+ *   node scripts/check-legacy-name.mjs --selftest
+ *   只跑内置正例/负例断言（覆盖下划线/中缀变体、点号命名空间与豁免），全部通过退出 0，否则 1。
  *
  * 退出码：0 通过；1 命中；2 用法或环境错误（非 git 仓库、git 调用失败、参数不合法）。
  *
@@ -30,18 +32,81 @@ const EXIT_USAGE = 2;
 
 /** 旧名首字母缩写（两字母） */
 const ABBR = "f" + "r";
+const ABBR_UPPER = ABBR.toUpperCase();
 
 /** 旧产品名：由两段拼接，本文件不得出现完整旧名 */
 const OLD_NAME = ["Flow", "Read"].join("");
+
+/**
+ * 标识符边界：旧前缀前允许行首或任意非字母数字字符（下划线、点号、引号、括号均可）。
+ * 不能用单词边界 —— 下划线在正则里属于单词字符，双下划线、中缀、大写下划线前缀都会漏检。
+ */
+const IDENT_START = "(^|[^A-Za-z0-9])";
+
+/**
+ * 语言/地区代码豁免：前缀分隔符后是两位大写地区码，且后面不再接
+ * 字母/数字/下划线。地区码是语言标签的一部分，不是旧前缀。
+ * 注意：该正则大小写敏感 —— 只有小写语言码的标签才豁免；大写形式仍按旧前缀处理。
+ */
+const LOCALE_TAIL_RE = /^[A-Z]{2}(?![A-Za-z0-9_])/;
+
+/** 常见顶级域名（后缀）：最后一节命中这里时按域名处理，不算点号命名空间。 */
+const COMMON_TLDS = new Set([
+  "com", "org", "net", "io", "dev", "cn", "fr", "ai", "co", "uk", "de", "jp", "edu", "gov",
+  "info", "me", "app", "xyz", "top", "site", "online", "tech", "cloud", "pro", "biz", "tv",
+  "cc", "us", "eu", "au", "ca", "ru", "br", "in", "it", "nl", "se", "no", "fi", "pl", "es",
+  "ch", "at", "be", "dk", "kr", "tw", "hk", "sg",
+]);
+
+/** 常见文件扩展名：唯一一节命中这里时按文件名处理，不算点号命名空间。 */
+const FILE_EXTS = new Set([
+  "json", "jsonl", "js", "mjs", "cjs", "ts", "svelte", "md", "html", "css", "txt", "yml",
+  "yaml", "toml", "xml", "csv", "log", "lock", "png", "jpg", "jpeg", "webp", "gif", "svg",
+  "rs", "py", "sh", "ps1", "bat", "exe", "zip",
+]);
+
+/** 点号命名空间规则：前缀 + 点 + token（token 可为空：句末的单前缀句点不报）。 */
+const DOT_NS_RE = new RegExp(IDENT_START + ABBR + "\\.([A-Za-z0-9._-]*)", "i");
+
+/** 命中判定：token 形似域名（最后一节是常见 TLD）或文件名（唯一一节是文件扩展名）时豁免。 */
+function dotNamespaceHits(match) {
+  // IDENT_START 是可选捕获组：行首时 match[1] 为空串，token 在 match[2]。
+  const token = match[2] || "";
+  if (!token) return false;
+  const lower = token.toLowerCase();
+  if (token.includes(".")) {
+    const last = lower.slice(lower.lastIndexOf(".") + 1);
+    return !COMMON_TLDS.has(last);
+  }
+  return !FILE_EXTS.has(lower);
+}
+
+/** 命中判定：前缀后紧跟语言地区码时豁免。 */
+function prefixHits(match, line) {
+  const rest = line.slice(match.index + match[0].length);
+  return !LOCALE_TAIL_RE.test(rest);
+}
 
 const CHECKS = [
   {
     label: `旧产品名「${OLD_NAME}」`,
     re: new RegExp(["Flow", "[ _-]?", "Read"].join(""), "i"),
   },
-  { label: `旧前缀「${ABBR}-」`, re: new RegExp("\\b" + ABBR + "-", "i") },
-  { label: `旧前缀「${ABBR}_」`, re: new RegExp("\\b" + ABBR + "_", "i") },
-  { label: `旧 DEV 钩子「__${ABBR}Debug」`, re: new RegExp("__" + ABBR + "(?=[A-Z])") },
+  {
+    label: `旧前缀「${ABBR}-」/「${ABBR}_」`,
+    re: new RegExp(IDENT_START + ABBR + "[-_]", "i"),
+    accept: prefixHits,
+  },
+  {
+    label: `旧点号命名空间「${ABBR}.」`,
+    re: DOT_NS_RE,
+    accept: dotNamespaceHits,
+  },
+  {
+    label: `旧 DEV 钩子「__${ABBR}Debug」`,
+    // 覆盖双下划线、紧跟字母或下划线、大小写混写等变体。
+    re: new RegExp("__" + ABBR + "(?=[A-Za-z_])", "i"),
+  },
 ];
 
 /** `_test/` 下由探针生成的临时产物（沙箱 profile、导出结果、截图、日志） */
@@ -70,9 +135,10 @@ const seenIdentity = new Set();
 
 function usage() {
   return [
-    '用法：node scripts/check-legacy-name.mjs [--identities "<name>|<email>|<cname>|<cemail>"]',
+    '用法：node scripts/check-legacy-name.mjs [--identities "<name>|<email>|<cname>|<cemail>"] [--selftest]',
     "  无参数：扫 git ls-files 文本文件 + git log -200 提交信息 + 提交身份",
     "  --identities：只检查传入的四个身份字段，不扫文件与提交信息",
+    "  --selftest：只跑内置正例/负例断言（不扫仓库）",
     "退出码：0 通过；1 命中；2 用法或环境错误",
   ].join("\n");
 }
@@ -128,7 +194,10 @@ function scanText(text) {
     const line = lines[i];
     for (const c of CHECKS) {
       const m = c.re.exec(line);
-      if (m) out.push({ line: i + 1, col: m.index + 1, label: c.label, snippet: m[0] });
+      if (!m) continue;
+      // accept(m, line) 为 false 表示该匹配被豁免（语言地区码 / 域名 / 文件名）。
+      if (c.accept && !c.accept(m, line)) continue;
+      out.push({ line: i + 1, col: m.index + 1, label: c.label, snippet: m[0] });
     }
   }
   return out;
@@ -224,10 +293,65 @@ function scanArgIdentities(fields) {
   }
 }
 
+/* ------------------------------- --selftest ------------------------------- */
+
+/**
+ * 自测：正例必须命中、负例必须不命中。样例同样用拼接构造，避免脚本自我命中。
+ * 覆盖规则要求的下划线/中缀变体、点号命名空间、语言地区码与域名/文件名豁免。
+ */
+function runSelftest() {
+  const lowercase = ABBR;
+  const uppercase = ABBR_UPPER;
+  const positives = [
+    ["双下划线 + 连字符", "__" + lowercase + "-x"],
+    ["BEM 中缀", "block__" + lowercase + "-item"],
+    ["大写下划线前缀", "MY_" + uppercase + "_THEME"],
+    ["点号命名空间 ai.winw", lowercase + ".ai.winw"],
+    ["点号命名空间 ai.open", lowercase + ".ai.open"],
+    ["DEV 钩子", "__" + lowercase + "Debug"],
+    ["行首下划线前缀", lowercase + "_theme"],
+  ];
+  const negatives = [
+    ["英文单词 front", "front"],
+    ["英文单词 frame", "frame"],
+    ["英文单词 from", "from"],
+    ["英文单词 affront", "affront"],
+    ["语言地区代码连字符", 'lang="' + lowercase + '-FR"'],
+    ["语言地区代码下划线", "locale " + lowercase + "_CA"],
+    ["域名", lowercase + ".wikipedia.org"],
+    ["URL 中的语言域名", "https://example." + lowercase + "/x"],
+    ["文件名", lowercase + ".json"],
+  ];
+  let failed = 0;
+  for (const [name, sample] of positives) {
+    const hits = scanText(sample);
+    if (!hits.length) {
+      failed++;
+      console.error(`check-legacy-name: --selftest 正例未命中：${name} → ${JSON.stringify(sample)}`);
+    }
+  }
+  for (const [name, sample] of negatives) {
+    const hits = scanText(sample);
+    if (hits.length) {
+      failed++;
+      console.error(
+        `check-legacy-name: --selftest 负例误报：${name} → ${JSON.stringify(sample)} 命中 ${JSON.stringify(hits.map((h) => h.snippet))}`,
+      );
+    }
+  }
+  if (failed) {
+    console.error(`check-legacy-name: --selftest 失败（${failed} 条）`);
+    process.exit(EXIT_HIT);
+  }
+  console.log(`check-legacy-name: --selftest 通过（${positives.length} 条正例、${negatives.length} 条负例）`);
+  process.exit(EXIT_PASS);
+}
+
 /* ---------------------------------- 入口 ---------------------------------- */
 
 function parseArgs(argv) {
   let identities = null;
+  let selftest = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--identities") {
@@ -238,6 +362,8 @@ function parseArgs(argv) {
         fail(`--identities 参数必须是 4 个以 | 分隔的字段，实际 ${parts.length} 个：${JSON.stringify(raw)}`);
       }
       identities = parts;
+    } else if (a === "--selftest") {
+      selftest = true;
     } else if (a === "-h" || a === "--help") {
       console.log(usage());
       process.exit(EXIT_PASS);
@@ -245,7 +371,7 @@ function parseArgs(argv) {
       fail(`未知参数 ${JSON.stringify(a)}`);
     }
   }
-  return { identities };
+  return { identities, selftest };
 }
 
 function finish() {
@@ -268,7 +394,9 @@ function finish() {
 
 const args = parseArgs(process.argv.slice(2));
 
-if (args.identities) {
+if (args.selftest) {
+  runSelftest();
+} else if (args.identities) {
   scanArgIdentities(args.identities);
 } else {
   const inside = git(["rev-parse", "--is-inside-work-tree"]);

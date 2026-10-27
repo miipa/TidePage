@@ -5,6 +5,45 @@ export interface EdgeEvent {
   carry: number;
 }
 
+/** F7：越界累计的纯状态机（便于单测，也避免 wheelBy 里两套口径各算一次）。
+ * 约定：待跨章量 pending 记录原始越界量；视觉回弹 over 只用于装饰且封顶；
+ * 跨章触发时 carry 带上本次全部原始越界量并把 over 清零，保证同一位移只计一次。 */
+export interface OverscrollState {
+  over: number;
+  pending: number;
+  threshold: number;
+  strength: number;
+  bounce: boolean;
+}
+
+export interface OverscrollResult {
+  over: number;
+  pending: number;
+  edge: -1 | 0 | 1;
+  carry: number;
+}
+
+export function accumulateOverscroll(s: OverscrollState, delta: number): OverscrollResult {
+  if (delta === 0) {
+    return { over: s.over, pending: 0, edge: 0, carry: 0 };
+  }
+  const sign = delta > 0 ? 1 : -1;
+  // 反向越界重置累计（先回弹到 0 再往另一头累计，语义与旧实现一致）。
+  const pending = s.pending === 0 || Math.sign(s.pending) === sign ? s.pending + delta : delta;
+  if (!s.bounce) {
+    // 非回弹：越界直接全部转成跨章量，视觉回弹清零。
+    return { over: 0, pending: 0, edge: sign as -1 | 1, carry: delta };
+  }
+  const damp = 1.0 / (1 + s.strength * 1.1);
+  const cap = s.threshold * 0.55;
+  const over = Math.max(-cap, Math.min(cap, s.over + delta * damp));
+  if (Math.abs(pending) >= s.threshold) {
+    // 跨章：carry 取全部原始越界量（含本轮与之前累计），over 清零避免同一位移双计。
+    return { over: 0, pending: 0, edge: sign as -1 | 1, carry: pending };
+  }
+  return { over, pending, edge: 0, carry: 0 };
+}
+
 export class SmoothScroller {
   private target = 0;
   private current = 0;
@@ -106,35 +145,20 @@ export class SmoothScroller {
     }
     this.target = to;
 
-    let edge: -1 | 0 | 1 = 0;
-    let carry = 0;
-    if (over !== 0) {
-      const sign = over > 0 ? 1 : -1;
-      if (this.pending === 0 || Math.sign(this.pending) === sign) {
-        this.pending += over;
-      } else {
-        this.pending = over;
-      }
-      if (!this.bounce) {
-        edge = sign as -1 | 1;
-        carry = over;
-        this.pending = 0;
-        this.over = 0;
-      } else {
-        const damp = 1.0 / (1 + this.strength * 1.1);
-        const cap = this.threshold * 0.55;
-        this.over = Math.max(-cap, Math.min(cap, this.over + over * damp));
-        this.pending += over * 0.6;
-        const limit = this.threshold;
-        if (Math.abs(this.pending) >= limit) {
-          edge = sign as -1 | 1;
-          carry = Math.max(0, Math.abs(this.pending) - limit) / 0.6;
-          this.pending = 0;
-        }
-      }
-    } else {
-      this.pending = 0;
-    }
+    const acc = accumulateOverscroll(
+      {
+        over: this.over,
+        pending: this.pending,
+        threshold: this.threshold,
+        strength: this.strength,
+        bounce: this.bounce,
+      },
+      over,
+    );
+    this.over = acc.over;
+    this.pending = acc.pending;
+    const edge = acc.edge;
+    const carry = acc.carry;
 
     // 「减少动效」：目标位置与越界量照常计算（章节补齐等调用方依赖 edge/carry），
     // 但跳过惯性逼近与橡皮筋回弹——直接落到目标并渲染一帧。

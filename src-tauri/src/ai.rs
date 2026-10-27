@@ -6,6 +6,72 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// S4：远端响应体上限。超出即返回可读错误，避免恶意/异常上游用超大 body 撑爆内存。
+/// JSON 16MiB：正常聊天/语音清单/错误 JSON 远小于此；音频 32MiB（与 Edge 音频上限一致）；
+/// 错误体/诊断文本 1MiB：只用于拼错误摘要，不需要整段保留。
+const AI_JSON_MAX: usize = 16 * 1024 * 1024;
+const AI_AUDIO_MAX: usize = 32 * 1024 * 1024;
+const AI_ERROR_MAX: usize = 1024 * 1024;
+
+/// 判断响应体是否超限：Content-Length 预检（不信任但可提前拒绝）+ 流式累计。
+fn body_limit_exceeded(content_length: Option<u64>, received: u64, max: u64) -> bool {
+    if let Some(cl) = content_length {
+        if cl > max {
+            return true;
+        }
+    }
+    received > max
+}
+
+fn body_too_large(what: &str, max: usize) -> AiError {
+    // 空 code = 前端原样透传动态文案，避免为容量错误新增 i18n 键。
+    AiError::protocol("", format!("{what}响应超过上限 {}MiB", max / 1048576))
+}
+
+/// 读取响应体并施加大小上限；超限立即取消读取并返回可读错误。
+async fn read_body_capped(
+    resp: reqwest::Response,
+    max: usize,
+    what: &str,
+) -> Result<Vec<u8>, AiError> {
+    let content_length = resp.content_length();
+    let max_u64 = max as u64;
+    if body_limit_exceeded(content_length, 0, max_u64) {
+        return Err(body_too_large(what, max));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut received: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| classify_req(&e))?;
+        received = received.saturating_add(chunk.len() as u64);
+        if body_limit_exceeded(content_length, received, max_u64) {
+            return Err(body_too_large(what, max));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// 文本响应（错误体/诊断）：按 lossy UTF-8 解码，调用方决定截断展示长度。
+async fn text_capped(
+    resp: reqwest::Response,
+    max: usize,
+    what: &str,
+) -> Result<String, AiError> {
+    let bytes = read_body_capped(resp, max, what).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// JSON 响应：先按上限读字节，再解析；解析失败保留既有 ai.responseParse 语义。
+async fn json_capped(
+    resp: reqwest::Response,
+    what: &str,
+) -> Result<serde_json::Value, AiError> {
+    let bytes = read_body_capped(resp, AI_JSON_MAX, what).await?;
+    serde_json::from_slice(&bytes).map_err(|e| AiError::protocol("ai.responseParse", e.to_string()))
+}
+
 pub struct AiConfig {
     pub provider: String,
     pub base_url: String,
@@ -156,7 +222,14 @@ const NO_PROXY_LIST: &str =
 fn proxy_with_bypass(u: &str) -> Result<reqwest::Proxy, AiError> {
     reqwest::Proxy::all(u)
         .map(|p| p.no_proxy(reqwest::NoProxy::from_string(NO_PROXY_LIST)))
-        .map_err(|e| AiError::config("ai.proxyAddrInvalid", format!("{u} ({e})")))
+        // S4：错误串会随 AiError.message 显示到聊天/TTS/测试连接，代理地址里的 user:pass@
+        // 与 query 凭据必须先打码（mask_creds/redact_query 不改变可用性判断）。
+        .map_err(|e| {
+            AiError::config(
+                "ai.proxyAddrInvalid",
+                format!("{} ({e})", mask_creds(&redact_query(u))),
+            )
+        })
 }
 
 /// 解析 `ProxyServer`，兼容 `host:port` 与 `http=host:port;https=host:port` 两种格式。
@@ -420,7 +493,9 @@ fn build_client_uncached(
         // 保证「直连」与「系统代理解析不到」两种语义都确定。
         None => b = b.no_proxy(),
     }
-    b.build().map_err(|e| AiError::config("", e.to_string()))
+    // S4：builder 错误也可能回显代理地址，统一打码后再上行。
+    b.build()
+        .map_err(|e| AiError::config("", mask_creds(&redact_query(&e.to_string()))))
 }
 
 /* ============================ 服务商适配 ============================ */
@@ -974,6 +1049,46 @@ pub enum AiTestResult {
     AllFailed { detail: String, lines: Vec<AiPiece> },
 }
 
+/// P1-4：测试连接成功必须同时满足「2xx + 可解析为 JSON object/array」。
+/// 旧实现 unwrap_or_default 把空/HTML/非法 JSON 都当空对象，仍判成功。
+/// 错误信息带 HTTP 状态与脱敏后的响应摘要，便于用户判断是代理/网关还是接口问题。
+fn parse_test_connection_body(status: u16, text: &str) -> Result<serde_json::Value, AiError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::protocol(
+            "",
+            format!("HTTP {status}: 响应为空，接口可能返回了空 body"),
+        ));
+    }
+    let brief = |s: &str| -> String {
+        let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let truncated: String = one_line.chars().take(180).collect();
+        mask_creds(&truncated)
+    };
+    if trimmed.starts_with('<') {
+        return Err(AiError::protocol(
+            "",
+            format!("HTTP {status}: 响应不是 JSON（疑似 HTML 登录页/网关页）：{}", brief(trimmed)),
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        AiError::protocol(
+            "",
+            format!(
+                "HTTP {status}: 响应不是合法 JSON（{e}）：{}",
+                brief(trimmed)
+            ),
+        )
+    })?;
+    if parsed.is_null() || !(parsed.is_object() || parsed.is_array()) {
+        return Err(AiError::protocol(
+            "",
+            format!("HTTP {status}: 响应结构不符合预期（需要 JSON 对象或数组）"),
+        ));
+    }
+    Ok(parsed)
+}
+
 pub async fn test_connection(
     provider: String,
     base_url: String,
@@ -1055,12 +1170,9 @@ pub async fn test_connection(
             }
         }
     }
-    // 非直连模式再补一条直连回退，便于诊断
-    if mode != "direct" {
-        if let Ok(c) = build_client("direct", "", None, target) {
-            candidates.push((AiPiece::new("ai.routeDirectFallback", ""), c));
-        }
-    }
+    // S4：不再为非直连模式自动追加「直连回退」候选 —— 配置了代理就必须真正走代理，
+    // 不能悄悄绕过代理直连上游，也不能把带 API key 的请求头带到非代理链路。
+    // 用户想看直连结果，可显式切到「直连」模式再测试（界面已有该选项）。
 
     let mut errs: Vec<(AiPiece, AiError)> = Vec::new();
     for (route, http) in &candidates {
@@ -1074,12 +1186,22 @@ pub async fn test_connection(
         let outcome = async {
             let resp = req.send().await.map_err(|e| classify_req(&e))?;
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // S4：测试连接同样限制 body 大小（成功/失败都走上限读取）。
+            // P1-4：读取失败/超限要给可读失败，不能 unwrap_or_default 后继续判成功。
+            let text = text_capped(resp, AI_JSON_MAX, "测试连接")
+                .await
+                .map_err(|e| {
+                    AiError::protocol(
+                        "",
+                        format!("HTTP {status}: 读取测试连接响应失败：{e}"),
+                    )
+                })?;
             if !status.is_success() {
                 let brief = error_message_from_body(&text);
                 return Err(AiError::http(status.as_u16(), "", format!("HTTP {status}: {brief}")));
             }
-            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            // P1-4：2xx 且响应必须是合法 JSON object/array 才算成功；reply 仍由 full_content 提取（可为空）。
+            let parsed = parse_test_connection_body(status.as_u16(), &text)?;
             let reply = full_content(p, &parsed).unwrap_or_default();
             Ok::<String, AiError>(reply.trim().to_string())
         }
@@ -1112,6 +1234,180 @@ pub async fn test_connection(
 
 /* ============================ 流式聊天 ============================ */
 
+/// H8：SSE/NDJSON 行缓冲。按字节累积，只在完整行上做 UTF-8 解码——
+/// 旧实现每块单独 from_utf8_lossy，多字节字符跨 chunk 时会被拆成两个 U+FFFD。
+struct SseLineBuf {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuf {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// 追加一块字节，返回其中所有完整行（去行尾 \r）。残行留在缓冲区等下一块。
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        for (i, b) in self.buf.iter().enumerate() {
+            if *b != b'\n' {
+                continue;
+            }
+            let mut line = &self.buf[start..i];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            out.push(String::from_utf8_lossy(line).into_owned());
+            start = i + 1;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
+        }
+        out
+    }
+
+    /// 流结束：返回最后一条无换行的尾行（没有则 None）。
+    fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let mut line = std::mem::take(&mut self.buf);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+}
+
+fn stream_emit_delta(app: &tauri::AppHandle, id: &str, content: &str, done: bool) {
+    let _ = app.emit(
+        &format!("ai-token:{id}"),
+        serde_json::json!({"delta": content, "done": done}),
+    );
+}
+
+fn stream_emit_err(app: &tauri::AppHandle, id: &str, e: &AiError) {
+    let _ = app.emit(
+        &format!("ai-token:{id}"),
+        serde_json::json!({"error": e.message, "kind": e.kind, "done": true}),
+    );
+}
+
+/// H9：从上游 data JSON 里识别错误事件。
+/// 兼容 OpenAI/Azure/DashScope（{"error":{...}} 或 {"error":"..."}）、Anthropic
+/// （{"type":"error","error":{"message":...}}）与 Gemini（{"error":{...}}）。
+fn stream_error_text(_p: Provider, v: &serde_json::Value) -> Option<String> {
+    let is_error_type = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t.eq_ignore_ascii_case("error"))
+        .unwrap_or(false);
+    if !is_error_type && v.get("error").is_none() {
+        return None;
+    }
+    v.pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .or_else(|| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .or_else(|| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .or_else(|| v.get("error").map(|e| e.to_string()))
+        .or_else(|| is_error_type.then(|| "upstream error".to_string()))
+}
+
+/// H9：协议层终止标记（[DONE] 之外的 JSON 事件）。
+/// OpenAI/Azure/DashScope 只认文本 [DONE]；Ollama 认 done:true；Anthropic 认 message_stop；
+/// Gemini 没有 sentinel，只看 finishReason（空/缺失不算终止）。
+fn is_terminal(p: Provider, v: &serde_json::Value) -> bool {
+    match p {
+        Provider::OpenAi | Provider::Azure | Provider::DashScope => false,
+        Provider::Ollama => v.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
+        Provider::Anthropic => v.get("type").and_then(|t| t.as_str()) == Some("message_stop"),
+        Provider::Gemini => v
+            .pointer("/candidates/0/finishReason")
+            .and_then(|f| f.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+    }
+}
+
+/// H9：流结束是否正常。有内容但没有终止标记 → 视为提前 EOF（协议错误）；
+/// Gemini 的流没有 sentinel，有内容即视为正常结束（不能误报截断）。
+fn stream_end_ok(p: Provider, got_any: bool, terminal_seen: bool) -> bool {
+    if !got_any {
+        return false;
+    }
+    terminal_seen || matches!(p, Provider::Gemini)
+}
+
+/// 处理一行流数据：Ok(true)=流可正常结束；Ok(false)=继续；Err=上游错误/协议错误。
+fn handle_stream_line(
+    app: &tauri::AppHandle,
+    id: &str,
+    p: Provider,
+    is_ollama: bool,
+    line: &str,
+    got_any: &mut bool,
+    terminal_seen: &mut bool,
+    raw_diag: &[u8],
+) -> Result<bool, AiError> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(false);
+    }
+    if is_ollama {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Ok(false);
+        };
+        if let Some(msg) = stream_error_text(p, &v) {
+            return Err(AiError::protocol("", msg));
+        }
+        if is_terminal(p, &v) {
+            *terminal_seen = true;
+        }
+        if let Some(content) = stream_delta(Provider::Ollama, &v) {
+            *got_any = true;
+            let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+            stream_emit_delta(app, id, &content, done);
+            if done {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        if !*got_any {
+            // [DONE] 前没有任何内容：保持既有 protocolMismatchStream 语义。
+            return Err(AiError::protocol(
+                "ai.protocolMismatchStream",
+                String::from_utf8_lossy(raw_diag).chars().take(200).collect::<String>(),
+            ));
+        }
+        *terminal_seen = true;
+        return Ok(true);
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Ok(false);
+    };
+    if let Some(msg) = stream_error_text(p, &v) {
+        return Err(AiError::protocol("", msg));
+    }
+    if is_terminal(p, &v) {
+        *terminal_seen = true;
+    }
+    if let Some(content) = stream_delta(p, &v) {
+        if !content.is_empty() {
+            *got_any = true;
+        }
+        stream_emit_delta(app, id, &content, false);
+    }
+    Ok(false)
+}
+
 pub async fn stream_chat(
     app: tauri::AppHandle,
     http: reqwest::Client,
@@ -1127,17 +1423,9 @@ pub async fn stream_chat(
     let p = Provider::parse(&cfg.provider);
     let prepared = build_request(p, &cfg, &system, &messages, true)?;
 
-    let emit_err = |app: &tauri::AppHandle, id: &str, e: &AiError| {
-        let _ = app.emit(
-            &format!("ai-token:{id}"),
-            serde_json::json!({"error": e.message, "kind": e.kind, "done": true}),
-        );
-    };
+    let emit_err = |app: &tauri::AppHandle, id: &str, e: &AiError| stream_emit_err(app, id, e);
     let emit_delta = |app: &tauri::AppHandle, id: &str, content: &str, done: bool| {
-        let _ = app.emit(
-            &format!("ai-token:{id}"),
-            serde_json::json!({"delta": content, "done": done}),
-        );
+        stream_emit_delta(app, id, content, done)
     };
 
     let mut req = http
@@ -1166,7 +1454,7 @@ pub async fn stream_chat(
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let text = text_capped(resp, AI_ERROR_MAX, "错误响应").await.unwrap_or_default();
         let err = AiError::http(status, "", format!("HTTP {status}: {}", error_message_from_body(&text)));
         emit_err(&app, &id, &err);
         return Err(err);
@@ -1182,7 +1470,7 @@ pub async fn stream_chat(
     let is_sse = ct.contains("text/event-stream") || (is_ollama && ct.contains("ndjson"));
 
     if !is_sse {
-        let text = resp.text().await.map_err(|e| classify_req(&e))?;
+        let text = text_capped(resp, AI_JSON_MAX, "聊天响应").await?;
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         if let Some(content) = full_content(p, &parsed) {
             if !content.is_empty() {
@@ -1197,8 +1485,12 @@ pub async fn stream_chat(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut line_buf = SseLineBuf::new();
+    // 诊断缓冲：只服务错误消息（保留尾部 4KiB，按字节截断不会破坏 UTF-8 边界，
+    // 真正解码时用 from_utf8_lossy）。
+    let mut raw_diag: Vec<u8> = Vec::new();
     let mut got_any = false;
+    let mut terminal_seen = false;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
@@ -1208,43 +1500,55 @@ pub async fn stream_chat(
                 return Err(err);
             }
         };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buf.find('\n') {
-            let line: String = buf.drain(..=pos).collect();
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            if is_ollama {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(content) = stream_delta(Provider::Ollama, &v) {
-                        got_any = true;
-                        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                        emit_delta(&app, &id, &content, done);
-                        if done {
-                            return Ok(());
-                        }
-                    }
+        raw_diag.extend_from_slice(&chunk);
+        if raw_diag.len() > 4096 {
+            let cut = raw_diag.len() - 4096;
+            raw_diag.drain(..cut);
+        }
+        for line in line_buf.push(&chunk) {
+            match handle_stream_line(
+                &app,
+                &id,
+                p,
+                is_ollama,
+                &line,
+                &mut got_any,
+                &mut terminal_seen,
+                &raw_diag,
+            ) {
+                Ok(true) => {
+                    emit_delta(&app, &id, "", true);
+                    return Ok(());
                 }
-                continue;
-            }
-            let Some(data) = line.strip_prefix("data:") else { continue };
-            let data = data.trim();
-            if data == "[DONE]" {
-                if !got_any {
-                    let err = AiError::protocol("ai.protocolMismatchStream", buf.chars().take(200).collect::<String>());
-                    emit_err(&app, &id, &err);
-                    return Err(err);
+                Ok(false) => {}
+                Err(e) => {
+                    emit_err(&app, &id, &e);
+                    return Err(e);
                 }
-                emit_delta(&app, &id, "", true);
-                return Ok(());
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(content) = stream_delta(p, &v) {
-                    if !content.is_empty() {
-                        got_any = true;
-                    }
-                    emit_delta(&app, &id, &content, false);
+        }
+    }
+    // H8：流结束处理最后一条无换行的尾行（可能正是完整的最后一行 JSON）。
+    if let Some(last) = line_buf.finish() {
+        if !last.trim().is_empty() {
+            match handle_stream_line(
+                &app,
+                &id,
+                p,
+                is_ollama,
+                &last,
+                &mut got_any,
+                &mut terminal_seen,
+                &raw_diag,
+            ) {
+                Ok(true) => {
+                    emit_delta(&app, &id, "", true);
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    emit_err(&app, &id, &e);
+                    return Err(e);
                 }
             }
         }
@@ -1252,8 +1556,9 @@ pub async fn stream_chat(
 
     if !got_any {
         let ct2 = if ct.is_empty() { "unknown" } else { &ct };
-        let brief: String = buf.chars().take(300).collect();
-        let parsed: serde_json::Value = serde_json::from_str(buf.trim()).unwrap_or_default();
+        let raw = String::from_utf8_lossy(&raw_diag).into_owned();
+        let brief: String = raw.chars().take(300).collect();
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
         if let Some(content) = full_content(p, &parsed) {
             if !content.is_empty() {
                 emit_delta(&app, &id, &content, true);
@@ -1261,6 +1566,13 @@ pub async fn stream_chat(
             }
         }
         let err = AiError::protocol("ai.protocolMismatchEmpty", format!("{ct2} | {brief}"));
+        emit_err(&app, &id, &err);
+        return Err(err);
+    }
+    // H9：有内容但没有终止标记 = 提前 EOF。Gemini 没有 sentinel，按正常结束处理。
+    if !stream_end_ok(p, true, terminal_seen) {
+        let brief: String = String::from_utf8_lossy(&raw_diag).chars().take(200).collect();
+        let err = AiError::protocol("ai.protocolMismatchStream", brief);
         emit_err(&app, &id, &err);
         return Err(err);
     }
@@ -1275,11 +1587,11 @@ async fn post_audio(req: reqwest::RequestBuilder) -> Result<Vec<u8>, AiError> {
     let resp = req.send().await.map_err(|e| classify_req(&e))?;
     let status = resp.status();
     if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
+        let msg = text_capped(resp, AI_ERROR_MAX, "错误响应").await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
     }
-    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    let bytes = read_body_capped(resp, AI_AUDIO_MAX, "音频").await?;
     if bytes.is_empty() {
         return Err(AiError::protocol("ai.emptyAudio", ""));
     }
@@ -1347,11 +1659,11 @@ async fn synthesize_dashscope(
         .map_err(|e| classify_req(&e))?;
     let status = resp.status();
     if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
+        let msg = text_capped(resp, AI_ERROR_MAX, "错误响应").await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
     }
-    let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
+    let v: serde_json::Value = json_capped(resp, "语音合成响应").await?;
     // DashScope 可能以 HTTP 200 携带业务错误码返回。
     let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
     if !code.is_empty() {
@@ -1377,7 +1689,7 @@ async fn synthesize_dashscope(
             if !ar.status().is_success() {
                 return Err(AiError::http(ar.status().as_u16(), "ai.audioDownloadFailed", ""));
             }
-            let bytes = ar.bytes().await.map_err(|e| classify_req(&e))?;
+            let bytes = read_body_capped(ar, AI_AUDIO_MAX, "音频").await?;
             if bytes.is_empty() {
                 return Err(AiError::protocol("ai.audioDownloadEmpty", ""));
             }
@@ -1502,11 +1814,11 @@ async fn fetch_breeze_voice_at(
         .map_err(|e| classify_req(&e))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let msg = resp.text().await.unwrap_or_default();
+        let msg = text_capped(resp, AI_ERROR_MAX, "错误响应").await.unwrap_or_default();
         let brief: String = msg.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
     }
-    let v: serde_json::Value = resp.json().await.map_err(|e| classify_req(&e))?;
+    let v: serde_json::Value = json_capped(resp, "音色列表响应").await?;
     let empty: Vec<serde_json::Value> = Vec::new();
     let arr = v
         .get("voices")
@@ -1552,7 +1864,7 @@ async fn fetch_breeze_voice_at(
     if !aref.status().is_success() {
         return Err(AiError::http(aref.status().as_u16(), "ai.refAudioReadFailed", ""));
     }
-    let bytes = aref.bytes().await.map_err(|e| classify_req(&e))?;
+    let bytes = read_body_capped(aref, AI_AUDIO_MAX, "参考音频").await?;
     if bytes.is_empty() {
         return Err(AiError::protocol("ai.refAudioEmpty", ""));
     }
@@ -1623,12 +1935,12 @@ async fn synthesize_breeze(
             .unwrap_or("")
             .to_ascii_lowercase();
         if !status.is_success() {
-            let msg = resp.text().await.unwrap_or_default();
+            let msg = text_capped(resp, AI_ERROR_MAX, "错误响应").await.unwrap_or_default();
             let brief: String = msg.chars().take(300).collect();
             last_err = Some(AiError::http(status.as_u16(), "", brief));
             continue;
         }
-        let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+        let bytes = read_body_capped(resp, AI_AUDIO_MAX, "合成音频").await?;
         if ctype.contains("application/json") {
             // 兼容以 JSON 携带 Base64 音频的实现。
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -1712,7 +2024,14 @@ pub async fn synthesize_tts(
             synth_baidu(&c, p, text).await
         }
         // Edge 走 wss（tokio-tungstenite），不使用 reqwest client。
-        "edge" => synth_edge(p, text).await,
+        // S4：配置了生效代理时明确报错，绝不静默直连；无代理时保持原行为。
+        "edge" => {
+            let resolved = resolve_proxy(proxy_mode, proxy_url, proxy_type)?;
+            if edge_proxy_blocked(&resolved) {
+                return Err(AiError::config("ai.edgeProxyUnsupported", ""));
+            }
+            synth_edge(p, text).await
+        }
         // openai / voicestudio 均为 OpenAI 兼容（VoiceStudio 本地 /v1/audio/speech）。
         _ => synth_openai(&http, p, base, text).await,
     }
@@ -1825,7 +2144,7 @@ async fn synth_minimax(
     }
     let resp = req.send().await.map_err(|e| classify_req(&e))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let txt = text_capped(resp, AI_JSON_MAX, "语音合成响应").await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
@@ -1965,7 +2284,7 @@ async fn synth_volcano(
         .await
         .map_err(|e| classify_req(&e))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let txt = text_capped(resp, AI_JSON_MAX, "语音合成响应").await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
@@ -2028,7 +2347,7 @@ async fn synth_baidu(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let bytes = resp.bytes().await.map_err(|e| classify_req(&e))?;
+    let bytes = read_body_capped(resp, AI_AUDIO_MAX, "语音合成响应").await?;
     if ctype.starts_with("audio") {
         if bytes.is_empty() {
             return Err(AiError::protocol("ai.baiduEmptyAudio", ""));
@@ -2072,7 +2391,7 @@ async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) ->
         .await
         .map_err(|e| classify_req(&e))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let txt = text_capped(resp, AI_JSON_MAX, "令牌响应").await.unwrap_or_default();
     if !status.is_success() {
         let brief: String = txt.chars().take(300).collect();
         return Err(AiError::http(status.as_u16(), "", brief));
@@ -2103,6 +2422,33 @@ async fn baidu_token(http: &reqwest::Client, api_key: &str, secret_key: &str) ->
 const EDGE_TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 /// 伪装成较新的 Edge 稳定版；与 Sec-MS-GEC-Version 后缀保持一致。
 const EDGE_CHROMIUM_VERSION: &str = "143.0.3650.75";
+
+/// H10：Edge TTS 超时与容量上限。
+const EDGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const EDGE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const EDGE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const EDGE_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// 音频上限 32MiB：300s@48kbps 只有约 1.8MB，32MiB 是防异常放大的硬上限。
+const EDGE_AUDIO_MAX: usize = 32 * 1024 * 1024;
+
+/// 单次等待预算：min(空闲 30s, 整体剩余)；整体已耗尽返回 None。
+fn edge_recv_budget(elapsed: std::time::Duration) -> Option<std::time::Duration> {
+    let left = EDGE_TOTAL_TIMEOUT.checked_sub(elapsed)?;
+    if left.is_zero() {
+        return None;
+    }
+    Some(left.min(EDGE_IDLE_TIMEOUT))
+}
+
+fn edge_audio_over_limit(len: usize) -> bool {
+    len > EDGE_AUDIO_MAX
+}
+
+/// S4：Edge TTS 走 wss（tokio-tungstenite），无法套用 reqwest 的代理配置。
+/// 只有「确有生效代理」时才阻断（返回 true）；None（无代理 / system 模式解析不到）继续直连。
+fn edge_proxy_blocked(resolved: &Option<String>) -> bool {
+    resolved.is_some()
+}
 
 /// Edge TTS 免费接口：走 WebSocket（wss），直连，无需密钥与地址。
 async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
@@ -2140,14 +2486,24 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
         headers.insert("Pragma", "no-cache".parse().unwrap());
         headers.insert("Cache-Control", "no-cache".parse().unwrap());
     }
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| AiError::network("ai.edgeConnect", e.to_string()))?;
+    // H10：连接超时 15s（网络黑洞时不能无限挂住 tts_synth）。
+    let (mut ws, _resp) = match tokio::time::timeout(
+        EDGE_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(AiError::network("ai.edgeConnect", e.to_string())),
+        Err(_) => return Err(AiError::timeout("ai.edgeConnect", "")),
+    };
 
     let config_msg = "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}";
-    ws.send(Message::text(config_msg))
-        .await
-        .map_err(|e| AiError::network("ai.edgeSend", e.to_string()))?;
+    match tokio::time::timeout(EDGE_SEND_TIMEOUT, ws.send(Message::text(config_msg))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(AiError::network("ai.edgeSend", e.to_string())),
+        Err(_) => return Err(AiError::timeout("ai.edgeSend", "")),
+    }
 
     let request_id = uuid_v4();
     let timestamp = rfc3339_utc();
@@ -2158,13 +2514,24 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
     let ssml_msg = format!(
         "X-RequestId:{request_id}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:{timestamp}\r\nPath:ssml\r\n\r\n{ssml}"
     );
-    ws.send(Message::text(ssml_msg))
-        .await
-        .map_err(|e| AiError::network("ai.edgeSend", e.to_string()))?;
+    match tokio::time::timeout(EDGE_SEND_TIMEOUT, ws.send(Message::text(ssml_msg))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(AiError::network("ai.edgeSend", e.to_string())),
+        Err(_) => return Err(AiError::timeout("ai.edgeSend", "")),
+    }
 
+    let started = std::time::Instant::now();
     let mut audio: Vec<u8> = Vec::new();
     loop {
-        match ws.next().await {
+        // 每帧等待预算 = min(空闲 30s, 整体剩余)；整体 300s 耗尽立即超时。
+        let Some(budget) = edge_recv_budget(started.elapsed()) else {
+            return Err(AiError::timeout("ai.requestTimeout", ""));
+        };
+        let frame = match tokio::time::timeout(budget, ws.next()).await {
+            Ok(v) => v,
+            Err(_) => return Err(AiError::timeout("ai.edgeReceive", "")),
+        };
+        match frame {
             Some(Ok(Message::Text(t))) => {
                 if t.contains("Path:turn.end") {
                     break;
@@ -2179,6 +2546,12 @@ async fn synth_edge(p: &TtsParams<'_>, text: &str) -> Result<Vec<u8>, AiError> {
                 let start = 2 + header_len;
                 if start <= b.len() {
                     audio.extend_from_slice(&b[start..]);
+                }
+                if edge_audio_over_limit(audio.len()) {
+                    return Err(AiError::network(
+                        "ai.edgeReceive",
+                        format!("音频数据超过上限（{} 字节）", EDGE_AUDIO_MAX),
+                    ));
                 }
             }
             Some(Ok(Message::Close(_))) => break,
@@ -2751,6 +3124,138 @@ mod tests {
         assert_eq!(AiError::http(502, "", "x").kind, "http_5xx");
         assert_eq!(AiError::model_id("", "x").kind, "model_id");
         assert_eq!(AiError::protocol("", "x").kind, "protocol");
+    }
+
+    /// H8：中文跨 chunk 不得被逐块 lossy 解码成 U+FFFD；CRLF、非法字节、尾行都要正常。
+    #[test]
+    fn sse_line_buf_decodes_complete_lines_only() {
+        let mut b = SseLineBuf::new();
+        let bytes = "你好".as_bytes();
+        assert_eq!(bytes.len(), 6);
+        let (head, tail) = bytes.split_at(4); // 切在「好」的两个字节之间
+        assert!(b.push(head).is_empty(), "没有换行时不得产出半行");
+        let mut rest = tail.to_vec();
+        rest.push(b'\n');
+        let lines = b.push(&rest);
+        assert_eq!(lines, vec!["你好".to_string()]);
+        assert!(!lines[0].contains('\u{FFFD}'), "跨块中文不得损坏: {:?}", lines[0]);
+        // CRLF：行尾 \r 去掉
+        assert_eq!(b.push(b"abc\r\ndef\n"), vec!["abc".to_string(), "def".to_string()]);
+        // 非法字节不能 panic（按 lossy 处理）
+        let bad = b.push(b"ok \xff\n");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].starts_with("ok "));
+        // 流结束时处理无换行尾行；空缓冲返回 None
+        assert!(b.push(b"tail").is_empty());
+        assert_eq!(b.finish(), Some("tail".to_string()));
+        assert_eq!(b.finish(), None);
+    }
+
+    /// H9：错误事件与终止标记识别（OpenAI/Azure/Anthropic/Gemini/Ollama）。
+    #[test]
+    fn stream_error_and_terminal_detection() {
+        let oai: serde_json::Value =
+            serde_json::from_str(r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#).unwrap();
+        assert_eq!(stream_error_text(Provider::OpenAi, &oai).as_deref(), Some("rate limited"));
+        let azure: serde_json::Value = serde_json::from_str(r#"{"error":"bad request"}"#).unwrap();
+        assert_eq!(stream_error_text(Provider::Azure, &azure).as_deref(), Some("bad request"));
+        let claude: serde_json::Value = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_error_text(Provider::Anthropic, &claude).as_deref(), Some("overloaded"));
+        let gem: serde_json::Value =
+            serde_json::from_str(r#"{"error":{"code":429,"message":"quota exceeded"}}"#).unwrap();
+        assert_eq!(stream_error_text(Provider::Gemini, &gem).as_deref(), Some("quota exceeded"));
+        assert!(stream_error_text(Provider::OpenAi, &json!({"choices":[{"delta":{"content":"x"}}]})).is_none());
+
+        assert!(is_terminal(Provider::Anthropic, &json!({"type":"message_stop"})));
+        assert!(!is_terminal(Provider::Anthropic, &json!({"type":"content_block_delta"})));
+        assert!(is_terminal(Provider::Ollama, &json!({"done":true})));
+        assert!(!is_terminal(Provider::Ollama, &json!({"done":false})));
+        assert!(is_terminal(Provider::Gemini, &json!({"candidates":[{"finishReason":"STOP"}]})));
+        assert!(!is_terminal(Provider::Gemini, &json!({"candidates":[{"finishReason":""}]})));
+        // OpenAI 系只认文本 [DONE]，不看 JSON finish_reason
+        assert!(!is_terminal(Provider::OpenAi, &json!({"choices":[{"finish_reason":"stop"}]})));
+
+        assert!(stream_end_ok(Provider::OpenAi, true, true));
+        assert!(!stream_end_ok(Provider::OpenAi, true, false), "缺 [DONE] 应判截断");
+        assert!(stream_end_ok(Provider::Anthropic, true, true));
+        assert!(stream_end_ok(Provider::Ollama, true, true));
+        assert!(stream_end_ok(Provider::Gemini, true, false), "Gemini 无 sentinel 不得误报截断");
+        assert!(!stream_end_ok(Provider::OpenAi, false, true));
+    }
+
+    /// H10：Edge 等待预算与音频上限的边界。
+    #[test]
+    fn edge_budget_and_audio_cap() {
+        use std::time::Duration;
+        assert_eq!(edge_recv_budget(Duration::ZERO), Some(Duration::from_secs(30)));
+        assert_eq!(edge_recv_budget(Duration::from_secs(290)), Some(Duration::from_secs(10)));
+        let near = edge_recv_budget(Duration::from_millis(299_999)).expect("未到整体上限应有余量");
+        assert!(near > Duration::ZERO);
+        assert_eq!(edge_recv_budget(Duration::from_secs(300)), None);
+        assert_eq!(edge_recv_budget(Duration::from_secs(400)), None);
+        assert!(!edge_audio_over_limit(EDGE_AUDIO_MAX), "恰好等于上限允许");
+        assert!(edge_audio_over_limit(EDGE_AUDIO_MAX + 1));
+        assert_eq!(AiError::timeout("ai.edgeReceive", "").kind, "timeout");
+    }
+    // ---------------- S4：代理错误打码 / body 上限 / Edge 代理阻断 ----------------
+
+    /// S4-1：代理错误信息里的 user:pass@ 必须打码；无凭据的非法串保持可读原地址。
+    #[test]
+    fn proxy_errors_mask_credentials() {
+        let bad = "http://user:secret@[::1";
+        let err = proxy_with_bypass(bad).unwrap_err();
+        assert_eq!(err.code, "ai.proxyAddrInvalid");
+        assert!(!err.message.contains("user"), "代理错误不得含用户名：{}", err.message);
+        assert!(!err.message.contains("secret"), "代理错误不得含密码：{}", err.message);
+        // 无凭据的非法代理串：message 仍包含原地址（既有测试断言未改）。
+        let plain = proxy_with_bypass("not a proxy").unwrap_err();
+        assert!(plain.message.contains("not a proxy"), "{}", plain.message);
+        // build_client 的 manual 硬失败路径同样打码。
+        let err2 = build_client("manual", bad, None, "https://api.example.com").unwrap_err();
+        assert!(!err2.message.contains("secret"), "build_client 错误不得含密码：{}", err2.message);
+    }
+
+    /// S4-2：body 上限判定边界（None/等于/超 1 字节/Content-Length 预检）。
+    #[test]
+    fn body_limit_exceeded_boundaries() {
+        assert!(!body_limit_exceeded(None, 0, 1024));
+        assert!(!body_limit_exceeded(None, 1024, 1024));
+        assert!(!body_limit_exceeded(None, 1023, 1024));
+        assert!(body_limit_exceeded(None, 1025, 1024));
+        // Content-Length 预检：即使还没收到字节，声明超限即拒绝。
+        assert!(body_limit_exceeded(Some(2048), 0, 1024));
+        assert!(!body_limit_exceeded(Some(1024), 0, 1024));
+    }
+
+    /// S4-3：Edge TTS 只在确实解析出生效代理时阻断；无代理/PAC-only 继续直连。
+    #[test]
+    fn edge_proxy_blocked_only_when_resolved() {
+        assert!(!edge_proxy_blocked(&None));
+        assert!(edge_proxy_blocked(&Some("http://127.0.0.1:7897".to_string())));
+    }
+
+    /// P1-4：测试连接严格 parse 边界（2xx + 空/HTML/非法 JSON/null 必须失败）。
+    #[test]
+    fn parse_test_connection_body_is_strict() {
+        assert!(parse_test_connection_body(200, "{\"ok\":true}").unwrap().is_object());
+        assert!(parse_test_connection_body(200, "[1,2]").unwrap().is_array());
+        for (status, text, needle) in [
+            (200u16, "", "响应为空"),
+            (200, "   \n\t ", "响应为空"),
+            (200, "<html><body>login</body></html>", "HTML"),
+            (200, "not json", "不是合法 JSON"),
+            (200, "null", "结构不符合预期"),
+        ] {
+            let e = parse_test_connection_body(status, text).unwrap_err();
+            assert!(e.message.contains(needle), "status={status} text={text:?} err={e:?}");
+            assert!(e.message.contains(&format!("HTTP {status}")), "{e:?}");
+        }
+        // 成功结构允许 object/array；其余标量一律拒绝。
+        assert!(parse_test_connection_body(200, "42").is_err());
+        assert!(parse_test_connection_body(200, "\"text\"").is_err());
     }
 }
 

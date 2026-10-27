@@ -193,6 +193,9 @@ export const api = {
   /** Task F：手动设置阅读状态覆盖。state 取 "read" | "unread" | "auto"。只写 read_state，不动真实进度。 */
   setReadState: (bookId: number, state: "read" | "unread" | "auto") =>
     invoke<void>("set_read_state", { bookId, stateStr: state }),
+  /** F3-H2：标记已读/未读的最小写入（同时写 read_pct 与 progress，不写 last_read、不打开书）。 */
+  markBookReadState: (bookId: number, state: "read" | "unread") =>
+    invoke<void>("mark_book_read_state", { bookId, state }),
   /** 秩可寻址分页命令 2：按 ids 批量取行，返回长度/顺序恒等于 ids，缺行为 null。ids.len()>4096 抛错。 */
   listBooksByIds: (ids: number[]) => invoke<(BookRow | null)[]>("list_books_by_ids", { ids }),
   rescan: () => invoke<void>("rescan"),
@@ -253,7 +256,9 @@ export const api = {
     destH: number,
   ) => invoke<ArrayBuffer>("pdf_native_render_page", { bookId, page, x, y, w, h, destW, destH }),
   /** 关闭当前原生文档（关书/换书时调用）。 */
-  pdfNativeClose: () => invoke<void>("pdf_native_close"),
+  // L30：bookId 可选：不传保持旧行为（关闭全部），传则只关对应书（双窗口互不影响）。
+  pdfNativeClose: (bookId?: number) =>
+    invoke<void>("pdf_native_close", bookId == null ? {} : { bookId }),
 
   /* ---- 纯图扫描版 PDF 的「直读页面图」通道（见 Rust pdfscan.rs）---- */
   /** 探测：返回页数与是否纯图扫描件；解析失败即抛错（调用方回落到原生通道）。 */
@@ -300,6 +305,9 @@ export const api = {
     invoke<void>("delete_books", { paths, fromDisk, keepNotes }),
   bookNoteInfo: (bookId: number) =>
     invoke<{ hasNotes: boolean; noteCount: number }>("book_note_info", { bookId }),
+  /** 批量查询选中书是否有笔记：无笔记时不显示「保留/删除笔记」选择。 */
+  booksHaveNotes: (bookIds: number[]) =>
+    invoke<boolean>("books_have_notes", { bookIds }),
   listNoteBooks: () =>
     invoke<
       {

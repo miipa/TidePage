@@ -3,6 +3,7 @@
   import { AI_CTX_KEY, AI_MODE_KEY } from "../lib/aiPanelKeys";
   import { updateState } from "../lib/update.svelte";
   import { onMount, onDestroy, tick } from "svelte";
+  import { shouldRetryMangaMeasure } from "../lib/retryLimit";
   import { fade } from "svelte/transition";
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
@@ -52,6 +53,10 @@ import { reorderByDrop } from "../lib/reorder";
   import { applyReadFix, clearReadFix } from "../lib/readFix";
   import { planDavApply } from "../lib/davApply";
   import { clampMarginH } from "../lib/readLayout";
+  import { planPrefetchQueue } from "../lib/prefetchQueue";
+  import { layoutSwitchRatio } from "../lib/layoutSwitch";
+  import { windowedBookRatio } from "../lib/bookRatio";
+  import { PROGRESS_RETRY_DELAY_MS, shouldRetryProgressSave } from "../lib/progressSave";
   import { pageFromLeftPosition, pageFromRatio, ratioFromPage } from "../lib/pagination";
   import { parseInternalHref, pickSameDocAnchorTarget } from "../lib/readerLinks";
   import { displayChapterTitle, normalizeChapterTitle } from "../lib/chapterTitle";
@@ -200,7 +205,6 @@ import {
   let loadingIdx = -1;
   let chapterNum = $state(0);
 
-  let scrollWrap: HTMLDivElement | undefined = $state();
   let scrollArea: HTMLDivElement | undefined = $state();
   let pageWrap: HTMLDivElement | undefined = $state();
   /** 翻页模式的文字层滑块（过渡位移载体；`.clip` 静止）。 */
@@ -250,6 +254,8 @@ import {
   onDestroy(() => releaseAll());
   onDestroy(() => {
     // C13：关书/组件销毁清空章节缓存与图片临时引用；进度/书签状态不在此清。
+    // F1-H1：组件销毁同样递增书代际，销毁后到达的在途回包不得再写任何缓存。
+    bookEpoch++;
     chapterCache.clear();
     inflight.clear();
     bookImages = null;
@@ -771,11 +777,12 @@ import {
   let hlVersion = $state(0);
   let pendingHighlightJump: HighlightRow | null = null;
 
-  type SelMenuState = { text: string; start: number; end: number; anchor: PopupAnchor };
+  /** F2-H1：浮层创建时记录所在章号，落库前比对；防止换章后拿旧选区写进新章。 */
+  type SelMenuState = { text: string; start: number; end: number; anchor: PopupAnchor; chapterIndex: number };
   let selMenu: SelMenuState | null = $state(null);
   let hlMenu: { h: HighlightRow; anchor: PopupAnchor } | null = $state(null);
   let searchPopup: { query: string; anchor: PopupAnchor } | null = $state(null);
-  let quickAiPopup: { text: string; anchor: PopupAnchor; highlightId?: number; sel?: { start: number; end: number; text: string } } | null = $state(null);
+  let quickAiPopup: { text: string; anchor: PopupAnchor; highlightId?: number; sel?: { start: number; end: number; text: string; chapterIndex: number } } | null = $state(null);
 
   /* ================= 右侧面板互斥（单一状态源 rightPanel） =================
    * rightPanel 是唯一可写来源；bookmarksOpen/statsOpen/highlightsOpen/aiDrawerOpen 全部由它 $derived。
@@ -1112,11 +1119,25 @@ import {
   // 用于在保存真实进度时释放手动状态覆盖（read_state!==0）。初次打开的定位保存不置真，
   // 避免仅「打开」就把手动「未读/已读」覆盖误清除。
   let progressUserMoved = false;
+  /** B6：进度读取失败标记。置真后本次打开期间所有自动保存都被拦截（防 0 章覆盖旧进度）；
+   *  只有用户显式移动（翻章/滚动/点进度条等 → saveProgressDebounced(true)）才清除恢复。 */
+  let progressLoadFailed = false;
+  // F1：进度保存失败重试/提示状态。attempt 0=首次失败待重试，1=重试已用；
+  // warned 保证同一失败序列只提示一次；inFlight/pending 保证重试期间只保留最新一次待写。
+  let progressSaveAttempt = 0;
+  let progressSaveWarned = false;
+  let progressSaveInFlight = false;
+  let progressSavePending = false;
   let measureRaf = 0;
   /** measurePages「容器尺寸为 0」的重试帧数（P6）：上限 30 帧，避免无上限 rAF 空转。 */
   let measureRetry = 0;
   let openError = $state("");
   let handledNonce = 0;
+  /** F1：open() 重入保护。所有改变当前书的入口（open/close/搜索跳转）都会自增；
+   *  await 后 token 不一致的旧流程只允许直接返回，不得写会话/进度/loading。 */
+  let openToken = 0;
+  /** F6：搜索命中要跳的章，由 pendingOpen 写入、open() 在本章加载成功后消费（替代固定延时）。 */
+  let pendingJumpChapter: number | null = null;
 
   let sessionId = 0;
   let lastPos = 0;
@@ -1147,6 +1168,10 @@ import {
   const inflight = new Map<number, Promise<ChapterData>>();
   /** 加载代号：快速翻页时递增，旧请求结果不得覆盖新页面。 */
   let loadGeneration = 0;
+  /** 书代际（F1-H1）：换书/关书/覆盖排版重载时递增。在途章节请求回包时只有代际与书 id
+   *  都对得上才允许写 chapterCache / 删 inflight —— 换书后在途的 A 书章节不得写进 B 书缓存。
+   *  刻意不用 loadGeneration：它按章递增，会把跨章预取结果全部误判为过期。 */
+  let bookEpoch = 0;
   /** 字体是否已确保加载过（只等一次，之后不再每章 await）。 */
   let fontsEnsured = false;
 
@@ -1447,14 +1472,18 @@ import {
     if (hit) return Promise.resolve(hit);
     const pending = inflight.get(idx);
     if (pending) return pending;
+    // 发起时快照书 id 与书代际：回包时两者都一致才允许写缓存（换书后在途回包直接丢弃）。
+    const bid = book!.book.id;
+    const epoch = bookEpoch;
     const p = api
-      .getChapter(book!.book.id, idx, !effOverrideCss())
+      .getChapter(bid, idx, !effOverrideCss())
       .then((c) => {
-        cachePut(idx, c);
+        if (epoch === bookEpoch && book?.book.id === bid) cachePut(idx, c);
         return c;
       })
       .finally(() => {
-        inflight.delete(idx);
+        // 只删自己那一次 inflight：旧 promise 的 finally 不得删掉新书为同 idx 登记的新条目。
+        if (inflight.get(idx) === p) inflight.delete(idx);
       });
     inflight.set(idx, p);
     return p;
@@ -1462,6 +1491,8 @@ import {
 
   /** 预取窗口：以当前章为中心，前后若干章；受限并发避免打爆 IPC/内存。 */
   const PREFETCH_INFLIGHT_MAX = 3;
+  /** F1：队列长度上限；按距中心由近到远重建，40 项足够覆盖大书来回翻页。 */
+  const PREFETCH_QUEUE_MAX = 40;
   let prefetchActive = 0;
   let prefetchQueue: number[] = [];
   let prefetchScheduled = false;
@@ -1474,16 +1505,11 @@ import {
     const total = book.toc.length;
     // 大书窗口更大（来回翻页/跳读更顺），但仍设上限，避免内存/IO 过载。
     const span = total > 400 ? 12 : total > 120 ? 10 : 6;
-    const list: number[] = [];
-    for (let d = 1; d <= span; d++) {
-      if (center + d < total) list.push(center + d);
-      if (center - d >= 0) list.push(center - d);
-    }
-    for (const n of list) {
-      if (!chapterCache.has(n) && !inflight.has(n) && !prefetchQueue.includes(n)) {
-        prefetchQueue.push(n);
-      }
-    }
+    // F1：按当前中心整体重建队列（不再只 push）——跳章/换中心后旧窗口条目自动丢弃，
+    // 已缓存/在途章节排除，队列长度封顶。
+    const cached = new Set<number>(chapterCache.keys());
+    const inFlight = new Set<number>(inflight.keys());
+    prefetchQueue = planPrefetchQueue(center, total, span, cached, inFlight, prefetchQueue, PREFETCH_QUEUE_MAX);
     schedulePrefetch();
   }
 
@@ -1502,9 +1528,14 @@ import {
       if (!book || n < 0 || n >= book.toc.length) continue;
       if (chapterCache.has(n) || inflight.has(n)) continue;
       prefetchActive++;
+      // 预取同样带书 id/代际快照：换书后的预取回包不得污染新书缓存。
+      const bid = book.book.id;
+      const epoch = bookEpoch;
       api
-        .getChapter(book.book.id, n, !effOverrideCss())
-        .then((c) => cachePut(n, c))
+        .getChapter(bid, n, !effOverrideCss())
+        .then((c) => {
+          if (epoch === bookEpoch && book?.book.id === bid) cachePut(n, c);
+        })
         .catch(() => {})
         .finally(() => {
           prefetchActive--;
@@ -1517,6 +1548,8 @@ import {
   $effect(() => {
     if (pendingOpen.nonce > handledNonce) {
       handledNonce = pendingOpen.nonce;
+      // F6：读走本次跳章意图，由 open() 在章节加载完成后消费；requestOpenBook 打开时为 null。
+      pendingJumpChapter = pendingOpen.jumpChapter;
       open(pendingOpen.bookId);
     }
   });
@@ -1528,7 +1561,12 @@ import {
   }
 
   export async function open(bookId: number) {
+    // F1：每次打开/重开都换 token；旧流程在任意 await 后发现 token 变化就直接放弃。
+    const token = ++openToken;
     openError = "";
+    // 跳章意图只对真正被打开的书有效：别的入口（手动开书/书库）打开时不沿用上一本书的意图。
+    if (pendingOpen.bookId !== bookId) pendingJumpChapter = null;
+    progressLoadFailed = false;
     try {
       // 原地换书也要释放上一本的 PDF（这条路径不经过 close()）：pdf.js 持有我们传进去的
       // 整份文件字节与解析结构，扫描版大 PDF 可达数百 MB；页位图也不会自己消失。
@@ -1540,6 +1578,7 @@ import {
       prefetchQueue = [];
       prefetchActive = 0;
       loadGeneration++;
+      bookEpoch++; // 换书：在途章节/预取回包全部作废
       // 换书复位加载态：上一本的请求可能仍在途，残留的 loadingChapter 会让首屏骨架屏不消失。
       loadingChapter = false;
       loadingIdx = -1;
@@ -1558,6 +1597,7 @@ import {
       lastPdfViewKey = "";
       progressUserMoved = false; // 新书打开：清空「用户已移动」标记（打开本身不释放手动状态覆盖）
       book = await api.openBook(bookId);
+      if (token !== openToken) return;
       // PDF：后端不解析 PDF 内容，页数只能由前端 pdf.js 给出。拿到真实页数后重建页码目录
       // （覆盖后端按上次上报页数给的目录），并回写设置项，让后端下次 open_book 直接给出正确目录。
       if (book.book.format === "pdf") {
@@ -1565,6 +1605,7 @@ import {
         // 否则这段时间 loadingChapter 与 chapter 都不满足骨架屏条件 → 正文区纯白。
         loadingChapter = true;
         const pdf = await ensurePdf(book.book.id);
+        if (token !== openToken) return;
         pdfNative = pdf.native;
         // 这类文件只能整页出图：打开时说明一次，免得用户找文字层/划线找半天。
         // 只在原生通道弹：直读通道（纯图扫描件）的打开反馈已由进度条与首屏体现，
@@ -1573,6 +1614,7 @@ import {
         // 目录：PDF 自带 outline 优先（真实章节名 + 层级），解析不到才回落「第 N 页」。
         // 目录数组下标恒等于页号，所以合并只换标题，不改导航语义（页码=chapter_index）。
         const outline = await docOutline(book.book.id).catch(() => []);
+        if (token !== openToken) return;
         const base = buildPageToc(pdf.doc.numPages, (n) => t("reader.pdf.page", { n }));
         pdfHasOutline = outline.length > 0;
     book.toc = outline.length ? mergeOutlineTitles(base, outline, (n) => t("reader.pdf.page", { n })) : base;
@@ -1619,16 +1661,32 @@ import {
       } else {
         mangaGuideOpen = false;
       }
+      // B6：区分「无进度（null）」与「读取失败（throw）」。失败重试一次并提示；
+      // 仍失败则本次打开不自动写进度，避免用 0 章覆盖本机/云端旧进度。
       let restore: Progress | null = null;
       try {
         restore = await api.loadProgress(bookId);
-      } catch { /* ignore */ }
+      } catch (e) {
+        console.warn("[progress] loadProgress failed, retrying:", e);
+        try {
+          restore = await api.loadProgress(bookId);
+        } catch (e2) {
+          console.warn("[progress] loadProgress retry failed:", e2);
+          progressLoadFailed = true;
+          toast(errText(e2), "error");
+          restore = null;
+        }
+      }
+      if (token !== openToken) return;
       let startIdx = restore && restore.chapter_index < book.toc.length ? restore.chapter_index : 0;
-      // PDF：书库「标记已读」写的是 100% 进度，重开应落到最后一页（页 = 章，目录长度即页数）。
-      if (isPdfBook() && restore && restore.pct >= 99.5) startIdx = Math.max(0, book.toc.length - 1);
+      // 书库「标记已读」写的是 100% 进度：重开落到最后一章（PDF 页 = 章；其它格式由
+      // loadChapter 用 restore.chapter_ratio=1 定位到章末）。标记未读写 0%，回开头。
+      if (restore && restore.pct >= 99.5) startIdx = Math.max(0, book.toc.length - 1);
       chapterNum = Math.min(startIdx, Math.max(0, book.toc.length - 1));
       navTarget = chapterNum; // 初次定位：累积导航目标与落地章号对齐
       await loadChapter(chapterNum, restore ?? undefined);
+      // 旧流程（连开两本/连续搜索跳转）不得再写会话、进度、跳章与统计定时器。
+      if (token !== openToken) return;
       refreshHighlights();
       // 后台建索引改为「用户空闲 / 窗口隐藏 / 关书」时触发（P2）：开书后不再 4s 内与首屏阅读抢 DB 锁。
       scheduleBookIndex(book.book.id);
@@ -1639,8 +1697,20 @@ import {
       }
       if (statsTimer) clearInterval(statsTimer);
       const bid = bookId;
+      // F6：搜索命中跳章改为事件驱动——本章已加载完成后再跳，不再用 1200ms 猜加载时长。
+      if (pendingJumpChapter !== null) {
+        const j = pendingJumpChapter;
+        pendingJumpChapter = null;
+        if (j >= 0 && j < book.toc.length) void navTo(j, { at: "head", extra: 0 });
+      }
       try {
         sessionId = await api.startSession(bid);
+        if (token !== openToken) {
+          // 会话已建立但书已被新的 open 取代：丢弃该 sessionId，避免旧流程继续按新书位置计时写库。
+          // 后端没有单独的「结束会话」命令，未 flush 的这段时间按丢弃处理（小于一次 30s 计时窗口）。
+          sessionId = 0;
+          return;
+        }
         lastPos = bookPos();
         lastFlushTs = Date.now();
         lastActivityTs = Date.now();
@@ -1656,6 +1726,8 @@ import {
           .catch(() => {});
       }
     } catch (e) {
+      // 只有当前 token 的流程可以写失败态/清 loading；旧流程静默退出。
+      if (token !== openToken) return;
       const s = String(e);
       // R13-A4：DRM/解析超时保留既有准确文案；稳定的 PDF 大文件/原生通道错误码走文案表；
       // 其余按 missing/permission/damaged/unsupported/unknown 分类，绝不把原始错误串放进 UI。
@@ -1766,6 +1838,9 @@ import {
   }
 
   export async function close() {
+    // F1：关书同样换 token —— 在途 open() 的后续写入全部作废；清掉未消费的搜索跳章意图。
+    openToken++;
+    pendingJumpChapter = null;
     stopTts();
     // 关书：取消延迟建索引与字数统计。不再在关书时补建索引（P9：大书建索引 8~40s，
     // 关书触发就是卡顿来源；未建索引的书由用户在搜索弹窗按需建立）。
@@ -1787,6 +1862,9 @@ import {
     loadingIdx = -1;
     pendingEdge = null;
     clearTimeout(edgeFlushTimer);
+    bookEpoch++; // F1-H1：关书后在途章节回包一律作废
+    inflight.clear();
+    clearChapterOverlays(); // F2-H1：关书清浮层
     mangaWindow = [];
     // 关书释放 PDF 文档与全部页位图（非 PDF 时是空操作）：位图是 blob，不主动回收内存不会降。
     releaseAll();
@@ -2055,6 +2133,8 @@ import {
     // R10-1：章标题统一规范化（去文件名后缀、空/纯数字 → 本地化「第 N 节」），
     // 保证状态栏/书签/AI 上下文/TTS 显示一致。
     ch = { ...ch, title: displayChapterTitle(ch.title, idx, (n) => t("common.sectionN", { n })) };
+    // F2-H1：章号变化前先清掉上一章的划词/AI/朗读起点浮层（内容已换，旧选区不再可信）。
+    if (chapterNum !== idx) clearChapterOverlays();
     chapter = ch;
     chapterNum = idx;
     // 非事务期间（初次打开 / 换书 / 重排重载）让累积导航目标跟随落地章号；事务期间保留意图，
@@ -2204,7 +2284,12 @@ import {
 
   function saveProgressDebounced(userMoved = true) {
     // 除「初次打开/换章定位」外的调用都视为用户真实移动，记入标记以便释放手动状态覆盖。
-    if (userMoved) progressUserMoved = true;
+    if (userMoved) {
+      progressUserMoved = true;
+      // B6：只有用户显式移动才解除失败保护；自动路径（applyChapter/重排/隐藏）继续被拦截。
+      progressLoadFailed = false;
+    }
+    if (progressLoadFailed) return;
     clearTimeout(progressSaveTimer);
     progressSaveTimer = setTimeout(doSaveProgress, 1200);
   }
@@ -2243,6 +2328,14 @@ import {
 
   async function doSaveProgress(ratioOverride?: number) {
     if (!book) return;
+    // B6：进度读取失败后，自动保存一律不写（用户显式移动会先清除标记）。
+    if (progressLoadFailed) return;
+    // F1：同一时刻只允许一次写；重试/去抖撞车时只保留最新一次待写（不并发、不丢最后位置）。
+    if (progressSaveInFlight) {
+      progressSavePending = true;
+      return;
+    }
+    const bid = book.book.id;
     const ratio = Math.max(0, Math.min(1, ratioOverride ?? currentRatio()));
     const p: Progress = {
       chapter_index: chapterNum,
@@ -2251,17 +2344,43 @@ import {
       updated_at: Date.now(),
       device: "pc",
     };
+    progressSaveInFlight = true;
     try {
-      await api.saveProgress(book.book.id, p);
+      await api.saveProgress(bid, p);
+      // 成功：复位重试/提示状态，下一次失败序列可再次提示。
+      progressSaveAttempt = 0;
+      progressSaveWarned = false;
       // 用户产生真实阅读进度后，若该书存在手动状态覆盖（已读/未读），释放为「自动」，
       // 使有效状态回归由真实进度推导（不再需要手动「恢复自动」）。
-      if (progressUserMoved && book.book.read_state !== 0) {
+      if (book && book.book.id === bid && progressUserMoved && book.book.read_state !== 0) {
         book.book.read_state = 0;
         try {
-          await api.setReadState(book.book.id, "auto");
-        } catch { /* ignore */ }
+          await api.setReadState(bid, "auto");
+        } catch (e) {
+          console.warn("[progress] setReadState failed:", e);
+        }
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.warn("[progress] saveProgress failed:", e);
+      // 换书/关书后不重试旧书进度（避免把旧位置写到别的书）。
+      if (!book || book.book.id !== bid) return;
+      if (shouldRetryProgressSave(progressSaveAttempt)) {
+        progressSaveAttempt = 1;
+        clearTimeout(progressSaveTimer);
+        progressSaveTimer = setTimeout(() => {
+          if (book?.book.id === bid) void doSaveProgress();
+        }, PROGRESS_RETRY_DELAY_MS);
+      } else if (!progressSaveWarned) {
+        progressSaveWarned = true;
+        toast(t("toast.saveFailed"), "error");
+      }
+    } finally {
+      progressSaveInFlight = false;
+      if (progressSavePending) {
+        progressSavePending = false;
+        void doSaveProgress();
+      }
+    }
   }
 
   function bookPos(): number {
@@ -2474,7 +2593,8 @@ import {
     if (sbDragging || jumpPending) return Math.max(0, Math.min(1, sbDragRatio));
     const n = book?.toc.length || 1;
     const within = maxScroll > 0 ? Math.max(0, Math.min(1, p / maxScroll)) : 0;
-    return Math.max(0, Math.min(1, (chapterNum + within) / n));
+    // A4：统一走纯函数（整书量程；窗口章数=1，与旧公式一致但可测边界）。
+    return windowedBookRatio(chapterNum, 1, within, n);
   }
 
   /** 只写拇指位移（不碰 scrollTop 与滚动位置）。行程公式与旧路径共用 `trackH * 0.92`。 */
@@ -3782,17 +3902,36 @@ import {
   /** 横向布局下，内容宽度是否小于可用宽度（单图不满屏 → 主轴居中）。 */
   let widthCentered = false;
 
+  /** P2-1：漫画测量零尺寸按帧重试计数与上限；非重试入口/成功测量清零。 */
+  let mangaMeasureRetry = 0;
+  let mangaMeasureRaf = 0;
+  let mangaRetryWarned = false;
+
   /** 测量横向内容尺寸，计算可平移范围；进入/换章/窗口变化/图片加载后调用。 */
-  function measureManga() {
+  function measureManga(retry = false) {
     const vp = mangaViewport;
     const el = mangaCanvas;
     if (!vp) return;
     const vw = vp.clientWidth;
     const vh = vp.clientHeight;
     if (vw <= 0 || vh <= 0) {
-      requestAnimationFrame(() => { if (mangaHorizontal()) measureManga(); });
+      // 窗口隐藏/最小化/换书期尺寸可能长期为 0：无上限 rAF 链会一直空转。
+      // 外部正常调用重置计数并重新计一轮；超限停止本次重试链（resize/换章仍会再次触发）。
+      cancelAnimationFrame(mangaMeasureRaf);
+      if (!retry) { mangaMeasureRetry = 0; mangaRetryWarned = false; }
+      if (!shouldRetryMangaMeasure(mangaMeasureRetry)) {
+        if (import.meta.env.DEV && !mangaRetryWarned) {
+          mangaRetryWarned = true;
+          console.warn("[manga] measure retry limit reached, waiting for next relayout");
+        }
+        return;
+      }
+      mangaMeasureRetry++;
+      mangaMeasureRaf = requestAnimationFrame(() => { if (mangaHorizontal()) measureManga(true); });
       return;
     }
+    mangaMeasureRetry = 0;
+    mangaRetryWarned = false;
     // 上下边距只保留这一条路径：作为固定视口 padding 后，基准图高 = 视口高 - 上下边距。
     // 删除原先 imgMaxH = vh - mv*2 与 align-items:center、applyMangaPan 居中三者并存的打架。
     imgMaxH = Math.max(120, vh - effMarginV() * 2);
@@ -4005,17 +4144,25 @@ import {
     // 一张图一章 → 约 imgInit 章；每章很多图 → 当前章一张就超初值 → 窗口仅 1~2 章。
     const items = new Map<number, MangaItem>();
     const objs = new Map<number, ChapterData | null>();
+    // F1-H2：记录取章失败，构建完成后给可见提示（不再把失败静默成空块）。
+    const failed = new Set<number>();
     const take = (i: number) =>
       fetchChapter(i)
-        .catch(() => null)
+        .catch(() => {
+          failed.add(i);
+          return null;
+        })
         .then((ch) => {
           objs.set(i, ch);
           const it = mangaItem(i, ch?.html ?? "");
           items.set(i, it);
           return it.imgs;
         });
-    // 先占位当前章，首屏即出结构。
+    // 先占位当前章，首屏即出结构。F1-H2：写入前先判代际 —— 旧请求不得把窗口换回旧书/旧章。
+    if (gen !== loadGeneration) return;
     mangaWindow = [mangaItem(idx, "")];
+    // F2-H1：换章先清旧选区浮层，再落新章号。
+    if (chapterNum !== idx) clearChapterOverlays();
     chapterNum = idx;
     // 目标章已落地：窗口化布局的拇指从「拖动比例」切回真实位置。
     if (jumpPending) jumpPending = false;
@@ -4065,11 +4212,18 @@ import {
     }
     const next: MangaItem[] = [];
     for (let i = lo; i <= hi; i++) next.push(items.get(i) ?? mangaItem(i, ""));
+    // F1-H2：mangaWindow/chapter 的写入必须晚于代际校验，旧请求不得覆盖新窗口。
+    if (gen !== loadGeneration) return;
     mangaWindow = next;
     chapter = objs.get(idx) ?? chapter;
+    if (failed.has(idx)) {
+      // 目标章取失败：给一次可见提示（复用既有错误文案，不新增 i18n），并留 DEV 痕迹。
+      if (import.meta.env.DEV) pdfHlTracePush("loadMangaWindow: target chapter failed idx=" + idx);
+      toast(t("reader.open.failed"), "error");
+    }
     await tick();
     // 只有最后一次加载才允许清 loading 标记：更晚的加载（gen 更新）接手时若被这里清掉，
-    // 去重/节流就会误判成空闲 —— 漫画路径原先在 gen 校验之前清，属于同一类竞态。
+    // 去重/节流就会误判成空闲。
     if (gen !== loadGeneration) return;
     loadingChapter = false;
     loadingIdx = -1; // 与 loadingChapter 成对收尾，避免去重状态残留
@@ -4665,6 +4819,9 @@ import {
     typoRelayoutAnchor = false;
     if (!chapter) return;
     if (import.meta.env.DEV) pdfHlTracePush("relayout");
+    // B5：模式切换保存的比例只消费一次；图片书分支不使用（它们按自己的锚点重建）。
+    const switchRatio = pendingLayoutSwitchRatio;
+    pendingLayoutSwitchRatio = null;
     // 漫画横向：重测窗口尺寸。内容窗口宽度可能因图片加载/缩放/边距变化而改变，
     // 以横向绝对位置占内容总宽的比例恢复，避免重排后跳到别处。
     if (mangaHorizontal()) {
@@ -4697,7 +4854,7 @@ import {
       if (viewportChanged || anchorTypo) {
         // 可视区变化（窗口缩放）或排版参数变化（字号/行距/段距/边距）：按比例恢复，保持阅读位置。
         // 比例必须在 measureScroll() 前取：它按旧的 maxScroll 换算当前位置。
-        const ratio = currentRatio();
+        const ratio = switchRatio ?? currentRatio();
         measureScroll();
         scroller?.jumpTo(ratio * maxScroll, true);
       } else {
@@ -4706,7 +4863,7 @@ import {
         measureScroll();
       }
     } else {
-      const ratio = currentRatio();
+      const ratio = switchRatio ?? currentRatio();
       measurePages();
       gotoPage(pageFromRatio(ratio, pageCount), true);
     }
@@ -4932,6 +5089,11 @@ import {
     if (ui.webdavOpen) return "webdavOpen";
     if (convertState.open) return "convert";
     if (confirmBox.active) return "confirm";
+    // F2-H1：划词/快速 AI/朗读起点浮层打开时同样算「有模态」，翻页键不得穿透。
+    if (selMenu) return "selMenu";
+    if (quickAiPopup) return "quickAiPopup";
+    if (ttsStartChoice) return "ttsStartChoice";
+    // hlMenu 原本就不在此列（点划线的操作菜单允许翻页关闭）。
     return "";
   }
 
@@ -5200,6 +5362,9 @@ import {
   }
 
   function goBack() {
+    // A1：退出前先收起顶栏浮层（PDF 布局/WebDAV/朗读起始菜单），避免残留；
+    // 错误态返回按钮与正常返回共用同一套收尾。
+    closeTbPanels();
     stopTts();
     if (standalone) {
       // 独立书窗关窗前按主窗 close() 的顺序补齐保存序列：先发云端推送（不 await，命令在
@@ -5667,7 +5832,7 @@ import {
             if (!n || len < 2) return { ok: false, why: "no-text" };
             const end = Math.min(8, len);
             const text = (n.nodeValue ?? "").slice(0, end);
-            selMenu = { text, start: 0, end, anchor: { top: 100, bottom: 101, cx: 100 } };
+            selMenu = { text, start: 0, end, anchor: { top: 100, bottom: 101, cx: 100 }, chapterIndex: chapterNum };
             await onHighlight(style, color);
             await tick();
             paintNow();
@@ -5814,7 +5979,8 @@ import {
 
   $effect(() => {
     const w = pageWrap;
-    const sw = mangaFlowCanvas ?? scrollWrap;
+    // A3：滚动模式必须观察真正的原生滚动容器 .scroll-area（旧变量 scrollWrap 未被绑定，等同没有观察目标）。
+    const sw = mangaFlowCanvas ?? scrollArea;
     const c = contentEl;
     if (!w && !sw && !c) return;
     const ro = new ResizeObserver(() => { scheduleRelayout(); requestAnimationFrame(() => repaintPdfSearchHighlights()); });
@@ -6056,6 +6222,8 @@ ${effCssExtra() || ""}
     chapterCache.clear();
     inflight.clear();
     if (book) {
+      // F1-H1：覆盖排版会改变章节 HTML，旧请求的缓存结果同样作废（与章节代际一起递增）。
+      bookEpoch++;
       loadGeneration++;
       loadChapter(chapterNum);
     }
@@ -6141,6 +6309,10 @@ ${effCssExtra() || ""}
   // 初次打开由 applyChapter 直接调用 loadMangaWindow，这里用 lastMangaOn 初始化避免重复加载。
   let lastMangaLayout: string | null = null;
   let lastMangaOn: boolean | null = null;
+  // B5：阅读模式切换时按旧布局口径记录章内比例，relayout 后按新布局落位。
+  let lastReaderMode: "page" | "scroll" | null = null;
+  let lastReaderMangaLayout: string | null = null;
+  let pendingLayoutSwitchRatio: number | null = null;
   $effect(() => {
     const lay = config.reader.manga.layout;
     const on = isMangaMode();
@@ -6160,6 +6332,28 @@ ${effCssExtra() || ""}
       return;
     }
     if (layoutChanged) loadMangaWindow(chapterNum);
+  });
+
+  // B5：翻页 ⇄ 滚动切换时保持章内位置。图片书（PDF/漫画）有各自的窗口重建逻辑，跳过。
+  $effect(() => {
+    const mode: "page" | "scroll" = scrollLayout() ? "scroll" : "page";
+    const lay = config.reader.manga.layout;
+    if (lastReaderMode === null) {
+      lastReaderMode = mode;
+      lastReaderMangaLayout = lay;
+      return;
+    }
+    const modeChanged = mode !== lastReaderMode;
+    lastReaderMode = mode;
+    lastReaderMangaLayout = lay;
+    if (!modeChanged || !book || isPdfBook() || isMangaMode()) return;
+    // 旧布局的章内比例：翻页取当前页，滚动取当前滚动位置。
+    const pageRatio = ratioFromPage(page, pageCount);
+    const scrollRatio = maxScroll > 0 ? scrollRender / maxScroll : 0;
+    const ratio = layoutSwitchRatio(mode === "page" ? "scroll" : "page", mode, pageRatio, scrollRatio);
+    if (ratio === null) return;
+    pendingLayoutSwitchRatio = ratio;
+    scheduleRelayout();
   });
 
   /** 有效背景图不透明度：唯一背景面（.bg-layer）与遮挡带必须同源，
@@ -6360,13 +6554,26 @@ ${effCssExtra() || ""}
   }
 
   function showSelectionMenu(text: string, offs: { start: number; end: number }, rect: DOMRect) {
-    selMenu = { text, start: offs.start, end: offs.end, anchor: rectAnchor(rect) };
+    selMenu = { text, start: offs.start, end: offs.end, anchor: rectAnchor(rect), chapterIndex: chapterNum };
+  }
+
+  /** F2-H1：换章/关书时清掉一切「来自本章旧选区」的浮层，避免对旧选区做划词/添加感想。 */
+  function clearChapterOverlays() {
+    selMenu = null;
+    quickAiPopup = null;
+    ttsStartChoice = null;
+    hlMenu = null;
   }
 
   async function onHighlight(style: string, color: string) {
     const s = selMenu;
     selMenu = null;
     if (!s || !book || !chapter) return;
+    // F2-H1：选区来自旧章（打开浮层后换过章）→ 不落库，避免把旧章文字写成新章划线。
+    if (s.chapterIndex !== chapterNum) {
+      clearChapterOverlays();
+      return;
+    }
     try {
       const id = await api.addHighlight({
         bookId: book.book.id,
@@ -6516,6 +6723,8 @@ ${effCssExtra() || ""}
     try {
       const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
       await revealItemInDir(p);
+      // F10-H1：openPath 被 scope 拒绝时会降到「在文件夹中显示」，给可见提示说明已降级。
+      toast(t("bookDetail.reveal"));
     } catch (e) {
       toast(errText(e), "error");
     }
@@ -6551,7 +6760,11 @@ ${effCssExtra() || ""}
     selMenu = null;
     if (!s) return;
     // 携带选区信息：QuickAiPopup「添加到感想」在新划选来源时据此创建划线
-    quickAiPopup = { text: s.text, anchor: s.anchor, sel: { start: s.start, end: s.end, text: s.text } };
+    quickAiPopup = {
+      text: s.text,
+      anchor: s.anchor,
+      sel: { start: s.start, end: s.end, text: s.text, chapterIndex: s.chapterIndex },
+    };
   }
 
   /** 判重（口径对齐 src-tauri/src/db.rs::append_highlight_note）：
@@ -6603,6 +6816,12 @@ ${effCssExtra() || ""}
     // 来源②：新划选 → 先建划线（note 空）拿 id，再写入 note；写 note 失败则回滚删除，杜绝无 note 残留划线
     const s = q.sel;
     if (!s || !book || !chapter) {
+      toast(t("reader.toast.noSelectionToNote"), "error");
+      return false;
+    }
+    // F2-H1：选区来自旧章 → 清浮层并拒绝落库。
+    if (s.chapterIndex !== chapterNum) {
+      clearChapterOverlays();
       toast(t("reader.toast.noSelectionToNote"), "error");
       return false;
     }
@@ -7580,7 +7799,7 @@ ${effCssExtra() || ""}
           <!-- 出口（P0）：任何"打不开"都必须留一条出路 —— 交给系统程序打开原文件。
                失败（无关联程序/权限）时降级为"在文件夹中显示"，用户至少能找到文件。 -->
           <button data-testid="reader-open-external" onclick={openExternally}>{t("reader.open.withSystemApp")}</button>
-          <button data-testid="reader-open-back" onclick={() => (ui.view = "library")}>{labelOfId("bind", "close")}</button>
+          <button data-testid="reader-open-back" onclick={() => goBack()}>{labelOfId("bind", "close")}</button>
         </div>
       </div>
     {:else if !book}
@@ -7737,7 +7956,7 @@ ${effCssExtra() || ""}
             tabindex="0"
             aria-label={t("reader.prevChapter")}
             onclick={() => prevChapter()}
-            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); prevChapter(); } }}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); prevChapter(); } }}
           >
             {#each leftFooterItems as x, i (x.id)}
               {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
@@ -7769,7 +7988,7 @@ ${effCssExtra() || ""}
             tabindex="0"
             aria-label={t("reader.nextChapter")}
             onclick={() => nextChapter()}
-            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nextChapter(); } }}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); nextChapter(); } }}
           >
             {#each rightFooterItems as x, i (x.id)}
               {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>

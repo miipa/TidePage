@@ -13,6 +13,11 @@
 
 export type DropPlace = "before" | "after";
 
+/** G21：只有正常松手才提交排序；pointercancel（系统手势/窗口失焦）必须取消。 */
+export function dragReleaseCommits(eventType: string): boolean {
+  return eventType === "pointerup";
+}
+
 export interface DragSortOptions {
   /** 松手且进入过拖拽时回调；由父级更新顺序数组并持久化。 */
   onDrop: (from: string, target: string, place: DropPlace) => void;
@@ -104,7 +109,7 @@ export function dragSort(node: HTMLElement, options: DragSortOptions) {
     target = null;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
+    window.addEventListener("pointercancel", onCancel);
   }
 
   function onMove(e: PointerEvent) {
@@ -167,7 +172,21 @@ export function dragSort(node: HTMLElement, options: DragSortOptions) {
   function unbindWindow() {
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
+    window.removeEventListener("pointercancel", onCancel);
+  }
+
+  /** G21：取消路径——清标记/解绑，但绝不回调 onDrop（旧实现 pointercancel 直接走 finish 提交）。 */
+  function cancelDrag() {
+    unbindWindow();
+    clearMarks();
+    dragging = false;
+    pointerId = -1;
+    src = null;
+    target = null;
+  }
+
+  function onCancel(e: PointerEvent) {
+    if (e.pointerId === pointerId) cancelDrag();
   }
 
   function finish() {
@@ -189,7 +208,12 @@ export function dragSort(node: HTMLElement, options: DragSortOptions) {
   }
 
   function onUp(e: PointerEvent) {
-    if (e.pointerId === pointerId) finish();
+    if (e.pointerId !== pointerId) return;
+    if (!dragReleaseCommits(e.type)) {
+      cancelDrag();
+      return;
+    }
+    finish();
   }
 
   node.addEventListener("pointerdown", onDown);

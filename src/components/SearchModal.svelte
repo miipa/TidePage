@@ -56,13 +56,13 @@
   }
 
   function openHit(h: SearchHit) {
+    // F6：跳章意图随打开请求一起交给 Reader，由章节加载完成事件消费；
+    // 固定 1200ms 定时器在大书上会早于加载、在快速连搜时会打到下一本书。
     pendingOpen.bookId = h.book_id;
+    pendingOpen.jumpChapter = h.chapter_index;
     pendingOpen.nonce++;
     ui.view = "reader";
     ui.searchOpen = false;
-    setTimeout(() => {
-      window.dispatchEvent(new CustomEvent("tidepage-jump", { detail: h.chapter_index }));
-    }, 1200);
   }
 </script>
 

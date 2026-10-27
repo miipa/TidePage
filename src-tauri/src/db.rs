@@ -32,10 +32,56 @@ pub fn path_id(path: &str) -> i64 {
     (h & 0xF_FFFF_FFFF_FFFF) as i64
 }
 
+/// 主连接等锁上限（毫秒）。SQLite 默认 0ms：多窗口 + 后台扫描并发写时 BUSY 会被上层
+/// 当成普通错误吞掉（表现为数据静默丢失）。10s 覆盖一次封面/扫描事务的最长持锁时间。
+pub(crate) const DB_BUSY_TIMEOUT_MS: u32 = 10_000;
+
+/// P1-6：补列失败必须上抛（旧实现 pragma 查询 unwrap_or(false)、ALTER .ok()，列缺失后
+/// 查询会表现为空数据，用户误以为书库丢了）。错误带表名/列名，init 失败走 setup fatal。
+fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Result<(), String> {
+    let name = column_def.split_whitespace().next().unwrap_or("");
+    // 表尚未创建（初始化中途：如 tags 在后面的批量建表里才出现）→ 无需补列，
+    // 后续 CREATE TABLE 已带该列；老库此时表一定存在，走下面的严格检查/ALTER。
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("检查表 {table} 是否存在失败：{e}"))?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+    let exists: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+            params![name],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("检查列 {table}.{name} 失败：{e}"))?;
+    if exists == 0 {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column_def}"), [])
+            .map_err(|e| format!("补列 {table}.{name} 失败：{e}"))?;
+    }
+    Ok(())
+}
+
 pub fn init(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "journal_mode", "WAL").ok();
-    conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    // busy_timeout 失败必须显式返回 Err：没有它后续所有写都可能在并发下静默失败。
+    conn.busy_timeout(std::time::Duration::from_millis(DB_BUSY_TIMEOUT_MS as u64))
+        .map_err(|e| format!("设置 busy_timeout 失败：{e}"))?;
+    // journal_mode/synchronous 的 pragma 结果不静默：设置失败不中断启动，但记录实际值。
+    if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+        crate::memlog::stage_note("db:init", &format!("journal_mode_set_err={e}"));
+    }
+    let actual_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap_or_else(|e| format!("unknown({e})"));
+    crate::memlog::stage_note("db:init", &format!("journal_mode={actual_mode}"));
+    if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
+        crate::memlog::stage_note("db:init", &format!("synchronous_set_err={e}"));
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS folders(
@@ -200,49 +246,24 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "last_attempt_at INTEGER",
         "fail_count INTEGER NOT NULL DEFAULT 0",
     ] {
-        let name = col.split(' ').next().unwrap_or("");
-        let exists: bool = conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('books') WHERE name=?1",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !exists {
-            conn.execute(&format!("ALTER TABLE books ADD COLUMN {col}"), [])
-                .ok();
-        }
+        ensure_column(&conn, "books", col)?;
     }
     // highlights.color：旧库补列（新库建表时已含）
-    let has_hl_color: bool = conn
-        .query_row(
-            "SELECT count(*) FROM pragma_table_info('highlights') WHERE name='color'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
-    if !has_hl_color {
-        conn.execute("ALTER TABLE highlights ADD COLUMN color TEXT NOT NULL DEFAULT ''", [])
-            .ok();
-    }
+    ensure_column(&conn, "highlights", "color TEXT NOT NULL DEFAULT ''")?;
     // B9：条目标记 updated_at（幂等补列 + created_at 回填，0 保留 0）。
     for table in ["bookmarks", "highlights", "tags"] {
-        let exists: bool = conn
-            .query_row(
-                &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name='updated_at'"),
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !exists {
-            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"), [])
-                .ok();
+        ensure_column(
+            &conn,
+            table,
+            "updated_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // 回填 UPDATE 失败只记日志、下次启动重试（幂等 WHERE updated_at=0）：
+        // 与上面的 schema 变更不同，回填失败不会让查询缺列，不值得阻断启动。
+        if let Err(e) =
+            conn.execute(&format!("UPDATE {table} SET updated_at=created_at WHERE updated_at=0"), [])
+        {
+            eprintln!("[db] 回填 {table}.updated_at 失败（下次启动会重试）：{e}");
         }
-        conn.execute(&format!("UPDATE {table} SET updated_at=created_at WHERE updated_at=0"), [])
-            .ok();
     }
     // last_read 一次性回填（新列/旧库）：= max(last_opened, 该书 progress.updated_at)。
     // 原子性（🔴 修）：UPDATE 与「已回填」标记放**同一事务**，杜绝「标记在、数据缺」的半成品态；
@@ -364,76 +385,168 @@ pub fn init(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-pub fn migrate_book_ids(conn: &Connection) {
+/// books.id 变化时必须同步的普通表清单。fts 是 FTS5 虚拟表，单独处理。
+/// 不迁移：orphan_books（负 id 是已删书快照，按 path_id 再算会撞正 id）、
+/// stale_pending / ignored_paths / sync_tombstones（按 path / key 记录，无 book_id）、
+/// folders（无 book_id）。
+const BOOK_ID_TABLES: &[&str] = &[
+    "progress",
+    "txt_cache",
+    "bookmarks",
+    "reading_sessions",
+    "highlights",
+    "txt_encoding",
+    "epub_stats",
+    "fts_meta",
+    "chapter_text",
+    "book_fingerprint",
+    "stats",
+    "cover_priority",
+    "book_tags",
+];
+
+fn fts_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+    .unwrap_or(false)
+}
+
+/// 迁移 fts 虚拟表里的 book_id：优先 `UPDATE fts SET book_id`；若该版本不支持更新该列，
+/// 读出 (rowid, chapter_index, title, body) 后按原 rowid 重插，保留正文。
+/// 返回是否走了 UPDATE 路径（测试据此确认实际执行分支）。
+fn migrate_fts_ids(conn: &Connection, old_id: i64, new_id: i64) -> Result<bool, String> {
+    if !fts_table_exists(conn) {
+        return Ok(false);
+    }
+    if conn
+        .execute(
+            "UPDATE fts SET book_id=?1 WHERE book_id=?2",
+            params![new_id, old_id],
+        )
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    // 回退路径：先读全量再删再插，所有步骤处在调用方的事务里，失败整批回滚。
+    let rows: Vec<(i64, i64, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT rowid, chapter_index, title, body FROM fts WHERE book_id=?1")
+            .map_err(|e| format!("读取 fts 失败：{e}"))?;
+        let iter = stmt
+            .query_map(params![old_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| format!("读取 fts 失败：{e}"))?;
+        iter.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("读取 fts 失败：{e}"))?
+    };
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM fts WHERE book_id=?1", params![old_id])
+        .map_err(|e| format!("清理 fts 失败：{e}"))?;
+    for (rowid, chapter_index, title, body) in rows {
+        conn.execute(
+            "INSERT INTO fts(rowid, book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4,?5)",
+            params![rowid, new_id, chapter_index, title, body],
+        )
+        .map_err(|e| format!("重插 fts 失败：{e}"))?;
+    }
+    Ok(false)
+}
+
+/// 把 books.id 迁移为 path_id(path)（一次性，标记 id_migrated_v2）。
+///
+/// 与旧实现的区别：
+/// - 每批的 books.id 更新与**全部**含 book_id 的子表更新在同一事务里；任一失败整批回滚并返回 Err，
+///   完成标记只在全部批次成功后写（失败调用方中止启动，下次重试）。
+/// - 补齐旧实现漏掉的 book_fingerprint / stats / cover_priority / book_tags / fts。
+/// - 新 id 已被占用时返回可读错误，不再静默跳过（那会让整本书与子表停在旧 id 上）。
+/// - query_map 的行错误用 collect 传播，不再 filter_map 吞掉。
+pub fn migrate_book_ids(conn: &Connection) -> Result<(), String> {
     // 先判「要不要迁移」再决定要不要读库：迁移完成后（id_migrated_v2=1）这里**一次查询都不做**。
     // 旧实现无论迁没迁过都先 `SELECT id, path FROM books` 全量 collect 一遍 ——
     // 17 万本时那是 17 万条 (i64, String) 的常驻物化，纯白烧内存。
     if get_setting(conn, "id_migrated_v2").is_some() {
-        return;
+        return Ok(());
     }
-    // 只迁移一次；分批（每批 2000 行）流式处理，内存与书数无关。
     // 分页键用 path（UNIQUE 且本迁移不改它），**不能用 id**：迁移本身在改 id，按 id 翻页会漏行/重复。
     const BATCH: usize = 2000;
     let mut cursor = String::new();
     loop {
         let rows: Vec<(i64, String)> = {
-            let mut stmt = match conn.prepare(
-                "SELECT id, path FROM books WHERE path > ?1 ORDER BY path LIMIT ?2",
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            stmt.query_map(params![cursor, BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map(|rs| rs.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
+            let mut stmt = conn
+                .prepare("SELECT id, path FROM books WHERE path > ?1 ORDER BY path LIMIT ?2")
+                .map_err(|e| e.to_string())?;
+            let iter = stmt
+                .query_map(params![cursor, BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?;
+            iter.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
         };
         if rows.is_empty() {
             break;
         }
         cursor = rows.last().map(|(_, p)| p.clone()).unwrap_or_default();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         for (old_id, path) in &rows {
             let new_id = path_id(path);
             if new_id == *old_id {
                 continue;
             }
-            let occupied: bool = conn
+            let occupied = tx
                 .query_row("SELECT 1 FROM books WHERE id=?1", params![new_id], |_| Ok(true))
                 .optional()
-                .unwrap_or(None)
+                .map_err(|e| e.to_string())?
                 .is_some();
             if occupied {
-                continue;
+                return Err(format!(
+                    "书籍 ID 迁移失败：新 ID {new_id} 已被占用（旧 ID {old_id}，路径 {path}）"
+                ));
             }
-            if conn
-                .execute("UPDATE books SET id=?1 WHERE id=?2", params![new_id, old_id])
-                .is_ok()
-            {
-                for table in [
-                    "progress",
-                    "txt_cache",
-                    "bookmarks",
-                    "reading_sessions",
-                    "highlights",
-                    "txt_encoding",
-                    "epub_stats",
-                    "fts_meta",
-                ] {
-                    conn.execute(
-                        &format!("UPDATE {table} SET book_id=?1 WHERE book_id=?2"),
-                        params![new_id, old_id],
-                    )
-                    .ok();
-                }
-                conn.execute(
-                    "UPDATE chapter_text SET book_id=?1 WHERE book_id=?2",
+            tx.execute("UPDATE books SET id=?1 WHERE id=?2", params![new_id, old_id])
+                .map_err(|e| format!("迁移书籍 ID {old_id}→{new_id} 失败：{e}"))?;
+            for table in BOOK_ID_TABLES {
+                tx.execute(
+                    &format!("UPDATE {table} SET book_id=?1 WHERE book_id=?2"),
                     params![new_id, old_id],
                 )
-                .ok();
+                .map_err(|e| format!("迁移 {table}.book_id {old_id}→{new_id} 失败：{e}"))?;
+            }
+            migrate_fts_ids(&tx, *old_id, new_id)?;
+            // 事务内自检：旧 id 在全部迁移表里必须已无残留，否则回滚整批。
+            for table in BOOK_ID_TABLES {
+                let left: i64 = tx
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE book_id=?1"),
+                        params![old_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("校验 {table} 迁移结果失败：{e}"))?;
+                if left != 0 {
+                    return Err(format!("迁移后 {table} 仍有 {left} 行旧 ID {old_id}"));
+                }
+            }
+            if fts_table_exists(&tx) {
+                let left: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM fts WHERE book_id=?1",
+                        params![old_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("校验 fts 迁移结果失败：{e}"))?;
+                if left != 0 {
+                    return Err(format!("迁移后 fts 仍有 {left} 行旧 ID {old_id}"));
+                }
             }
         }
-        drop(rows); // 本批中间对象及时释放
+        tx.commit().map_err(|e| e.to_string())?;
     }
-    set_setting(conn, "id_migrated_v2", "1");
+    // 完成标记只在全部批次成功后写；失败即 Err（调用方中止启动，下次重试）。
+    set_setting_checked(conn, "id_migrated_v2", "1")
 }
 
 /// 章节切分算法版本。改变 `txt.rs` 的切分策略（如引入 `MAX_CHAPTER_CHARS` 细分、
@@ -451,16 +564,19 @@ pub const CHAPTER_SPLIT_VER: &str = "4";
 ///   按书懒清理。启动期绝不逐行 DELETE（真实库上会卡死窗口出现）。
 /// - 其它更旧值（缺失/"1" 等）：一次性作废整库缓存，但用 DROP/重建（O(索引) 级），
 ///   仍不允许逐行 DELETE。
-pub fn migrate_chapter_split(conn: &Connection) {
+/// P1-7：迁移改 Result——只有全部清理成功才写版本号；任一步失败返回可读错误且不写版本，
+/// 下次启动重试。旧实现各步 .ok()、最后 set_setting 吞错，失败也会写版本，旧 FTS 永久残留。
+pub fn migrate_chapter_split(conn: &Connection) -> Result<(), String> {
     let cur = get_setting(conn, "chapter_split_ver").unwrap_or_default();
     if cur == CHAPTER_SPLIT_VER {
-        return;
+        return Ok(());
     }
     if cur == "2" || cur == "3" {
         // 零成本升级：只改版本号。切分/自动切章书的搜索缓存由 open_book 调
-        // invalidate_split_book_search_cache 按书懒清（见该函数说明）。
-        set_setting(conn, "chapter_split_ver", CHAPTER_SPLIT_VER);
-        return;
+        // invalidate_book_search_cache 按书懒清（见该函数说明）。
+        set_setting_checked(conn, "chapter_split_ver", CHAPTER_SPLIT_VER)
+            .map_err(|e| format!("写入章节切分迁移版本失败：{e}"))?;
+        return Ok(());
     }
     // 更旧库：整库作废。FTS 直接 DROP 后重建：
     // - FTS5 的 delete-all 只适用于 contentless/external content 表，本表是普通 content 表，
@@ -469,16 +585,16 @@ pub fn migrate_chapter_split(conn: &Connection) {
     // - 逐行 DELETE FROM fts 在真实库 63,867 行上会卡启动（P11 卡死启动的根因）。
     // DROP 是删整棵索引树（非逐行），实测仍明显快于逐行删除。
     let t0 = std::time::Instant::now();
-    let fts_table_exists = conn
+    let fts_table_exists: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts'",
             [],
             |r| r.get::<_, i64>(0),
         )
-        .map(|c| c > 0)
-        .unwrap_or(false);
-    if fts_table_exists {
-        conn.execute("DROP TABLE IF EXISTS fts", []).ok();
+        .map_err(|e| format!("迁移检查 fts 表失败：{e}"))?;
+    if fts_table_exists > 0 {
+        conn.execute("DROP TABLE IF EXISTS fts", [])
+            .map_err(|e| format!("迁移 DROP fts 失败：{e}"))?;
     }
     let fts_drop_ms = t0.elapsed().as_millis();
     // chapter_text 用 DROP + 按 init 的原 schema 重建：比逐行 DELETE 快几个数量级。
@@ -492,19 +608,22 @@ pub fn migrate_chapter_split(conn: &Connection) {
             PRIMARY KEY(book_id, chapter_index)
          );",
     )
-    .ok();
+    .map_err(|e| format!("迁移重建 chapter_text 失败：{e}"))?;
     // P12：fts 清空的同时清 meta，否则旧 meta 行数可能与新期望巧合相等而误判「已索引」。
-    conn.execute("DELETE FROM fts_meta", []).ok();
+    conn.execute("DELETE FROM fts_meta", [])
+        .map_err(|e| format!("迁移清空 fts_meta 失败：{e}"))?;
     // 表被 DROP 过或原本不存在时重建，保证后续搜索/索引路径可用（已存在时是 no-op）。
-    ensure_fts(conn).ok();
+    ensure_fts(conn).map_err(|e| format!("迁移重建 fts 失败：{e}"))?;
     if std::env::var("TIDEPAGE_OPEN_DIAG").is_ok() {
         eprintln!(
             "[db] migrate_chapter_split old path fts_drop={fts_drop_ms}ms total={}ms",
             t0.elapsed().as_millis()
         );
     }
-    // 版本号最后写：中途失败下次重跑仍是幂等的清理。
-    set_setting(conn, "chapter_split_ver", CHAPTER_SPLIT_VER);
+    // 版本号最后写：所有清理都成功才写；中途失败则不写，下次启动重跑（清理本身幂等）。
+    set_setting_checked(conn, "chapter_split_ver", CHAPTER_SPLIT_VER)
+        .map_err(|e| format!("写入章节切分迁移版本失败：{e}"))?;
+    Ok(())
 }
 
 /// P11 切分书的搜索缓存按书懒清理（open_book 在确认 split 后调用）。
@@ -542,20 +661,17 @@ pub fn reset_epub_covers(conn: &Connection, covers_dir: &std::path::Path) {
     if get_setting(conn, KEY).is_some() {
         return;
     }
+    // 只复位「自动封面」行：custom-* 是用户自选封面，置空等于覆盖用户选择。
     conn
         .execute(
-            "UPDATE books SET cover_path=NULL, meta_done=0 WHERE meta_done=1",
+            "UPDATE books SET cover_path=NULL, meta_done=0 WHERE meta_done=1 \
+             AND (cover_path IS NULL OR lower(cover_path) NOT LIKE 'custom-%')",
             [],
         )
         .ok();
-    if let Ok(entries) = std::fs::read_dir(covers_dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            if name.ends_with(".svg") || name.ends_with(".png") {
-                std::fs::remove_file(e.path()).ok();
-            }
-        }
-    }
+    // 只删自动生成的封面文件（纯数字 stem、扩展名不限）：旧实现按扩展名删目录里所有
+    // .svg/.png，会把 custom-* 自选封面与 bg-* 背景图一起删掉，同时又漏删 .webp/.jpg 自动封面。
+    crate::covers::clean_auto_covers(covers_dir);
     set_setting(conn, "cover_reset_done", "1");
     set_setting(conn, "cover_reset_v2", "1");
     set_setting(conn, "cover_reset_v3", "1");
@@ -863,11 +979,14 @@ pub fn set_fts_meta(conn: &Connection, book_id: i64, rows: i64) {
 }
 
 /// 删除某本书的 FTS 元信息（重建前先删，崩溃后残留半成品不会被误判为已索引）。
+/// 第 6 轮后索引改走 -1 哨兵标记（mark_book_fts_stale），保留该入口供未来/测试使用。
+#[allow(dead_code)]
 pub fn delete_fts_meta(conn: &Connection, book_id: i64) {
     conn.execute("DELETE FROM fts_meta WHERE book_id=?1", params![book_id]).ok();
 }
 
-/// 清空全部 FTS 元信息（全库重建前调用）。
+/// 清空全部 FTS 元信息（全库重建前调用）。第 6 轮重建不再全表清空，保留入口。
+#[allow(dead_code)]
 pub fn clear_fts_meta(conn: &Connection) {
     conn.execute("DELETE FROM fts_meta", []).ok();
 }
@@ -1246,6 +1365,7 @@ pub fn set_book_tags(conn: &mut Connection, book_id: i64, tag_ids: &[i64]) -> Re
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let path: Option<String> = tx.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get(0)).ok();
+    let identity: Option<String> = book_sync_identity_by_id(&tx, book_id).map(|(_, i)| i);
     let old_tags: Vec<String> = tx
         .prepare("SELECT t.norm FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id=?1")
         .and_then(|mut s| s.query_map(params![book_id], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).map_err(Into::into))
@@ -1264,11 +1384,19 @@ pub fn set_book_tags(conn: &mut Connection, book_id: i64, tag_ids: &[i64]) -> Re
         .map_err(|e| e.to_string())?;
     }
     if let Some(p) = path {
+        // H20：删除记新身份 + legacy 两把 key；新增关联清两把 key。
+        let t = now_ms();
         for n in old_tags.iter().filter(|n| !new_tags.contains(n)) {
-            let _ = record_tombstone(&tx, "book_tag", &book_tag_tomb_key(&p, n), now_ms());
+            let _ = record_tombstone(&tx, "book_tag", &book_tag_tomb_key(&p, n), t);
+            if let Some(ident) = &identity {
+                let _ = record_tombstone(&tx, "book_tag", &book_tag_sync_key(ident, n), t);
+            }
         }
         for n in new_tags.iter().filter(|n| !old_tags.contains(n)) {
             let _ = remove_tombstone(&tx, "book_tag", &book_tag_tomb_key(&p, n));
+            if let Some(ident) = &identity {
+                let _ = remove_tombstone(&tx, "book_tag", &book_tag_sync_key(ident, n));
+            }
         }
     }
     tx.commit().map_err(|e| e.to_string())
@@ -1282,6 +1410,39 @@ pub fn set_read_state(conn: &Connection, book_id: i64, state: i64) -> Result<(),
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// F3-H2：右键标记已读/未读的最小写入。
+///
+/// 只写 progress 与 books.read_state/read_pct，**不写 books.last_read** —— 标记动作不是阅读，
+/// 不能把「最近阅读」排序顶到最前（旧实现经 openBook+saveProgress 会顺带 touch_book_opened）。
+/// 已读：progress(0, 1.0, 100)，reader 按 pct>=99.5 打开即落末章末；未读：progress(0, 0, 0) 回开头。
+pub fn mark_book_read_state(conn: &Connection, book_id: i64, read: bool) -> Result<(), String> {
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM books WHERE id=?1", params![book_id], |_| Ok(true))
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if !exists {
+        return Err("书籍不存在".into());
+    }
+    let (ratio, pct) = if read { (1.0f64, 100.0f64) } else { (0.0, 0.0) };
+    let state = if read { 1i64 } else { 2i64 };
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO progress(book_id, chapter_index, chapter_ratio, pct, updated_at, device)
+         VALUES(?1,0,?2,?3,?4,'pc')
+         ON CONFLICT(book_id) DO UPDATE SET chapter_index=0, chapter_ratio=?2, pct=?3, updated_at=?4, device='pc'",
+        params![book_id, ratio, pct, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    // 只改 read_state / read_pct；last_read 保持原值（F3-H2 的核心约束）。
+    tx.execute(
+        "UPDATE books SET read_state=?2, read_pct=?3 WHERE id=?1",
+        params![book_id, state, pct],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// 记录「最近打开」时间（不改动阅读进度）。打开失败的书也能出现在「按最近阅读」里。
@@ -1316,15 +1477,22 @@ pub fn upsert_book(
              id=?1, size=?5, mtime=?6, meta_done=0",
         params![id, path, title, format, size, mtime, now_ms()],
     );
-    if res.is_err() {
-        conn.execute("DELETE FROM books WHERE path=?1", params![path])
-            .map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO books(id, path, title, author, format, size, mtime, added_at, meta_done)
-             VALUES(?1,?2,?3,'',?4,?5,?6,?7,0)",
-            params![id, path, title, format, size, mtime, now_ms()],
-        )
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = res {
+        // 不再「先删行再重插」：那会把 author/cover_path/total_chars/read_pct 等整行数据丢掉，
+        // 且 SQLITE_BUSY/磁盘满这类瞬态错误也被当成可删除信号。单条 INSERT 本身是原子的，
+        // 失败时已有行保持不变（调用方多在外层事务里，这里也不另开事务）。
+        //
+        // 唯一需要单独解释的是 id 冲突：books.id 由路径派生，若同 id 已被另一路径占用，
+        // INSERT 会因主键冲突失败；此时给出可读错误，便于定位历史脏数据。
+        let occupied: Option<String> = conn
+            .query_row("SELECT path FROM books WHERE id=?1", params![id], |r| r.get(0))
+            .ok();
+        return match occupied {
+            Some(other) if other != path => Err(format!(
+                "书库 ID 冲突：{id} 已被路径 {other} 占用（本次路径 {path}）"
+            )),
+            _ => Err(e.to_string()),
+        };
     }
     Ok(id)
 }
@@ -1360,7 +1528,7 @@ pub fn list_books(conn: &Connection) -> Vec<BookRow> {
 }
 
 /// 转义 LIKE 通配符，配合 SQL 的 `ESCAPE '\'` 使用，避免用户输入 `%`/`_` 被当作模式。
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
@@ -1877,7 +2045,9 @@ pub fn refresh_book_fingerprint(
     mtime: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE books SET size=?2, mtime=?3, meta_done=0, meta_error=NULL, fail_count=0 WHERE id=?1",
+        // S3：文件指纹变了，字数统计必然失效；与 upsert_book 的 CASE 清理语义保持一致，
+        // 否则旧 total_chars 会让字数统计/统计面板一直返回旧文件的数字。
+        "UPDATE books SET size=?2, mtime=?3, meta_done=0, meta_error=NULL, fail_count=0,          total_chars=0, total_text_chars=0 WHERE id=?1",
         params![id, size, mtime],
     )?;
     Ok(())
@@ -2150,6 +2320,226 @@ mod upsert_chars_tests {
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// H7①：写入失败时不得先删已有行再重插（author 等整行数据必须保留）。
+    /// 用 BEFORE UPDATE 触发器制造失败：UPSERT 命中路径冲突走的是 UPDATE 分支，
+    /// 真正的写入错误就在这里被观察到。
+    #[test]
+    fn upsert_failure_keeps_existing_row_and_author() {
+        let dir = std::env::temp_dir().join(format!("tp_db_upsert_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = init(&dir.join("t.db")).unwrap();
+        let path = "C:/x/keep.epub";
+        upsert_book(&conn, path, "原书名", "epub", 100, 1000).unwrap();
+        conn.execute("UPDATE books SET author='原作者' WHERE path=?1", params![path])
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_upsert BEFORE UPDATE ON books
+             WHEN NEW.path='C:/x/keep.epub'
+             BEGIN SELECT RAISE(ABORT,'写入被拒'); END;",
+        )
+        .unwrap();
+        let err = upsert_book(&conn, path, "新书名", "epub", 200, 2000).unwrap_err();
+        assert!(!err.is_empty());
+        let b = get_book_by_path(&conn, path).expect("旧行必须仍在");
+        assert_eq!(b.author, "原作者", "失败不得丢掉 author");
+        assert_eq!(b.title, "原书名", "失败的更新不得部分生效");
+        assert_eq!(b.size, 100, "旧行的 size 保持");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H7②：id 已被另一路径占用时返回可读的 ID 冲突错误，已有行原样保留、不产生半写入行。
+    #[test]
+    fn upsert_reports_id_conflict_without_deleting_rows() {
+        let dir = std::env::temp_dir().join(format!("tp_db_upsert_idconf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = init(&dir.join("t.db")).unwrap();
+        let target = "C:/x/target.epub";
+        let id = path_id(target);
+        let other = "C:/x/other.epub";
+        conn.execute(
+            "INSERT INTO books(id,path,title,author,format,size,mtime,added_at,meta_done)
+             VALUES(?1,?2,'占位','','epub',1,1,1,0)",
+            params![id, other],
+        )
+        .unwrap();
+        let err = upsert_book(&conn, target, "书", "epub", 10, 20).unwrap_err();
+        assert!(err.contains("ID 冲突"), "应报 ID 冲突，实际：{err}");
+        assert!(err.contains(&id.to_string()), "错误里应含冲突 id，实际：{err}");
+        assert!(err.contains(other), "错误里应含占用路径，实际：{err}");
+        // 冲突行仍在、目标行没有被插入（失败不得留下半成品行）。
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "只应有原来那行，不得插入半成品行");
+        let kept_path: String = conn
+            .query_row("SELECT path FROM books WHERE id=?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept_path, other, "占用 id 的旧行必须原样保留");
+        let target_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM books WHERE path=?1", params![target], |r| r.get(0))
+            .unwrap();
+        assert_eq!(target_rows, 0, "失败的目标行不得落库");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod migrate_ids_tests {
+    //! H5：书籍 id 迁移必须整批事务化、覆盖全部含 book_id 的子表、失败不写完成标记。
+    use super::*;
+
+    fn tmp_conn(tag: &str) -> (std::path::PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("tp_db_migrate_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = init(&dir.join("t.db")).unwrap();
+        (dir, conn)
+    }
+
+    fn insert_old_book(conn: &Connection, old_id: i64, path: &str) {
+        conn.execute(
+            "INSERT INTO books(id,path,title,author,format,size,mtime,added_at,meta_done)
+             VALUES(?1,?2,'书','作者','epub',1,2,3,0)",
+            params![old_id, path],
+        )
+        .unwrap();
+    }
+
+    /// 给一本书在全部待迁移子表里各插一行（fts 单独建表后插正文）。
+    fn seed_child_rows(conn: &Connection, id: i64) {
+        for sql in [
+            "INSERT INTO progress(book_id,chapter_index,chapter_ratio,pct,updated_at,device) VALUES(?1,1,0.5,50,1,'')",
+            "INSERT INTO txt_cache(book_id,offsets,rules_hash) VALUES(?1,'[]','')",
+            "INSERT INTO bookmarks(book_id,chapter_index,title,excerpt,created_at) VALUES(?1,0,'书签','摘录',1)",
+            "INSERT INTO reading_sessions(book_id,day,started_at,seconds,chars) VALUES(?1,'2026-01-01',1,60,100)",
+            "INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,0,'章',0,1,'划线','underline','','',1)",
+            "INSERT INTO txt_encoding(book_id,size,mtime,enc) VALUES(?1,1,2,'utf-8')",
+            "INSERT INTO epub_stats(book_id,size,mtime,total,pure,per_chapter) VALUES(?1,1,2,10,9,'[]')",
+            "INSERT INTO fts_meta(book_id,rows) VALUES(?1,1)",
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(?1,0,'章','正文')",
+            "INSERT INTO book_fingerprint(book_id,size,mtime,hash,title_snap,author_snap) VALUES(?1,1,2,'h','书','作者')",
+            "INSERT INTO stats(day,book_id,seconds) VALUES('2026-01-01',?1,60)",
+            "INSERT INTO cover_priority(book_id,queued_at) VALUES(?1,1)",
+            "INSERT INTO book_tags(book_id,tag_id) VALUES(?1,7)",
+        ] {
+            conn.execute(sql, params![id]).unwrap();
+        }
+        ensure_fts(conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'章','正文')",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrates_all_child_tables_and_fts_in_transaction() {
+        let (dir, conn) = tmp_conn("all");
+        let path_a = "/x/a.epub";
+        let path_b = "/x/b.epub";
+        insert_old_book(&conn, 101, path_a);
+        insert_old_book(&conn, 102, path_b);
+        seed_child_rows(&conn, 101);
+        migrate_book_ids(&conn).unwrap();
+
+        let new_a = path_id(path_a);
+        let new_b = path_id(path_b);
+        // books.id 迁移为 path_id，旧 id 不留
+        for (old, new) in [(101i64, new_a), (102, new_b)] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM books WHERE id=?1", params![new], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "books.id 应迁移到 path_id");
+            let gone: i64 = conn
+                .query_row("SELECT COUNT(*) FROM books WHERE id=?1", params![old], |r| r.get(0))
+                .unwrap();
+            assert_eq!(gone, 0, "旧 id 不得残留");
+        }
+        // 13 张普通子表：book_id 同步到新 id，旧 id 无残留
+        for table in BOOK_ID_TABLES {
+            let moved: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE book_id=?1"), params![new_a], |r| r.get(0))
+                .unwrap();
+            assert_eq!(moved, 1, "{table} 的 book_id 应迁移");
+            let left: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE book_id=?1"), params![101i64], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{table} 不得残留旧 id");
+        }
+        // fts 虚拟表：正文保留
+        let (bid, title, body): (i64, String, String) = conn
+            .query_row("SELECT book_id,title,body FROM fts", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((bid, title.as_str(), body.as_str()), (new_a, "章", "正文"));
+        // 完成标记写入；二次调用 no-op
+        assert_eq!(get_setting(&conn, "id_migrated_v2").as_deref(), Some("1"));
+        migrate_book_ids(&conn).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "二次调用不得重复迁移");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failure_rolls_back_batch_and_skips_marker() {
+        let (dir, conn) = tmp_conn("rollback");
+        insert_old_book(&conn, 101, "/x/a.epub");
+        insert_old_book(&conn, 102, "/x/b.epub");
+        seed_child_rows(&conn, 101);
+        // stats 更新失败 ⇒ 整批回滚
+        conn.execute_batch(
+            "CREATE TRIGGER block_stats BEFORE UPDATE ON stats
+             BEGIN SELECT RAISE(ABORT,'blocked'); END;",
+        )
+        .unwrap();
+        let err = migrate_book_ids(&conn).unwrap_err();
+        assert!(!err.is_empty());
+        for old in [101i64, 102] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM books WHERE id=?1", params![old], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "事务回滚后 books.id 应保持旧值");
+        }
+        let progress_id: i64 = conn
+            .query_row("SELECT book_id FROM progress", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(progress_id, 101, "子表更新也必须回滚");
+        assert!(
+            get_setting(&conn, "id_migrated_v2").is_none(),
+            "失败不得写完成标记"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FTS 迁移实际走的路径：内置 SQLite 的 FTS5 支持 UPDATE book_id，应报告 UPDATE 路径。
+    #[test]
+    fn fts_migration_moves_rows_and_reports_update_path() {
+        let (dir, conn) = tmp_conn("fts");
+        insert_old_book(&conn, 101, "/x/a.epub");
+        ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(101,0,'章','正文')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let used_update = migrate_fts_ids(&tx, 101, 999).unwrap();
+        tx.commit().unwrap();
+        let (bid, body): (i64, String) = conn
+            .query_row("SELECT book_id,body FROM fts", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(bid, 999);
+        assert_eq!(body, "正文");
+        assert!(used_update, "FTS5 应支持 UPDATE book_id，实际走了回退路径");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 删除书籍（G1 分级）。`keep_notes=true` 时保留带笔记的划线（并落 orphan 快照），
@@ -2273,22 +2663,68 @@ pub fn get_progress(conn: &Connection, book_id: i64) -> Option<Progress> {
 }
 
 pub fn set_progress(conn: &Connection, book_id: i64, p: &Progress) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO progress(book_id, chapter_index, chapter_ratio, pct, updated_at, device)
-         VALUES(?1,?2,?3,?4,?5,?6)
-         ON CONFLICT(book_id) DO UPDATE SET chapter_index=?2, chapter_ratio=?3, pct=?4, updated_at=?5, device=?6",
-        params![book_id, p.chapter_index, p.chapter_ratio, p.pct, p.updated_at, p.device],
-    )
-    .map_err(|e| e.to_string())?;
-    // 同步维护 books.last_read（取大）：秩可寻址分页「按最近阅读」的排序键。
-    // 同步维护 books.read_pct（反规范化，红线 5）：所有写 progress.pct 的路径都经由本函数，
-    // 故这一处覆盖 §0 第 4 条列出的全部写入点（save_progress / webdav 合并回写）。
-    conn.execute(
-        "UPDATE books SET last_read=MAX(last_read, ?2), read_pct=?3 WHERE id=?1",
-        params![book_id, p.updated_at, p.pct],
-    )
-    .ok();
-    Ok(())
+    // S3：progress 行与 books 反规范化列必须原子写入。
+    // - autocommit：自建事务，任一语句失败整体回滚，不再 .ok() 吞掉反规范化写失败；
+    // - 外层事务（如 databackup restore 传入 &tx）：直接在该事务内执行并上抛，由外层回滚。
+    let apply = |c: &Connection| -> Result<(), String> {
+        c.execute(
+            "INSERT INTO progress(book_id, chapter_index, chapter_ratio, pct, updated_at, device)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(book_id) DO UPDATE SET chapter_index=?2, chapter_ratio=?3, pct=?4, updated_at=?5, device=?6",
+            params![book_id, p.chapter_index, p.chapter_ratio, p.pct, p.updated_at, p.device],
+        )
+        .map_err(|e| e.to_string())?;
+        // 同步维护 books.last_read（取大）：秩可寻址分页「按最近阅读」的排序键。
+        // 同步维护 books.read_pct（反规范化，红线 5）：所有写 progress.pct 的路径都经由本函数，
+        // 故这一处覆盖 §0 第 4 条列出的全部写入点（save_progress / webdav 合并回写）。
+        c.execute(
+            "UPDATE books SET last_read=MAX(last_read, ?2), read_pct=?3 WHERE id=?1",
+            params![book_id, p.updated_at, p.pct],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    };
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        apply(&tx)?;
+        tx.commit().map_err(|e| e.to_string())
+    } else {
+        apply(conn)
+    }
+}
+
+/// 进度写入的单调保护版本（H11）：save_progress 改 async + spawn_blocking 后，旧请求
+/// 可能晚于新请求执行；这里用 excluded.updated_at >= progress.updated_at 拒绝倒退写入。
+/// 反规范化列只在记录真正生效时更新（read_pct 随生效记录走，last_read 仍取大）。
+pub fn set_progress_monotonic(conn: &Connection, book_id: i64, p: &Progress) -> Result<(), String> {
+    // S3：与 set_progress 同一套事务边界：progress 真正生效（changed>0）时，
+    // books 反规范化更新与它同事务；autocommit 下自建事务，外层事务下直接执行并上抛。
+    let apply = |c: &Connection| -> Result<(), String> {
+        let changed = c
+            .execute(
+                "INSERT INTO progress(book_id, chapter_index, chapter_ratio, pct, updated_at, device)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(book_id) DO UPDATE SET chapter_index=?2, chapter_ratio=?3, pct=?4, updated_at=?5, device=?6
+                 WHERE excluded.updated_at >= progress.updated_at",
+                params![book_id, p.chapter_index, p.chapter_ratio, p.pct, p.updated_at, p.device],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed > 0 {
+            c.execute(
+                "UPDATE books SET last_read=MAX(last_read, ?2), read_pct=?3 WHERE id=?1",
+                params![book_id, p.updated_at, p.pct],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        apply(&tx)?;
+        tx.commit().map_err(|e| e.to_string())
+    } else {
+        apply(conn)
+    }
 }
 
 /// 进度重置/清除时调用：把 last_read 回落到 last_opened（不再受已删进度影响），
@@ -2392,8 +2828,10 @@ pub fn add_bookmark(
         params![book_id, chapter_index, title, excerpt, t, t],
     )
     .map_err(|e| e.to_string())?;
-    if let Some(path) = conn.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get::<_, String>(0)).ok() {
+    if let Some((path, identity)) = book_sync_identity_by_id(conn, book_id) {
+        // H20：新 key（跨设备可匹配）与 legacy 路径 key 一起清，避免旧墓碑把刚建的条目删掉。
         let _ = remove_tombstone(conn, "bookmark", &bookmark_tomb_key(&path, chapter_index, title, excerpt));
+        let _ = remove_tombstone(conn, "bookmark", &bookmark_sync_key(&identity, chapter_index, title, excerpt));
     }
     Ok(())
 }
@@ -2413,17 +2851,33 @@ pub fn list_bookmarks(conn: &Connection, book_id: i64) -> Vec<(i64, i64, String,
 }
 
 pub fn delete_bookmark(conn: &Connection, id: i64) -> Result<(), String> {
-    let key = conn
+    // H20：同时产出新身份 key 与 legacy 路径 key 的墓碑（旧客户端仍按旧 key 生效）。
+    let keys: Option<(String, String)> = conn
         .query_row(
-            "SELECT b.path, bm.chapter_index, bm.title, bm.excerpt FROM bookmarks bm JOIN books b ON b.id=bm.book_id WHERE bm.id=?1",
+            "SELECT b.path, b.title, COALESCE(b.author,''), COALESCE(b.size,0), bm.chapter_index, bm.title, bm.excerpt FROM bookmarks bm JOIN books b ON b.id=bm.book_id WHERE bm.id=?1",
             params![id],
-            |r| Ok(bookmark_tomb_key(&r.get::<_, String>(0)?, r.get(1)?, &r.get::<_, String>(2)?, &r.get::<_, String>(3)?)),
+            |r| {
+                let path: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                let author: String = r.get(2)?;
+                let size: i64 = r.get(3)?;
+                let chapter: i64 = r.get(4)?;
+                let bm_title: String = r.get(5)?;
+                let excerpt: String = r.get(6)?;
+                let ident = book_sync_identity(&title, &author, size, &path);
+                Ok((
+                    bookmark_sync_key(&ident, chapter, &bm_title, &excerpt),
+                    bookmark_tomb_key(&path, chapter, &bm_title, &excerpt),
+                ))
+            },
         )
         .ok();
     conn.execute("DELETE FROM bookmarks WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
-    if let Some(k) = key {
-        let _ = record_tombstone(conn, "bookmark", &k, now_ms());
+    if let Some((new_key, legacy_key)) = keys {
+        let t = now_ms();
+        let _ = record_tombstone(conn, "bookmark", &new_key, t);
+        let _ = record_tombstone(conn, "bookmark", &legacy_key, t);
     }
     Ok(())
 }
@@ -2447,8 +2901,10 @@ pub fn add_highlight(
         params![book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, now_ms()],
     )
     .map_err(|e| e.to_string())?;
-    if let Some(path) = conn.query_row("SELECT path FROM books WHERE id=?1", params![book_id], |r| r.get::<_, String>(0)).ok() {
+    if let Some((path, identity)) = book_sync_identity_by_id(conn, book_id) {
+        // H20：新身份 key 与 legacy 路径 key 一起清（旧墓碑不复活删除）。
         let _ = remove_tombstone(conn, "highlight", &highlight_tomb_key(&path, chapter_index, pos_start, pos_end, text));
+        let _ = remove_tombstone(conn, "highlight", &highlight_sync_key(&identity, chapter_index, pos_start, pos_end, text));
     }
     Ok(conn.last_insert_rowid())
 }
@@ -2510,17 +2966,34 @@ pub fn search_highlights(conn: &Connection, query: &str) -> Vec<crate::models::H
 }
 
 pub fn delete_highlight(conn: &Connection, id: i64) -> Result<(), String> {
-    let key = conn
+    // H20：同时写新身份 key 与 legacy 路径 key 墓碑。
+    let keys: Option<(String, String)> = conn
         .query_row(
-            "SELECT b.path, h.chapter_index, h.pos_start, h.pos_end, h.text FROM highlights h JOIN books b ON b.id=h.book_id WHERE h.id=?1",
+            "SELECT b.path, b.title, COALESCE(b.author,''), COALESCE(b.size,0), h.chapter_index, h.pos_start, h.pos_end, h.text FROM highlights h JOIN books b ON b.id=h.book_id WHERE h.id=?1",
             params![id],
-            |r| Ok(highlight_tomb_key(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, &r.get::<_, String>(4)?)),
+            |r| {
+                let path: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                let author: String = r.get(2)?;
+                let size: i64 = r.get(3)?;
+                let chapter: i64 = r.get(4)?;
+                let pos_start: i64 = r.get(5)?;
+                let pos_end: i64 = r.get(6)?;
+                let text: String = r.get(7)?;
+                let ident = book_sync_identity(&title, &author, size, &path);
+                Ok((
+                    highlight_sync_key(&ident, chapter, pos_start, pos_end, &text),
+                    highlight_tomb_key(&path, chapter, pos_start, pos_end, &text),
+                ))
+            },
         )
         .ok();
     conn.execute("DELETE FROM highlights WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
-    if let Some(k) = key {
-        let _ = record_tombstone(conn, "highlight", &k, now_ms());
+    if let Some((new_key, legacy_key)) = keys {
+        let t = now_ms();
+        let _ = record_tombstone(conn, "highlight", &new_key, t);
+        let _ = record_tombstone(conn, "highlight", &legacy_key, t);
     }
     Ok(())
 }
@@ -2865,6 +3338,26 @@ pub fn book_has_notes(conn: &Connection, book_id: i64) -> bool {
     .is_ok()
 }
 
+/// 批量版本：任一本有笔记即 true。分块 IN 查询，避免全选上万本时逐本 SQL。
+pub fn any_book_has_notes(conn: &Connection, book_ids: &[i64]) -> bool {
+    for chunk in book_ids.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT 1 FROM highlights WHERE note!='' AND book_id IN ({placeholders}) LIMIT 1"
+        );
+        if conn
+            .query_row(&sql, params_from_iter(chunk.iter().copied()), |_| Ok(()))
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// 删除书籍（G1 分级）：
 /// - keep_notes=true：保留 note!='' 的划线，删除纯划线(note='')；bookmarks 全删。
 /// - keep_notes=false：highlights/bookmarks 全删。
@@ -2873,7 +3366,7 @@ pub fn book_has_notes(conn: &Connection, book_id: i64) -> bool {
 /// 取下一个「孤儿命名空间」唯一 id：负数，且不复用 -path_id。
 /// 保证同一路径被多次「删书 + 保留笔记」时，各批笔记互不覆盖。
 /// 实现：取所有现有负数 book_id（orphan_books 与 highlights）的最小值再 -1。
-fn next_orphan_id(conn: &Connection) -> i64 {
+pub(crate) fn next_orphan_id(conn: &Connection) -> i64 {
     let min_orphan: i64 = conn
         .query_row("SELECT COALESCE(MIN(book_id), 0) FROM orphan_books", [], |r| r.get(0))
         .unwrap_or(0);
@@ -3086,6 +3579,67 @@ pub fn highlight_tomb_key(path: &str, chapter_index: i64, pos_start: i64, pos_en
 
 pub fn book_tag_tomb_key(path: &str, tag_name: &str) -> String {
     format!("{}\u{1}{}", sync_norm_path(path), tag_name.trim().to_lowercase())
+}
+
+/* ---------------- H20：路径无关的同步身份 key ---------------- */
+//
+// 旧墓碑 key 内嵌删除端绝对路径：A 删一条笔记，B 的本地 key 是另一条路径，墓碑匹配不上，
+// 删除不跨设备传播。新 key 改用「归一化 title + author + size」的书籍身份；title 为空时
+// 回退旧路径身份（与旧行为一致）。分隔符用 \u{2}：Windows 文件名不能含控制字符，
+// 新 key 前缀（"v2\u{2}" / "p\u{2}"）不会与任何 legacy 路径 key 撞键。
+// 身份碰撞（同 title+author+size 实际是两本书）时，davsync 侧删除前会做唯一性检查，
+// 无法唯一确定就保留条目（宁可多留，不误删）。
+
+/// 跨设备同步的书籍身份 key（纯函数，便于单测）。
+pub fn book_sync_identity(title: &str, author: &str, size: i64, path: &str) -> String {
+    let t = title.trim().to_lowercase();
+    if t.is_empty() {
+        // 无名书没有跨设备稳定的身份，回退旧路径身份（保持历史行为）。
+        format!("p\u{2}{}", sync_norm_path(path))
+    } else {
+        format!(
+            "v2\u{2}{}\u{2}{}\u{2}{}",
+            t,
+            author.trim().to_lowercase(),
+            size
+        )
+    }
+}
+
+pub fn bookmark_sync_key(identity: &str, chapter_index: i64, title: &str, excerpt: &str) -> String {
+    format!("{identity}\u{1}{chapter_index}\u{1}{title}\u{1}{excerpt}")
+}
+
+pub fn highlight_sync_key(
+    identity: &str,
+    chapter_index: i64,
+    pos_start: i64,
+    pos_end: i64,
+    text: &str,
+) -> String {
+    format!("{identity}\u{1}{chapter_index}\u{1}{pos_start}\u{1}{pos_end}\u{1}{text}")
+}
+
+pub fn book_tag_sync_key(identity: &str, tag_name: &str) -> String {
+    format!("{identity}\u{2}{}", tag_name.trim().to_lowercase())
+}
+
+/// 按 book_id 取 (本机路径, 新身份 key)。书不存在时 None（墓碑清理直接跳过）。
+fn book_sync_identity_by_id(conn: &Connection, book_id: i64) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT path, title, COALESCE(author,''), COALESCE(size,0) FROM books WHERE id=?1",
+        [book_id],
+        |r| {
+            let path: String = r.get(0)?;
+            let title: String = r.get(1)?;
+            let author: String = r.get(2)?;
+            let size: i64 = r.get(3)?;
+            Ok((path.clone(), book_sync_identity(&title, &author, size, &path)))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -3585,6 +4139,53 @@ mod cover_scan_tests {
         set_book_meta_ex(&conn, id, "书", "", None, 1, 1, 1, false).unwrap();
         assert_eq!(get_book(&conn, id).unwrap().cover_ver, 2);
     }
+
+    /// H4：启动期封面重置只删自动封面、只复位自动封面行；custom-*/bg-*/default/background 保留。
+    #[test]
+    fn reset_epub_covers_only_auto_covers_and_keeps_custom() {
+        let conn = tmpdb("reset_covers");
+        let dir = tmpcovers(
+            "reset_covers",
+            &[
+                "1.png",
+                "2.webp",
+                "custom-7.png",
+                "bg-1-2.png",
+                "default-cover.img",
+                "background.img",
+            ],
+        );
+        let auto_id = book(&conn, "/b/1.epub", Some("1.png"), 1);
+        let custom_id = book(&conn, "/b/2.epub", Some("custom-7.png"), 1);
+        reset_epub_covers(&conn, &dir);
+        // 自动封面（扩展名不限）被删；用户数据与背景/默认底图保留
+        assert!(!dir.join("1.png").exists(), "自动封面 1.png 应删除");
+        assert!(!dir.join("2.webp").exists(), "自动封面 2.webp 应删除");
+        for keep in ["custom-7.png", "bg-1-2.png", "default-cover.img", "background.img"] {
+            assert!(dir.join(keep).exists(), "{keep} 不得删除");
+        }
+        let cover = |id: i64| -> Option<String> {
+            conn.query_row("SELECT cover_path FROM books WHERE id=?1", rusqlite::params![id], |r| r.get(0))
+                .unwrap()
+        };
+        let md = |id: i64| -> i64 {
+            conn.query_row("SELECT meta_done FROM books WHERE id=?1", rusqlite::params![id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(cover(auto_id), None, "自动封面行 cover_path 置空");
+        assert_eq!(md(auto_id), 0);
+        assert_eq!(
+            cover(custom_id).as_deref(),
+            Some("custom-7.png"),
+            "用户自选封面行不得置空"
+        );
+        assert_eq!(md(custom_id), 1, "用户自选封面行 meta_done 保持");
+        // 一次性标记已写：再次调用不得再删任何文件
+        std::fs::write(dir.join("3.png"), b"x").unwrap();
+        reset_epub_covers(&conn, &dir);
+        assert!(dir.join("3.png").exists(), "一次性标记生效后不再清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -3954,7 +4555,7 @@ mod chapter_split_migration_tests {
         let conn = mem_db();
         seed_search_cache(&conn);
         set_setting(&conn, "chapter_split_ver", "2");
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(
             get_setting(&conn, "chapter_split_ver").as_deref(),
             Some(CHAPTER_SPLIT_VER)
@@ -3966,7 +4567,7 @@ mod chapter_split_migration_tests {
         );
         assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3, "P11 升级不得清 fts");
         assert_eq!(get_fts_meta(&conn, 1), Some(2), "fts_meta 应保持");
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "二次调用无副作用");
         assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3);
     }
@@ -3978,7 +4579,7 @@ mod chapter_split_migration_tests {
         let conn = mem_db();
         seed_search_cache(&conn);
         set_setting(&conn, "chapter_split_ver", "3");
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(
             get_setting(&conn, "chapter_split_ver").as_deref(),
             Some(CHAPTER_SPLIT_VER)
@@ -3986,7 +4587,7 @@ mod chapter_split_migration_tests {
         assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "3→4 不得删数据");
         assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 3, "3→4 不得清 fts");
         assert_eq!(get_fts_meta(&conn, 1), Some(2), "fts_meta 应保持");
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 3, "二次调用无副作用");
     }
 
@@ -3995,7 +4596,7 @@ mod chapter_split_migration_tests {
     fn missing_version_rebuilds_search_cache_fast_and_idempotent() {
         let conn = mem_db();
         seed_search_cache(&conn);
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(
             get_setting(&conn, "chapter_split_ver").as_deref(),
             Some(CHAPTER_SPLIT_VER)
@@ -4021,7 +4622,7 @@ mod chapter_split_migration_tests {
         assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 1);
         assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 1);
         // 二次调用：版本已是最新，不得再清。
-        migrate_chapter_split(&conn);
+        migrate_chapter_split(&conn).unwrap();
         assert_eq!(count(&conn, "SELECT count(*) FROM chapter_text"), 1, "二次调用应幂等");
         assert_eq!(count(&conn, "SELECT count(*) FROM fts"), 1);
     }
@@ -4143,3 +4744,357 @@ mod sync_tombstone_tests {
     }
 }
 
+#[cfg(test)]
+mod round2_db_tests {
+    //! H6 busy_timeout、H11 进度单调、H20 同步身份 key 与双 key 墓碑。
+    use super::*;
+
+    fn tmpdb(tag: &str) -> Connection {
+        let p = std::env::temp_dir().join(format!("tp_db_r2_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        init(&p).unwrap()
+    }
+
+    #[test]
+    fn init_sets_busy_timeout_and_wal() {
+        let conn = tmpdb("busy");
+        let bt: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert_eq!(bt, DB_BUSY_TIMEOUT_MS as i64, "主连接必须设 busy_timeout");
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal", "journal_mode 应为 WAL");
+    }
+
+    #[test]
+    fn set_progress_monotonic_rejects_stale_write() {
+        let conn = tmpdb("mono");
+        let path = "C:/x/mono.txt";
+        let id = upsert_book(&conn, path, "书", "txt", 10, 1).unwrap();
+        let mk = |pct: f64, updated_at: i64| crate::models::Progress {
+            chapter_index: 1,
+            chapter_ratio: 0.5,
+            pct,
+            updated_at,
+            device: "".into(),
+        };
+        set_progress_monotonic(&conn, id, &mk(50.0, 200)).unwrap();
+        // 旧请求（updated_at 更小）晚到：不得覆盖
+        set_progress_monotonic(&conn, id, &mk(10.0, 100)).unwrap();
+        let (pct, up): (f64, i64) = conn
+            .query_row("SELECT pct, updated_at FROM progress WHERE book_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((pct, up), (50.0, 200), "旧进度不得覆盖新进度");
+        let read_pct: f64 = conn
+            .query_row("SELECT read_pct FROM books WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert!((read_pct - 50.0).abs() < 1e-9, "read_pct 只随生效记录更新: {read_pct}");
+        // 相等时间戳：后写生效（>= 语义）
+        set_progress_monotonic(&conn, id, &mk(77.0, 200)).unwrap();
+        let pct2: f64 = conn
+            .query_row("SELECT pct FROM progress WHERE book_id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pct2, 77.0);
+        drop(conn);
+    }
+
+    #[test]
+    fn sync_identity_keys_are_path_independent() {
+        let a = book_sync_identity("书名", "作者", 123, "C:/a.epub");
+        let b = book_sync_identity(" 书名 ", "作者", 123, "D:/完全不同的路径/b.epub");
+        assert_eq!(a, b, "同 title+author+size 的身份与路径无关");
+        assert_ne!(a, book_sync_identity("书名", "作者", 124, "C:/a.epub"), "size 变化即不同身份");
+        assert_ne!(a, book_sync_identity("书名", "别的作者", 123, "C:/a.epub"));
+        // 无名书回退旧路径身份，且不同路径不同 key
+        let p1 = book_sync_identity("", "", 1, "C:/a.epub");
+        let p2 = book_sync_identity("", "", 1, "C:/b.epub");
+        assert!(p1.starts_with(&format!("p\u{2}")));
+        assert_ne!(p1, p2);
+        // 新 key 与 legacy key 不相等，避免误匹配
+        let legacy = bookmark_tomb_key("C:/a.epub", 1, "t", "e");
+        assert_ne!(bookmark_sync_key(&a, 1, "t", "e"), legacy);
+        assert_ne!(highlight_sync_key(&a, 1, 1, 2, "x"), highlight_tomb_key("C:/a.epub", 1, 1, 2, "x"));
+        assert_ne!(book_tag_sync_key(&a, "标签"), book_tag_tomb_key("C:/a.epub", "标签"));
+    }
+
+    #[test]
+    fn delete_bookmark_and_highlight_write_both_tombstone_keys() {
+        let conn = tmpdb("tomb2");
+        let path = "C:/x/tomb2.txt";
+        let id = upsert_book(&conn, path, "书", "txt", 10, 1).unwrap();
+        add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        add_highlight(&conn, id, 1, "ch", 1, 2, "hl", "underline", "", "n").unwrap();
+        let bm_id: i64 = conn.query_row("SELECT id FROM bookmarks LIMIT 1", [], |r| r.get(0)).unwrap();
+        let hl_id: i64 = conn.query_row("SELECT id FROM highlights LIMIT 1", [], |r| r.get(0)).unwrap();
+        delete_bookmark(&conn, bm_id).unwrap();
+        delete_highlight(&conn, hl_id).unwrap();
+        let tombs = list_tombstones(&conn);
+        let ident = book_sync_identity("书", "", 10, path);
+        let keys: Vec<String> = tombs.iter().map(|(_, k, _)| k.clone()).collect();
+        assert!(keys.contains(&bookmark_sync_key(&ident, 0, "t", "e")), "应写新身份 key: {keys:?}");
+        assert!(keys.contains(&bookmark_tomb_key(path, 0, "t", "e")), "应保留 legacy key: {keys:?}");
+        assert!(keys.contains(&highlight_sync_key(&ident, 1, 1, 2, "hl")));
+        assert!(keys.contains(&highlight_tomb_key(path, 1, 1, 2, "hl")));
+        // 重新创建同条目：两把 key 的墓碑都应被清掉
+        add_bookmark(&conn, id, 0, "t", "e").unwrap();
+        add_highlight(&conn, id, 1, "ch", 1, 2, "hl", "underline", "", "n").unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_tombstones WHERE kind IN ('bookmark','highlight')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "复活时应清新+legacy 两把 key 的墓碑");
+        drop(conn);
+    }
+
+    /// F3-H2：标记已读/未读只写 read_state/read_pct/progress，不改 last_read；不存在 id 报错。
+    #[test]
+    fn mark_book_read_state_keeps_last_read() {
+        let conn = tmpdb("mark_read");
+        let path = "C:/x/mark.txt";
+        let id = upsert_book(&conn, path, "书", "txt", 10, 1).unwrap();
+        // 先写一段真实进度，让 last_read 有非零值。
+        let p = crate::models::Progress {
+            chapter_index: 3,
+            chapter_ratio: 0.5,
+            pct: 40.0,
+            updated_at: 500,
+            device: "".into(),
+        };
+        set_progress(&conn, id, &p).unwrap();
+        let last_before: i64 = conn
+            .query_row("SELECT last_read FROM books WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert!(last_before > 0);
+
+        mark_book_read_state(&conn, id, true).unwrap();
+        let (state, pct, last_after): (i64, f64, i64) = conn
+            .query_row("SELECT read_state, read_pct, last_read FROM books WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(state, 1);
+        assert_eq!(pct, 100.0);
+        assert_eq!(last_after, last_before, "标记已读不得写 last_read");
+        let (ci, cr, pp): (i64, f64, f64) = conn
+            .query_row("SELECT chapter_index, chapter_ratio, pct FROM progress WHERE book_id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((ci, cr, pp), (0, 1.0, 100.0));
+
+        mark_book_read_state(&conn, id, false).unwrap();
+        let (state2, pct2, last2): (i64, f64, i64) = conn
+            .query_row("SELECT read_state, read_pct, last_read FROM books WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((state2, pct2, last2), (2, 0.0, last_before), "标记未读同样不得改 last_read");
+        let (ci2, cr2, pp2): (i64, f64, f64) = conn
+            .query_row("SELECT chapter_index, chapter_ratio, pct FROM progress WHERE book_id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((ci2, cr2, pp2), (0, 0.0, 0.0));
+
+        assert!(mark_book_read_state(&conn, 999_999_999, true).is_err(), "不存在的书必须报错");
+        drop(conn);
+    }
+}
+
+#[cfg(test)]
+mod r6_progress_tests {
+    use super::*;
+
+    fn tmpdb(tag: &str) -> Connection {
+        let p = std::env::temp_dir().join(format!("tp_r6db_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        init(&p).unwrap()
+    }
+
+    fn add_book_r6(conn: &Connection) -> i64 {
+        upsert_book(conn, "C:/r6/a.txt", "书", "txt", 10, 1).unwrap()
+    }
+
+    fn sample_progress() -> crate::models::Progress {
+        crate::models::Progress {
+            chapter_index: 3,
+            chapter_ratio: 0.5,
+            pct: 42.0,
+            updated_at: 900,
+            device: "pc".into(),
+        }
+    }
+
+    /// S3①：autocommit 下 books UPDATE 失败 → progress 与 books 反规范化列都回滚。
+    #[test]
+    fn set_progress_rolls_back_both_tables_on_autocommit_failure() {
+        let conn = tmpdb("atomic");
+        let id = add_book_r6(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER r6_fail_books BEFORE UPDATE ON books BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+        assert!(set_progress(&conn, id, &sample_progress()).is_err(), "books 更新失败必须上报");
+        assert!(get_progress(&conn, id).is_none(), "progress 行必须随事务回滚");
+        let (last, pct): (i64, f64) = conn
+            .query_row("SELECT last_read, read_pct FROM books WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((last, pct), (0, 0.0));
+        drop(conn);
+    }
+
+    /// S3②：外层事务里调用成功，外层回滚时 progress 与 books 都不变。
+    #[test]
+    fn set_progress_inside_outer_transaction_rolls_back_with_it() {
+        let conn = tmpdb("outer");
+        let id = add_book_r6(&conn);
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            set_progress(&tx, id, &sample_progress()).unwrap();
+            tx.rollback().unwrap();
+        }
+        assert!(get_progress(&conn, id).is_none(), "外层回滚后 progress 不应存在");
+        let (last, pct): (i64, f64) = conn
+            .query_row("SELECT last_read, read_pct FROM books WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((last, pct), (0, 0.0));
+        drop(conn);
+    }
+
+    /// S3：set_progress_monotonic 的 autocommit 失败分支同样回滚 progress。
+    #[test]
+    fn set_progress_monotonic_rolls_back_on_autocommit_failure() {
+        let conn = tmpdb("mono");
+        let id = add_book_r6(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER r6_fail_books2 BEFORE UPDATE ON books BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+        assert!(set_progress_monotonic(&conn, id, &sample_progress()).is_err());
+        assert!(get_progress(&conn, id).is_none(), "changed>0 时 progress 必须随 books 失败回滚");
+        drop(conn);
+    }
+
+    /// S3③：刷新文件指纹同时清空字数统计（与 upsert_book CASE 语义一致）。
+    #[test]
+    fn refresh_fingerprint_clears_char_counts() {
+        let conn = tmpdb("refresh");
+        let id = add_book_r6(&conn);
+        conn.execute(
+            "UPDATE books SET total_chars=123, total_text_chars=456, meta_done=1 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        refresh_book_fingerprint(&conn, id, 20, 2).unwrap();
+        let (tc, ttc, md, size, mtime): (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT total_chars, total_text_chars, meta_done, size, mtime FROM books WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((tc, ttc), (0, 0), "指纹刷新必须清字数统计");
+        assert_eq!((md, size, mtime), (0, 20, 2));
+        drop(conn);
+    }
+}
+
+#[cfg(test)]
+mod r10_db_tests {
+    use super::*;
+
+    fn tmp_db(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tp_db_r10_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("t.db")
+    }
+
+    /// P1-6：ensure_column 正常补列/已存在幂等；只读库补列失败返回可读 Err。
+    #[test]
+    fn ensure_column_ok_and_error() {
+        let p = tmp_db("col");
+        let conn = init(&p).unwrap();
+        // 已存在：幂等。
+        ensure_column(&conn, "books", "read_pct REAL NOT NULL DEFAULT 0").unwrap();
+        // 临时表补列。
+        conn.execute_batch("CREATE TABLE t_col(a INTEGER);").unwrap();
+        ensure_column(&conn, "t_col", "b TEXT NOT NULL DEFAULT ''").unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('t_col') WHERE name='b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1);
+        // 只读连接上 ALTER 必失败：错误必须带表.列。
+        drop(conn);
+        let ro = Connection::open_with_flags(
+            &p,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let err = ensure_column(&ro, "t_col", "c TEXT").unwrap_err();
+        assert!(err.contains("补列 t_col.c"), "{err}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// P1-6：init 在 schema 冲突/不可补列时返回 Err，而不是把查询失败当空库。
+    #[test]
+    fn init_returns_err_on_schema_failure() {
+        let p = tmp_db("initfail");
+        {
+            // 用 view 占住 books：CREATE TABLE IF NOT EXISTS 不会替换视图，后续补列 ALTER 必失败。
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("CREATE VIEW books AS SELECT 1 AS x;").unwrap();
+        }
+        let err = init(&p).unwrap_err();
+        assert!(!err.is_empty(), "init 必须返回可读错误");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// P1-7：失败注入（chapter_text 被视图占用 → DROP TABLE 失败）→ Err 且版本未写；
+    /// 移除阻碍后重跑成功并写版本。
+    #[test]
+    fn migrate_chapter_split_failure_keeps_version() {
+        let p = tmp_db("migfail");
+        let conn = init(&p).unwrap();
+        set_setting(&conn, "chapter_split_ver", "0");
+        conn.execute_batch("DROP TABLE IF EXISTS chapter_text; CREATE VIEW chapter_text AS SELECT 1 AS x;")
+            .unwrap();
+        let err = migrate_chapter_split(&conn).unwrap_err();
+        assert!(err.contains("chapter_text"), "{err}");
+        assert_eq!(
+            get_setting(&conn, "chapter_split_ver").as_deref(),
+            Some("0"),
+            "失败不得写版本号"
+        );
+        // 移除阻碍（视图）后重跑：成功且写版本。
+        conn.execute_batch("DROP VIEW chapter_text;").unwrap();
+        migrate_chapter_split(&conn).unwrap();
+        assert_eq!(
+            get_setting(&conn, "chapter_split_ver").as_deref(),
+            Some(CHAPTER_SPLIT_VER),
+            "成功后应写版本"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// P1-7：正常新库/旧版本路径都 Ok 且写版本。
+    #[test]
+    fn migrate_chapter_split_normal_paths_ok() {
+        let p = tmp_db("migok");
+        let conn = init(&p).unwrap();
+        migrate_chapter_split(&conn).unwrap();
+        assert_eq!(get_setting(&conn, "chapter_split_ver").as_deref(), Some(CHAPTER_SPLIT_VER));
+        // 重复调用幂等。
+        migrate_chapter_split(&conn).unwrap();
+        // "2" 零成本路径。
+        set_setting(&conn, "chapter_split_ver", "2");
+        migrate_chapter_split(&conn).unwrap();
+        assert_eq!(get_setting(&conn, "chapter_split_ver").as_deref(), Some(CHAPTER_SPLIT_VER));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+}

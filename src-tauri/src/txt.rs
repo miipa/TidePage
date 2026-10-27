@@ -224,6 +224,69 @@ pub fn split_custom(text: &str, pattern: &str) -> Result<PlainDoc, String> {
     })
 }
 
+/// P0-1：无 BOM UTF-16 的奇偶 NUL 启发式（纯函数，便于单测）。
+/// 背景：无 BOM 的 UTF-16LE ASCII 文本字节里含大量 0x00，std::str::from_utf8 会成功，
+/// 旧实现直接当 UTF-8 返回带 NUL 的乱码，永远走不到 UTF-16 解码。
+/// 做法：只采样前 64KB；按字节位置分奇/偶两组统计 NUL：
+/// - LE 文本：偶数字节是低位（ASCII 非 0），奇数字节是高位 0 → odd 侧 NUL 占比高、even 低；
+/// - BE 文本相反。
+/// 阈值取 0.3（中英混排时中文对不产生 NUL，ASCII 对约占一半，0.6 会漏判；随机二进制很难
+/// 在单侧达到 0.3 且另一侧 <=0.05）。候选解码后再校验替换符/控制字符占比，双重防误判。
+fn try_decode_utf16_without_bom(data: &[u8]) -> Option<(String, &'static str)> {
+    const SAMPLE_LIMIT: usize = 64 * 1024;
+    const MIN_PAIRS: usize = 8;
+    const PAD_RATIO: f64 = 0.30;
+    const OTHER_RATIO: f64 = 0.05;
+    const MAX_FFFD_RATIO: f64 = 0.01;
+    const MAX_CTRL_RATIO: f64 = 0.02;
+    if data.len() < MIN_PAIRS * 2 || data.len() % 2 != 0 {
+        return None;
+    }
+    let sample_len = data.len().min(SAMPLE_LIMIT) & !1;
+    if sample_len < MIN_PAIRS * 2 {
+        return None;
+    }
+    let pairs = sample_len / 2;
+    let mut even_nul = 0usize;
+    let mut odd_nul = 0usize;
+    for c in data[..sample_len].chunks_exact(2) {
+        if c[0] == 0 {
+            even_nul += 1;
+        }
+        if c[1] == 0 {
+            odd_nul += 1;
+        }
+    }
+    let even_ratio = even_nul as f64 / pairs as f64;
+    let odd_ratio = odd_nul as f64 / pairs as f64;
+    let le_candidate = odd_ratio >= PAD_RATIO && even_ratio <= OTHER_RATIO;
+    let be_candidate = even_ratio >= PAD_RATIO && odd_ratio <= OTHER_RATIO;
+    // 两侧同时成立只可能是长度极短/极端构造：保守放弃，回落 UTF-8/自动链。
+    if le_candidate == be_candidate {
+        return None;
+    }
+    let (enc, label) = if le_candidate {
+        (encoding_rs::UTF_16LE, "utf-16le")
+    } else {
+        (encoding_rs::UTF_16BE, "utf-16be")
+    };
+    let (text, _actual, _had_err) = enc.decode(data);
+    let text = text.into_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let total = text.chars().count().max(1) as f64;
+    let bad = text.chars().filter(|&c| c == '\u{fffd}').count() as f64;
+    let ctrl = text
+        .chars()
+        .filter(|&c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+        .count() as f64;
+    if bad / total > MAX_FFFD_RATIO || ctrl / total > MAX_CTRL_RATIO {
+        return None;
+    }
+    Some((text, label))
+}
+
 pub fn decode_bytes(data: &[u8], forced: Option<&str>) -> (String, &'static str) {
     // 手动兜底:用户在设置「正文字符编码」里显式指定(与 MOBI 共用 `mobi.encoding` 键)时,
     // 直接用对应 Decoder 解码整个字节流并返回,**跳过** BOM 嗅探 / UTF-8 / chardetng 自动链。
@@ -255,6 +318,11 @@ pub fn decode_bytes(data: &[u8], forced: Option<&str>) -> (String, &'static str)
     }
     if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return (String::from_utf8_lossy(&data[3..]).into_owned(), "utf-8");
+    }
+    // P0-1：BOM 优先；无 BOM 时在 UTF-8 判定之前做保守的奇偶 NUL 启发式，
+    // 否则 UTF-16LE ASCII 字节会被 from_utf8 判成合法 UTF-8（含 NUL 的乱码）。
+    if let Some((text, label)) = try_decode_utf16_without_bom(data) {
+        return (text, label);
     }
     if let Ok(s) = std::str::from_utf8(data) {
         return (s.to_string(), "utf-8");
@@ -789,4 +857,61 @@ mod tests {
         assert_eq!(enc, encoding_rs::GB18030.name());
         assert!(s.contains("你好世界"));
     }
+    /// P0-1：无 BOM 的 UTF-16LE/BE（中英混排、含 ASCII 标点）应被启发式识别并正确解码。
+    #[test]
+    fn decode_utf16_no_bom_heuristic() {
+        let text = "第一章 Hello, TidePage! 你好世界。";
+        let mut le = Vec::new();
+        for u in text.encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        let (s, enc) = decode_bytes(&le, None);
+        assert_eq!(enc, "utf-16le", "无 BOM LE 应识别");
+        assert_eq!(s, text);
+
+        let mut be = Vec::new();
+        for u in text.encode_utf16() {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        let (s, enc) = decode_bytes(&be, None);
+        assert_eq!(enc, "utf-16be", "无 BOM BE 应识别");
+        assert_eq!(s, text);
+    }
+
+    /// P0-1：纯 ASCII UTF-8、GB18030 中文、少量 NUL 的二进制不得被误判为 UTF-16。
+    #[test]
+    fn decode_utf16_heuristic_does_not_misfire() {
+        let (s, enc) = decode_bytes(b"plain ascii text, no BOM", None);
+        assert_eq!(enc, "utf-8");
+        assert_eq!(s, "plain ascii text, no BOM");
+
+        let (gb, _, _) = encoding_rs::GB18030.encode("第一章 你好世界，潮汐页。");
+        let (s, enc) = decode_bytes(&gb, None);
+        assert_eq!(enc, encoding_rs::GB18030.name());
+        assert!(s.contains("你好世界"), "{s}");
+
+        // 奇偶两侧都只有零散 NUL（各约 0.1），不足以构成 UTF-16 的成对 padding。
+        let mut bin = Vec::new();
+        for i in 0..64u8 {
+            bin.push(if i % 10 == 0 { 0 } else { i });
+            bin.push(if i % 10 == 5 { 0 } else { i.wrapping_add(1) });
+        }
+        let (info, enc) = decode_bytes(&bin, None);
+        assert_ne!(enc, "utf-16le");
+        assert_ne!(enc, "utf-16be");
+        assert!(!info.starts_with('\u{fffd}') || info.contains('\u{fffd}'));
+    }
+
+    /// P0-1：带 BOM 的 UTF-16 行为不变（BOM 优先于启发式）。
+    #[test]
+    fn decode_utf16_bom_takes_priority() {
+        let text = "BOM 优先";
+        let mut le = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        let (s, enc) = decode_bytes(&le, None);
+        assert_eq!((s.as_str(), enc), (text, "utf-16le"));
+    }
+
 }

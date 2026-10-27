@@ -1,10 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
+  import { cachedImport } from "../lib/cachedImport";
   /** B7：PDF（含 pdfjs 主模块）按需加载，避免进入书库首屏包。 */
-  let pdfModPromise: Promise<typeof import("../lib/pdf")> | null = null;
-  function pdfMod(): Promise<typeof import("../lib/pdf")> {
-    return (pdfModPromise ??= import("../lib/pdf"));
-  }
+  // P2-2：动态 import 失败可重试（旧实现 ??= 会把 rejected promise 永久缓存）。
+  const pdfMod = cachedImport(() => import("../lib/pdf"));
   import { COVER_FAIL_KEY } from "../lib/openError";
   import {
     createPdfCoverQueue,
@@ -16,6 +15,7 @@
   import { api, coverUrl, bumpCoverBust, type TagInfo } from "../lib/api";
   import { emit } from "@tauri-apps/api/event";
   import {
+    dedupeShelfIds,
     deserializeShelves,
     stampShelfUpdates,
     serializeShelves,
@@ -25,6 +25,7 @@
     type Shelf,
   } from "../lib/libraryShelves";
   import { appConfirm, appChoose, config, convertState, libSession, openBookInNewWindow, pendingOpen, saveConfig, toast, ui, APP_VERSION, LIBRARY_TOPBAR_IDS, type LibraryTopbarId } from "../lib/stores.svelte";
+  import { windowCovers } from "../lib/libraryWindow";
   import { dateLocale, errText, t, type MessageKey } from "../lib/i18n/index.svelte";
   import { shouldRemindMaintenance, estimateVacuumTemp, formatBytes } from "../lib/maintenance";
   import { updateState } from "../lib/update.svelte";
@@ -89,11 +90,10 @@ import { reorderByDrop } from "../lib/reorder";
     }, 3000);
     return () => clearTimeout(timer);
   });
-  let detailModPromise: Promise<typeof import("./BookDetailModal.svelte")> | null = null;
-  function detailMod(): Promise<typeof import("./BookDetailModal.svelte")> {
-    return (detailModPromise ??= import("./BookDetailModal.svelte"));
-  }
+  // P2-2：同上，失败后下一次悬停/点击可重新加载。
+  const detailMod = cachedImport(() => import("./BookDetailModal.svelte"));
   import DuplicateBooksModal from "./DuplicateBooksModal.svelte";
+import { parentDirOf } from "../lib/duplicates";
   import ProgressRing from "./ProgressRing.svelte";
   import { outDissolve, outFade } from "../lib/motion";
   import type { BookRow } from "../lib/types";
@@ -121,8 +121,15 @@ import { reorderByDrop } from "../lib/reorder";
     for (const g of groups) for (const id of g.memberIds) m.set(id, { copies: g.copies });
     return m;
   }
+  /** 重复组全部成员 id（含被去重隐藏的副本）：删除单本时用来让用户选具体副本。 */
+  function membersFromGroups(groups: DupDisplayGroup[]): Map<number, number[]> {
+    const m = new Map<number, number[]>();
+    for (const g of groups) for (const id of g.memberIds) m.set(id, g.memberIds);
+    return m;
+  }
   let hiddenIds = new Set<number>(cachedHidden ? hiddenIdsFromGroups(cachedHidden.groups) : []);
   let dupMetaById = $state<Map<number, { copies: number }>>(cachedHidden ? metaFromGroups(cachedHidden.groups) : new Map());
+  let dupMembersById = new Map<number, number[]>(cachedHidden ? membersFromGroups(cachedHidden.groups) : new Map());
   let dupRepIds = $state<Set<number>>(new Set(cachedHidden?.groups.map((g) => g.repId) ?? []));
   let dupGroupCount = $state(cachedHidden?.groups.length ?? 0);
   /** 「重复分组」筛选：只看有重复的书；无筛选时每组 1 本，有筛选时显示范围内全部副本。 */
@@ -201,6 +208,7 @@ import { reorderByDrop } from "../lib/reorder";
         if (gen !== hiddenGen) return;
         hiddenIds = new Set(res.hiddenIds);
         dupMetaById = metaFromGroups(res.groups);
+        dupMembersById = membersFromGroups(res.groups);
         dupRepIds = new Set(res.groups.map((g) => g.repId));
         dupGroupCount = res.groups.length;
         hiddenLoaded = true;
@@ -478,9 +486,12 @@ import { reorderByDrop } from "../lib/reorder";
     } catch { /* ignore */ }
   }
 
-  /** 选中某文件夹（null=全部）：持久化并全量重载（排序/分类/随机随之限定作用域）。 */
+  /** 选中某文件夹（null=全部）：持久化并全量重载（排序/分类/随机随之限定作用域）。
+   *  重复视图与文件夹是互斥作用域：点任一文件夹会先退出重复视图，避免两个胶囊同时高亮。 */
   function selectFolder(f: string | null) {
-    if (selectedFolder === f) return;
+    const wasDuplicate = duplicateView;
+    if (wasDuplicate) duplicateView = false;
+    if (selectedFolder === f && !wasDuplicate) return;
     // 作用域变化：旧选中可能已不可见，先退出多选，避免批量删除误伤。
     exitSelect();
     selectedFolder = f;
@@ -531,13 +542,15 @@ import { reorderByDrop } from "../lib/reorder";
   async function loadShelves() {
     try {
       const raw = await api.getSetting(SHELVES_KEY);
-      shelves = deserializeShelves(raw);
+      shelves = dedupeShelfIds(deserializeShelves(raw));
     } catch {
       shelves = [];
     }
   }
 
   async function persistShelves(next: Shelf[]) {
+    // F8-H1：落盘/同步前再兜底去重一次（D5 合并可能引入重复 id，keyed each 会直接抛错）。
+    next = dedupeShelfIds(next);
     // B9：保存/重命名时按内容变化补 updatedAt（供同步按时间裁决）。
     next = stampShelfUpdates(next, shelves, Date.now());
     shelves = next;
@@ -579,7 +592,12 @@ import { reorderByDrop } from "../lib/reorder";
     filterFormats = f.formats;
     filterStates = f.states as ReadState[];
     filterTags = f.tags;
+    // C7：搜索框文本与生效查询同步写入，并取消在途 250ms 搜索定时器，
+    // 否则定时器随后会把旧 query 再应用一次、触发第二次 reload。
     libSession.queryInput = f.query;
+    libSession.query = f.query;
+    clearTimeout(searchTimer);
+    searchComposing = false;
     saveFolder();
     saveFilter();
     invalidateListTotal();
@@ -1080,42 +1098,76 @@ import { reorderByDrop } from "../lib/reorder";
     selVersion++;
   }
 
-  /** 批量移出/删除：按 ids 分批取 path（跳过死 id），一次性 deleteBooks 避免多次重建索引。 */
+  /** 批量移出/删除：按 ids 分批取 path（跳过死 id），一次性 deleteBooks 避免多次重建索引。
+   *  重复视图下若选中书分布在多个文件夹，先让用户选择删除范围（全部 / 某个文件夹）。
+   *  选中书都没有笔记时不再显示「保留/删除笔记」选项，只做一次删除确认。 */
   async function batchDelete(fromDisk: boolean) {
     if (!selection.size) return;
-    const count = selection.size;
-    const action = await appChoose(
-      fromDisk
-        ? t("library.batch.msg.fromDisk", { count })
-        : t("library.batch.msg.fromLib", { count }),
-      [
-        { id: "keep", label: t("library.batch.action.keep"), kind: "plain" },
-        { id: "del", label: t("library.batch.action.del"), kind: "danger" },
-        { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" },
-      ],
-    );
-    if (!action || action === "cancel") return;
-    const keepNotes = action === "keep";
     const ids = [...selection];
-    const paths: string[] = [];
+    const rows: BookRow[] = [];
     for (let i = 0; i < ids.length; i += IDS_CHUNK) {
       const chunk = ids.slice(i, i + IDS_CHUNK);
-      let rows: (BookRow | null)[];
+      let part: (BookRow | null)[];
       try {
-        rows = await api.listBooksByIds(chunk);
+        part = await api.listBooksByIds(chunk);
       } catch (e) {
         toast(errText(e), "error");
         return;
       }
-      // 注意：这里**不能**因 generation 变化（期间有重建/换档）就 return ——
-      // 用户已在确认弹窗里明确同意删除整批，静默丢弃会让「已选中 N 本」凭空消失且无任何提示。
-      // ids→path 是按 id 直查的，索引重建不影响其正确性。
-      for (const r of rows) if (r) paths.push(r.path);
+      for (const r of part) if (r) rows.push(r);
     }
-    if (!paths.length) {
+    if (!rows.length) {
       toast(t("toast.book.notFound"), "error");
       return;
     }
+    let targets = rows;
+    if (duplicateView) {
+      const dirs = [...new Set(rows.map((r) => parentDirOf(r.path)))];
+      if (dirs.length > 1) {
+        const actions = [
+          { id: "all", label: t("library.dup.batch.all", { count: rows.length }), kind: "plain" as const },
+          ...dirs.map((d) => ({
+            id: `dir:${d}`,
+            label: `${d}（${t("dupes.dirBookCount", { n: rows.filter((r) => parentDirOf(r.path) === d).length })}）`,
+            kind: "plain" as const,
+          })),
+          { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" as const },
+        ];
+        const action = await appChoose(t("library.dup.batch.deleteWhich"), actions);
+        if (!action || action === "cancel") return;
+        if (action.startsWith("dir:")) {
+          targets = rows.filter((r) => `dir:${parentDirOf(r.path)}` === action);
+        }
+      }
+    }
+    const count = targets.length;
+    let hasNotes = true;
+    try {
+      hasNotes = await api.booksHaveNotes(targets.map((r) => r.id));
+    } catch {
+      hasNotes = true; // 查询失败按有笔记处理，宁可多显示选项也不误删
+    }
+    let keepNotes = true;
+    if (hasNotes) {
+      const action = await appChoose(
+        fromDisk
+          ? t("library.batch.msg.fromDisk", { count })
+          : t("library.batch.msg.fromLib", { count }),
+        [
+          { id: "keep", label: t("library.batch.action.keep"), kind: "plain" },
+          { id: "del", label: t("library.batch.action.del"), kind: "danger" },
+          { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" },
+        ],
+      );
+      if (!action || action === "cancel") return;
+      keepNotes = action === "keep";
+    } else {
+      const ok = await appConfirm(
+        t(fromDisk ? "library.batch.msg.noNotes.fromDisk" : "library.batch.msg.noNotes.fromLib", { count }),
+      );
+      if (!ok) return;
+    }
+    const paths = targets.map((r) => r.path);
     let ok = false;
     try {
       await api.deleteBooks(paths, fromDisk, keepNotes);
@@ -1140,6 +1192,14 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   function onLibKey(e: KeyboardEvent) {
+    // 选择模式下 Ctrl/Cmd+A 全选书籍，而不是浏览器全选页面文字；输入框内仍保留原生全选。
+    const target = e.target as HTMLElement | null;
+    const typing = !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+    if (selectMode && !typing && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      selectAll();
+      return;
+    }
     if (e.key === "Escape" && dupChipMenu) {
       e.preventDefault();
       dupChipMenu = null;
@@ -1235,6 +1295,8 @@ import { reorderByDrop } from "../lib/reorder";
    *  不重复全表 COUNT；key 变化或 reload（库变更）时重新计数。 */
   let listTotalKey = "";
   let listTotalCached = -1;
+  // F3：回落档正在取数时 effect 不再重复发起；取完仍不覆盖才补一次（最多一次）。
+  let rangeLoading = false;
   function invalidateListTotal() {
     listTotalKey = "";
     listTotalCached = -1;
@@ -1273,23 +1335,36 @@ import { reorderByDrop } from "../lib/reorder";
       }
       total = resolved;
       rangeStart = offset;
-      // 回落档（超长结果/搜索）：同样按重复成员过滤窗口；总数仍取后端 total，状态栏可能偏大（报告说明）。
-      booksWindow = duplicateView && !isDefaultListView() ? r.rows.filter((b) => dupMetaById.has(b.id)) : r.rows;
+      // F3：回落档（搜索/超限）不应用重复过滤——过滤会改变窗口长度，ensureRange 用过滤后长度
+      // 判断覆盖会永远「不覆盖」，引发取数→赋值→effect 的循环。重复视图只在索引档生效；
+      // 状态栏 total 仍取后端 total，与这里未过滤的完整窗口一致。
+      booksWindow = r.rows;
     } catch (e) {
       if (seq === generation) toast(errText(e), "error");
     } finally {
-      if (seq === generation) loading = false;
+      if (seq === generation) {
+        loading = false;
+        rangeLoading = false;
+      }
     }
   }
 
-  /** 回落档（搜索/超限）：窗口未覆盖 [start,end) 时按 FETCH 对齐拉取，跨段时一次取够整段。 */
+  /** 回落档（搜索/超限）：窗口未覆盖 [start,end) 时按 FETCH 对齐拉取，跨段时一次取够整段。
+   *  F3：用 rangeLoading 防重入；请求结束后若仍不覆盖补拉一次，之后由 effect 的新状态决定，
+   * 不再用「过滤后长度」判断（那会形成自循环）。 */
   function ensureRange(start: number, end: number) {
     if (total === 0 || end <= start) return;
-    const rangeEnd = rangeStart + booksWindow.length;
-    if (booksWindow.length && rangeStart <= start && rangeEnd >= end) return;
+    if (rangeLoading) return;
+    if (windowCovers(rangeStart, booksWindow.length, start, end)) return;
     const off = Math.max(0, Math.floor(start / FETCH) * FETCH);
     const need = Math.max(FETCH, end - off);
-    loadRange(off, need);
+    rangeLoading = true;
+    void loadRange(off, need).then(() => {
+      if (!windowCovers(rangeStart, booksWindow.length, start, end)) {
+        rangeLoading = true;
+        void loadRange(off, need);
+      }
+    });
   }
 
   // ===== 索引档：窗口取行 + 剪枝 + 重建 =====
@@ -1576,10 +1651,18 @@ import { reorderByDrop } from "../lib/reorder";
     void rebuildIndex();
   }
 
+  /** 上次窗口刷新时间：refreshAll 与 library-changed 双触发去重用。 */
+  let lastWindowReloadAt = 0;
+
   /** 增量刷新当前窗口（library-changed / meta / cover 用）：
    *  索引档 —— 增删书会改变 N 与顺序，需按锚点重建 idIndex；
    *  回落档 —— 重拉当前 OFFSET 窗口与 total。 */
   async function reloadWindow() {
+    // C8：refreshAll 自己会刷一次、后端随后还会 emit library-changed → 120ms 后再刷一次。
+    // 300ms 内的重复窗口刷新直接合并（两次数据源相同，保留第一次结果即可）。
+    const now = Date.now();
+    if (now - lastWindowReloadAt < 300) return;
+    lastWindowReloadAt = now;
     if (indexMode) {
       await rebuildIndex(topAnchor());
     } else {
@@ -1796,6 +1879,8 @@ import { reorderByDrop } from "../lib/reorder";
       void refetchVisibleWindow();
       return;
     }
+    // F3：回落档取数中不重复发起（请求结束后的状态更新会自然重跑本 effect）。
+    if (rangeLoading) return;
     ensureRange(view === "grid" ? gFirst * cols : lFirst, view === "grid" ? Math.min(total, gLast * cols) : lLast);
   });
 
@@ -2089,12 +2174,89 @@ import { reorderByDrop } from "../lib/reorder";
     }
   }
 
-  /** 删除分级（G1）：有笔记时给出**三个明确动作**的弹窗；无笔记直接删。 */
+  /** 删除一个重复组的全部副本（来自删单本弹窗里的「全部删除」）。
+   *  与批量删除共用同一套笔记处理与 confirm 语义。 */
+  async function deleteDuplicateGroup(rows: BookRow[], fromDisk: boolean) {
+    if (!rows.length) return;
+    const paths = rows.map((r) => r.path);
+    const count = paths.length;
+    let hasNotes = true;
+    try {
+      hasNotes = await api.booksHaveNotes(rows.map((r) => r.id));
+    } catch {
+      hasNotes = true;
+    }
+    let keepNotes = true;
+    if (hasNotes) {
+      const action = await appChoose(
+        fromDisk
+          ? t("library.batch.msg.fromDisk", { count })
+          : t("library.batch.msg.fromLib", { count }),
+        [
+          { id: "keep", label: t("library.batch.action.keep"), kind: "plain" },
+          { id: "del", label: t("library.batch.action.del"), kind: "danger" },
+          { id: "cancel", label: t("common.confirm.cancel"), kind: "plain" },
+        ],
+      );
+      if (!action || action === "cancel") return;
+      keepNotes = action === "keep";
+    } else {
+      const ok = await appConfirm(
+        t(fromDisk ? "library.batch.msg.noNotes.fromDisk" : "library.batch.msg.noNotes.fromLib", { count }),
+      );
+      if (!ok) return;
+    }
+    try {
+      await api.deleteBooks(paths, fromDisk, keepNotes);
+      toast(
+        fromDisk
+          ? (keepNotes
+              ? t("toast.book.deletedKeepNotes", { count })
+              : t("toast.book.deletedWithNotes", { count }))
+          : (keepNotes
+              ? t("toast.book.removedKeepNotes", { count })
+              : t("toast.book.removedWithNotes", { count })),
+      );
+    } catch (e) {
+      toast(errText(e), "error");
+      await reloadWindow();
+    }
+  }
+
+  /** 删除分级（G1）：有笔记时给出**三个明确动作**的弹窗；无笔记直接删。
+   *  若该书属于重复组且副本分布在多个文件夹，先让用户选择要删除哪个文件夹里的副本。 */
   async function deleteBook(b: BookRow, fromDisk: boolean) {
+    let target = b;
+    const members = dupMembersById.get(b.id);
+    if (members && members.length > 1) {
+      try {
+        const rows = (await api.listBooksByIds(members)).filter((r): r is BookRow => !!r);
+        const dirs = new Set(rows.map((r) => parentDirOf(r.path)));
+        if (dirs.size > 1) {
+          const actions: { id: string; label: string; kind: "plain" | "danger"; footer?: boolean }[] = rows.slice(0, 20).map((r) => ({
+            id: String(r.id),
+            label: `${parentDirOf(r.path)} — ${r.path.split(/[\\/]/).pop() ?? ""}`,
+            kind: "plain" as const,
+          }));
+          actions.push({ id: "all", label: t("library.dup.deleteAll"), kind: "danger" as const, footer: true });
+          actions.push({ id: "cancel", label: t("common.confirm.cancel"), kind: "plain" as const, footer: true });
+          const action = await appChoose(t("library.dup.deleteWhich"), actions);
+          if (!action || action === "cancel") return;
+          if (action === "all") {
+            await deleteDuplicateGroup(rows, fromDisk);
+            return;
+          }
+          const chosen = rows.find((r) => String(r.id) === action);
+          if (chosen) target = chosen;
+        }
+      } catch {
+        // 副本信息读取失败：按原书走既有删除流程，不因辅助选择阻断删除。
+      }
+    }
     let hasNotes = false;
     let noteCount = 0;
     try {
-      const info = await api.bookNoteInfo(b.id);
+      const info = await api.bookNoteInfo(target.id);
       hasNotes = info.hasNotes;
       noteCount = info.noteCount;
     } catch { /* ignore */ }
@@ -2104,8 +2266,8 @@ import { reorderByDrop } from "../lib/reorder";
       // 三个明确动作：保留笔记并删除 / 删除笔记并删除 / 取消。绝不把选择藏进「确定/取消」。
       const action = await appChoose(
         fromDisk
-          ? t("library.delete.noteMsg.fromDisk", { title: b.title, count: noteCount })
-          : t("library.delete.noteMsg.fromLib", { title: b.title, count: noteCount }),
+          ? t("library.delete.noteMsg.fromDisk", { title: target.title, count: noteCount })
+          : t("library.delete.noteMsg.fromLib", { title: target.title, count: noteCount }),
         [
           { id: "keep", label: t("library.delete.action.keep"), kind: "plain" },
           { id: "del", label: t("library.delete.action.del"), kind: "danger" },
@@ -2117,14 +2279,14 @@ import { reorderByDrop } from "../lib/reorder";
     } else {
       const ok = await appConfirm(
         fromDisk
-          ? t("library.delete.msg.fromDisk", { title: b.title, path: b.path })
-          : t("library.delete.msg.fromLib", { title: b.title }),
+          ? t("library.delete.msg.fromDisk", { title: target.title, path: target.path })
+          : t("library.delete.msg.fromLib", { title: target.title }),
       );
       if (!ok) return;
     }
 
     try {
-      await api.deleteBooks([b.path], fromDisk, keepNotes);
+      await api.deleteBooks([target.path], fromDisk, keepNotes);
       toast(
         fromDisk
           ? (hasNotes && keepNotes
@@ -2149,15 +2311,31 @@ import { reorderByDrop } from "../lib/reorder";
   }
 
   async function setCover(b: BookRow) {
-    const p = await api.pickFile(t("library.dialog.pickCover"), [
-      { name: t("library.dialog.imageFilter"), exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
-    ]);
+    // C9：pickFile 失败（对话框异常/权限）也必须给出可读提示，不能变成未处理 rejection。
+    let p: string | null = null;
+    try {
+      p = await api.pickFile(t("library.dialog.pickCover"), [
+        { name: t("library.dialog.imageFilter"), exts: ["png", "jpg", "jpeg", "webp", "bmp"] },
+      ]);
+    } catch (e) {
+      toast(errText(e), "error");
+      return;
+    }
     if (!p) return;
     try {
       await api.setCustomCover(b.id, p);
       // 换新对象身份（不就地改属性），令 coverUrl 重算并触发封面 <img> 重挂即时刷新。
       replaceBook(b.id, { cover_path: `custom-${b.id}.png`, cover_ver: (b.cover_ver ?? 0) + 1 });
       toast(t("toast.library.coverUpdated"));
+    } catch (e) {
+      toast(errText(e), "error");
+    }
+  }
+
+  /** C9：右键「在文件夹中显示」失败也要提示（旧实现 fire-and-forget，异常无人处理）。 */
+  async function revealBook(b: BookRow) {
+    try {
+      await api.revealInExplorer(b.path);
     } catch (e) {
       toast(errText(e), "error");
     }
@@ -2183,41 +2361,15 @@ import { reorderByDrop } from "../lib/reorder";
   /** Task F：右键标记阅读状态。state=read/unread。
    *  一致性：idIndex 是后端秩快照。若当前有状态筛选生效，标记后该书 effective 状态会变，
    *  应从结果里出现/消失 → 必须 reload()（rebuildIndex 重算 idIndex/total）；否则仅就地刷新。
-   *  联动进度：
-   *   - 标记已读：read_state=1（角标✓、effectiveState=read），并把真实进度写到末尾（打开定位到末尾、显示 100%）。
-   *   - 标记未读：read_state=2（无角标、effectiveState=unread），并把进度重置为开头（打开回到开头）。
-   *  之后用户真实阅读时，Reader 保存进度会自动释放手动覆盖（read_state→0），状态随进度推导。 */
+   *  F3-H2：改走后端最小命令 mark_book_read_state —— 不再 openBook 触发整本解析/touch_book_opened，
+   *  也不再经 saveProgress 把 books.last_read 顶到 now，避免「最近阅读」排序被非阅读动作污染。
+   *  进度仍写入：已读=末章末尾（chapter 0 + ratio 1 + pct 100，Reader 按 pct>=99.5 落末章），
+   *  未读=开头（chapter 0 + ratio 0 + pct 0）。 */
   async function markReadState(b: BookRow, state: "read" | "unread") {
     try {
-      await api.setReadState(b.id, state);
+      await api.markBookReadState(b.id, state);
       const newState = state === "read" ? 1 : 2;
-      let newPct = b.read_pct;
-      if (state === "read") {
-        // 需要章节数才能把进度定位到「最后一章末尾」；Library 手里没有 toc，故用 openBook 取。
-        let lastChapter = 0;
-        try {
-          const r = await api.openBook(b.id);
-          lastChapter = Math.max(0, r.toc.length - 1);
-        } catch { /* 取不到章节数则退化为把当前章置末尾（chapter 0） */ }
-        await api.saveProgress(b.id, {
-          chapter_index: lastChapter,
-          chapter_ratio: 1,
-          pct: 100,
-          updated_at: Date.now(),
-          device: "pc",
-        });
-        newPct = 100;
-      } else {
-        // 未读：进度重置到开头（chapter 0 / ratio 0 / pct 0），保证 Reader 再打开定位到开头。
-        await api.saveProgress(b.id, {
-          chapter_index: 0,
-          chapter_ratio: 0,
-          pct: 0,
-          updated_at: Date.now(),
-          device: "pc",
-        });
-        newPct = 0;
-      }
+      const newPct = state === "read" ? 100 : 0;
       if (filterStates.length > 0) {
         await reloadWindow(); // 状态筛选生效：重建秩索引，令该书按新状态出现/消失
       } else {
@@ -2307,6 +2459,13 @@ import { reorderByDrop } from "../lib/reorder";
             const pg = await api.listBooksPage(p, "title", 0, 20);
             b = pg.rows.find((x) => x.path === p) ?? pg.rows[0];
           }
+          if (!b) return false;
+          void deleteBook(b, fromDisk);
+          return true;
+        },
+        deleteById: async (id: number, fromDisk = false) => {
+          const rows = await api.listBooksByIds([id]);
+          const b = rows.find((x): x is BookRow => !!x);
           if (!b) return false;
           void deleteBook(b, fromDisk);
           return true;
@@ -2551,6 +2710,9 @@ import { reorderByDrop } from "../lib/reorder";
       clearTimeout(windowRetryTimer);
       clearTimeout(nullRebuildTimer);
       clearTimeout(prioTimer);
+      // F3-H1：uTags/uShelves 之前漏注销，进出书库多次后监听会持续累积。
+      uTags.then((f) => f());
+      uShelves.then((f) => f());
       u1.then((f) => f());
       u2.then((f) => f());
       u4.then((f) => f());
@@ -2781,7 +2943,7 @@ import { reorderByDrop } from "../lib/reorder";
     <div class="folders" oncontextmenu={openDupChipMenu}>
       <button
         class="folder-chip"
-        class:active={selectedFolder === null}
+        class:active={!duplicateView && selectedFolder === null}
         data-testid="lib-folder-all"
         title={t("library.folder.allTip")}
         onclick={() => selectFolder(null)}
@@ -2813,7 +2975,7 @@ import { reorderByDrop } from "../lib/reorder";
       {#each folders as f (f)}
         <span
           class="folder-chip"
-          class:active={selectedFolder === f}
+          class:active={!duplicateView && selectedFolder === f}
           role="button"
           tabindex="0"
           data-testid="lib-folder-chip"
@@ -3096,7 +3258,7 @@ import { reorderByDrop } from "../lib/reorder";
         {#if effectiveState(ctxMenu.book) !== "unread"}
           <button class="ctx-item" data-testid="lib-ctx-mark-unread" onclick={() => { markReadState(ctxMenu!.book, "unread"); ctxMenu = null; }}><span class="ci"><IconCircle size={16} stroke={1.5} /></span>{t("library.ctx.markUnread")}</button>
         {/if}
-        <button class="ctx-item" data-testid="lib-ctx-reveal" onclick={() => { api.revealInExplorer(ctxMenu!.book.path); ctxMenu = null; }}><span class="ci"><IconFolder size={16} stroke={1.5} /></span>{t("library.ctx.reveal")}</button>
+        <button class="ctx-item" data-testid="lib-ctx-reveal" onclick={() => { const bk = ctxMenu!.book; ctxMenu = null; void revealBook(bk); }}><span class="ci"><IconFolder size={16} stroke={1.5} /></span>{t("library.ctx.reveal")}</button>
         <div class="ctx-sep"></div>
         <button class="ctx-item danger" data-testid="lib-ctx-remove" onclick={() => { deleteBook(ctxMenu!.book, false); ctxMenu = null; }}><span class="ci"><IconArrowBackUp size={16} stroke={1.5} /></span>{t("library.ctx.removeOnly")}</button>
         <button class="ctx-item danger" data-testid="lib-ctx-delete-file" onclick={() => { deleteBook(ctxMenu!.book, true); ctxMenu = null; }}><span class="ci"><IconTrash size={16} stroke={1.5} /></span>{t("library.ctx.deleteFile")}</button>

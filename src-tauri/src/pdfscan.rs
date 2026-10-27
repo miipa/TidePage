@@ -15,7 +15,7 @@
 //!
 //! 缓存按 `book_id` 键控：多窗口会同时开不同的书，`pdf_scan_close` 只清对应那一份。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -73,6 +73,182 @@ impl Val {
 
 fn dict_get<'a>(d: &'a Dict, k: &str) -> Option<&'a Val> {
     d.get(k)
+}
+
+// ============================ 页树/大纲遍历（防共享 DAG 指数展开） ============================
+// 旧实现只有深度与输出条数上限：共享 Kids 子节点会被重复展开，构造出的 DAG 可指数级放大。
+// 这里用 visited + 节点预算做硬上限；超限返回可读错误（页树）而不是静默截断。
+const PAGE_TREE_MAX_NODES: usize = 200_000;
+const PAGE_TREE_MAX_PAGES: usize = 100_000;
+const PAGE_TREE_MAX_DEPTH: usize = 64;
+const OUTLINE_MAX_NODES: usize = 20_000;
+const OUTLINE_MAX_DEPTH: usize = 32;
+const OUTLINE_MAX_LINKS: usize = 50_000;
+
+/// 遍历需要的解析动作（Doc 实现它；测试用合成 HashMap 实现）。
+trait PageTreeReader {
+    fn read_object(&mut self, obj: u32) -> Option<Val>;
+    fn read_value(&mut self, v: &Val) -> Val;
+}
+
+fn walk_page_tree<R: PageTreeReader>(
+    root: u32,
+    reader: &mut R,
+    max_nodes: usize,
+    max_pages: usize,
+    max_depth: usize,
+) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut budget = max_nodes;
+    walk_page_node(root, 0, reader, &mut visited, &mut out, &mut budget, max_pages, max_depth)?;
+    Ok(out)
+}
+
+fn walk_page_node<R: PageTreeReader>(
+    obj: u32,
+    depth: usize,
+    reader: &mut R,
+    visited: &mut std::collections::HashSet<u32>,
+    out: &mut Vec<u32>,
+    budget: &mut usize,
+    max_pages: usize,
+    max_depth: usize,
+) -> Result<(), String> {
+    if depth > max_depth {
+        return Err("页树过深".into());
+    }
+    // 共享 Kids 子节点只展开一次：DAG 不再指数级重复，输出也不会重复页。
+    if !visited.insert(obj) {
+        return Ok(());
+    }
+    if *budget == 0 {
+        return Err("页树节点过多".into());
+    }
+    *budget -= 1;
+    let node = match reader.read_object(obj) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let d = match node.as_dict() {
+        Some(d) => d.clone(),
+        None => return Ok(()),
+    };
+    let typ = d.get("Type").and_then(|v| v.as_name()).unwrap_or("");
+    if typ == "Page" {
+        if out.len() >= max_pages {
+            return Err("页数过多".into());
+        }
+        out.push(obj);
+        return Ok(());
+    }
+    if let Some(kids) = d.get("Kids").cloned() {
+        let kids = reader.read_value(&kids);
+        if let Some(arr) = kids.as_arr() {
+            let kids: Vec<Val> = arr.to_vec();
+            for k in kids {
+                match k {
+                    Val::Ref(n, _) => walk_page_node(
+                        n, depth + 1, reader, visited, out, budget, max_pages, max_depth,
+                    )?,
+                    other => {
+                        if let Some(kd) = other.as_dict() {
+                            if let Some(Val::Ref(n, _)) = dict_get(kd, "Kids") {
+                                walk_page_node(
+                                    *n, depth + 1, reader, visited, out, budget, max_pages, max_depth,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 大纲遍历额外需要「目的地 → 页号」解析。
+trait OutlineReader: PageTreeReader {
+    fn outline_dest(&mut self, d: &Dict) -> i64;
+}
+
+fn walk_outline_tree<R: OutlineReader>(
+    first: u32,
+    reader: &mut R,
+    max_nodes: usize,
+) -> Result<Vec<OutlineItem>, String> {
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut budget = max_nodes;
+    walk_outline_node(first, 0, reader, &mut visited, &mut budget, &mut out)?;
+    Ok(out)
+}
+
+fn walk_outline_node<R: OutlineReader>(
+    obj: u32,
+    depth: usize,
+    reader: &mut R,
+    visited: &mut std::collections::HashSet<u32>,
+    budget: &mut usize,
+    out: &mut Vec<OutlineItem>,
+) -> Result<(), String> {
+    if depth > OUTLINE_MAX_DEPTH {
+        return Err("大纲层级过深".into());
+    }
+    let mut cur = obj;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > OUTLINE_MAX_LINKS {
+            return Err("大纲链过长".into());
+        }
+        // 共享/自环节点只处理一次：旧实现无 visited，共享 Next 会重复展开并被静默截断。
+        if !visited.insert(cur) {
+            break;
+        }
+        if *budget == 0 {
+            return Err("大纲节点过多".into());
+        }
+        *budget -= 1;
+        let d = match reader.read_object(cur) {
+            Some(v) => match v.as_dict() {
+                Some(d) => d.clone(),
+                None => break,
+            },
+            None => break,
+        };
+        let title = match d.get("Title") {
+            Some(Val::Str(b)) => decode_pdf_text(b),
+            _ => String::new(),
+        };
+        let page = reader.outline_dest(&d);
+        if !title.is_empty() {
+            out.push(OutlineItem { title, page });
+        }
+        if let Some(Val::Ref(n, _)) = d.get("First") {
+            walk_outline_node(*n, depth + 1, reader, visited, budget, out)?;
+        }
+        match d.get("Next") {
+            Some(Val::Ref(n, _)) => cur = *n,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+impl PageTreeReader for Doc {
+    fn read_object(&mut self, obj: u32) -> Option<Val> {
+        self.resolve_obj(obj)
+    }
+    fn read_value(&mut self, v: &Val) -> Val {
+        self.resolve(v)
+    }
+}
+
+impl OutlineReader for Doc {
+    fn outline_dest(&mut self, d: &Dict) -> i64 {
+        self.outline_dest_page(d)
+    }
 }
 
 // ============================ 词法/语法 ============================
@@ -337,7 +513,8 @@ impl Src {
         if off >= self.len {
             return Ok(Vec::new());
         }
-        let n = n.min((self.len - off) as usize);
+        // P0-4：防御性上限（现有调用点都已校验 /Length；这里再钳一次，绝不按声明值大分配）。
+        let n = n.min((self.len - off) as usize).min(MAX_READ_AT_BYTES);
         self.f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; n];
         self.f.read_exact(&mut buf).map_err(|e| e.to_string())?;
@@ -483,6 +660,10 @@ struct Doc {
     /// 页对象号 -> 页序号（目录目的地的反查，O(1)）。
     page_index: HashMap<u32, usize>,
     outline: Option<Vec<OutlineItem>>,
+    /// P0-4：本 Doc 生命周期内已计入的内容流解压字节总量（同一页只计一次）。
+    decompressed_total: u64,
+    /// 已计入过的页号：page_verdict/取页/thumbs 会重复解码同一页，不能重复累计。
+    counted_pages: HashSet<usize>,
 }
 
 struct PageGeom {
@@ -513,6 +694,8 @@ impl Doc {
             page_refs: Vec::new(),
             page_index: HashMap::new(),
             outline: None,
+            decompressed_total: 0,
+            counted_pages: HashSet::new(),
         };
         let cat = match doc.resolve_obj(root) {
             Some(v) => v.as_dict().cloned().unwrap_or_default(),
@@ -556,52 +739,18 @@ impl Doc {
             Some(Val::Ref(n, _)) => *n,
             _ => return Err("Catalog 缺少 /Pages".into()),
         };
-        let mut out: Vec<u32> = Vec::new();
-        self.walk_pages(pages_ref, 0, &mut out)?;
+        let out = walk_page_tree(
+            pages_ref,
+            self,
+            PAGE_TREE_MAX_NODES,
+            PAGE_TREE_MAX_PAGES,
+            PAGE_TREE_MAX_DEPTH,
+        )?;
         if out.is_empty() {
             return Err("没有可用的页".into());
         }
         self.page_index = out.iter().enumerate().map(|(i, r)| (*r, i)).collect();
         self.page_refs = out;
-        Ok(())
-    }
-
-    /// 递归展开 Kids：扁平列表与 Pages 节点都覆盖。
-    fn walk_pages(&mut self, obj: u32, depth: usize, out: &mut Vec<u32>) -> Result<(), String> {
-        if depth > 64 || out.len() > 100_000 {
-            return Err("页树过深/过大".into());
-        }
-        let node = match self.resolve_obj(obj) {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-        let d = match node.as_dict() {
-            Some(d) => d.clone(),
-            None => return Ok(()),
-        };
-        let typ = d.get("Type").and_then(|v| v.as_name()).unwrap_or("");
-        if typ == "Page" {
-            out.push(obj);
-            return Ok(());
-        }
-        if let Some(kids) = d.get("Kids").cloned() {
-            let kids = self.resolve(&kids);
-            if let Some(arr) = kids.as_arr() {
-                let kids: Vec<Val> = arr.to_vec();
-                for k in kids {
-                    match k {
-                        Val::Ref(n, _) => self.walk_pages(n, depth + 1, out)?,
-                        other => {
-                            if let Some(kd) = other.as_dict() {
-                                if let Some(Val::Ref(n, _)) = dict_get(kd, "Kids") {
-                                    self.walk_pages(*n, depth + 1, out)?;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
@@ -746,79 +895,43 @@ impl Doc {
         if d.get("ImageMask").map(|v| !matches!(v, Val::Bool(false))).unwrap_or(false) {
             return Err("图像是 /ImageMask 模板".into());
         }
-        // `/Length` 可能是间接引用
+        // `/Length` 可能是间接引用；与内容流共用 stream_len_ok（有限、>0、≤64MiB）。
         let len_v = d.get("Length").cloned().ok_or("流缺少 /Length")?;
-        let len = match &len_v {
-            Val::Num(n) => *n as usize,
+        let n = match &len_v {
+            Val::Num(n) => *n,
             Val::Ref(..) => self
                 .resolve(&len_v)
                 .as_num()
-                .ok_or("/Length 引用无法解析")? as usize,
+                .ok_or("/Length 引用无法解析")?,
             _ => return Err("/Length 类型不支持".into()),
         };
-        // 保守上界：单页图像不可能超过 64MB
-        if len == 0 || len > 64 * 1024 * 1024 {
-            return Err(format!("/Length 异常（{len} 字节）"));
-        }
+        let len = stream_len_ok(n)?;
         Ok((d, start, len))
     }
 
-    fn outline(&mut self) -> Vec<OutlineItem> {
+    fn outline(&mut self) -> Result<Vec<OutlineItem>, String> {
         if let Some(v) = &self.outline {
-            return v.clone();
+            return Ok(v.clone());
         }
-        let mut out: Vec<OutlineItem> = Vec::new();
         let root = match self.catalog.get("Outlines").cloned() {
             Some(v) => self.resolve(&v),
             None => {
-                self.outline = Some(out.clone());
-                return out;
+                self.outline = Some(Vec::new());
+                return Ok(Vec::new());
             }
         };
-        if let Some(rd) = root.as_dict() {
-            if let Some(Val::Ref(n, _)) = rd.get("First") {
-                let _ = self.walk_outline(*n, 0, &mut out);
-            }
-        }
-        self.outline = Some(out.clone());
-        out
-    }
-
-    fn walk_outline(&mut self, obj: u32, depth: usize, out: &mut Vec<OutlineItem>) -> Result<(), String> {
-        if depth > 32 || out.len() > 20_000 {
-            return Ok(());
-        }
-        let mut cur = obj;
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 50_000 {
-                break;
-            }
-            let d = match self.resolve_obj(cur) {
-                Some(v) => match v.as_dict() {
-                    Some(d) => d.clone(),
-                    None => break,
-                },
-                None => break,
-            };
-            let title = match d.get("Title") {
-                Some(Val::Str(b)) => decode_pdf_text(b),
-                _ => String::new(),
-            };
-            let page = self.outline_dest_page(&d);
-            if !title.is_empty() {
-                out.push(OutlineItem { title, page });
-            }
-            if let Some(Val::Ref(n, _)) = d.get("First") {
-                let _ = self.walk_outline(*n, depth + 1, out);
-            }
-            match d.get("Next") {
-                Some(Val::Ref(n, _)) => cur = *n,
-                _ => break,
-            }
-        }
-        Ok(())
+        let items = match root
+            .as_dict()
+            .and_then(|rd| match rd.get("First") {
+                Some(Val::Ref(n, _)) => Some(*n),
+                _ => None,
+            }) {
+            // 超限返回可读错误（旧实现静默截断）；合法 PDF 输出不变。
+            Some(first) => walk_outline_tree(first, self, OUTLINE_MAX_NODES)?,
+            None => Vec::new(),
+        };
+        self.outline = Some(items.clone());
+        Ok(items)
     }
 
     /// 目的地 → 页号：`/Dest [ref /Fit...]` 或 `/A << /D [...] >>`。
@@ -916,15 +1029,15 @@ impl Doc {
     /// 流长度（`/Length` 可能是间接引用）。
     fn stream_len(&mut self, dd: &Dict) -> Result<usize, String> {
         let v = dd.get("Length").cloned().ok_or("流缺 /Length")?;
-        match v {
-            Val::Num(n) => Ok(n as usize),
+        let n = match v {
+            Val::Num(n) => n,
             r @ Val::Ref(..) => self
                 .resolve(&r)
                 .as_num()
-                .map(|n| n as usize)
-                .ok_or_else(|| "/Length 引用无法解析".into()),
-            _ => Err("/Length 类型不支持".into()),
-        }
+                .ok_or_else(|| "/Length 引用无法解析".to_string())?,
+            _ => return Err("/Length 类型不支持".into()),
+        };
+        stream_len_ok(n)
     }
 
     /// 把 `/Contents`（单流或数组）拼起来取字节。
@@ -950,11 +1063,20 @@ impl Doc {
                 let len = self.stream_len(&dd)?;
                 let filters = norm_filter(&dd);
                 let raw = self.src.read_at(start, len)?;
-                return decode_stream(&filters, &raw);
+                let bytes = decode_stream(&filters, &raw)?;
+                account_page_decode(
+                    &mut self.decompressed_total,
+                    &mut self.counted_pages,
+                    page,
+                    bytes.len() as u64,
+                    MAX_DOC_DECOMPRESSED_TOTAL,
+                )?;
+                return Ok(bytes);
             }
             _ => return Err("/Contents 类型不支持".into()),
         }
         let mut out: Vec<u8> = Vec::new();
+        let mut decoded_sum: u64 = 0;
         for obj in parts {
             let v = self.resolve_obj(obj).ok_or("内容流对象无法解析")?;
             let (dd, start) = match v {
@@ -962,14 +1084,24 @@ impl Doc {
                 _ => return Err("内容流不是流对象".into()),
             };
             let len = self.stream_len(&dd)?;
-            if len > 64 * 1024 * 1024 {
-                return Err(format!("内容流过大（{len} 字节）"));
-            }
             let filters = norm_filter(&dd);
             let raw = self.src.read_at(start, len)?;
-            out.extend_from_slice(&decode_stream(&filters, &raw)?);
+            let decoded = decode_stream(&filters, &raw)?;
+            decoded_sum = decoded_sum.saturating_add(decoded.len() as u64);
+            out.extend_from_slice(&decoded);
+            // 数组可以重复引用同一条流：单条合规也可能累计出巨量内容，故另有总上限。
+            if out.len() > MAX_CONTENT_TOTAL {
+                return Err(format!("页面内容流累计过大（上限 {MAX_CONTENT_TOTAL} 字节）"));
+            }
             out.push(b'\n');
         }
+        account_page_decode(
+            &mut self.decompressed_total,
+            &mut self.counted_pages,
+            page,
+            decoded_sum,
+            MAX_DOC_DECOMPRESSED_TOTAL,
+        )?;
         Ok(out)
     }
 
@@ -982,17 +1114,79 @@ impl Doc {
     }
 }
 
+/// 单条内容流解压后的字节上限（与 PDF 通道既有的 64MiB 口径一致）。
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// P0-4：单文档跨页内容流解压累计上限（256MiB）。同一页只计一次（counted_pages）。
+const MAX_DOC_DECOMPRESSED_TOTAL: u64 = 256 * 1024 * 1024;
+/// P0-4：read_at 单次分配的防御上限（与单流上限一致）。
+const MAX_READ_AT_BYTES: usize = MAX_STREAM_BYTES;
+
+/// P0-4：`/Length` 合法性（有限、>0、≤单流上限），异常返回可读错误。
+fn stream_len_ok(len: f64) -> Result<usize, String> {
+    if !len.is_finite() || len <= 0.0 || len > MAX_STREAM_BYTES as f64 {
+        return Err(format!("/Length 异常（{len}）"));
+    }
+    Ok(len as usize)
+}
+
+/// P0-4：累计解压字节（checked；超过 cap 返回可读错误）。
+fn add_decompressed(total: u64, add: u64, cap: u64) -> Result<u64, String> {
+    let next = total
+        .checked_add(add)
+        .ok_or_else(|| format!("文档内容流解压累计过大（上限 {cap} 字节）"))?;
+    if next > cap {
+        return Err(format!("文档内容流解压累计过大（上限 {cap} 字节）"));
+    }
+    Ok(next)
+}
+
+/// P0-4：只有某页首次被解码时才计入文档累计；重复解码同一页不再累加。
+fn account_page_decode(
+    total: &mut u64,
+    counted: &mut HashSet<usize>,
+    page: usize,
+    add: u64,
+    cap: u64,
+) -> Result<(), String> {
+    if counted.contains(&page) {
+        return Ok(());
+    }
+    let next = add_decompressed(*total, add, cap)?;
+    *total = next;
+    counted.insert(page);
+    Ok(())
+}
+/// 一页所有内容流解压后的累计上限：数组形式可重复引用同一条流。
+const MAX_CONTENT_TOTAL: usize = 64 * 1024 * 1024;
+
+/// 解压 FlateDecode 并限制输出上限：只读到 cap+1 字节，超限返回 Err 而不是分配到底。
+/// 损坏/压缩炸弹的 zlib 流也会在这里停下（调用方按内容流解析失败退回单图近似）。
+fn inflate_capped(raw: &[u8], cap: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let z = flate2::read::ZlibDecoder::new(raw);
+    let mut out = Vec::new();
+    z.take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("FlateDecode 失败：{e}"))?;
+    if out.len() > cap {
+        return Err(format!("内容流解压后过大（上限 {cap} 字节）"));
+    }
+    Ok(out)
+}
+
 /// 流解码（只支持 FlateDecode；**这里才是 flate2 的真实用途**）。
 fn decode_stream(filters: &[String], raw: &[u8]) -> Result<Vec<u8>, String> {
     if filters.is_empty() {
+        if raw.len() > MAX_STREAM_BYTES {
+            return Err(format!(
+                "内容流过大（{} 字节，上限 {MAX_STREAM_BYTES}）",
+                raw.len()
+            ));
+        }
         return Ok(raw.to_vec());
     }
     if filters.len() == 1 && (filters[0] == "FlateDecode" || filters[0] == "Fl") {
-        use std::io::Read as _;
-        let mut z = flate2::read::ZlibDecoder::new(raw);
-        let mut out = Vec::new();
-        z.read_to_end(&mut out).map_err(|e| format!("FlateDecode 失败：{e}"))?;
-        return Ok(out);
+        return inflate_capped(raw, MAX_STREAM_BYTES);
     }
     Err(format!("内容流编码不支持 {filters:?}"))
 }
@@ -1323,6 +1517,17 @@ fn jpeg_ok(b: &[u8]) -> Result<(u32, u32), String> {
         }
         // SOF0..SOF15（排除 DHT=C4, JPG=C8, DAC=CC）
         if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+            // SOF 段要读到下标 i+9 的分量数：段长至少 8、且文件里确实有这 10 个字节。
+            // 截断文件里段长很小又贴着文件尾时，旧实现直接 b[i+9] 会越界 panic。
+            if seg < 8 {
+                return Err("JPEG SOF 段不完整".into());
+            }
+            let Some(end) = i.checked_add(10) else {
+                return Err("JPEG SOF 段不完整".into());
+            };
+            if end > b.len() {
+                return Err("JPEG SOF 段不完整".into());
+            }
             let comps = b[i + 9] as u32;
             let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
             let w = ((b[i + 7] as u32) << 8) | b[i + 8] as u32;
@@ -1331,7 +1536,11 @@ fn jpeg_ok(b: &[u8]) -> Result<(u32, u32), String> {
             }
             return Ok((w, h));
         }
-        i += 2 + seg;
+        // checked_add：段长字段是文件里的原始 16 位值，损坏数据里不能靠普通加法兜底。
+        i = match i.checked_add(2 + seg) {
+            Some(n) => n,
+            None => break,
+        };
     }
     Err("JPEG 缺少 SOF".into())
 }
@@ -1341,6 +1550,20 @@ fn jpeg_ok(b: &[u8]) -> Result<(u32, u32), String> {
 struct Cached {
     doc: Doc,
     open: ScanOpen,
+    /// 缓存建立时的文件路径与 (size, mtime) 指纹：命中前必须校验。
+    /// book_id 由路径派生，同路径文件被替换后 id 不变，只按 id 命中会一直用旧句柄。
+    path: String,
+    stamp: (i64, i64),
+}
+
+/// 直读缓存命中判定：路径与文件指纹都一致才复用。
+fn cache_hit(
+    cached_path: &str,
+    cached_stamp: (i64, i64),
+    path: &str,
+    current: Option<(i64, i64)>,
+) -> bool {
+    cached_path == path && current == Some(cached_stamp)
 }
 
 /// 探测期的三个计数（进程内累计，日志与报告用）：
@@ -1445,10 +1668,24 @@ pub async fn pdf_scan_open(
 ) -> Result<ScanOpen, String> {
     let path = get_book_path(state.inner(), book_id)?;
     let key = book_id;
+    let stamp_now = crate::library::file_stamp(&path);
     if let Some(entry) = cache().lock().unwrap().get(&key).cloned() {
-        let g = entry.lock().unwrap();
-        return Ok(g.open.clone());
+        let hit = {
+            let g = entry.lock().unwrap();
+            if cache_hit(&g.path, g.stamp, &path, stamp_now) {
+                Some(g.open.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(open) = hit {
+            return Ok(open);
+        }
+        // 文件换了/取不到指纹：丢弃旧条目，按新文件重开（旧句柄随后由 Arc 释放）。
+        cache().lock().unwrap().remove(&key);
     }
+    // 打开新文档前必须有指纹：拿不到就无法判断后续是否被替换，宁可报错也不缓存无效条目。
+    let stamp = stamp_now.ok_or_else(|| "无法读取 PDF 文件状态".to_string())?;
     let t0 = std::time::Instant::now();
     let mut doc = Doc::open(Path::new(&path))?;
     let (usable, image_only, unsupported_sampled, reason) = probe(&mut doc);
@@ -1481,7 +1718,15 @@ pub async fn pdf_scan_open(
             t0.elapsed().as_millis()
         ),
     );
-    cache().lock().unwrap().insert(key, Arc::new(Mutex::new(Cached { doc, open: open.clone() })));
+    cache().lock().unwrap().insert(
+        key,
+        Arc::new(Mutex::new(Cached {
+            doc,
+            open: open.clone(),
+            path,
+            stamp,
+        })),
+    );
     Ok(open)
 }
 
@@ -1684,7 +1929,7 @@ pub async fn pdf_scan_outline(
 ) -> Result<Vec<OutlineItem>, String> {
     let _ = state;
     with_doc(book_id, |doc| {
-        let items = doc.outline();
+        let items = doc.outline()?;
         crate::memlog::stage_note(
             "pdf_scan:outline",
             &format!("book={book_id} items={}", items.len()),
@@ -1740,6 +1985,51 @@ mod tests {
         assert!(jpeg_ok(&c).is_err());
     }
 
+    /// 截断的 SOF 段（段长 2/3/7，数据贴着文件尾）必须返回 Err 而不是越界 panic。
+    #[test]
+    fn jpeg_truncated_sof_is_error_not_panic() {
+        for seg_len in [2u8, 3, 7] {
+            let b = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, seg_len];
+            assert!(jpeg_ok(&b).is_err(), "seg={seg_len} 应判为不完整");
+        }
+        // 段长够 8 但文件尾不足时同样 Err
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x08, 0x08, 0x00, 0x10];
+        assert!(jpeg_ok(&b).is_err());
+        // 恰好 10 字节的 SOF 段（无分量数据）不得 panic
+        b.extend_from_slice(&[0x00, 0x10]);
+        let _ = jpeg_ok(&b);
+    }
+
+    /// 同一路径文件被替换（size 或 mtime 变化）、路径不同、或取不到指纹时都不得复用缓存。
+    #[test]
+    fn cache_hit_requires_path_and_stamp() {
+        let stamp = (1024i64, 1_700_000_000_000i64);
+        assert!(cache_hit("C:\\books\\a.pdf", stamp, "C:\\books\\a.pdf", Some(stamp)));
+        // size 或 mtime 任一变化 ⇒ 不复用
+        assert!(!cache_hit("C:\\books\\a.pdf", stamp, "C:\\books\\a.pdf", Some((1025, stamp.1))));
+        assert!(!cache_hit("C:\\books\\a.pdf", stamp, "C:\\books\\a.pdf", Some((stamp.0, stamp.1 + 1))));
+        // 路径不同 / 当前取不到指纹 ⇒ 不复用
+        assert!(!cache_hit("C:\\books\\a.pdf", stamp, "C:\\books\\b.pdf", Some(stamp)));
+        assert!(!cache_hit("C:\\books\\a.pdf", stamp, "C:\\books\\a.pdf", None));
+    }
+
+    /// 解压上限：cap 足够时返回原数据；cap 不足时必须 Err，不能把 8KiB 解成整块返回。
+    #[test]
+    fn inflate_capped_enforces_limit() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&data).unwrap();
+        let raw = enc.finish().unwrap();
+        assert_eq!(inflate_capped(&raw, 8192).unwrap(), data);
+        let err = inflate_capped(&raw, 1024).unwrap_err();
+        assert!(err.contains("上限"), "应报超限，实际：{err}");
+        // 非 zlib 数据不能 panic，只能 Err
+        assert!(inflate_capped(b"not-zlib", 64).is_err());
+    }
+
     #[test]
     fn utf16_outline_title() {
         let mut b = vec![0xFE, 0xFF];
@@ -1749,4 +2039,160 @@ mod tests {
         }
         assert_eq!(decode_pdf_text(&b), "第一页");
     }
+    // ---------------- S8：页树/大纲 visited 与节点预算 ----------------
+
+    struct MapReader {
+        map: HashMap<u32, Val>,
+        reads: usize,
+    }
+
+    impl PageTreeReader for MapReader {
+        fn read_object(&mut self, obj: u32) -> Option<Val> {
+            self.reads += 1;
+            self.map.get(&obj).cloned()
+        }
+        fn read_value(&mut self, v: &Val) -> Val {
+            match v {
+                Val::Ref(n, _) => self.map.get(n).cloned().unwrap_or(Val::Null),
+                other => other.clone(),
+            }
+        }
+    }
+
+    impl OutlineReader for MapReader {
+        fn outline_dest(&mut self, _d: &Dict) -> i64 {
+            -1
+        }
+    }
+
+    fn val_dict(entries: Vec<(&str, Val)>) -> Val {
+        let mut d = Dict::new();
+        for (k, v) in entries {
+            d.insert(k.to_string(), v);
+        }
+        Val::Dict(d)
+    }
+
+    fn page_node() -> Val {
+        val_dict(vec![("Type", Val::Name("Page".into()))])
+    }
+
+    fn pages_node(kids: Vec<u32>) -> Val {
+        val_dict(vec![
+            ("Type", Val::Name("Pages".into())),
+            ("Kids", Val::Arr(kids.into_iter().map(|n| Val::Ref(n, 0)).collect())),
+        ])
+    }
+
+    /// 共享 Kids 的 DAG：旧实现会重复展开；visited 后只输出一次页，读取次数有界。
+    #[test]
+    fn page_tree_shared_kids_expand_once() {
+        let mut map = HashMap::new();
+        map.insert(0u32, pages_node(vec![1, 1]));
+        map.insert(1u32, pages_node(vec![2, 2]));
+        map.insert(2u32, page_node());
+        let mut r = MapReader { map, reads: 0 };
+        let out = walk_page_tree(0, &mut r, PAGE_TREE_MAX_NODES, 100, 64).unwrap();
+        assert_eq!(out, vec![2], "共享子节点只能输出一次页");
+        assert!(r.reads <= 3, "visited 后不应重复解析节点（reads={}）", r.reads);
+    }
+
+    /// 节点预算：访问数超限返回可读错误（不是静默截断）。
+    #[test]
+    fn page_tree_budget_errors() {
+        let mut map = HashMap::new();
+        map.insert(0u32, pages_node(vec![1]));
+        map.insert(1u32, pages_node(vec![2]));
+        map.insert(2u32, page_node());
+        let mut r = MapReader { map, reads: 0 };
+        let err = walk_page_tree(0, &mut r, 2, 100, 64).unwrap_err();
+        assert!(err.contains("页树节点过多"), "{err}");
+    }
+
+    /// 深度上限：超过 max_depth 返回错误。
+    #[test]
+    fn page_tree_depth_errors() {
+        let mut map = HashMap::new();
+        for i in 0..70u32 {
+            map.insert(i, pages_node(vec![i + 1]));
+        }
+        map.insert(70, page_node());
+        let mut r = MapReader { map, reads: 0 };
+        let err = walk_page_tree(0, &mut r, PAGE_TREE_MAX_NODES, 1000, 64).unwrap_err();
+        assert!(err.contains("页树过深"), "{err}");
+    }
+
+    fn outline_node(title: &str, next: Option<u32>) -> Val {
+        let mut entries = vec![("Title", Val::Str(title.as_bytes().to_vec()))];
+        if let Some(n) = next {
+            entries.push(("Next", Val::Ref(n, 0)));
+        }
+        val_dict(entries)
+    }
+
+    /// 大纲：Next 成环时 visited 终止、不重复输出；预算超限返回 Err。
+    #[test]
+    fn outline_visited_and_budget() {
+        let mut map = HashMap::new();
+        map.insert(1u32, outline_node("Chapter 1", Some(2)));
+        map.insert(2u32, outline_node("Chapter 2", Some(1)));
+        let mut r = MapReader { map, reads: 0 };
+        let items = walk_outline_tree(1, &mut r, 100).unwrap();
+        assert_eq!(items.len(), 2, "成环的 Next 不得重复输出");
+        assert_eq!(items[0].title, "Chapter 1");
+        assert_eq!(items[0].page, -1);
+
+        let mut map = HashMap::new();
+        map.insert(1u32, outline_node("Chapter 1", Some(2)));
+        map.insert(2u32, outline_node("Chapter 2", None));
+        let mut r = MapReader { map, reads: 0 };
+        let err = match walk_outline_tree(1, &mut r, 1) {
+            Err(e) => e,
+            Ok(v) => panic!("预算超限应返回 Err，实际 {} 条", v.len()),
+        };
+        assert!(err.contains("大纲节点过多"), "{err}");
+    }
+
+    /// P0-4：累计上限边界：恰好上限通过、+1 拒绝、checked 溢出可读错误。
+    #[test]
+    fn decompressed_total_boundaries() {
+        assert_eq!(add_decompressed(0, 10, 100).unwrap(), 10);
+        assert_eq!(add_decompressed(95, 5, 100).unwrap(), 100, "恰好上限允许");
+        let e = add_decompressed(96, 5, 100).unwrap_err();
+        assert!(e.contains("累计过大"), "{e}");
+        // checked_add：接近 u64::MAX 时不得回绕。
+        assert!(add_decompressed(u64::MAX - 1, 10, u64::MAX).is_err());
+    }
+
+    /// P0-4：/Length 边界（0/负/NaN/无穷/上限/上限+1）。
+    #[test]
+    fn stream_length_validation() {
+        assert!(stream_len_ok(0.0).is_err());
+        assert!(stream_len_ok(-1.0).is_err());
+        assert!(stream_len_ok(f64::NAN).is_err());
+        assert!(stream_len_ok(f64::INFINITY).is_err());
+        assert!(stream_len_ok(MAX_STREAM_BYTES as f64).is_ok(), "恰好上限允许");
+        assert_eq!(stream_len_ok(MAX_STREAM_BYTES as f64).unwrap(), MAX_STREAM_BYTES);
+        assert!(stream_len_ok(MAX_STREAM_BYTES as f64 + 1.0).is_err(), "上限 +1 拒绝");
+    }
+
+    /// P0-4：同一页重复解码只计一次（探针/取页/thumbs 会重复请求），不同页才累加。
+    #[test]
+    fn page_decode_counted_once() {
+        let mut total = 0u64;
+        let mut counted = std::collections::HashSet::new();
+        let cap = 100u64;
+        assert!(account_page_decode(&mut total, &mut counted, 7, 60, cap).is_ok());
+        assert_eq!(total, 60);
+        // 同一页再次解码 60 字节：不累加、不因累计误判超限。
+        assert!(account_page_decode(&mut total, &mut counted, 7, 60, cap).is_ok());
+        assert_eq!(total, 60, "同一页只计一次");
+        assert!(account_page_decode(&mut total, &mut counted, 8, 30, cap).is_ok());
+        assert_eq!(total, 90);
+        // 新页累加后超限 → 可读错误。
+        let e = account_page_decode(&mut total, &mut counted, 9, 20, cap).unwrap_err();
+        assert!(e.contains("上限 100 字节"), "{e}");
+        assert_eq!(total, 90, "失败时不得写回累计值");
+    }
+
 }

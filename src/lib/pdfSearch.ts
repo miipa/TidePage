@@ -115,8 +115,8 @@ export interface PdfSearchGroup {
   snippet: string;
 }
 
-/** 把按页文本拼成一条流，跨页/跨行查询只产生一条结果；同页多次按页内 occurrence 编号。 */
-export function groupPdfMatches(
+/** 单个连续页段内：把文本拼成一条流，跨页/跨行查询只产生一条结果；同页多次按页内 occurrence 编号。 */
+function groupPdfMatchesRun(
   pages: { page: number; text: string }[],
   query: string,
   limit = 500,
@@ -171,6 +171,37 @@ export function groupPdfMatches(
       segments,
       snippet: snippetFor(combined, map[gs] ?? segments[0].start, (map[Math.max(gs, ge - 1)] ?? segments[segments.length - 1].end - 1) + 1),
     });
+  }
+  return groups;
+}
+
+/**
+ * F16：按页号连续性切 run，每个 run 内独立做跨页匹配；页缺口之间不拼接
+ *（否则缺页位置的查询会被跨缺口拼成一条假命中）。
+ */
+export function groupPdfMatches(
+  pages: { page: number; text: string }[],
+  query: string,
+  limit = 500,
+): PdfSearchGroup[] {
+  if (!pages.length) return [];
+  const runs: { page: number; text: string }[][] = [];
+  let cur: { page: number; text: string }[] = [];
+  let prevPage = Number.NaN;
+  for (const p of pages) {
+    if (cur.length && p.page === prevPage + 1) {
+      cur.push(p);
+    } else {
+      if (cur.length) runs.push(cur);
+      cur = [p];
+    }
+    prevPage = p.page;
+  }
+  if (cur.length) runs.push(cur);
+  const groups: PdfSearchGroup[] = [];
+  for (const run of runs) {
+    if (groups.length >= limit) break;
+    groups.push(...groupPdfMatchesRun(run, query, limit - groups.length));
   }
   return groups;
 }

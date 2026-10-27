@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { decodeRawPage, inflatePdfStream, undoPredictor } from "./pdfFlate";
+import {
+  MAX_INFLATED_BYTES,
+  MAX_PAGE_PIXELS,
+  MAX_PAGE_SIDE,
+  decodeRawPage,
+  inflatePdfStream,
+  pageDataError,
+  undoPredictor,
+} from "./pdfFlate";
 
 /** PNG 预测（Predictor ≥10）单行构造：`[filter, bytes...]`。 */
 function pngRow(filter: number, bytes: number[]): Uint8Array {
@@ -111,5 +119,66 @@ describe("inflatePdfStream", () => {
     );
     const out = await inflatePdfStream(zipped);
     expect(new TextDecoder().decode(out)).toBe("q 1 0 0 1 0 0 cm /Im1 Do Q");
+  });
+
+  async function zlibCompress(data: Uint8Array, fmt: "deflate" | "deflate-raw"): Promise<Uint8Array> {
+    const cs = new CompressionStream(fmt);
+    return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(cs)).arrayBuffer());
+  }
+
+  it("解压输出超过 maxBytes 时拒绝；恰好等于上限通过（F7）", async () => {
+    const data = new Uint8Array(4096).fill(7);
+    const zipped = await zlibCompress(data, "deflate");
+    // 1024 < 4096：拒绝；断言错误是「超过上限」而不是「解压失败」—— 证明首轮超限后没有再按裸 deflate 重试。
+    await expect(inflatePdfStream(zipped, 1024)).rejects.toThrow(/超过上限/);
+    // 边界：上限恰等于输出长度必须通过（判定用 >，不是 >=）。
+    const ok = await inflatePdfStream(zipped, data.length);
+    expect(ok.length).toBe(data.length);
+  });
+
+  it("畸形裸 deflate 仍可回退（deflate-raw）", async () => {
+    const src = new TextEncoder().encode("raw-deflate-fallback");
+    const zipped = await zlibCompress(src, "deflate-raw");
+    const out = await inflatePdfStream(zipped);
+    expect(new TextDecoder().decode(out)).toBe("raw-deflate-fallback");
+  });
+});
+
+describe("pageDataError：页面预算边界（F7）", () => {
+  const base = { bpc: 8, color_space: "DeviceRGB", predictor: 1 };
+
+  it("非正/非数宽高拒绝", () => {
+    expect(pageDataError({ ...base, width: 0, height: 10 })).toMatch(/宽高非法/);
+    expect(pageDataError({ ...base, width: 10, height: -1 })).toMatch(/宽高非法/);
+    expect(pageDataError({ ...base, width: Number.NaN, height: 10 })).toMatch(/宽高非法/);
+  });
+
+  it("单边超限拒绝，恰好等于上限通过", () => {
+    expect(pageDataError({ ...base, width: MAX_PAGE_SIDE, height: 1 })).toBeNull();
+    expect(pageDataError({ ...base, width: MAX_PAGE_SIDE + 1, height: 1 })).toMatch(/单边上限/);
+    expect(pageDataError({ ...base, width: 1, height: MAX_PAGE_SIDE + 1 })).toMatch(/单边上限/);
+  });
+
+  it("像素超限拒绝；恰好等于上限（在单边/字节预算内）通过", () => {
+    // 20000 × 1600 = 32,000,000 = MAX_PAGE_PIXELS（RGB 行字节 96,000,000 < 128MiB）。
+    expect(pageDataError({ ...base, width: 20_000, height: 1_600 })).toBeNull();
+    expect(pageDataError({ ...base, width: 20_000, height: 1_601 })).toMatch(/像素上限/);
+  });
+
+  it("高 bpc 的解压行字节超预算拒绝（像素未超）", () => {
+    // 8000 × 4000 = 32MP 像素恰好上限，但 RGB 16bpc 行字节 = 6 × 32MP = 192MB > 128MiB。
+    const err = pageDataError({ ...base, bpc: 16, width: 8_000, height: 4_000 });
+    expect(err).toMatch(/解压行字节/);
+    expect(MAX_INFLATED_BYTES).toBe(128 * 1024 * 1024);
+    expect(MAX_PAGE_PIXELS).toBe(32_000_000);
+  });
+
+  it("decodeRawPage 对超限页抛可读错误（不分配像素）", () => {
+    expect(() =>
+      decodeRawPage({ width: MAX_PAGE_SIDE + 1, height: 1, bpc: 8, color_space: "DeviceGray", predictor: 1 }, new Uint8Array(1)),
+    ).toThrow(/页面数据过大/);
+    expect(() =>
+      decodeRawPage({ width: 20_000, height: 1_601, bpc: 8, color_space: "DeviceRGB", predictor: 1 }, new Uint8Array(1)),
+    ).toThrow(/页面数据过大/);
   });
 });

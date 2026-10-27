@@ -478,7 +478,9 @@ pub fn sniff_ext(data: &[u8]) -> Option<&'static str> {
     None
 }
 
-pub fn make_thumbnail(data: &[u8], out_png: &Path) -> Result<(), String> {
+/// P1-8：完整解码校验（header 尺寸 + 真实像素解码）。直出与缩略图共用，
+/// 保证「header 可解析但像素截断」的图不会直出成封面。上限沿用 COVER_MAX_*。
+fn decode_cover_image(data: &[u8]) -> Result<image::DynamicImage, String> {
     if data.len() > COVER_MAX_INPUT_BYTES {
         return Err(format!(
             "封面数据过大：{} 字节（上限 {COVER_MAX_INPUT_BYTES}）",
@@ -494,7 +496,12 @@ pub fn make_thumbnail(data: &[u8], out_png: &Path) -> Result<(), String> {
     if (w as u64).saturating_mul(h as u64) > COVER_MAX_PIXELS {
         return Err(format!("封面尺寸过大：{w}×{h}（上限 {COVER_MAX_PIXELS} 像素）"));
     }
-    let img = image::load_from_memory(data).map_err(|e| e.to_string())?;
+    image::load_from_memory(data)
+        .map_err(|e| format!("封面图片解码失败（文件可能损坏或被截断）：{e}"))
+}
+
+pub fn make_thumbnail(data: &[u8], out_png: &Path) -> Result<(), String> {
+    let img = decode_cover_image(data)?;
     let thumb = img.thumbnail(320, 480);
     thumb.save(out_png).map_err(|e| e.to_string())?;
     Ok(())
@@ -532,6 +539,8 @@ pub fn direct_cover_ext(data: &[u8]) -> Option<&'static str> {
     if (w as u64).saturating_mul(h as u64) > COVER_DIRECT_MAX_PIXELS {
         return None;
     }
+    // P1-8：直出前完整解码校验，截断/损坏图不直出（返回 None 让调用方回落缩略图并报错）。
+    decode_cover_image(data).ok()?;
     Some(ext)
 }
 
@@ -544,6 +553,45 @@ pub fn is_cover_stem(stem: &str) -> bool {
         return digits(rest);
     }
     digits(stem)
+}
+
+/// 自动生成封面的 stem 判定：非空且全部为 ASCII 数字（扩展名不限）。
+/// 与 `is_cover_stem` 不同，它**不含** `custom-{数字}`：清理路径只能用这个更窄的判定，
+/// 否则会把用户自选封面（custom-*）一起删掉。
+pub fn is_auto_cover_stem(stem: &str) -> bool {
+    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 清理自动生成的封面文件，返回 (释放字节数, 删除个数)。
+///
+/// 只删「stem 为纯数字且带扩展名的普通文件」；custom-*（用户自选封面）、bg-*（阅读背景图）、
+/// background.img / default-cover* 与所有子目录一律不碰。目录读不到时返回 (0, 0)，
+/// 调用方不得把读取失败当成空目录继续全量清理（沿用 heal_missing_covers 的约定）。
+pub fn clean_auto_covers(dir: &Path) -> (u64, usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    let mut freed = 0u64;
+    let mut removed = 0usize;
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let p = Path::new(&name);
+        let Some(stem) = p.file_stem() else { continue };
+        if p.extension().is_none() || !is_auto_cover_stem(&stem.to_string_lossy()) {
+            continue;
+        }
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(e.path()).is_ok() {
+            freed += size;
+            removed += 1;
+        }
+    }
+    (freed, removed)
 }
 
 /// 按 **stem 完全相等** 清理同一封面的其它扩展名文件，保留 `keep`（刚写入的文件名）。
@@ -798,6 +846,47 @@ mod tests {
         assert!(!is_cover_stem(""));
     }
 
+    /// 自动封面判定只能认纯数字：custom-* 是用户数据，清理路径不得覆盖。
+    #[test]
+    fn is_auto_cover_stem_only_pure_digits() {
+        assert!(is_auto_cover_stem("123"));
+        assert!(is_auto_cover_stem("0"));
+        assert!(!is_auto_cover_stem(""));
+        assert!(!is_auto_cover_stem("custom-123"));
+        assert!(!is_auto_cover_stem("bg-1792370600155-10"));
+        assert!(!is_auto_cover_stem("background"));
+        assert!(!is_auto_cover_stem("default-cover"));
+        assert!(!is_auto_cover_stem("12a"));
+        assert!(!is_auto_cover_stem("١٢٣"), "非 ASCII 数字不算自动封面");
+    }
+
+    /// 清理只删自动封面：custom/bg/background/default 与子目录都保留；读目录失败返回 (0,0)。
+    #[test]
+    fn clean_auto_covers_only_auto_files() {
+        let d = tmpdir("auto_clean");
+        for n in [
+            "1.png",
+            "2.webp",
+            "custom-7.png",
+            "bg-1-2.png",
+            "default-cover.img",
+            "background.img",
+        ] {
+            std::fs::write(d.join(n), b"x").unwrap();
+        }
+        std::fs::create_dir_all(d.join("9.png")).unwrap(); // 子目录不得当文件删
+        let (bytes, removed) = clean_auto_covers(&d);
+        assert_eq!(removed, 2);
+        assert_eq!(bytes, 2);
+        assert!(!d.join("1.png").exists() && !d.join("2.webp").exists());
+        for keep in ["custom-7.png", "bg-1-2.png", "default-cover.img", "background.img"] {
+            assert!(d.join(keep).exists(), "{keep} 不得删除");
+        }
+        assert!(d.join("9.png").is_dir());
+        assert_eq!(clean_auto_covers(&d.join("missing_dir_9c1f")), (0, 0));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn clean_same_stem_exact_stem_only() {
         let d = tmpdir("stem");
@@ -1004,5 +1093,44 @@ mod tests {
     fn empty_title_fallback() {
         let svg = default_cover_svg("", "", None);
         assert!(svg.contains("未命名"));
+    }
+}
+
+#[cfg(test)]
+mod r11_cover_tests {
+    use super::*;
+    use image::ImageFormat;
+
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    /// P1-8：完整小 PNG 仍可直出；像素数据截断的 PNG 必须拒绝直出且缩略图报错。
+    #[test]
+    fn direct_cover_requires_full_decode() {
+        let ok = png_bytes();
+        assert_eq!(direct_cover_ext(&ok), Some("png"), "完整 PNG 应直出");
+        // 截掉尾部像素数据：header 尺寸仍可读，但完整解码必失败。
+        let truncated = &ok[..ok.len().saturating_sub(20)];
+        assert!(image::ImageReader::new(std::io::Cursor::new(truncated))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .is_ok(), "测试前提：header 仍可解析");
+        assert_eq!(direct_cover_ext(truncated), None, "截断图不得直出");
+        let d = std::env::temp_dir().join(format!("tp_cover_r11_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let out = d.join("t.png");
+        let err = make_thumbnail(truncated, &out).unwrap_err();
+        assert!(err.contains("解码失败"), "{err}");
+        // 坏字节同样直出拒绝。
+        assert_eq!(direct_cover_ext(b"\x89PNG\r\n\x1a\nbad"), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

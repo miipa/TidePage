@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tauri::State;
 
 pub const FORMAT: &str = "tidepage-backup";
-pub const VERSION: u32 = 1;
+/// v2：新增 orphan_books（「删书保留」的孤儿划线及其书名/作者快照）。
+/// v1 备份仍可读（缺失字段 serde default）；> VERSION 拒绝。
+pub const VERSION: u32 = 2;
 const SHELVES_KEY: &str = "library.shelves.v1";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -36,6 +38,47 @@ pub struct Backup {
     pub tags: Vec<TagRec>,
     #[serde(default)]
     pub book_tags: Vec<BookTagRec>,
+    /// v2：删书保留（keep_notes=true）产生的孤儿划线，按孤儿书分组。
+    #[serde(default)]
+    pub orphan_books: Vec<OrphanBookRec>,
+}
+
+/// v2：孤儿书的书名/作者快照 + 其下的带笔记划线。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OrphanBookRec {
+    #[serde(default)]
+    pub book_id: i64,
+    #[serde(default)]
+    pub title_snap: String,
+    #[serde(default)]
+    pub author_snap: String,
+    #[serde(default)]
+    pub deleted_at: i64,
+    #[serde(default)]
+    pub highlights: Vec<OrphanHighlightRec>,
+}
+
+/// v2：孤儿划线（字段语义与 HighlightRec 相同，只是没有书籍身份）。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OrphanHighlightRec {
+    #[serde(default)]
+    pub chapter_index: i64,
+    #[serde(default)]
+    pub chapter_title: String,
+    #[serde(default)]
+    pub pos_start: i64,
+    #[serde(default)]
+    pub pos_end: i64,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub style: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -118,6 +161,9 @@ pub struct ExportSummary {
     pub highlights: usize,
     pub tags: usize,
     pub book_tags: usize,
+    /// v2 孤儿计数（导出/预览/恢复都含）。
+    pub orphan_books: usize,
+    pub orphan_highlights: usize,
     pub skipped: usize,
     pub size_bytes: u64,
     pub path: String,
@@ -135,6 +181,9 @@ pub struct BackupPreview {
     pub highlights: usize,
     pub tags: usize,
     pub book_tags: usize,
+    /// v2 孤儿计数（导出/预览/恢复都含）。
+    pub orphan_books: usize,
+    pub orphan_highlights: usize,
     pub matched_books: usize,
     pub skipped: usize,
     pub conflicts: usize,
@@ -151,6 +200,9 @@ pub struct RestoreSummary {
     pub highlights: usize,
     pub tags: usize,
     pub book_tags: usize,
+    /// v2 孤儿计数（导出/预览/恢复都含）。
+    pub orphan_books: usize,
+    pub orphan_highlights: usize,
     pub skipped: usize,
     pub conflicts: usize,
     pub overwrite: bool,
@@ -338,28 +390,101 @@ fn collect_backup(conn: &Connection, config_json: Option<&str>) -> Result<Backup
         });
         backup.book_tags = rows.map_err(|e| e.to_string())?.flatten().collect();
     }
+    // v2：孤儿书（删书保留）单独采集，不走 JOIN books——它们本来就没有 books 行。
+    {
+        let mut by_book: HashMap<i64, OrphanBookRec> = HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT book_id, title_snap, author_snap, deleted_at FROM orphan_books ORDER BY book_id")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| {
+            Ok(OrphanBookRec {
+                book_id: r.get(0)?,
+                title_snap: r.get(1).unwrap_or_default(),
+                author_snap: r.get(2).unwrap_or_default(),
+                deleted_at: r.get(3).unwrap_or(0),
+                highlights: Vec::new(),
+            })
+        });
+        for rec in rows.map_err(|e| e.to_string())?.flatten() {
+            by_book.insert(rec.book_id, rec);
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, created_at                  FROM highlights WHERE book_id<0 ORDER BY book_id, chapter_index, pos_start",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                OrphanHighlightRec {
+                    chapter_index: r.get(1)?,
+                    chapter_title: r.get(2).unwrap_or_default(),
+                    pos_start: r.get(3).unwrap_or(0),
+                    pos_end: r.get(4).unwrap_or(0),
+                    text: r.get(5).unwrap_or_default(),
+                    style: r.get(6).unwrap_or_default(),
+                    color: r.get(7).unwrap_or_default(),
+                    note: r.get(8).unwrap_or_default(),
+                    created_at: r.get(9).unwrap_or(0),
+                },
+            ))
+        });
+        for row in rows.map_err(|e| e.to_string())?.flatten() {
+            let (book_id, hl) = row;
+            by_book
+                .entry(book_id)
+                .or_insert_with(|| OrphanBookRec { book_id, ..Default::default() })
+                .highlights
+                .push(hl);
+        }
+        let mut orphans: Vec<OrphanBookRec> = by_book.into_values().collect();
+        orphans.sort_by_key(|o| o.book_id);
+        backup.orphan_books = orphans;
+    }
     Ok(backup)
+}
+
+/// 孤儿划线总数（导出/预览计数用）。
+fn orphan_highlight_count(b: &Backup) -> usize {
+    b.orphan_books.iter().map(|o| o.highlights.len()).sum()
 }
 
 fn write_backup_atomic(path: &str, backup: &Backup) -> Result<u64, String> {
     let json = serde_json::to_vec(backup).map_err(|e| format!("序列化备份失败：{e}"))?;
     let target = Path::new(path);
     let tmp = target.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).map_err(|e| format!("写入备份失败：{e}"))?;
-    if target.exists() {
-        std::fs::remove_file(target).map_err(|e| format!("替换备份失败：{e}"))?;
-    }
-    std::fs::rename(&tmp, target).map_err(|e| {
+    // S7：替换不再「先删旧文件再 rename」——那两步之间失败会新旧备份同时丢失。
+    // 改为 target → target.bak → 新文件 → 删 .bak；任一步失败回滚。
+    let bak = target.with_extension("json.bak");
+    std::fs::write(&tmp, &json).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("保存备份失败：{e}")
+        format!("写入备份临时文件失败：{e}")
     })?;
+    let had_target = target.exists();
+    if had_target {
+        if let Err(e) = std::fs::rename(target, &bak) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("备份替换失败（旧文件转入 .bak）：{e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        // 回滚：旧文件还在 .bak 里且目标位空缺时换回去，保证旧备份不丢。
+        if had_target && bak.exists() && !target.exists() {
+            let _ = std::fs::rename(&bak, target);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("备份保存失败（临时文件替换目标）：{e}"));
+    }
+    if had_target {
+        let _ = std::fs::remove_file(&bak);
+    }
     Ok(json.len() as u64)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn export_backup_to_file(conn: &Connection, path: &str, config_json: Option<&str>) -> Result<ExportSummary, String> {
     let backup = collect_backup(conn, config_json)?;
-    let skipped = 0usize; // 导出 JOIN books，孤儿行不会进入备份
+    let skipped = 0usize; // 普通表按 JOIN books 采集；孤儿已在 orphan_books 中单独计入
     let size = write_backup_atomic(path, &backup)?;
     Ok(ExportSummary {
         progress: backup.progress.len(),
@@ -367,6 +492,8 @@ pub fn export_backup_to_file(conn: &Connection, path: &str, config_json: Option<
         highlights: backup.highlights.len(),
         tags: backup.tags.len(),
         book_tags: backup.book_tags.len(),
+        orphan_books: backup.orphan_books.len(),
+        orphan_highlights: orphan_highlight_count(&backup),
         skipped,
         size_bytes: size,
         path: path.to_string(),
@@ -379,8 +506,12 @@ fn read_backup(path: &str) -> Result<Backup, String> {
     if b.format != FORMAT {
         return Err("不是 TidePage 备份文件".into());
     }
-    if b.version != VERSION {
-        return Err(format!("备份版本 {} 不受支持（当前支持 {}）", b.version, VERSION));
+    // v2 读 v1（缺失的 orphan 字段按空）；拒绝 0 与未来版本。
+    if b.version == 0 || b.version > VERSION {
+        return Err(format!(
+            "备份版本 {} 不受支持（当前支持 1..={}）",
+            b.version, VERSION
+        ));
     }
     Ok(b)
 }
@@ -410,8 +541,16 @@ fn shelves_conflicts(conn: &Connection, backup_shelves: &Option<Value>) -> usize
         .count()
 }
 
+/// P1-5：读文件 + JSON 解析在锁外；core 只做 DB 查询/冲突判断（调用方负责持锁）。
+/// 保留包装供测试/兼容调用；生产命令直接读解析后调 core。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn inspect_backup_file(conn: &Connection, path: &str) -> Result<BackupPreview, String> {
     let b = read_backup(path)?;
+    Ok(inspect_backup_core(conn, &b))
+}
+
+/// 已解析备份的检查核心：必须在持锁段内调用（BookIndex/冲突查询基于当前 DB 状态）。
+pub fn inspect_backup_core(conn: &Connection, b: &Backup) -> BackupPreview {
     let idx = BookIndex::build(conn);
     let mut matched: HashSet<i64> = HashSet::new();
     let mut skipped = 0usize;
@@ -470,24 +609,32 @@ pub fn inspect_backup_file(conn: &Connection, path: &str) -> Result<BackupPrevie
         }
     }
     conflicts += shelves_conflicts(conn, &b.shelves);
-    let total_rows = b.progress.len() + b.bookmarks.len() + b.highlights.len() + b.book_tags.len();
-    Ok(BackupPreview {
-        format: b.format,
+    let orphan_highlights = orphan_highlight_count(&b);
+    let total_rows = b.progress.len()
+        + b.bookmarks.len()
+        + b.highlights.len()
+        + b.book_tags.len()
+        + b.orphan_books.len()
+        + orphan_highlights;
+    BackupPreview {
+        format: b.format.clone(),
         version: b.version,
-        app_version: b.app_version,
+        app_version: b.app_version.clone(),
         created_at: b.created_at,
         progress: b.progress.len(),
         bookmarks: b.bookmarks.len(),
         highlights: b.highlights.len(),
         tags: b.tags.len(),
         book_tags: b.book_tags.len(),
+        orphan_books: b.orphan_books.len(),
+        orphan_highlights,
         matched_books: matched.len(),
         skipped,
         conflicts,
         has_config: b.config.is_some(),
         has_shelves: b.shelves.is_some(),
         empty: total_rows == 0 && b.tags.is_empty() && b.shelves.is_none(),
-    })
+    }
 }
 
 fn merge_shelves(conn: &Connection, backup_shelves: &Option<Value>, overwrite: bool) -> Result<(), String> {
@@ -527,22 +674,136 @@ fn merge_shelves(conn: &Connection, backup_shelves: &Option<Value>, overwrite: b
     Ok(())
 }
 
-pub fn restore_backup_file(conn: &mut Connection, path: &str, overwrite: bool) -> Result<RestoreSummary, String> {
+/// 本机书籍的 (路径, 跨设备身份 key)：恢复笔记后清理墓碑要用。
+fn book_identity_for(conn: &Connection, book_id: i64) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT path, title, COALESCE(author,''), COALESCE(size,0) FROM books WHERE id=?1",
+        [book_id],
+        |r| {
+            let path: String = r.get(0)?;
+            let title: String = r.get(1)?;
+            let author: String = r.get(2)?;
+            let size: i64 = r.get(3)?;
+            Ok((
+                path.clone(),
+                db::book_sync_identity(&title, &author, size, &path),
+            ))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// H19：恢复 bookmarks/highlights 后清掉对应墓碑（新身份 key + legacy 路径 key）。
+/// 不清的话，下次 WebDAV 同步会被旧墓碑（早于恢复时间）重新删除。
+fn clear_note_tombstones(
+    conn: &Connection,
+    kind: &str,
+    book_id: i64,
+    chapter_index: i64,
+    pos_start: i64,
+    pos_end: i64,
+    title: &str,
+    text: &str,
+) {
+    if let Some((path, ident)) = book_identity_for(conn, book_id) {
+        let legacy = if kind == "bookmark" {
+            db::bookmark_tomb_key(&path, chapter_index, title, text)
+        } else {
+            db::highlight_tomb_key(&path, chapter_index, pos_start, pos_end, text)
+        };
+        let new_key = if kind == "bookmark" {
+            db::bookmark_sync_key(&ident, chapter_index, title, text)
+        } else {
+            db::highlight_sync_key(&ident, chapter_index, pos_start, pos_end, text)
+        };
+        let _ = db::remove_tombstone(conn, kind, &legacy);
+        let _ = db::remove_tombstone(conn, kind, &new_key);
+    }
+}
+
+/// P0-1：恢复前预解析备份能匹配到本机的书 id 集合。
+/// 用于两件事：0 匹配时在写任何表之前拒绝恢复；overwrite 时只清匹配书的数据。
+fn backup_matched_book_ids(conn: &Connection, b: &Backup) -> HashSet<i64> {
+    let idx = BookIndex::build(conn);
+    let mut matched: HashSet<i64> = HashSet::new();
+    for rec in &b.progress {
+        if let Some(id) = idx.resolve(&rec.book) { matched.insert(id); }
+    }
+    for rec in &b.bookmarks {
+        if let Some(id) = idx.resolve(&rec.book) { matched.insert(id); }
+    }
+    for rec in &b.highlights {
+        if let Some(id) = idx.resolve(&rec.book) { matched.insert(id); }
+    }
+    for rec in &b.book_tags {
+        if let Some(id) = idx.resolve(&rec.book) { matched.insert(id); }
+    }
+    matched
+}
+
+/// P0-1：备份是否有可恢复内容。只有孤儿书（删书保留的划线）也算可用；
+/// 纯配置/书架/标签定义没有书籍归属数据，不能单独触发写库恢复。
+fn backup_has_restorable_data(matched: &HashSet<i64>, b: &Backup) -> bool {
+    !matched.is_empty() || !b.orphan_books.is_empty()
+}
+
+/// P1-5：读文件 + JSON 解析在锁外；core 在锁内完成校验与写库（同一把锁、同一事务）。
+/// 保留包装供测试/兼容调用；生产命令直接读解析后调 core。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn restore_backup_file(
+    conn: &mut Connection,
+    path: &str,
+    overwrite: bool,
+) -> Result<RestoreSummary, String> {
     let b = read_backup(path)?;
+    restore_backup_core(conn, &b, overwrite)
+}
+
+/// 已解析备份的恢复核心：校验（0 匹配/matched/冲突）与写入必须在同一持锁段内，
+/// 不能基于解析前的旧状态判断。
+pub fn restore_backup_core(
+    conn: &mut Connection,
+    b: &Backup,
+    overwrite: bool,
+) -> Result<RestoreSummary, String> {
+    // P0-1：先做「能否恢复」判定，再开事务/写表。旧实现先无条件 DELETE，
+    // 0 匹配时会清空本机全部进度/划线/标签并返回 Ok（不可恢复的数据丢失）。
+    let matched = backup_matched_book_ids(conn, b);
+    if !backup_has_restorable_data(&matched, b) {
+        return Err("备份与本机书库没有匹配的书籍，已取消恢复（未修改本地数据）".into());
+    }
     let idx = BookIndex::build(conn);
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     if overwrite {
-        for table in ["progress", "bookmarks", "highlights", "tags"] {
-            tx.execute(&format!("DELETE FROM {table}"), []).map_err(|e| e.to_string())?;
+        // P0-1：覆盖语义只作用于「备份匹配到的书」；非匹配书的进度/划线/标签原样保留。
+        // 标签定义（tags）是全局共享的，不再整体 DELETE，恢复时走 create_tag 合并。
+        let ids: Vec<i64> = matched.iter().copied().collect();
+        if !ids.is_empty() {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            for table in ["progress", "bookmarks", "book_tags"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE book_id IN ({placeholders})"),
+                    rusqlite::params_from_iter(ids.iter()),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            // 本机孤儿划线（book_id<0）不在 matched 里，天然保留。
+            tx.execute(
+                &format!("DELETE FROM highlights WHERE book_id IN ({placeholders})"),
+                rusqlite::params_from_iter(ids.iter()),
+            )
+            .map_err(|e| e.to_string())?;
+            // 只重置匹配书的反规范化进度；非匹配书保持不变（旧实现全部清零）。
+            tx.execute(
+                &format!(
+                    "UPDATE books SET last_read = COALESCE(last_opened, 0), read_pct = 0 WHERE id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(ids.iter()),
+            )
+            .map_err(|e| e.to_string())?;
         }
-        tx.execute("DELETE FROM book_tags", []).map_err(|e| e.to_string())?;
-        // 覆盖模式重置 books 上的反规范化进度：无备份进度的书回到未读；
-        // 有进度的书随后由 set_progress 按备份 updated_at/pct 重建。
-        tx.execute(
-            "UPDATE books SET last_read = COALESCE(last_opened, 0), read_pct = 0",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
     }
     let mut summary = RestoreSummary { overwrite, ..Default::default() };
 
@@ -571,6 +832,8 @@ pub fn restore_backup_file(conn: &mut Connection, path: &str, overwrite: bool) -
     }
     for rec in &b.bookmarks {
         let Some(book_id) = idx.resolve(&rec.book) else { summary.skipped += 1; continue };
+        // H19：无论本条是否已存在都清对应墓碑（恢复语义 = 该记录重新存在，不应被旧墓碑再删）。
+        clear_note_tombstones(&tx, "bookmark", book_id, rec.chapter_index, 0, 0, &rec.title, &rec.excerpt);
         let exists: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM bookmarks WHERE book_id=?1 AND chapter_index=?2 AND title=?3 AND excerpt=?4",
@@ -579,15 +842,19 @@ pub fn restore_backup_file(conn: &mut Connection, path: &str, overwrite: bool) -
             )
             .unwrap_or(0);
         if exists > 0 { summary.conflicts += 1; continue; }
+        // H19：写 updated_at=now_ms()——旧实现只写 created_at，表默认 updated_at=0，
+        // 恢复出来的条目会被早于现在的墓碑再次删除。
         tx.execute(
-            "INSERT INTO bookmarks(book_id, chapter_index, title, excerpt, created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![book_id, rec.chapter_index, rec.title, rec.excerpt, rec.created_at],
+            "INSERT INTO bookmarks(book_id, chapter_index, title, excerpt, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![book_id, rec.chapter_index, rec.title, rec.excerpt, rec.created_at, now_ms()],
         )
         .map_err(|e| e.to_string())?;
         summary.bookmarks += 1;
     }
     for rec in &b.highlights {
         let Some(book_id) = idx.resolve(&rec.book) else { summary.skipped += 1; continue };
+        // H19：冲突（已存在）同样清墓碑，避免旧墓碑在下次同步再删一次。
+        clear_note_tombstones(&tx, "highlight", book_id, rec.chapter_index, rec.pos_start, rec.pos_end, "", &rec.text);
         let exists: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM highlights WHERE book_id=?1 AND chapter_index=?2 AND pos_start=?3 AND pos_end=?4 AND text=?5",
@@ -596,15 +863,18 @@ pub fn restore_backup_file(conn: &mut Connection, path: &str, overwrite: bool) -
             )
             .unwrap_or(0);
         if exists > 0 { summary.conflicts += 1; continue; }
+        // H19：updated_at=now_ms()，并清掉对应墓碑（新身份 key + legacy 路径 key）。
         tx.execute(
-            "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![book_id, rec.chapter_index, rec.chapter_title, rec.pos_start, rec.pos_end, rec.text, rec.style, rec.color, rec.note, rec.created_at],
+            "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![book_id, rec.chapter_index, rec.chapter_title, rec.pos_start, rec.pos_end, rec.text, rec.style, rec.color, rec.note, rec.created_at, now_ms()],
         )
         .map_err(|e| e.to_string())?;
         summary.highlights += 1;
     }
     for rec in &b.tags {
         if let Ok((_id, _name)) = db::create_tag(&tx, &rec.name) {
+            // H19：标签恢复同样清 tag 墓碑（create_tag 仅新建时清，已存在时这里补一次）。
+            let _ = db::remove_tombstone(&tx, "tag", &norm_key(&rec.name));
             summary.tags += 1;
         }
     }
@@ -618,7 +888,58 @@ pub fn restore_backup_file(conn: &mut Connection, path: &str, overwrite: bool) -
         let n = tx
             .execute("INSERT OR IGNORE INTO book_tags(book_id, tag_id) VALUES(?1,?2)", params![book_id, tag_id])
             .map_err(|e| e.to_string())?;
+        // H19/H20：恢复的书籍标签清 book_tag 墓碑（新身份 + legacy 两把 key）。
+        if let Some((path, ident)) = book_identity_for(&tx, book_id) {
+            let _ = db::remove_tombstone(&tx, "book_tag", &db::book_tag_tomb_key(&path, &rec.tag_name));
+            let _ = db::remove_tombstone(&tx, "book_tag", &db::book_tag_sync_key(&ident, &rec.tag_name));
+        }
         if n > 0 { summary.book_tags += 1; } else { summary.conflicts += 1; }
+    }
+    // C2：恢复孤儿（删书保留的划线）。本机已有同快照的孤儿书复用其负 id；否则用
+    // db::next_orphan_id 分配新负 id（禁止用 path_id 造负 id，那会和其它批次撞键）。
+    for o in &b.orphan_books {
+        let t = o.title_snap.trim();
+        let a = o.author_snap.trim();
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT book_id FROM orphan_books WHERE trim(title_snap)=?1 AND trim(author_snap)=?2 AND book_id<0 ORDER BY book_id DESC LIMIT 1",
+                params![t, a],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        let book_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = db::next_orphan_id(&tx);
+                tx.execute(
+                    "INSERT OR IGNORE INTO orphan_books(book_id,title_snap,author_snap,deleted_at) VALUES(?1,?2,?3,?4)",
+                    params![id, o.title_snap, o.author_snap, o.deleted_at],
+                )
+                .map_err(|e| e.to_string())?;
+                id
+            }
+        };
+        summary.orphan_books += 1;
+        for h in &o.highlights {
+            let exists: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM highlights WHERE book_id=?1 AND chapter_index=?2 AND pos_start=?3 AND pos_end=?4 AND text=?5",
+                    params![book_id, h.chapter_index, h.pos_start, h.pos_end, h.text],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if exists > 0 {
+                summary.conflicts += 1;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO highlights(book_id, chapter_index, chapter_title, pos_start, pos_end, text, style, color, note, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![book_id, h.chapter_index, h.chapter_title, h.pos_start, h.pos_end, h.text, h.style, h.color, h.note, h.created_at, now_ms()],
+            )
+            .map_err(|e| e.to_string())?;
+            summary.orphan_highlights += 1;
+        }
     }
     merge_shelves(&tx, &b.shelves, overwrite)?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -746,8 +1067,9 @@ mod tests {
         let pv = inspect_backup_file(&conn, ep.to_str().unwrap()).unwrap();
         assert!(pv.empty && pv.progress == 0 && !pv.has_config);
         let mut conn2 = conn;
-        let r = restore_backup_file(&mut conn2, ep.to_str().unwrap(), false).unwrap();
-        assert_eq!(r.progress + r.bookmarks + r.highlights, 0);
+        // P0-1：空备份/0 匹配不得进入写库，直接返回可读 Err（旧实现返回 Ok 且可能清空数据）。
+        let err = restore_backup_file(&mut conn2, ep.to_str().unwrap(), false).unwrap_err();
+        assert!(err.contains("未修改本地数据"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -866,14 +1188,340 @@ mod tests {
         let (pct2, last2): (f64, i64) = conn2
             .query_row("SELECT read_pct, last_read FROM books WHERE id=?1", [b2], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
-        assert_eq!(pct2, 0.0, "无备份进度的书 read_pct 应清零");
-        assert_eq!(last2, 50, "last_read 应回落 COALESCE(last_opened,0)");
+        // P0-1：备份只匹配到 b1，b2 不在 matched 中，覆盖恢复不得动它的任何数据。
+        assert_eq!(pct2, 88.0, "非匹配书的 read_pct 必须保留");
+        assert_eq!(last2, 999, "非匹配书的 last_read 必须保留");
         // 有备份进度的书：按备份 pct/updated_at 重建。
         let (pct1, last1): (f64, i64) = conn2
             .query_row("SELECT read_pct, last_read FROM books WHERE id=?1", [b1], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert!((pct1 - 30.0).abs() < 1e-6, "有进度书 read_pct 应按备份重建: {pct1}");
         assert!(last1 >= 100, "有进度书 last_read 应取备份 updated_at: {last1}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C2：v2 备份包含「删书保留」的孤儿划线；覆盖恢复保留本机孤儿并恢复备份孤儿；重复恢复不重复。
+    #[test]
+    fn backup_v2_orphans_roundtrip_and_overwrite_keeps_local_orphans() {
+        let root = tmp_root("orphans");
+        let (conn, _path, sp) = setup_book(&root);
+        let book_id: i64 = conn.query_row("SELECT id FROM books", [], |r| r.get(0)).unwrap();
+        // 一条带笔记（删书后进孤儿）、一条纯划线（keep_notes 会删）
+        conn.execute(
+            "INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,1,'第一章',10,20,'孤儿正文','underline','','我的感想',100)",
+            [book_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,2,'第二章',1,2,'纯划线','underline','','',200)",
+            [book_id],
+        )
+        .unwrap();
+        db::delete_books_policy(&conn, &[sp.clone()], true).unwrap();
+        let (snap_t, snap_a): (String, String) = conn
+            .query_row("SELECT title_snap, author_snap FROM orphan_books", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(snap_t, "书名", "删书保留应写入孤儿快照");
+
+        let bk = root.join("bk.json").to_string_lossy().into_owned();
+        let sum = export_backup_to_file(&conn, &bk, None).unwrap();
+        assert_eq!((sum.orphan_books, sum.orphan_highlights), (1, 1), "导出计数应含孤儿: {sum:?}");
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&bk).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2, "写盘版本应为 2");
+        assert_eq!(raw["orphan_books"][0]["title_snap"], snap_t);
+        assert_eq!(raw["orphan_books"][0]["author_snap"], snap_a);
+        assert_eq!(raw["orphan_books"][0]["highlights"][0]["note"], "我的感想");
+        assert_eq!(raw["orphan_books"][0]["highlights"][0]["text"], "孤儿正文");
+        // 纯划线不得进入备份
+        let hl_total: i64 = conn.query_row("SELECT COUNT(*) FROM highlights", [], |r| r.get(0)).unwrap();
+        assert_eq!(hl_total, 1, "keep_notes 已删纯划线");
+
+        let pv = inspect_backup_file(&conn, &bk).unwrap();
+        assert_eq!((pv.version, pv.orphan_books, pv.orphan_highlights), (2, 1, 1));
+        assert!(!pv.empty, "只有孤儿也不得判空");
+
+        // 新库：先放一个无关的本机孤儿，覆盖恢复不得删除它。
+        let root2 = tmp_root("orphans-new");
+        let mut conn2 = db::init(&root2.join("t.db")).unwrap();
+        conn2
+            .execute("INSERT INTO orphan_books(book_id,title_snap,author_snap,deleted_at) VALUES(-5,'别的书','',1)", [])
+            .unwrap();
+        conn2
+            .execute("INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(-5,0,'','',0,'保留我','underline','','老感想',1)", [])
+            .unwrap();
+        let r = restore_backup_file(&mut conn2, &bk, true).unwrap();
+        assert_eq!((r.orphan_books, r.orphan_highlights), (1, 1), "恢复计数应含孤儿: {r:?}");
+        let kept: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM highlights WHERE book_id=-5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "覆盖恢复只删书相关划线，本机孤儿必须保留");
+        let kept_book: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM orphan_books WHERE book_id=-5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept_book, 1, "本机孤儿快照不得删除");
+        // 备份孤儿已恢复（负 id、快照、正文、感想）
+        let (bid, title, author, note): (i64, String, String, String) = conn2
+            .query_row(
+                "SELECT o.book_id,o.title_snap,o.author_snap,h.note FROM orphan_books o JOIN highlights h ON h.book_id=o.book_id WHERE h.text='孤儿正文'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!(bid < 0, "孤儿 id 必须是负数: {bid}");
+        assert_eq!((title.as_str(), author.as_str(), note.as_str()), (snap_t.as_str(), snap_a.as_str(), "我的感想"));
+        // 重复恢复（合并模式）不重复插入
+        let r2 = restore_backup_file(&mut conn2, &bk, false).unwrap();
+        assert_eq!(r2.orphan_highlights, 0, "重复恢复不得重复插入孤儿划线: {r2:?}");
+        assert!(r2.conflicts >= 1);
+        let n: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM highlights WHERE text='孤儿正文'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// C2：v1 旧备份（无 orphan_books 字段）仍可预览与恢复。
+    #[test]
+    fn v1_backup_without_orphan_fields_still_works() {
+        let root = tmp_root("v1compat");
+        let (mut conn, _p, _sp) = setup_book(&root);
+        let v1 = r#"{"format":"tidepage-backup","version":1,"appVersion":"0.1.0","createdAt":1,"progress":[],"bookmarks":[],"highlights":[],"tags":[],"bookTags":[]}"#;
+        let p = root.join("v1.json");
+        std::fs::write(&p, v1).unwrap();
+        let pv = inspect_backup_file(&conn, p.to_str().unwrap()).unwrap();
+        assert_eq!((pv.version, pv.orphan_books, pv.orphan_highlights), (1, 0, 0));
+        assert!(pv.empty);
+        // P0-1：v1 空备份没有可恢复条目 → Err（旧实现返回 Ok）。
+        let err = restore_backup_file(&mut conn, p.to_str().unwrap(), true).unwrap_err();
+        assert!(err.contains("未修改本地数据"), "{err}");
+        // version 0 / 未来版本拒绝
+        let v0 = root.join("v0.json");
+        std::fs::write(&v0, r#"{"format":"tidepage-backup","version":0}"#).unwrap();
+        assert!(inspect_backup_file(&conn, v0.to_str().unwrap()).is_err());
+        let v3 = root.join("v3.json");
+        std::fs::write(&v3, r#"{"format":"tidepage-backup","version":3}"#).unwrap();
+        assert!(inspect_backup_file(&conn, v3.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H19：恢复 bookmarks/highlights 写 updated_at=now_ms()，并清掉新+legacy 墓碑。
+    #[test]
+    fn restore_refreshes_updated_at_and_clears_tombstones() {
+        let root = tmp_root("tomb19");
+        let (mut conn, _path, sp) = setup_book(&root);
+        let book_id: i64 = conn.query_row("SELECT id FROM books", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO bookmarks(book_id,chapter_index,title,excerpt,created_at) VALUES(?1,0,'t','e',100)",
+            [book_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,1,'ch',10,20,'hl','underline','','感想',200)",
+            [book_id],
+        )
+        .unwrap();
+        let (tag_id, _) = db::create_tag(&conn, "标签").unwrap();
+        conn.execute("INSERT INTO book_tags(book_id,tag_id) VALUES(?1,?2)", params![book_id, tag_id]).unwrap();
+        let bk = root.join("bk.json").to_string_lossy().into_owned();
+        export_backup_to_file(&conn, &bk, None).unwrap();
+
+        // 删掉本地条目，并写入旧墓碑（新身份 key + legacy 路径 key + tag/book_tag）
+        conn.execute("DELETE FROM bookmarks", []).unwrap();
+        conn.execute("DELETE FROM highlights", []).unwrap();
+        conn.execute("DELETE FROM book_tags", []).unwrap();
+        let ident = db::book_sync_identity("书名", "", 123, &sp);
+        for (kind, key) in [
+            ("bookmark", db::bookmark_tomb_key(&sp, 0, "t", "e")),
+            ("bookmark", db::bookmark_sync_key(&ident, 0, "t", "e")),
+            ("highlight", db::highlight_tomb_key(&sp, 1, 10, 20, "hl")),
+            ("highlight", db::highlight_sync_key(&ident, 1, 10, 20, "hl")),
+            ("book_tag", db::book_tag_tomb_key(&sp, "标签")),
+            ("book_tag", db::book_tag_sync_key(&ident, "标签")),
+            ("tag", "标签".to_lowercase()),
+        ] {
+            db::record_tombstone(&conn, kind, &key, 50).unwrap();
+        }
+        let t0 = db::now_ms();
+        let r = restore_backup_file(&mut conn, &bk, false).unwrap();
+        assert_eq!((r.bookmarks, r.highlights, r.book_tags), (1, 1, 1), "{r:?}");
+        let (created, updated): (i64, i64) = conn
+            .query_row("SELECT created_at, updated_at FROM bookmarks LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(created, 100, "created_at 应保留原值");
+        assert!(updated >= t0, "恢复应写 updated_at=now_ms: {updated} < {t0}");
+        let hl_updated: i64 = conn
+            .query_row("SELECT updated_at FROM highlights LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(hl_updated >= t0, "划线恢复同样写 updated_at");
+        let tombs: i64 = conn.query_row("SELECT COUNT(*) FROM sync_tombstones", [], |r| r.get(0)).unwrap();
+        assert_eq!(tombs, 0, "恢复后对应墓碑必须清掉: {tombs}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// S7：替换失败时旧备份不丢、tmp 清理、错误可读。
+    #[test]
+    fn write_backup_atomic_keeps_old_on_replace_failure() {
+        let dir = std::env::temp_dir().join(format!("tp_r6_backup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("TidePage-backup.json");
+        std::fs::write(&target, b"old-content").unwrap();
+        // 把 .bak 占成目录：Windows 上 rename target→bak 必然失败（目录已存在）。
+        let bak = target.with_extension("json.bak");
+        std::fs::create_dir_all(&bak).unwrap();
+        let tmp = target.with_extension("json.tmp");
+        let err = write_backup_atomic(&target.to_string_lossy(), &Backup::default()).unwrap_err();
+        assert!(err.contains("备份替换失败"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-content", "旧备份内容必须保留");
+        assert!(!tmp.exists(), "临时文件必须清理");
+        // 清理故障后正常替换：新内容落盘，无 tmp/bak 残留。
+        std::fs::remove_dir_all(&bak).unwrap();
+        let n = write_backup_atomic(&target.to_string_lossy(), &Backup::default()).unwrap();
+        assert!(n > 0);
+        assert!(std::fs::read(&target).unwrap().starts_with(b"{"), "目标应写入新 JSON");
+        assert!(!tmp.exists() && !bak.exists(), "成功后不留中间文件");
+        // 首次创建（目标不存在）也正常。
+        let fresh = dir.join("fresh.json");
+        assert!(write_backup_atomic(&fresh.to_string_lossy(), &Backup::default()).is_ok());
+        assert!(fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-1：0 匹配备份不得修改任何本地表（旧实现先 DELETE 全表）。
+    #[test]
+    fn restore_zero_match_keeps_local_data() {
+        let root = tmp_root("zero-match");
+        let (mut conn, _p, sp) = setup_book(&root);
+        let bid: i64 = conn.query_row("SELECT id FROM books", [], |r| r.get(0)).unwrap();
+        db::set_progress(&conn, bid, &crate::models::Progress {
+            chapter_index: 3, chapter_ratio: 0.5, pct: 55.0, updated_at: 111, device: "dev".into(),
+        }).unwrap();
+        conn.execute("INSERT INTO bookmarks(book_id,chapter_index,title,excerpt,created_at) VALUES(?1,1,'bm','ex',1)", [bid]).unwrap();
+        conn.execute("INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,1,'ch',1,2,'hl','underline','','n',1)", [bid]).unwrap();
+        let (tid, _) = db::create_tag(&conn, "本地标签").unwrap();
+        conn.execute("INSERT INTO book_tags(book_id,tag_id) VALUES(?1,?2)", rusqlite::params![bid, tid]).unwrap();
+        conn.execute("UPDATE books SET last_read=222, read_pct=55, last_opened=200 WHERE id=?1", [bid]).unwrap();
+        let snapshot = |c: &Connection| -> Vec<i64> {
+            vec![
+                c.query_row("SELECT COUNT(*) FROM progress", [], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT COUNT(*) FROM highlights", [], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT COUNT(*) FROM book_tags", [], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT updated_at FROM progress WHERE book_id=?1", [bid], |r| r.get(0)).unwrap(),
+                c.query_row("SELECT last_read FROM books WHERE id=?1", [bid], |r| r.get(0)).unwrap(),
+            ]
+        };
+        let before = snapshot(&conn);
+        let foreign = Backup {
+            format: FORMAT.into(), version: VERSION,
+            progress: vec![ProgressRec {
+                book: BookIdent { book_path: "C:/别的机器/不存在.epub".into(), book_title: "别的书".into(), book_author: "".into(), book_size: 999 },
+                chapter_index: 1, chapter_ratio: 0.2, pct: 10.0, updated_at: 500, device: "".into(),
+            }],
+            config: Some(serde_json::json!({"reader": {}})),
+            ..Default::default()
+        };
+        let path = root.join("zero.json").to_string_lossy().into_owned();
+        std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        for ow in [false, true] {
+            let err = restore_backup_file(&mut conn, &path, ow).unwrap_err();
+            assert!(err.contains("未修改本地数据"), "{err}");
+            assert_eq!(snapshot(&conn), before, "0 匹配恢复不得修改任何表（overwrite={ow}）");
+        }
+        // 路径本身仍匹配的书可正常恢复（确认失败不是一概拒绝）。
+        let ok = Backup {
+            format: FORMAT.into(), version: VERSION,
+            progress: vec![ProgressRec {
+                book: BookIdent { book_path: sp.clone(), book_title: "".into(), book_author: "".into(), book_size: 0 },
+                chapter_index: 0, chapter_ratio: 0.0, pct: 1.0, updated_at: 900, device: "".into(),
+            }],
+            ..Default::default()
+        };
+        let okp = root.join("ok.json").to_string_lossy().into_owned();
+        std::fs::write(&okp, serde_json::to_vec(&ok).unwrap()).unwrap();
+        assert!(restore_backup_file(&mut conn, &okp, false).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P0-1：部分匹配时只替换匹配书数据，非匹配书的进度/划线/标签保留。
+    #[test]
+    fn restore_partial_match_preserves_unmatched_books() {
+        let root = tmp_root("partial");
+        let conn = db::init(&root.join("t.db")).unwrap();
+        let pa = root.join("a.epub");
+        let pb = root.join("b.epub");
+        std::fs::write(&pa, b"a").unwrap();
+        std::fs::write(&pb, b"b").unwrap();
+        let a = db::upsert_book(&conn, &pa.to_string_lossy(), "A书", "epub", 10, 1).unwrap();
+        let b = db::upsert_book(&conn, &pb.to_string_lossy(), "B书", "epub", 20, 2).unwrap();
+        for (id, pct) in [(a, 10.0), (b, 77.0)] {
+            db::set_progress(&conn, id, &crate::models::Progress {
+                chapter_index: 1, chapter_ratio: 0.4, pct, updated_at: 100, device: "".into(),
+            }).unwrap();
+            conn.execute("INSERT INTO bookmarks(book_id,chapter_index,title,excerpt,created_at) VALUES(?1,1,'本地书签','ex',1)", [id]).unwrap();
+            conn.execute("INSERT INTO highlights(book_id,chapter_index,chapter_title,pos_start,pos_end,text,style,color,note,created_at) VALUES(?1,1,'ch',1,2,'本地划线','underline','','n',1)", [id]).unwrap();
+        }
+        let (ta, _) = db::create_tag(&conn, "A标签").unwrap();
+        let (tb, _) = db::create_tag(&conn, "B标签").unwrap();
+        conn.execute("INSERT INTO book_tags(book_id,tag_id) VALUES(?1,?2)", rusqlite::params![a, ta]).unwrap();
+        conn.execute("INSERT INTO book_tags(book_id,tag_id) VALUES(?1,?2)", rusqlite::params![b, tb]).unwrap();
+        let mut conn = conn;
+        let backup = Backup {
+            format: FORMAT.into(), version: VERSION,
+            progress: vec![ProgressRec {
+                book: BookIdent { book_path: pa.to_string_lossy().into_owned(), book_title: "".into(), book_author: "".into(), book_size: 0 },
+                chapter_index: 5, chapter_ratio: 0.9, pct: 90.0, updated_at: 500, device: "".into(),
+            }],
+            bookmarks: vec![BookmarkRec {
+                book: BookIdent { book_path: pa.to_string_lossy().into_owned(), book_title: "".into(), book_author: "".into(), book_size: 0 },
+                chapter_index: 5, title: "备份书签".into(), excerpt: "be".into(), created_at: 2,
+            }],
+            highlights: vec![HighlightRec {
+                book: BookIdent { book_path: pa.to_string_lossy().into_owned(), book_title: "".into(), book_author: "".into(), book_size: 0 },
+                chapter_index: 5, chapter_title: "备份章".into(), pos_start: 1, pos_end: 3, text: "备份划线".into(),
+                style: "underline".into(), color: "".into(), note: "".into(), created_at: 2,
+            }],
+            ..Default::default()
+        };
+        let path = root.join("partial.json").to_string_lossy().into_owned();
+        std::fs::write(&path, serde_json::to_vec(&backup).unwrap()).unwrap();
+        restore_backup_file(&mut conn, &path, true).unwrap();
+        // A：按备份替换。
+        let (apct, amark, ahl): (f64, i64, i64) = conn.query_row(
+            "SELECT (SELECT pct FROM progress WHERE book_id=?1), (SELECT COUNT(*) FROM bookmarks WHERE book_id=?1), (SELECT COUNT(*) FROM highlights WHERE book_id=?1 AND text='备份划线')",
+            [a], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(apct, 90.0);
+        assert_eq!(amark, 1, "A 的旧书签应被覆盖替换");
+        assert_eq!(ahl, 1);
+        // B：完全原样。
+        let (bpct, bmark, bhl, btag): (f64, i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT pct FROM progress WHERE book_id=?1), (SELECT COUNT(*) FROM bookmarks WHERE book_id=?1), (SELECT COUNT(*) FROM highlights WHERE book_id=?1), (SELECT COUNT(*) FROM book_tags WHERE book_id=?1)",
+            [b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!((bpct, bmark, bhl, btag), (77.0, 1, 1, 1), "非匹配书数据必须原样保留");
+        // 标签定义全局共享：B 的标签仍在。
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM tags WHERE name='B标签'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P0-1：备份只有配置/书架、没有书籍条目 → Err 且不应用任何配置/书架。
+    #[test]
+    fn restore_config_only_backup_rejected_without_changes() {
+        let root = tmp_root("config-only");
+        let (mut conn, _p, _sp) = setup_book(&root);
+        db::set_setting(&conn, SHELVES_KEY, "{\"v\":1,\"shelves\":[{\"id\":\"keep\",\"name\":\"本机书架\"}]}");
+        let before = db::get_setting(&conn, SHELVES_KEY).unwrap();
+        let b = Backup {
+            format: FORMAT.into(), version: VERSION,
+            config: Some(serde_json::json!({"reader": {}})),
+            shelves: Some(serde_json::json!([{"id":"new","name":"备份书架"}])),
+            ..Default::default()
+        };
+        let path = root.join("cfg.json").to_string_lossy().into_owned();
+        std::fs::write(&path, serde_json::to_vec(&b).unwrap()).unwrap();
+        let err = restore_backup_file(&mut conn, &path, true).unwrap_err();
+        assert!(err.contains("未修改本地数据"), "{err}");
+        assert_eq!(db::get_setting(&conn, SHELVES_KEY).unwrap(), before, "配置/书架也不得先应用");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -900,6 +1548,8 @@ pub async fn export_data_backup(
             highlights: backup.highlights.len(),
             tags: backup.tags.len(),
             book_tags: backup.book_tags.len(),
+            orphan_books: backup.orphan_books.len(),
+            orphan_highlights: orphan_highlight_count(&backup),
             skipped: 0,
             size_bytes: size,
             path: path.clone(),
@@ -916,8 +1566,10 @@ pub async fn inspect_data_backup(
 ) -> Result<BackupPreview, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // P1-5：文件读取 + JSON 解析不持锁（大备份期间 DB 命令仍可响应）。
+        let b = read_backup(&path)?;
         let conn = st.db.0.lock().unwrap();
-        inspect_backup_file(&conn, &path)
+        Ok(inspect_backup_core(&conn, &b))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -931,8 +1583,10 @@ pub async fn restore_data_backup(
 ) -> Result<RestoreSummary, String> {
     let st = state.inner().clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
+        // P1-5：解析在锁外；随后同一把锁内完成校验+写入。
+        let b = read_backup(&path)?;
         let mut conn = st.db.0.lock().unwrap();
-        restore_backup_file(&mut conn, &path, overwrite)
+        restore_backup_core(&mut conn, &b, overwrite)
     })
     .await
     .map_err(|e| e.to_string())??;

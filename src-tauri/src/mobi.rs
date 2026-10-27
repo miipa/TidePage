@@ -155,8 +155,19 @@ pub fn detect_drm(bytes: &[u8]) -> Result<(), String> {
 /// 与规范一致：0x00/0x09..0x7F 字面量；0x01..0x08 复制其后 N 字节字面量；
 /// 0x80..0xBF 与下一字节合成 14bit (距离<<3|长度-3) 回引（4KB 窗口）；
 /// 0xC0..0xFF = 空格 + (字节^0x80)。
-pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
-    let mut text: Vec<u8> = Vec::with_capacity(data.len() * 2);
+/// P1-4：PalmDoc 最坏膨胀保守上界（8x）。每个 2 字节回引最多产出 10 字节（0x80..0xBF 对
+/// 最大长度 10），而前瞻字节对最坏也要 2 字节输入，理论 <5x；取 8x 留足余量，
+/// 仅用于「解压前预算预检」，不会误伤正常记录。
+pub fn palmdoc_max_expansion(input_len: usize) -> usize {
+    input_len.saturating_mul(8).saturating_add(16)
+}
+
+/// 带输出上限的 PalmDoc 解压：边 push 边 checked 计数，超过 max_out 立即 Err，
+/// 容量按 min(声明估算, max_out) 预分配，避免按输入 2x 盲目分配。
+pub fn decompress_palmdoc_lz77_limited(data: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
+    let cap = data.len().saturating_mul(2).min(max_out);
+    let mut text: Vec<u8> = Vec::with_capacity(cap);
+    let over = || format!("PalmDoc 解压输出超过上限（{max_out} 字节）");
     let mut prev: Option<u8> = None;
     let mut pos = 0usize;
     let length = data.len();
@@ -169,32 +180,48 @@ pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
             let len = ((pair & 0x07) + 3) as usize;
             let text_pos = text.len();
             let start = if offset > text_pos { text_pos } else { text_pos - offset };
-            let end = (start + len).min(text.len().max(text_pos + len));
             for i in 0..len {
                 let src_i = start + i;
                 if src_i >= text.len() {
                     break;
                 }
+                if text.len() >= max_out {
+                    return Err(over());
+                }
                 let ch = text[src_i];
                 text.push(ch);
             }
-            let _ = end;
         } else if byte == 0x00 || (0x09..=0x7F).contains(&byte) {
+            if text.len() >= max_out {
+                return Err(over());
+            }
             text.push(byte);
         } else if (0x01..=0x08).contains(&byte) {
             let n = byte as usize;
             if pos + n <= length {
+                if text.len().saturating_add(n) > max_out {
+                    return Err(over());
+                }
                 text.extend_from_slice(&data[pos..pos + n]);
                 pos += n;
             }
         } else if (0x80..=0xBF).contains(&byte) {
             prev = Some(byte);
         } else {
+            if text.len().saturating_add(2) > max_out {
+                return Err(over());
+            }
             text.push(b' ');
             text.push(byte ^ 0x80);
         }
     }
-    text
+    Ok(text)
+}
+
+/// 旧公开入口（无上限语义，仅测试/兼容）：内部走带上限实现。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn decompress_palmdoc_lz77(data: &[u8]) -> Vec<u8> {
+    decompress_palmdoc_lz77_limited(data, usize::MAX).unwrap_or_default()
 }
 
 /// 拼接并解压可读记录区间 [first_content_record .. first_non_text)，
@@ -538,24 +565,30 @@ pub fn extract_records_and_decompress_limited(
         Compression::PalmDoc => {
             let mut out = Vec::new();
             for r in &all[start..end] {
-                out.extend_from_slice(&decompress_palmdoc_lz77(r.content));
-                if out.len() > max_bytes {
+                let remaining = max_bytes.saturating_sub(out.len());
+                // P1-4：先按保守膨胀界预检，超预算立即 Err，避免单条先膨胀再判断。
+                if palmdoc_max_expansion(r.content.len()) > remaining {
                     return Err(format!(
-                        "ParseTimeoutOrCorrupted: 解压输出超过 {max_bytes} 字节上限，文件畸形"
+                        "ParseTimeoutOrCorrupted: 记录 {} 解压预算超过 {max_bytes} 字节上限，文件畸形",
+                        r.index
                     ));
                 }
+                let bytes = decompress_palmdoc_lz77_limited(r.content, remaining)?;
+                out.extend_from_slice(&bytes);
             }
             Ok((out, None))
         }
         Compression::No => {
             let mut out = Vec::new();
             for r in &all[start..end] {
-                out.extend_from_slice(r.content);
-                if out.len() > max_bytes {
+                // P1-4：未压缩分支同样先按剩余预算预检，避免超限后已占用内存。
+                if r.content.len() > max_bytes.saturating_sub(out.len()) {
                     return Err(format!(
-                        "ParseTimeoutOrCorrupted: 正文超过 {max_bytes} 字节上限，文件畸形"
+                        "ParseTimeoutOrCorrupted: 记录 {} 正文超过 {max_bytes} 字节上限，文件畸形",
+                        r.index
                     ));
                 }
+                out.extend_from_slice(r.content);
             }
             Ok((out, None))
         }
@@ -833,6 +866,70 @@ pub fn extract_cover_path(path: &str) -> Option<Vec<u8>> {
     .flatten()
 }
 
+/// 从 record0 解析封面所需的偏移：返回 (first_image_index, EXTH201/202 偏移列表)。
+///
+/// 偏移依据：PalmDOC 头 16B 之后是 MOBI 头，字段相对 MOBI 头起点：
+/// +0x04 header_length、+0x5C first_image_index、+0x70 exth_flags。
+/// 旧实现按 +0x14 / +0x6C / +0x80 读取（分别落在 gen_version、huff_table_length、unused_0 上），
+/// EXTH 201/202 与首图回退恒不成立。抽成纯函数便于对合成 record0 做单测。
+fn cover_offsets_from_record0(r0: &[u8]) -> Option<(usize, Vec<u32>)> {
+    // 至少覆盖到 exth_flags 结尾（16 + 0x74）；不足或不是 MOBI 头直接判不可解析。
+    if r0.len() < 16 + 0x74 || r0.get(16..20) != Some(b"MOBI") {
+        return None;
+    }
+    let mobi_hdr_len =
+        u32::from_be_bytes([r0[16 + 0x04], r0[16 + 0x05], r0[16 + 0x06], r0[16 + 0x07]]) as usize;
+    // 头长度下限 0x10（覆盖到基本字段），上限不能越过 record0 末尾。
+    if !(0x10..=r0.len() - 16).contains(&mobi_hdr_len) {
+        return None;
+    }
+    let first_image =
+        u32::from_be_bytes([r0[16 + 0x5C], r0[16 + 0x5D], r0[16 + 0x5E], r0[16 + 0x5F]]) as usize;
+    let exth_flags =
+        u32::from_be_bytes([r0[16 + 0x70], r0[16 + 0x71], r0[16 + 0x72], r0[16 + 0x73]]);
+    let mut cover_offs: Vec<u32> = Vec::new();
+    if exth_flags & 0x40 != 0 {
+        let exth_start = 16 + mobi_hdr_len;
+        // EXTH 头 12 字节："EXTH" + 总长度 + 记录数。
+        let exth_ok = exth_start
+            .checked_add(12)
+            .map_or(false, |e| e <= r0.len())
+            && r0.get(exth_start..exth_start + 4) == Some(b"EXTH");
+        if exth_ok {
+            let rec_count = u32::from_be_bytes([
+                r0[exth_start + 8],
+                r0[exth_start + 9],
+                r0[exth_start + 10],
+                r0[exth_start + 11],
+            ]) as usize;
+            let mut p = exth_start + 12;
+            // 记录数沿用既有 4096 上限，损坏文件不能靠超大计数拖住解析。
+            for _ in 0..rec_count.min(4096) {
+                if p.checked_add(8).map_or(true, |e| e > r0.len()) {
+                    break;
+                }
+                let ty = u32::from_be_bytes([r0[p], r0[p + 1], r0[p + 2], r0[p + 3]]);
+                let len =
+                    u32::from_be_bytes([r0[p + 4], r0[p + 5], r0[p + 6], r0[p + 7]]) as usize;
+                if len < 8 || p.checked_add(len).map_or(true, |e| e > r0.len()) {
+                    break;
+                }
+                // 201=cover offset, 202=thumbnail offset（值为相对 first_image 的记录偏移）。
+                if (ty == 201 || ty == 202) && len >= 12 {
+                    cover_offs.push(u32::from_be_bytes([
+                        r0[p + 8],
+                        r0[p + 9],
+                        r0[p + 10],
+                        r0[p + 11],
+                    ]));
+                }
+                p += len;
+            }
+        }
+    }
+    Some((first_image, cover_offs))
+}
+
 /// **只提取封面（seek）**：不读全文。仅读取
 ///   ① PDB 头(78B) + 记录偏移表；② record0（PalmDOC+MOBI 头 + EXTH）；③ 封面所在的单条图片记录。
 /// 从 record0 的 EXTH 201/202 取封面记录相对偏移（叠加 first_image_index），seek 到该记录读取。
@@ -875,48 +972,8 @@ pub fn extract_cover_seek(path: &str) -> Option<Vec<u8>> {
         };
         // record0：PalmDOC 头(16B) + MOBI 头(+EXTH)。cap 16MB（record0 通常 < 64KB）。
         let r0 = read_rec(&mut f, 0, 16 * 1024 * 1024)?;
-        if r0.len() < 16 + 0x84 || &r0[16..20] != b"MOBI" {
-            return None;
-        }
-        let mobi_hdr_len =
-            u32::from_be_bytes([r0[16 + 0x14], r0[16 + 0x15], r0[16 + 0x16], r0[16 + 0x17]]) as usize;
-        let first_image =
-            u32::from_be_bytes([r0[16 + 0x6C], r0[16 + 0x6D], r0[16 + 0x6E], r0[16 + 0x6F]]) as usize;
-        let exth_flags =
-            u32::from_be_bytes([r0[16 + 0x80], r0[16 + 0x81], r0[16 + 0x82], r0[16 + 0x83]]);
-        let mut cover_offs: Vec<u32> = Vec::new();
-        if exth_flags & 0x40 != 0 {
-            let exth_start = 16 + mobi_hdr_len;
-            if exth_start + 12 <= r0.len() && &r0[exth_start..exth_start + 4] == b"EXTH" {
-                let rec_count = u32::from_be_bytes([
-                    r0[exth_start + 8],
-                    r0[exth_start + 9],
-                    r0[exth_start + 10],
-                    r0[exth_start + 11],
-                ]) as usize;
-                let mut p = exth_start + 12;
-                for _ in 0..rec_count.min(4096) {
-                    if p + 8 > r0.len() {
-                        break;
-                    }
-                    let ty = u32::from_be_bytes([r0[p], r0[p + 1], r0[p + 2], r0[p + 3]]);
-                    let len = u32::from_be_bytes([r0[p + 4], r0[p + 5], r0[p + 6], r0[p + 7]]) as usize;
-                    if len < 8 || p + len > r0.len() {
-                        break;
-                    }
-                    // 201=cover offset, 202=thumbnail offset（值为相对 first_image 的记录偏移）。
-                    if (ty == 201 || ty == 202) && len >= 12 {
-                        cover_offs.push(u32::from_be_bytes([
-                            r0[p + 8],
-                            r0[p + 9],
-                            r0[p + 10],
-                            r0[p + 11],
-                        ]));
-                    }
-                    p += len;
-                }
-            }
-        }
+        // 解析逻辑抽到纯函数：偏移按 MOBI 头规范读取，损坏文件安全返回 None。
+        let (first_image, cover_offs) = cover_offsets_from_record0(&r0)?;
         let is_img = |b: &[u8]| -> bool {
             b.starts_with(&[0xFF, 0xD8, 0xFF])
                 || b.starts_with(b"\x89PNG")
@@ -1036,7 +1093,7 @@ pub fn extract_images(
     out_dir: &Path,
     url_prefix: &str,
     src_stamp: Option<(i64, i64)>,
-) -> (HashMap<u32, String>, HashMap<u32, String>, Vec<String>) {
+) -> Result<(HashMap<u32, String>, HashMap<u32, String>, Vec<String>), String> {
     let mut by_rec: HashMap<u32, String> = HashMap::new();
     let mut by_res: HashMap<u32, String> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
@@ -1049,11 +1106,13 @@ pub fn extract_images(
             prune_unkept_res_files(out_dir, &HashSet::new());
             write_res_marker(out_dir, stamp, 0);
         }
-        return (by_rec, by_res, ordered);
+        return Ok((by_rec, by_res, ordered));
     }
     let reuse = res_dir_ready(out_dir, src_stamp);
     if !reuse {
-        let _ = std::fs::create_dir_all(out_dir);
+        // P0-6：目录创建失败必须上报（旧实现静默 continue，随后写盘全失败却仍 prune + 写标记）。
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| format!("创建图片目录失败（{}）：{e}", out_dir.display()))?;
     }
     if reuse {
         // 复用已落盘图片：按文件名记录号升序重建（与当初抽取的写入顺序一致）。
@@ -1072,8 +1131,13 @@ pub fn extract_images(
             }
             let Some(ext) = image_magic(c) else { continue };
             let fname = format!("r{:05}.{ext}", r.index);
-            if std::fs::write(out_dir.join(&fname), c).is_err() {
-                continue;
+            // P0-6：任一张写盘失败立即返回 Err，且不做 prune / 不写新 marker，
+            // 旧图与旧 marker 原样保留，下次打开会重新尝试。
+            if let Err(e) = std::fs::write(out_dir.join(&fname), c) {
+                return Err(format!(
+                    "写入图片失败（记录 {}，文件 {fname}）：{e}",
+                    r.index
+                ));
             }
             written.insert(fname.clone());
             let url = format!("{url_prefix}{fname}");
@@ -1087,7 +1151,7 @@ pub fn extract_images(
         }
     }
     if by_rec.is_empty() {
-        return (by_rec, by_res, ordered);
+        return Ok((by_rec, by_res, ordered));
     }
     // EXTH 121: "recidx:residx" 逗号分隔（十六进制），recidx 为绝对记录索引
     if let Some(list) = mobi.metadata.exth_record_at(121) {
@@ -1105,13 +1169,20 @@ pub fn extract_images(
             }
         }
     }
-    (by_rec, by_res, ordered)
+    Ok((by_rec, by_res, ordered))
 }
 
 
 const RES_MANIFEST: &str = ".images";
 const RES_MANIFEST_MAGIC: &[u8; 4] = b"TPIM";
 const RES_MANIFEST_VER: u16 = 1;
+/// S6：图片清单条目数上限。正常书最多数万张图；20 万条已远超真实书，但足以防止
+/// 恶意/损坏清单用巨大 count 触发 with_capacity 巨型分配。
+const MAX_MANIFEST_ENTRIES: usize = 200_000;
+/// S6：清单里源文件路径的长度上限（正常运行路径远小于此）。
+const MAX_MANIFEST_SOURCE: usize = 4096;
+/// S6：单条目最小字节数 = rec(4) + ext_len(1) + offset(8) + len(4)。
+const MIN_ENTRY_BYTES: usize = 4 + 1 + 8 + 4;
 /// 协议层单张图片上限（与 lib.rs res/ 分支一致）。
 pub const RES_IMAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
@@ -1203,12 +1274,14 @@ fn encode_manifest(m: &ResManifest) -> Vec<u8> {
 
 fn decode_manifest(b: &[u8]) -> Option<ResManifest> {
     let mut p = 0usize;
+    // S6：所有长度都用 checked_add，32 位/构造数据不会回绕成小偏移后继续切片。
     let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
-        if *p + n > b.len() {
+        let end = (*p).checked_add(n)?;
+        if end > b.len() {
             return None;
         }
-        let s = &b[*p..*p + n];
-        *p += n;
+        let s = &b[*p..end];
+        *p = end;
         Some(s)
     };
     if take(&mut p, 4)? != RES_MANIFEST_MAGIC {
@@ -1222,8 +1295,20 @@ fn decode_manifest(b: &[u8]) -> Option<ResManifest> {
     let size = i64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
     let mtime = i64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
     let slen = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?) as usize;
+    // S6：路径长度先按上限校验，再读内容。
+    if slen > MAX_MANIFEST_SOURCE {
+        return None;
+    }
     let source = String::from_utf8_lossy(take(&mut p, slen)?).into_owned();
     let count = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?) as usize;
+    // S6：count 先与硬上限、剩余字节数（每条至少 MIN_ENTRY_BYTES）对齐，通过后才分配。
+    if count > MAX_MANIFEST_ENTRIES {
+        return None;
+    }
+    let remaining = b.len().checked_sub(p)?;
+    if count.checked_mul(MIN_ENTRY_BYTES)? > remaining {
+        return None;
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let rec = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
@@ -1368,7 +1453,8 @@ pub fn read_res_image_manifest(
         if entry.offset + entry.len as u64 > size as u64 {
             continue;
         }
-        let mut f = std::fs::File::open(src).ok()?;
+        // P1-5：主 source 打开失败不能再提前 return None，否则 fallback_source 永远不会尝试。
+        let Ok(mut f) = std::fs::File::open(src) else { continue };
         use std::io::{Read, Seek, SeekFrom};
         if f.seek(SeekFrom::Start(entry.offset)).is_err() {
             continue;
@@ -1465,7 +1551,7 @@ pub fn extract_images_lazy(
     url_prefix: &str,
     src_stamp: Option<(i64, i64)>,
     src_path: &str,
-) -> (HashMap<u32, String>, HashMap<u32, String>, Vec<String>) {
+) -> Result<(HashMap<u32, String>, HashMap<u32, String>, Vec<String>), String> {
     let state = res_dir_state(out_dir, src_stamp);
     match state {
         ResDirState::Lazy => {
@@ -1473,7 +1559,7 @@ pub fn extract_images_lazy(
                 let (by_rec, ordered) = manifest_maps(&m, url_prefix);
                 let fi = mobi.metadata.mobi.first_image_index;
                 let by_res = build_res_map(mobi, &by_rec, fi);
-                return (by_rec, by_res, ordered);
+                return Ok((by_rec, by_res, ordered));
             }
             // 清单读取失败：回退全量写盘（保持正确性）。
         }
@@ -1495,7 +1581,7 @@ pub fn extract_images_lazy(
             let (by_rec, ordered) = manifest_maps(&manifest, url_prefix);
             let fi = mobi.metadata.mobi.first_image_index;
             let by_res = build_res_map(mobi, &by_rec, fi);
-            return (by_rec, by_res, ordered);
+            return Ok((by_rec, by_res, ordered));
         }
     }
     // 构建/校验失败：回退现有全量写盘模式（慢但正确），并清掉可能残留的半成品清单。
@@ -2114,14 +2200,28 @@ pub fn parse_with_cover(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>
 
 // staged: parse_with_cover 的 catch_unwind 内核（随其一同保留）。
 #[allow(dead_code)]
+/// P1-6：解析前后源指纹一致才算成功；两端都取不到指纹视为一致（老文件系统限制）。
+fn stamp_consistent(before: Option<(i64, i64)>, after: Option<(i64, i64)>) -> bool {
+    before == after
+}
+
 fn parse_with_cover_inner(path: &str) -> (Result<MobiDoc, String>, Option<Vec<u8>>) {
+    let stamp_before = src_file_stamp(path);
     let mobi = match read_and_parse_mobi_bytes(path) {
         Ok(m) => m,
         Err(e) => return (Err(e), None),
     };
     let cover = extract_cover_bytes(&mobi);
-    match build_mobi_doc(path, &mobi, None, None, ResMode::Files) {
-        Ok(doc) => (Ok(doc), cover),
+    match build_mobi_doc(path, &mobi, None, None, ResMode::Files, stamp_before) {
+        Ok(doc) => {
+            if !stamp_consistent(stamp_before, src_file_stamp(path)) {
+                return (
+                    Err("MOBI 文件在解析期间被替换，请重试".to_string()),
+                    None,
+                );
+            }
+            (Ok(doc), cover)
+        }
         Err(e) => (Err(e), None),
     }
 }
@@ -2132,8 +2232,14 @@ fn parse_full_inner(
     images: Option<(&Path, &str)>,
     res_mode: ResMode,
 ) -> Result<MobiDoc, String> {
+    // P1-6：解析前取一次源指纹，传给抽图/清单使用；结束后复核，防止新旧文件混用。
+    let stamp_before = src_file_stamp(path);
     let mobi = read_and_parse_mobi_bytes(path)?;
-    build_mobi_doc(path, &mobi, force_encoding, images, res_mode)
+    let doc = build_mobi_doc(path, &mobi, force_encoding, images, res_mode, stamp_before)?;
+    if !stamp_consistent(stamp_before, src_file_stamp(path)) {
+        return Err("MOBI 文件在解析期间被替换，请重试".to_string());
+    }
+    Ok(doc)
 }
 
 /// 纯构建：解码/清洗正文、改写图片、切分章节（不做任何文件读取）。
@@ -2143,6 +2249,7 @@ fn build_mobi_doc(
     force_encoding: Option<&str>,
     images: Option<(&Path, &str)>,
     res_mode: ResMode,
+    src_stamp: Option<(i64, i64)>,
 ) -> Result<MobiDoc, String> {
     // C3：环境变量开启的分段计时（默认零输出，不改变行为）；用于大书 profile 定位。
     let prof = std::env::var("TIDEPAGE_PARSE_PROFILE").is_ok();
@@ -2188,11 +2295,10 @@ fn build_mobi_doc(
     let mut res_map = 0usize;
     let mut rewrite_stats = RewriteStats::default();
     if let Some((dir, prefix)) = images {
+        // P0-6：抽图失败向上传播（解析错误由 open_book 以可读错误返回）。
         let (by_rec, by_res, ordered) = match res_mode {
-            ResMode::Lazy => {
-                extract_images_lazy(&mobi, dir, prefix, src_file_stamp(path), path)
-            }
-            ResMode::Files => extract_images(&mobi, dir, prefix, src_file_stamp(path)),
+            ResMode::Lazy => extract_images_lazy(&mobi, dir, prefix, src_stamp, path)?,
+            ResMode::Files => extract_images(&mobi, dir, prefix, src_stamp)?,
         };
         image_count = ordered.len();
         res_map = by_res.len();
@@ -2933,7 +3039,7 @@ mod tests {
         let mobi = Mobi::new(&b).unwrap();
         let dir = std::env::temp_dir().join(format!("tidepage-mobi-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://tidepage.localhost/res/1/", None);
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "http://tidepage.localhost/res/1/", None).unwrap();
         assert_eq!(ordered.len(), 2, "应提取 2 张图");
         std::fs::remove_dir_all(&dir).ok();
         let html = String::from_utf8_lossy(&text).to_string();
@@ -3024,13 +3130,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tidepage-mobi-reuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let stamp = (12345i64, 67890i64);
-        let (by_rec1, by_res1, ordered1) = extract_images(&mobi, &dir, "res/", Some(stamp));
+        let (by_rec1, by_res1, ordered1) = extract_images(&mobi, &dir, "res/", Some(stamp)).unwrap();
         assert_eq!(ordered1.len(), 2, "应提取 2 张图");
         assert_eq!(by_res1.len(), 1);
         // 篡改一张已落盘图片：复用分支不得重写，所以篡改内容会保留（证明没有重新抽图）。
         let tampered = dir.join("r00002.jpg");
         std::fs::write(&tampered, b"tampered").unwrap();
-        let (by_rec2, by_res2, ordered2) = extract_images(&mobi, &dir, "res/", Some(stamp));
+        let (by_rec2, by_res2, ordered2) = extract_images(&mobi, &dir, "res/", Some(stamp)).unwrap();
         assert_eq!(ordered2, ordered1, "复用重建的按序映射必须一致");
         assert_eq!(by_rec2, by_rec1);
         assert_eq!(by_res2, by_res1);
@@ -3055,7 +3161,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 旧版本残留的图片：无图分支必须清掉，否则「扫描数 == 标记数」永远不成立。
         std::fs::write(dir.join("r00009.png"), b"stale").unwrap();
-        let (_by_rec, _by_res, ordered) = extract_images(&mobi, &dir, "res/", Some((1, 2)));
+        let (_by_rec, _by_res, ordered) = extract_images(&mobi, &dir, "res/", Some((1, 2))).unwrap();
         assert!(ordered.is_empty());
         assert!(!dir.join("r00009.png").exists(), "无图分支应清掉旧图残留");
         assert!(res_dir_ready(&dir, Some((1, 2))), "无图书也应写 0 张标记供磁盘缓存复用");
@@ -3084,7 +3190,7 @@ mod tests {
         let mobi = Mobi::new(&b).unwrap();
         let dir = std::env::temp_dir().join(format!("tidepage-mobi-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/", None);
+        let (by_rec, by_res, ordered) = extract_images(&mobi, &dir, "res/", None).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let fi = mobi.metadata.mobi.first_image_index;
         assert_eq!(fi, 2);
@@ -3747,14 +3853,14 @@ mod tests {
         let stamp = src_file_stamp(&path);
         let lazy_dir = keep.join("res_lazy");
         let (by_rec, by_res, ordered) =
-            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path);
+            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path).unwrap();
         assert_eq!(ordered.len(), 2, "两张图都进清单");
         assert_eq!(res_dir_state(&lazy_dir, stamp), ResDirState::Lazy);
         let names = res_image_names(&lazy_dir).expect("Lazy 应能列出图片名");
         assert_eq!(names.len(), 2);
         // Files 模式对照：三种映射必须完全一致。
         let files_dir = keep.join("res_files");
-        let (f_rec, f_res, f_ordered) = extract_images(&mobi, &files_dir, "http://x/", stamp);
+        let (f_rec, f_res, f_ordered) = extract_images(&mobi, &files_dir, "http://x/", stamp).unwrap();
         assert_eq!(by_rec, f_rec);
         assert_eq!(by_res, f_res);
         assert_eq!(ordered, f_ordered);
@@ -3771,7 +3877,7 @@ mod tests {
         // 重复调用 Lazy 命中：映射不变、清单不重建。
         let manifest_before = std::fs::read(res_manifest_path(&lazy_dir)).unwrap();
         let (by_rec2, _, ordered2) =
-            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path);
+            extract_images_lazy(&mobi, &lazy_dir, "http://x/", stamp, &path).unwrap();
         assert_eq!(by_rec2, by_rec);
         assert_eq!(ordered2, ordered);
         let manifest_after = std::fs::read(res_manifest_path(&lazy_dir)).unwrap();
@@ -3789,7 +3895,7 @@ mod tests {
         let dir = keep.join("res");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("r99999.jpg"), b"stale").unwrap();
-        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path).unwrap();
         assert!(!dir.join("r99999.jpg").exists(), "旧残留图片应被清理");
         let mut m = read_manifest(&dir).unwrap();
         m.source = "C:/definitely-missing-book.mobi".into();
@@ -3819,7 +3925,7 @@ mod tests {
         let stamp = src_file_stamp(&path);
         let dir = keep.join("res");
         let (by_rec, by_res, ordered) =
-            extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+            extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path).unwrap();
         assert!(by_rec.is_empty() && by_res.is_empty() && ordered.is_empty());
         assert_eq!(res_dir_state(&dir, stamp), ResDirState::Lazy);
         assert_eq!(res_image_names(&dir), Some(Vec::new()));
@@ -3880,7 +3986,7 @@ mod tests {
         let mobi = read_and_parse_mobi_bytes(&path).unwrap();
         let stamp = src_file_stamp(&path);
         let dir = keep.join("res");
-        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path).unwrap();
         let names = res_image_names(&dir).expect("Lazy 应列出图片名");
         assert!(names.iter().all(|n| is_res_image_name(n)), "只能有合法图片名");
         assert!(!names.iter().any(|n| n.starts_with('.')), "不得含隐藏标记/清单文件");
@@ -3904,9 +4010,64 @@ mod tests {
         let blocker = keep.join("not_a_dir");
         std::fs::write(&blocker, b"x").unwrap();
         let dir = blocker.join("res");
-        let (by_rec, _, ordered) = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
-        assert!(by_rec.is_empty() && ordered.is_empty(), "不可写目录应安全返回空映射");
+        // P0-6：写盘失败必须返回 Err（旧实现静默返回空映射，还会写「0 张」类自洽标记）。
+        let err = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path).unwrap_err();
+        assert!(
+            err.contains("创建图片目录失败") || err.contains("写入图片失败") || err.contains("清单"),
+            "{err}"
+        );
         assert_eq!(res_dir_state(&dir, stamp), ResDirState::NotReady);
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// P0-6：抽图写盘失败 → Err；不 prune 旧图、不写新 marker；移除阻塞后重试成功。
+    #[test]
+    fn extract_images_write_failure_keeps_old_files_and_marker() {
+        let (bytes, _imgs) = build_image_mobi();
+        let (path, keep) = write_mobi_file(&bytes, "write-fail");
+        let mobi = read_and_parse_mobi_bytes(&path).unwrap();
+        let dir = keep.join("res");
+        let stamp1 = src_file_stamp(&path).unwrap();
+        let (by1, _, ordered1) = extract_images(&mobi, &dir, "http://x/", Some(stamp1)).unwrap();
+        assert!(!by1.is_empty() && !ordered1.is_empty(), "首次抽图应成功");
+        let marker_path = res_marker_path(&dir);
+        let marker_before = std::fs::read_to_string(&marker_path).unwrap();
+        let old_files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('r'))
+            .map(|e| e.path())
+            .collect();
+        assert!(old_files.len() >= 2, "合成书应有多张图: {}", old_files.len());
+
+        // 新指纹 → reuse=false 走重写；把其中一个目标文件名占成目录，写盘必然失败。
+        let stamp2 = Some((stamp1.0, stamp1.1 + 1));
+        let blocker = old_files[0].clone();
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir_all(&blocker).unwrap();
+        let err = extract_images(&mobi, &dir, "http://x/", stamp2).unwrap_err();
+        assert!(err.contains("写入图片失败"), "{err}");
+        assert!(err.contains("记录"), "错误应含记录号/文件名: {err}");
+        // 旧 marker 不得被改写。
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            marker_before,
+            "失败时不得写新 marker"
+        );
+        // 其它旧图未被 prune。
+        assert!(
+            old_files.iter().skip(1).all(|p| p.exists()),
+            "失败时不得 prune 旧图片"
+        );
+        // 移除阻塞后重试成功并更新 marker。
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let (by2, _, ordered2) = extract_images(&mobi, &dir, "http://x/", stamp2).unwrap();
+        assert!(!by2.is_empty() && !ordered2.is_empty());
+        assert_ne!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            marker_before,
+            "成功后 marker 应更新"
+        );
         let _ = std::fs::remove_dir_all(&keep);
     }
 
@@ -3918,18 +4079,217 @@ mod tests {
         let mobi = read_and_parse_mobi_bytes(&path).unwrap();
         let stamp = src_file_stamp(&path);
         let dir = keep.join("res");
-        let (f_rec, _, f_ordered) = extract_images(&mobi, &dir, "http://x/", stamp);
+        let (f_rec, _, f_ordered) = extract_images(&mobi, &dir, "http://x/", stamp).unwrap();
         assert_eq!(res_dir_state(&dir, stamp), ResDirState::Files);
-        let (by_rec, _, ordered) = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path);
+        let (by_rec, _, ordered) = extract_images_lazy(&mobi, &dir, "http://x/", stamp, &path).unwrap();
         assert_eq!(by_rec, f_rec);
         assert_eq!(ordered, f_ordered);
         assert_eq!(res_dir_state(&dir, stamp), ResDirState::Files, "旧目录保持 files 模式");
         assert!(!res_manifest_path(&dir).exists(), "复用旧目录不写清单");
         // 无指纹：无法建清单，直接回退 Files 写盘（不写清单）。
         let dir2 = keep.join("res_nostamp");
-        extract_images_lazy(&mobi, &dir2, "http://x/", None, &path);
+        extract_images_lazy(&mobi, &dir2, "http://x/", None, &path).unwrap();
         assert!(!res_manifest_path(&dir2).exists(), "无指纹不得写清单");
         let _ = std::fs::remove_dir_all(&keep);
     }
+
+    /// 构造合成 record0：PalmDOC 头(16B) + MOBI 头(hdr_len) + EXTH。
+    /// 旧实现误用的 0x14/0x6C/0x80 一律填垃圾值，用来断言修正后的偏移不受它们影响。
+    fn synth_record0(first_image: u32, covers: &[u32], exth_flags: u32, hdr_len: u32) -> Vec<u8> {
+        let hdr = hdr_len as usize;
+        let mut r0 = vec![0u8; 16 + hdr + 12 + covers.len() * 12];
+        r0[16..20].copy_from_slice(b"MOBI");
+        r0[16 + 0x04..16 + 0x08].copy_from_slice(&hdr_len.to_be_bytes()); // +0x04 header_length
+        r0[16 + 0x5C..16 + 0x60].copy_from_slice(&first_image.to_be_bytes()); // +0x5C first_image
+        r0[16 + 0x70..16 + 0x74].copy_from_slice(&exth_flags.to_be_bytes()); // +0x70 exth_flags
+        // 旧偏移处的垃圾值（gen_version / huff_table_length / unused_0）
+        r0[16 + 0x14..16 + 0x18].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        r0[16 + 0x6C..16 + 0x70].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        r0[16 + 0x80..16 + 0x84].copy_from_slice(&0u32.to_be_bytes());
+        let exth = 16 + hdr;
+        r0[exth..exth + 4].copy_from_slice(b"EXTH");
+        let total = (12 + covers.len() * 12) as u32;
+        r0[exth + 4..exth + 8].copy_from_slice(&total.to_be_bytes());
+        r0[exth + 8..exth + 12].copy_from_slice(&(covers.len() as u32).to_be_bytes());
+        let mut p = exth + 12;
+        for (i, v) in covers.iter().enumerate() {
+            let ty = if i == 0 { 201u32 } else { 202u32 };
+            r0[p..p + 4].copy_from_slice(&ty.to_be_bytes());
+            r0[p + 4..p + 8].copy_from_slice(&12u32.to_be_bytes());
+            r0[p + 8..p + 12].copy_from_slice(&v.to_be_bytes());
+            p += 12;
+        }
+        r0
+    }
+
+    /// H14：封面偏移按 MOBI 头真实字段读（+0x04/+0x5C/+0x70），旧偏移的垃圾值不影响结果。
+    #[test]
+    fn record0_cover_offsets_use_real_mobi_header_offsets() {
+        let r0 = synth_record0(5, &[2, 3], 0x40, 0xE8);
+        let (fi, offs) = cover_offsets_from_record0(&r0).expect("合法合成 record0 应解析成功");
+        assert_eq!(fi, 5);
+        assert_eq!(offs, vec![2, 3]);
+        // 无 EXTH 标志：只有 first_image，旧偏移处的垃圾值不得混进来。
+        let r0 = synth_record0(7, &[], 0, 0xE8);
+        let (fi, offs) = cover_offsets_from_record0(&r0).unwrap();
+        assert_eq!(fi, 7);
+        assert!(offs.is_empty());
+        // 任意截断前缀都不 panic。
+        let full = synth_record0(5, &[2], 0x40, 0xE8);
+        for n in 0..=full.len() {
+            let _ = cover_offsets_from_record0(&full[..n]);
+        }
+        // 不足 exth_flags 结尾 / 非 MOBI 魔数 / 头长度越界 ⇒ None
+        assert!(cover_offsets_from_record0(&full[..16 + 0x74]).is_none());
+        assert!(cover_offsets_from_record0(&vec![0u8; 256]).is_none());
+        let mut bad_hdr = full.clone();
+        bad_hdr[16 + 0x04..16 + 0x08].copy_from_slice(&0x08u32.to_be_bytes());
+        assert!(cover_offsets_from_record0(&bad_hdr).is_none());
+        let mut huge_hdr = full.clone();
+        huge_hdr[16 + 0x04..16 + 0x08].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(cover_offsets_from_record0(&huge_hdr).is_none());
+    }
+
+    // ---------------- S6：.images 清单解码上限 ----------------
+
+    fn sample_manifest() -> ResManifest {
+        ResManifest {
+            size: 1234,
+            mtime: 5678,
+            source: "C:/books/a.mobi".to_string(),
+            entries: vec![
+                ResImageEntry { rec: 5, ext: "jpg".to_string(), offset: 100, len: 200 },
+                ResImageEntry { rec: 9, ext: "png".to_string(), offset: 300, len: 400 },
+            ],
+        }
+    }
+
+    /// 清单头部里 count 字段的偏移：magic(4)+ver(2)+pad(2)+size(8)+mtime(8)+slen(4)+source+slen。
+    fn manifest_count_offset(m: &[u8]) -> usize {
+        let slen = u32::from_le_bytes(m[24..28].try_into().unwrap()) as usize;
+        28 + slen
+    }
+
+    #[test]
+    fn manifest_roundtrip_keeps_entries() {
+        let m = sample_manifest();
+        let b = encode_manifest(&m);
+        let got = decode_manifest(&b).expect("正常清单应可解码");
+        assert_eq!(got.size, m.size);
+        assert_eq!(got.mtime, m.mtime);
+        assert_eq!(got.source, m.source);
+        assert_eq!(got.entries.len(), 2);
+        assert_eq!(got.entries[0].rec, 5);
+        assert_eq!(got.entries[0].ext, "jpg");
+        assert_eq!(got.entries[0].offset, 100);
+        assert_eq!(got.entries[0].len, 200);
+        assert_eq!(got.entries[1].rec, 9);
+    }
+
+    #[test]
+    fn manifest_rejects_huge_count_without_allocating() {
+        let mut m = sample_manifest();
+        m.entries.clear();
+        let mut b = encode_manifest(&m);
+        let off = manifest_count_offset(&b);
+        b[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_manifest(&b).is_none(), "count=u32::MAX 必须拒绝");
+    }
+
+    #[test]
+    fn manifest_rejects_count_without_entry_bytes() {
+        let mut m = sample_manifest();
+        m.entries.clear();
+        let mut b = encode_manifest(&m);
+        let off = manifest_count_offset(&b);
+        b[off..off + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_manifest(&b).is_none(), "声明 2 条但无条目字节必须拒绝");
+    }
+
+    #[test]
+    fn manifest_rejects_truncated_entry() {
+        let b = encode_manifest(&sample_manifest());
+        assert!(decode_manifest(&b[..b.len() - 1]).is_none(), "条目中途截断必须拒绝");
+    }
+
+    #[test]
+    fn manifest_rejects_oversized_source_path() {
+        let mut m = sample_manifest();
+        m.entries.clear();
+        let mut b = encode_manifest(&m);
+        b[24..28].copy_from_slice(&((MAX_MANIFEST_SOURCE as u32) + 1).to_le_bytes());
+        assert!(decode_manifest(&b).is_none(), "源路径超上限必须拒绝");
+    }
 }
 
+#[cfg(test)]
+mod r11_mobi_tests {
+    use super::*;
+
+    /// P1-4：膨胀上界/输出上限边界；0 输入与恰好上限通过、+1 拒绝。
+    #[test]
+    fn palmdoc_limited_boundaries() {
+        assert_eq!(palmdoc_max_expansion(0), 16);
+        assert_eq!(palmdoc_max_expansion(10), 96);
+        assert_eq!(decompress_palmdoc_lz77_limited(b"", 0).unwrap(), Vec::<u8>::new());
+        assert_eq!(decompress_palmdoc_lz77_limited(b"hello", 5).unwrap(), b"hello");
+        assert!(decompress_palmdoc_lz77_limited(b"hello", 4).is_err());
+        // 0xC0..0xFF = 空格 + 字面量，单字节膨胀 2 倍：上限 1 必拒绝。
+        assert!(decompress_palmdoc_lz77_limited(&[0xC0, 0xC1], 1).is_err());
+        assert_eq!(decompress_palmdoc_lz77_limited(&[0xC0], 2).unwrap(), b" @");
+    }
+
+    /// P1-6：解析前后源指纹一致性判定。
+    #[test]
+    fn stamp_consistency_rules() {
+        let a = Some((100i64, 200i64));
+        assert!(stamp_consistent(a, a));
+        assert!(stamp_consistent(None, None));
+        assert!(!stamp_consistent(a, Some((100, 201))));
+        assert!(!stamp_consistent(a, None));
+        assert!(!stamp_consistent(None, a));
+    }
+
+    /// P1-5：manifest.source 不可读时继续尝试 fallback_source；两源都失败才 None。
+    #[test]
+    fn manifest_reads_fallback_source_when_primary_missing() {
+        let d = std::env::temp_dir().join(format!("tp_manifest_r11_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let good = d.join("good.bin");
+        std::fs::write(&good, b"ABCDEFGH").unwrap();
+        let meta = std::fs::metadata(&good).unwrap();
+        let size = meta.len() as i64;
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mk = |source: &str| ResManifest {
+            size,
+            mtime,
+            source: source.to_string(),
+            entries: vec![ResImageEntry {
+                rec: 1,
+                ext: "png".into(),
+                offset: 2,
+                len: 3,
+            }],
+        };
+        let missing = mk(d.join("missing.bin").to_str().unwrap());
+        let (mime, bytes) = read_res_image_manifest(&missing, "r00001.png", good.to_str())
+            .expect("主 source 不存在时应回退 fallback_source");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"CDE");
+        // 两源都失败 → None。
+        assert!(read_res_image_manifest(&missing, "r00001.png", d.join("nope.bin").to_str()).is_none());
+        // 主 source 存在但指纹不符 → 继续 fallback。
+        let bad = d.join("bad.bin");
+        std::fs::write(&bad, b"XX").unwrap();
+        let mismatch = mk(bad.to_str().unwrap());
+        let got = read_res_image_manifest(&mismatch, "r00001.png", good.to_str());
+        assert!(got.is_some(), "指纹不符时仍应尝试 fallback");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

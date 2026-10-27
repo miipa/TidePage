@@ -28,6 +28,7 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { prefersReducedMotion } from "./reducedMotion";
+import { TimerGate } from "./timerGate";
 
 const BASE_LABEL = "main";
 const EDGE_SNAP = 10;         // 物理 px：边缘差 ≤ 此值且另一轴真实重叠 → 真正吸附（6–12 取中）
@@ -56,6 +57,9 @@ let syncing = false;
 let expected: XY | null = null;
 let suppressUntil = 0;
 let settleTimer: ReturnType<typeof setTimeout> | undefined;
+// F7：节流评估的定时器改为可取消门，stopSnap 时统一清掉，避免卸载后仍评估/吸附。
+let evalGate = new TimerGate();
+let previewGate = new TimerGate();
 let lastSatPos: XY = { x: 0, y: 0 };
 let evalPending = false;
 let previewPending = false;
@@ -161,6 +165,11 @@ export async function refreshSnapBase(): Promise<void> {
 export async function startSnap(): Promise<void> {
   if (started) return;
   started = true;
+  // 停止后再次启动：换新门并复位 pending，否则 stopped 的门会吞掉后续调度。
+  evalGate = new TimerGate();
+  previewGate = new TimerGate();
+  evalPending = false;
+  previewPending = false;
   const win = getCurrentWindow();
   myLabel = win.label;
   isBase = myLabel === BASE_LABEL;
@@ -206,6 +215,11 @@ export async function stopSnap(): Promise<void> {
   for (const un of unlisteners) { try { un(); } catch { /* ignore */ } }
   unlisteners = [];
   if (settleTimer !== undefined) { clearTimeout(settleTimer); settleTimer = undefined; }
+  // F7：清理节流评估定时器（旧实现 setTimeout 句柄丢失，卸载后仍会评估/吸附）。
+  evalGate.stop();
+  previewGate.stop();
+  evalPending = false;
+  previewPending = false;
   if (bcTimer !== undefined) { clearTimeout(bcTimer); bcTimer = undefined; }
   bcPending = null;
   if (raiseTimer !== undefined) { clearTimeout(raiseTimer); raiseTimer = undefined; }
@@ -232,9 +246,9 @@ async function mirrorToBase(basePos: XY): Promise<void> {
 }
 
 function scheduleEvaluate(): void {
-  if (evalPending || grouped) return;
+  if (evalPending || grouped || !started || evalGate.stopped) return;
   evalPending = true;
-  setTimeout(() => { evalPending = false; void evaluateSnapOnce(); }, EVAL_THROTTLE_MS);
+  evalGate.schedule(() => { evalPending = false; void evaluateSnapOnce(); }, EVAL_THROTTLE_MS);
 }
 
 // 卫星窗自身移动
@@ -256,11 +270,12 @@ function onSatelliteMoved(pos: XY): void {
 
 // 预吸附评估：只计算最小边缘差，进阈值→显示预吸附视觉；不 setPosition/不写 offset/不改 grouped
 function schedulePreview(): void {
-  if (previewPending) return;
+  if (previewPending || !started || previewGate.stopped) return;
   previewPending = true;
-  setTimeout(() => { previewPending = false; void evaluateSnapPreview(); }, PREVIEW_THROTTLE_MS);
+  previewGate.schedule(() => { previewPending = false; void evaluateSnapPreview(); }, PREVIEW_THROTTLE_MS);
 }
 async function evaluateSnapPreview(): Promise<void> {
+  if (!started || previewGate.stopped) return;
   if (grouped) { setPreview(false); return; }
   const self = getCurrentWindow();
   let baseWin = await WebviewWindow.getByLabel(baseLabel);
@@ -277,6 +292,7 @@ async function evaluateSnapPreview(): Promise<void> {
 
 // 松手/主窗贴近后评估一次：边缘差 ≤ EDGE_SNAP 且另一轴真实重叠才吸附
 async function evaluateSnapOnce(): Promise<void> {
+  if (!started || evalGate.stopped) return;
   if (grouped) return;
   const self = getCurrentWindow();
   let baseWin = await WebviewWindow.getByLabel(baseLabel);

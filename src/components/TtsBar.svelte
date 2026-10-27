@@ -5,6 +5,8 @@
   import {
     refreshOnlineVoices,
     refreshVoices,
+    ttsArmSleep,
+    ttsClearSleep,
     ttsNext,
     ttsPauseResume,
     ttsPrev,
@@ -12,6 +14,7 @@
     ttsState,
     ttsStop,
   } from "../lib/tts.svelte";
+  import { shouldArmSleep, sleepRemainingSec } from "../lib/ttsSleep";
   import { getBookOverride, setBookOverride, type BookOverride } from "../lib/bookcfg.svelte";
   import type { FlatSegment, OnlineVoice } from "../lib/tts.svelte";
   import {
@@ -53,8 +56,13 @@
   const FALLBACK_ONLINE_VOICES: OnlineVoice[] = [];
 
   let expanded = $state(false);
-  let sleepLeft = $state(0);
-  let sleepEnd = 0;
+  /** F5-H1：只做「每秒触发响应」的 tick；剩余时间来自 ttsState.sleepDeadline。 */
+  let nowTick = $state(Date.now());
+  const sleepLeft = $derived(
+    config.tts.sleepMinutes === -1
+      ? -1
+      : sleepRemainingSec(ttsState.sleepDeadline, nowTick),
+  );
 
   refreshVoices();
 
@@ -77,32 +85,41 @@
     }
   });
 
+  // F5-H1：睡眠截止时间放在 ttsState 里跨 TtsBar 挂载保持（章末自动续读 playing=false
+  // 会让本组件卸载重挂；若在这里重新 Date.now()+min，倒计时会被重置）。
   $effect(() => {
     const min = config.tts.sleepMinutes;
     void ttsState.playing;
-    if (!min || !ttsState.playing) {
-      sleepEnd = 0;
-      sleepLeft = 0;
-      return;
-    }
+    void ttsState.sleepDeadline;
     // D8：-1 = 章末停止（不跑倒计时，只在条上提示）；Reader 的 onTtsChapterEnd 负责停。
-    if (min === -1) {
-      sleepEnd = 0;
-      sleepLeft = -1;
+    if (min <= 0) {
+      ttsClearSleep();
       return;
     }
-    sleepEnd = Date.now() + min * 60000;
-    sleepLeft = Math.round(min * 60);
-    // 局部变量改名 timer：避免与 i18n 的 t() 同名遮蔽
-    const timer = setInterval(() => {
-      sleepLeft = Math.max(0, Math.round((sleepEnd - Date.now()) / 1000));
-      if (sleepLeft <= 0) {
-        clearInterval(timer);
-        ttsStop();
-        toast(t("tts.stopTimerDone"));
-      }
-    }, 1000);
-    return () => clearInterval(timer);
+    if (
+      ttsState.playing &&
+      shouldArmSleep(min, ttsState.sleepMinutesArmed, ttsState.sleepDeadline, Date.now())
+    ) {
+      ttsArmSleep(min);
+    }
+    // 只有真正启用倒计时后才每秒 tick；组件卸载时定时器随之清理。
+    if (ttsState.sleepDeadline > 0) {
+      const timer = setInterval(() => {
+        nowTick = Date.now();
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  });
+
+  // 到点停止：单独 effect 观察 tick/截止时间，避免在起臂 effect 内部写 ttsState 造成自触发。
+  $effect(() => {
+    void nowTick;
+    if (config.tts.sleepMinutes <= 0) return;
+    if (!ttsState.playing) return;
+    if (ttsState.sleepDeadline > 0 && sleepRemainingSec(ttsState.sleepDeadline, nowTick) <= 0) {
+      ttsStop();
+      toast(t("tts.stopTimerDone"));
+    }
   });
 
   function fmtLeft(s: number): string {

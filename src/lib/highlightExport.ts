@@ -47,9 +47,13 @@ export function formatExportTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** CSV 字段：始终加引号，引号加倍（逗号/换行/引号均安全）。 */
-function csvField(s: string): string {
-  return '"' + (s ?? "").replace(/"/g, '""') + '"';
+/** CSV 字段：始终加引号，引号加倍（逗号/换行/引号均安全）。
+ *  F8：Excel 会把以 = + - @ 或 TAB/CR 开头的单元格当公式执行（CSV 注入）。前置单引号
+ *  强制按文本处理 —— Excel 不显示该单引号，但数据不再被求值。 */
+export function csvField(s: string): string {
+  let v = s ?? "";
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+  return '"' + v.replace(/"/g, '""') + '"';
 }
 
 /** 导出 CSV；UTF-8 BOM 便于 Excel 识别中文。空数据仍输出表头。 */
@@ -79,10 +83,12 @@ export function toMarkdown(rows: HighlightExportRow[]): string {
   if (!rows.length) return "";
   const sorted = sortExportRows(rows);
   const out: string[] = ["# 划线笔记导出", ""];
-  let lastBook = "";
+  // G20：同名不同作者的书各自成节，不能只按书名分组。
+  let lastBookKey = "";
   for (const r of sorted) {
-    if (r.bookTitle !== lastBook) {
-      lastBook = r.bookTitle;
+    const bookKey = `${r.bookTitle}\u0000${r.bookAuthor}`;
+    if (bookKey !== lastBookKey) {
+      lastBookKey = bookKey;
       out.push(`## ${r.bookTitle || "未命名书籍"}`);
       if (r.bookAuthor.trim()) out.push(`作者：${r.bookAuthor}`);
       out.push("");

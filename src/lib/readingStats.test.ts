@@ -79,3 +79,16 @@ describe("readingStats", () => {
     expect(compositionPct([{ seconds: 0 }])).toEqual([0]);
   });
 });
+
+describe("computeStreak 日历日连续（G19）", () => {
+  it("连续日期按日历日累加，跨月/跨年不断", () => {
+    const r = computeStreak(["2024-02-28", "2024-02-29", "2024-03-01"], new Date("2024-03-01T12:00:00"));
+    expect(r.longest).toBe(3);
+    expect(r.current).toBe(3);
+  });
+  it("中间缺一天则断开", () => {
+    const r = computeStreak(["2024-03-01", "2024-03-03", "2024-03-04"], new Date("2024-03-04T12:00:00"));
+    expect(r.longest).toBe(2);
+    expect(r.current).toBe(2);
+  });
+});

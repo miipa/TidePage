@@ -39,3 +39,41 @@ export function initialSleepRemaining(sleepMinutes: number | null | undefined): 
   const m = sleepMinutes ?? 0;
   return m > 0 ? m * 60_000 : null;
 }
+
+/* ---------------- F5-H1：跨 TtsBar 挂载的睡眠定时 ---------------- */
+// 为什么保留上面那组纯逻辑并用新增函数而不是替换：它们是既有测试覆盖的公共函数，
+// 本轮只补「截止时间在 ttsState 里跨挂载保持」所需的新纯函数（TtsBar 卸载重挂不重置倒计时）。
+
+/** 从 now 起 n 分钟后的截止时间（毫秒）；n<=0 返回 0（未启用）。 */
+export function sleepDeadlineFromNow(minutes: number, now: number): number {
+  if (!Number.isFinite(minutes) || minutes <= 0) return 0;
+  return now + minutes * 60_000;
+}
+
+/** 距离截止的剩余秒数（向上取整，<=0 返回 0；未启用返回 0）。 */
+export function sleepRemainingSec(deadline: number, now: number): number {
+  if (!deadline || deadline <= 0) return 0;
+  const left = Math.ceil((deadline - now) / 1000);
+  return left > 0 ? left : 0;
+}
+
+/**
+ * 是否需要（重新）起臂：
+ * - minutes<=0：否（未启用/章末停止由 Reader 处理）；
+ * - 没有有效截止时间：是；
+ * - 已经过期：是（上一次朗读残留的截止时间不能把新一次朗读立刻停掉）；
+ * - 设置分钟数与已起臂分钟数不同：是（用户改时长按当前时刻重新计时）；
+ * - 否则：否（跨挂载保持同一截止时间，不重置）。
+ */
+export function shouldArmSleep(
+  minutes: number,
+  armedMinutes: number,
+  deadline: number,
+  now: number = Date.now(),
+): boolean {
+  if (!Number.isFinite(minutes) || minutes <= 0) return false;
+  if (!deadline || deadline <= 0) return true;
+  if (deadline <= now) return true;
+  if (armedMinutes !== minutes) return true;
+  return false;
+}

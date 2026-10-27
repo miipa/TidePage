@@ -52,6 +52,16 @@ pub fn data_dir(app: &tauri::AppHandle) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// L29：字体文件名（已 percent-decode）是否允许读取：
+/// 空名 / ".." / 路径分隔 / 冒号一律拒绝，避免任意文件读取。
+fn font_name_allowed(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
+}
+
 pub fn default_pattern() -> &'static str {
     r"第\s*[0-9〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,10}\s*[章节卷回部篇]"
 }
@@ -344,6 +354,28 @@ pub fn run() {
             // 连续启动失败时本轮自动跳过封面重建（见 memlog::skip_cover_rebuild）。
             memlog::init(&data_dir);
             memlog::stage("setup:data_dir");
+            // F9：便携模式下让所有窗口共用同一 WebView2 用户数据目录（localStorage 一致性）。
+            // 主窗口随后会用 data_directory 显式指定；JS 运行期创建的独立窗口不传该参数，
+            // wry 会走「默认目录」。WEBVIEW2_USER_DATA_FOLDER 正是 WebView2 默认目录的覆盖入口，
+            // 在此固定到便携目录。子窗前端另有同步保护兜底（configSyncGuard）。
+            if portable {
+                let wv_dir = data_dir.join("webview2");
+                if std::fs::create_dir_all(&wv_dir).is_ok() {
+                    let new_val = wv_dir.to_string_lossy().into_owned();
+                    match std::env::var("WEBVIEW2_USER_DATA_FOLDER") {
+                        Ok(old) if old != new_val => {
+                            // 仅记录路径（非敏感信息）；旧值便于排查用户环境变量干扰。
+                            memlog::stage(&format!(
+                                "setup:webview2_user_data_override old={old} new={new_val}"
+                            ));
+                        }
+                        _ => memlog::stage("setup:webview2_user_data_override"),
+                    }
+                    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &new_val);
+                } else {
+                    memlog::stage("setup:webview2_user_data_failed");
+                }
+            }
             let conn = match db::init(&data_dir.join("tidepage.db")) {
                 Ok(c) => c,
                 Err(e) => {
@@ -357,19 +389,78 @@ pub fn run() {
                 let _ = db::ensure_fts(&conn);
             }
             memlog::stage("setup:fts");
-            db::migrate_book_ids(&conn);
+            if let Err(e) = db::migrate_book_ids(&conn) {
+                // 与 db_init 一致的失败处理：写日志并中止启动。迁移失败时完成标记未写，
+                // 下次启动会重试；半迁移状态已由事务回滚。
+                memlog::fatal("migrate_book_ids", &e);
+                return Err(e.into());
+            }
             memlog::stage("setup:migrate_book_ids");
             // 切分算法升级（txt.rs 引入章节上限细分）：作废按旧 toc 写入的搜索缓存/FTS，
             // 避免划词全文搜索定位到错误章节；下次搜索按新 toc 懒重建。
-            db::migrate_chapter_split(&conn);
+            // P1-7/P1-8：迁移失败记录日志但不阻塞启动（版本未写，下次启动重试）；
+            // state 托管必须早于主窗口与封面重置，避免早期 IPC 在 state 未托管时失败。
+            if let Err(e) = db::migrate_chapter_split(&conn) {
+                eprintln!("[setup] migrate_chapter_split failed (will retry next start): {e}");
+                memlog::stage_note("setup:migrate_chapter_split_failed", &e);
+            }
             memlog::stage("setup:migrate_chapter_split");
+            // 共享 client 不再全局放宽 TLS：公网目标严格校验证书。按目标本机/私有
+            // 选择 client 的逻辑集中在 ai::build_client（带缓存），此字段仅作通用兜底。
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_default();
+            let state = Arc::new(AppState {
+                db: db::Db(Mutex::new(conn)),
+                app: app.handle().clone(),
+                watcher: Mutex::new(None),
+                last_fs_event: std::sync::atomic::AtomicU64::new(0),
+                fs_paths: Mutex::new(Vec::new()),
+                rules_ver: std::sync::atomic::AtomicU64::new(1),
+                txt_cache: Mutex::new(std::collections::HashMap::new()),
+                epub_cache: Mutex::new(std::collections::HashMap::new()),
+                epub_cache_order: Mutex::new(Vec::new()),
+                epub_stats_cache: Mutex::new(std::collections::HashMap::new()),
+                chapter_cache: Mutex::new(library::ChapterCache::new(80)),
+                image_cache: Mutex::new(std::collections::HashMap::new()),
+                http,
+                scan_running: std::sync::atomic::AtomicBool::new(false),
+                scan_stop: std::sync::atomic::AtomicBool::new(false),
+                library_ready: std::sync::atomic::AtomicBool::new(false),
+                scan_paused: std::sync::atomic::AtomicBool::new(false),
+                maintenance_running: std::sync::atomic::AtomicBool::new(false),
+                fts_optimize_running: std::sync::atomic::AtomicBool::new(false),
+                formats_cache: Mutex::new(None),
+                formats_epoch: std::sync::atomic::AtomicU64::new(0),
+                scan_start_count: std::sync::atomic::AtomicU64::new(0),
+                cover_scan_done: std::sync::atomic::AtomicU64::new(0),
+                cover_scan_total: std::sync::atomic::AtomicU64::new(0),
+                cover_scan_enabled: std::sync::atomic::AtomicBool::new(true),
+                cover_scan_ws_base: std::sync::atomic::AtomicU64::new(0),
+                cover_style_ver: std::sync::atomic::AtomicU64::new(1),
+                fts_index_running: std::sync::atomic::AtomicBool::new(false),
+                book_meta: Mutex::new(std::collections::HashMap::new()),
+                last_open_book: std::sync::atomic::AtomicI64::new(i64::MIN),
+                epub_stats_flights: Mutex::new(std::collections::HashMap::new()),
+                mobi_manifest_cache: Mutex::new(Vec::new()),
+            });
+            app.manage(state.clone());
 
+            // 冷启动增量扫描：处理全部 `meta_done=0`（含存量与新增），逐本提交、扫完即静默。
+            // 不再一次性把全部未处理 id 载入内存；worker 内部分批查询 + 限流（见 library::on_startup）。
+            // R11-3：这里不再启动扫描 worker；由前端首屏就绪后的 library_ready 命令拉起
+            //（见 library::library_ready：置 ready → 封面自愈 → ensure_scan_worker）。
+            memlog::stage("setup:state_ready");
             // 创建主窗口：注入 WebView2 字体渲染参数（需重启生效）。
             // 设置页现已简化为单个「灰度抗锯齿」复选框，只写入
             // --disable-lcd-text（勾选）或 --enable-lcd-text（取消）；
             // 旧版 GDI/自定义参数值仍原样尊重，保证升级用户配置不失效。
             {
-                let webview_args = db::get_setting(&conn, "render.webviewArgs").unwrap_or_default();
+                let webview_args = {
+                    let conn = state.db.0.lock().unwrap();
+                    db::get_setting(&conn, "render.webviewArgs").unwrap_or_default()
+                };
                 let raw = webview_args.trim().to_string();
                 let render_arg = if raw.is_empty() {
                     "--disable-lcd-text".to_string()
@@ -439,65 +530,27 @@ pub fn run() {
                 // 仍早于其余 setup 工作，且不改变「140ms 后才 show」的启动观感。
                 #[cfg(windows)]
                 restore_main_window_state(&main_window);
-                db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);
-                memlog::stage("setup:window");
+                {
+                    let conn = state.db.0.lock().unwrap();
+                    db::set_setting(&conn, "render.webviewArgs.applied", &main_window_args);
+                }
+
+                memlog::stage("setup:window_created");
             }
 
             let covers_dir = data_dir.join("covers");
             std::fs::create_dir_all(&covers_dir).ok();
-            db::reset_epub_covers(&conn, &covers_dir);
+            memlog::stage("setup:covers_dir");
+            // P1-8：state 已托管；封面重置走 state.db 锁（不再依赖裸 conn）。
+            {
+                let conn = state.db.0.lock().unwrap();
+                db::reset_epub_covers(&conn, &covers_dir);
+            }
+            memlog::stage("setup:covers_reset");
             // R11-3：封面自愈与封面扫描都推迟到「书库首屏就绪」之后（library_ready 命令）：
             // 启动期不再做全库封面核对，也不启动扫描 worker，首屏不再被后台扫描抢占 I/O/内存。
             // self-heal 的进程内一次性标记（COVER_HEAL_DONE）与崩溃保护语义保持不变。
             memlog::stage("setup:cover_heal_deferred");
-            memlog::stage("setup:covers_dir");
-            // 共享 client 不再全局放宽 TLS：公网目标严格校验证书。按目标本机/私有
-            // 选择 client 的逻辑集中在 ai::build_client（带缓存），此字段仅作通用兜底。
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_default();
-            let state = Arc::new(AppState {
-                db: db::Db(Mutex::new(conn)),
-                app: app.handle().clone(),
-                watcher: Mutex::new(None),
-                last_fs_event: std::sync::atomic::AtomicU64::new(0),
-                fs_paths: Mutex::new(Vec::new()),
-                rules_ver: std::sync::atomic::AtomicU64::new(1),
-                txt_cache: Mutex::new(std::collections::HashMap::new()),
-                epub_cache: Mutex::new(std::collections::HashMap::new()),
-                epub_cache_order: Mutex::new(Vec::new()),
-                epub_stats_cache: Mutex::new(std::collections::HashMap::new()),
-                chapter_cache: Mutex::new(library::ChapterCache::new(80)),
-                image_cache: Mutex::new(std::collections::HashMap::new()),
-                http,
-                scan_running: std::sync::atomic::AtomicBool::new(false),
-                scan_stop: std::sync::atomic::AtomicBool::new(false),
-                library_ready: std::sync::atomic::AtomicBool::new(false),
-                scan_paused: std::sync::atomic::AtomicBool::new(false),
-                maintenance_running: std::sync::atomic::AtomicBool::new(false),
-                fts_optimize_running: std::sync::atomic::AtomicBool::new(false),
-                formats_cache: Mutex::new(None),
-                formats_epoch: std::sync::atomic::AtomicU64::new(0),
-                scan_start_count: std::sync::atomic::AtomicU64::new(0),
-                cover_scan_done: std::sync::atomic::AtomicU64::new(0),
-                cover_scan_total: std::sync::atomic::AtomicU64::new(0),
-                cover_scan_enabled: std::sync::atomic::AtomicBool::new(true),
-                cover_scan_ws_base: std::sync::atomic::AtomicU64::new(0),
-                cover_style_ver: std::sync::atomic::AtomicU64::new(1),
-                fts_index_running: std::sync::atomic::AtomicBool::new(false),
-                book_meta: Mutex::new(std::collections::HashMap::new()),
-                last_open_book: std::sync::atomic::AtomicI64::new(i64::MIN),
-                epub_stats_flights: Mutex::new(std::collections::HashMap::new()),
-                mobi_manifest_cache: Mutex::new(Vec::new()),
-            });
-            app.manage(state.clone());
-
-            // 冷启动增量扫描：处理全部 `meta_done=0`（含存量与新增），逐本提交、扫完即静默。
-            // 不再一次性把全部未处理 id 载入内存；worker 内部分批查询 + 限流（见 library::on_startup）。
-            // R11-3：这里不再启动扫描 worker；由前端首屏就绪后的 library_ready 命令拉起
-            //（见 library::library_ready：置 ready → 封面自愈 → ensure_scan_worker）。
-            memlog::stage("setup:state_ready");
 
             {
                 let st = state.clone();
@@ -702,11 +755,15 @@ pub fn run() {
                     }
                 }
             } else if let Some(name) = path.strip_prefix("fonts/") {
-                let file = name.replace('/', "").replace('\\', "");
-                if file.contains("..") {
+                // L29：先 percent-decode（中文/空格字体名在 URL 里是编码形式），
+                // 再按「空名/.. /路径分隔/冒号」拒绝；旧实现直接对编码串读盘，
+                // %E6%80%9D… 这类合法字体名永远读不到。
+                let decoded = percent_decode(name);
+                let valid = font_name_allowed(&decoded);
+                if !valid {
                     ("text/plain".into(), Vec::new())
                 } else {
-                    match std::fs::read(dir.parent().unwrap_or(&dir).join("fonts").join(&file)) {
+                    match std::fs::read(dir.parent().unwrap_or(&dir).join("fonts").join(&decoded)) {
                         Ok(b) => ("font/ttf".into(), b),
                         Err(_) => ("text/plain".into(), Vec::new()),
                     }
@@ -757,6 +814,7 @@ pub fn run() {
             library::delete_tag,
             library::set_book_tags,
             library::set_read_state,
+            library::mark_book_read_state,
             library::list_books_by_ids,
             library::rescan,
             library::refresh_library,
@@ -856,6 +914,7 @@ pub fn run() {
             library::ensure_book_text_cmd,
             library::add_highlight,
             library::book_note_info,
+            library::books_have_notes,
             library::list_note_books,
             library::list_notes_of_book,
             library::set_highlight_note,
@@ -946,4 +1005,18 @@ mod tests {
         // 合法单一文件名（文件不存在时同样返回 None，但不会误判为越界）。
         assert_eq!(resolve_under(base, "ok.png"), None);
     }
+    /// L29：字体名先解码再校验：中文/空格名可读，..%2F 等穿越被拒。
+    #[test]
+    fn font_name_allowed_percent_decoded() {
+        let zh = percent_decode("%E6%80%9D%E6%BA%90%E5%AE%8B%E4%BD%93.ttf");
+        assert_eq!(zh, "思源宋体.ttf");
+        assert!(font_name_allowed(&zh));
+        let spaced = percent_decode("Source%20Han%20Serif.ttf");
+        assert!(font_name_allowed(&spaced), "空格文件名允许");
+        assert!(!font_name_allowed(&percent_decode("..%2Fsecret.ttf")), "穿越必须拒绝");
+        assert!(!font_name_allowed(&percent_decode("a%5Cb.ttf")), "反斜杠必须拒绝");
+        assert!(!font_name_allowed(&percent_decode("C%3A%5Cwindows.ttf")), "冒号必须拒绝");
+        assert!(!font_name_allowed(""));
+    }
+
 }

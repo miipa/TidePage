@@ -22,6 +22,7 @@
   import { config, saveConfig, toast, ui } from "../lib/stores.svelte";
   import { outDissolve, outFade } from "../lib/motion";
   import { BOOK_EXTENSIONS } from "../lib/bookExt";
+  import { downloadGate, resolveLoadWrite, shouldReloadAfterConfig } from "../lib/webdavLoad";
 
   interface Entry { name: string; is_dir: boolean; size: number; mtime: number }
   interface DlItem { key: string; name: string; pct: number; state: "downloading" | "done" | "error"; msg: string }
@@ -33,6 +34,8 @@
   let entries = $state<Entry[]>([]);
   let loading = $state(false);
   let error = $state("");
+  // F5：同一远端路径同时只允许一次下载（成功/失败都移除标记）。
+  let downloadInFlight = $state<Set<string>>(new Set());
   // 是否已完成至少一次列目录尝试（用于区分「首帧未加载」与「真·空目录」，避免闪现空态）。
   let attempted = $state(false);
 
@@ -92,24 +95,35 @@
     try { return localStorage.getItem("tidepage.wd.path") ?? ""; } catch { return ""; }
   }
 
-  /// 列目录：成功返回 true。失败只置 error（保留 path、不回连接页），交由界面展示错误+重试。
+  /// F5-H2：请求序号。快速连点目录时只让最新请求写 entries/path/loading/error，
+  /// 失败保留旧列表并展示错误，不再把界面清空。
+  let loadSeq = 0;
+  /// 列目录：成功返回 true。失败只置 error（保留旧列表与 path，不回连接页），交由界面展示错误+重试。
   async function load(p?: string): Promise<boolean> {
-    if (p !== undefined) {
-      path = p;
-      try { localStorage.setItem("tidepage.wd.path", p); } catch { /* ignore */ }
-    }
+    const seq = ++loadSeq;
+    const target = p !== undefined ? p : path;
     loading = true;
     error = "";
     let ok = false;
+    let items: Entry[] = [];
     try {
       const w = config.webdav;
-      const items = await api.webdavList(w.base, w.user, w.pass, path);
-      entries = items.filter((e) => e.name !== "" && e.name !== "." && e.name !== "..");
+      const list = await api.webdavList(w.base, w.user, w.pass, target);
+      items = list.filter((e) => e.name !== "" && e.name !== "." && e.name !== "..");
       ok = true;
     } catch (e) {
-      error = String(e);
-      entries = [];
-    } finally {
+      // 只有最新请求的错误才允许上屏（旧请求失败不覆盖新请求的结果）。
+      if (seq === loadSeq) error = String(e);
+    }
+    const decision = resolveLoadWrite(loadSeq, seq, ok, items, entries, path, target);
+    if (decision.apply) {
+      entries = decision.entries;
+      path = decision.path;
+      if (p !== undefined) {
+        try { localStorage.setItem("tidepage.wd.path", p); } catch { /* ignore */ }
+      }
+    }
+    if (seq === loadSeq) {
       loading = false;
       attempted = true;
     }
@@ -251,6 +265,10 @@
       return;
     }
     const remote = path ? `${path}/${e.name}` : e.name;
+    // F5：并发门（总数 <3 且同路径不在途）；同一条目重复点击直接忽略。
+    if (!downloadGate(activeDownloads, downloadInFlight, remote)) return;
+    downloadInFlight.add(remote);
+    try {
     const key = `dl${++dlSeq}`;
     const item: DlItem = { key, name: e.name, pct: 0, state: "downloading", msg: "" };
     downloads.push(item);
@@ -287,6 +305,9 @@
       delete dlUnlisteners[key];
       toast(t("webdav.downloadFailed", { err: String(e2) }), "error");
     }
+    } finally {
+      downloadInFlight.delete(remote);
+    }
   }
 
   function fmt(n: number): string {
@@ -306,6 +327,16 @@
 
   onMount(() => {
     if (configReady) autoConnect();
+  });
+
+  // F5：配置在面板挂载后才补齐（false→true）时自动重连一次；成功过不重复拉取，
+  // 失败保留重试按钮且仅在此次就绪变化时触发一次（不会持续循环）。
+  let prevConfigReady: boolean | null = null;
+  $effect(() => {
+    // 首次运行只记录基线（避免与 onMount 的自动连接重复）；之后只处理 false→true 的边沿。
+    const was = prevConfigReady === null ? configReady : prevConfigReady;
+    prevConfigReady = configReady;
+    if (shouldReloadAfterConfig(was, configReady, attempted, error, loading)) void autoConnect();
   });
 </script>
 
@@ -377,7 +408,7 @@
               <span class="wd-ico"><IconFileText /></span>
               <span class="wd-name" title={e.name}>{e.name}</span>
               <span class="wd-meta">{fmt(e.size)}{e.mtime ? " · " + fmtTime(e.mtime) : ""}</span>
-              <button class="wd-dl-btn" onclick={() => download(e)} disabled={activeDownloads >= 3}>
+              <button class="wd-dl-btn" onclick={() => download(e)} disabled={!downloadGate(activeDownloads, downloadInFlight, path ? `${path}/${e.name}` : e.name)}>
                 {isBook(e) ? t("webdav.downloadToLib") : t("webdav.download")}
               </button>
             </div>

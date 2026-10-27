@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { t } from "../lib/i18n/index.svelte";
+  import { locale, t } from "../lib/i18n/index.svelte";
+  import { fmtDurationParts, formatCountShort } from "../lib/countFormat";
 import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
@@ -62,9 +63,8 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   const speed = $derived(totalSeconds >= 60 ? Math.round(totalChars / (totalSeconds / 60)) : 0);
 
   function fmt(sec: number): string {
-    const h = Math.floor(sec / 3600);
-    const m = Math.round((sec % 3600) / 60);
-    const s = sec % 60;
+    // E14：先四舍五入到整秒再拆 h/m/s，避免出现 60m 与秒并存（3599.6s → 1h0m0s 而不是 59m60s）。
+    const { h, m, s } = fmtDurationParts(sec);
     if (h) return t("common.dur.hmShort", { h, m });
     if (m && s) return t("common.dur.ms", { m, s });
     if (m) return t("common.dur.mShort", { m });
@@ -77,8 +77,9 @@ import { IconArrowsSplit2, IconX } from "@tabler/icons-svelte";
   }
 
   function fmtChars(n: number): string {
-    if (n >= 10000) return (n / 10000).toFixed(1) + t("common.unit.tenThousand");
-    return String(n);
+    // H22：中文「万」/英文「k」按 locale 走同一纯函数。
+    const unit = t("common.unit.tenThousand");
+    return formatCountShort(n, unit, unit, locale());
   }
 
   function sessionSpeed(s: BookSession): string {

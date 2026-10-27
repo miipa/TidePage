@@ -3,6 +3,7 @@ import workerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { api } from "./api";
 import { fullPageLruStep, pdfTextUsable, type PageSize, type PdfOutlineItem } from "./pdfPage";
 import { decodeRawPage, inflatePdfStream } from "./pdfFlate";
+import { LruCache } from "./directMetaCache";
 
 // worker 指向 Vite 打出来的同源 URL：只设一次，不能每本书重设。
 GlobalWorkerOptions.workerSrc = workerSrc;
@@ -522,7 +523,7 @@ export function ensurePdf(bookId: number): Promise<PdfSession> {
         throw pdfError("pdf_native_failed");
       }
       if (gen !== generation) {
-        void api.pdfNativeClose().catch(() => {});
+        void api.pdfNativeClose(bookId).catch(() => {});
         throw new Error("已切换书籍");
       }
       nativeSession = { bookId, pages };
@@ -1137,13 +1138,15 @@ export async function regeneratePdfCover(bookId: number, longEdge = 320): Promis
 
 /** 页元数据（后端 `pdf_scan_page`）：几何用显示盒，像素尺寸用图像自身。 */
 type DirectMeta = Awaited<ReturnType<typeof api.pdfScanPage>>;
-const directMetaCache = new Map<number, DirectMeta>();
+// F7：key 含 bookId，避免 A 书第 N 页元信息被 B 书同页命中；LRU 上限 64 防跨书无限增长。
+const directMetaCache = new LruCache<string, DirectMeta>(64);
 
 async function directMeta(bookId: number, page: number): Promise<DirectMeta> {
-  const hit = directMetaCache.get(page);
+  const key = `${bookId}:${page}`;
+  const hit = directMetaCache.get(key);
   if (hit) return hit;
   const m = await api.pdfScanPage(bookId, page);
-  directMetaCache.set(page, m);
+  directMetaCache.set(key, m);
   return m;
 }
 
@@ -1206,9 +1209,17 @@ async function directPageUrl(
   if (meta.kind === "jpeg") {
     url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
   } else {
-    const inflated = await inflatePdfStream(bytes);
-    const c = rawToCanvas(meta, inflated);
-    url = URL.createObjectURL(await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/png")));
+    try {
+      const inflated = await inflatePdfStream(bytes);
+      const c = rawToCanvas(meta, inflated);
+      url = URL.createObjectURL(await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob 失败"))), "image/png")));
+    } catch (e) {
+      // F7：解压炸弹/超大页/解码失败时给可见占位（不白屏、不拖垮渲染进程），也不写入 bitmaps 缓存。
+      if (import.meta.env.DEV) console.warn("[pdf] 直读页解码失败：", e);
+      const tooLarge = e instanceof Error && e.message.includes("页面数据过大");
+      const text = tooLarge ? "页面数据过大，无法显示" : "本页解码失败，无法显示";
+      return { url: placeholderUrl(text, meta.pt_w * 2, meta.pt_h * 2), meta: null };
+    }
   }
   bitmaps.set(token, { url, page });
   sweep();
@@ -1335,13 +1346,18 @@ export function releaseAll(): void {
   releasePdfThumbs();
   geometry.clear();
   const s = session;
+  // F7-H1：直读通道（mode=direct）没有 pdf.js 文档，释放时要显式关掉后端直读会话缓存；
+  // 原生通道仍走下面的 pdfNativeClose。放在 session=null 之前，拿到 bookId。
+  if (s && s.mode === "direct") void api.pdfScanClose(s.bookId).catch(() => {});
   session = null;
   sessionPromise = null;
   sessionBookId = -1;
   if (nativeSession) {
+    const nativeBookId = nativeSession.bookId;
     nativeSession = null;
-    // 原生通道没有 pdf.js 文档：显式让 Rust 侧释放文档句柄（换书/关书都要走这条）
-    void api.pdfNativeClose().catch(() => {});
+    // 原生通道没有 pdf.js 文档：显式让 Rust 侧释放该书的文档句柄（换书/关书都要走这条）；
+    // 传 bookId 只关自己的书，双窗口交替不互相关文档。
+    void api.pdfNativeClose(nativeBookId).catch(() => {});
   }
   if (s && !s.native) {
     // R12-1：显式销毁 loadingTask 并 await 到 worker 终止，再打开下一本。

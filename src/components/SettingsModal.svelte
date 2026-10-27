@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { nextUniqueLabelId } from "../lib/uniqueLabelId";
   import { estimateVacuumTemp, maintenanceRecordView, shouldRemindMaintenance, shouldSuggestCoverCleanup, coverReclaimBytes, COVER_CACHE_HINT_BYTES } from "../lib/maintenance";
   import { listen } from "@tauri-apps/api/event";
   import { api, type DataBackupPreview, type CoverAudit } from "../lib/api";
@@ -54,6 +55,8 @@
     stripSecrets,
     applySecrets,
     applyConfigJson,
+    collectSecrets,
+    dropChangedEndpointSecrets,
     runSettingsBackup,
     runWebdavDataSync,
     builtinSchemeNames,
@@ -62,7 +65,35 @@
     absorbLegacyProfileProxy,
     marginScopeOf,
   } from "../lib/stores.svelte";
+  import { changedEndpointSecrets, type EndpointSecretChanges } from "../lib/configHost";
+  import { isInsecurePublicWebdav } from "../lib/webdavSecurity";
   import type { Icon as TablerIcon } from "@tabler/icons-svelte";
+
+  /** H13：提示哪些端点的已存凭据因 host 变化被清除（count = webdav + 各 AI 端点）。 */
+  /**
+ * D10：导入无可用外来密文时，只恢复「host 未变化」的本机凭据（H13：改道的端点不得
+ * 把本机旧凭据带到新主机）。
+ */
+function filterSecretsForUnchangedHosts(
+  secrets: Record<string, string>,
+  changes: EndpointSecretChanges,
+): Record<string, string> {
+  const out: Record<string, string> = { ...secrets };
+  if (changes.webdav) {
+    delete out["webdav:pass"];
+    delete out["webdav:baseRaw"];
+  }
+  for (const id of changes.profileIds) {
+    const prefix = "ai:" + id + ":";
+    for (const k of Object.keys(out)) if (k.startsWith(prefix)) delete out[k];
+  }
+  return out;
+}
+
+function notifyHostChangedSecrets(changes: EndpointSecretChanges) {
+    const count = (changes.webdav ? 1 : 0) + changes.profileIds.length;
+    if (count > 0) toast(t("settings.credentials.hostChanged", { count }), "info");
+  }
   import {
     IconCloud,
     IconColorSwatch,
@@ -295,7 +326,8 @@ IconPlus,
   function associateLabels() {
     const root = contentEl;
     if (!root) return;
-    let n = 0;
+    // P2-3①：id 由模块级递增分配器生成，跨多次 associateLabels 不重复；条件字段挂载后重跑安全。
+    const freshId = (prefix: string) => nextUniqueLabelId(prefix, (id) => !!document.getElementById(id));
     for (const field of root.querySelectorAll<HTMLElement>(".field")) {
       const label = field.querySelector<HTMLLabelElement>(":scope > label");
       if (!label || label.htmlFor) continue; // 只处理直接子级的裸 label；已关联的跳过
@@ -311,14 +343,14 @@ IconPlus,
         if (inner.length !== 1) {
           // B) 一组控件：语义上是一组，用 group + labelledby 把 label 当组名来源。
           if (sib.matches("div, fieldset") && !sib.hasAttribute("role")) {
-            if (!label.id) label.id = `set-l${++n}`;
+            if (!label.id) label.id = freshId("set-l");
             sib.setAttribute("role", "group");
             sib.setAttribute("aria-labelledby", label.id);
             // 「滑块 + 数值框」这类孪生对（.row-inline）：滑块是主控件，给它 for；
             // 数值框是同一份值的另一个入口，指回同一个 label，至少不再匿名。
             const range = sib.querySelector<HTMLElement>('input[type="range"]');
             if (range) {
-              if (!range.id) range.id = `set-f${++n}`;
+              if (!range.id) range.id = freshId("set-f");
               label.htmlFor = range.id;
             }
             for (const c of inner) {
@@ -334,7 +366,7 @@ IconPlus,
         }
         sib = inner[0];
       }
-      if (!sib.id) sib.id = `set-f${++n}`;
+      if (!sib.id) sib.id = freshId("set-f");
       label.htmlFor = sib.id;
     }
   }
@@ -345,21 +377,49 @@ IconPlus,
    *
    *  同时重建 label 关联：很多字段挂在 {#if} 下（阅读模式 scroll/page、背景图开关等），
    *  索引建完再改配置，DOM 一变索引与关联就都陈旧了。带上 tab 是因为条件字段随分区挂载。 */
+  // P2-3③：不再以 JSON.stringify(config) 为依赖。旧写法任何配置输入（含纯输入值变化）
+  // 都会在 tick 后全量 buildSearchIndex + associateLabels（150+ 条目 DOM 扫描）。
+  // 改为 MutationObserver 观察 .set-content 的 childList + subtree（条件字段/折叠出现），
+  // 不观察 attributes：associateLabels 会写 for/id/aria-labelledby，观察 attributes 会自触发循环。
+  let settingsRebuildTimer: ReturnType<typeof setTimeout> | undefined;
+  function rebuildSettingsDom() {
+    try {
+      buildSearchIndex();
+      associateLabels();
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn("[settings] index rebuild failed", e);
+    }
+  }
+  /** debounce 50ms 后一次性重建（显式事件与 MutationObserver 共用；不会自循环）。 */
+  function scheduleSettingsRebuild() {
+    if (settingsRebuildTimer) clearTimeout(settingsRebuildTimer);
+    settingsRebuildTimer = setTimeout(() => {
+      settingsRebuildTimer = undefined;
+      void (async () => {
+        await tick();
+        rebuildSettingsDom();
+      })();
+    }, 50);
+  }
+  onMount(() => {
+    let observer: MutationObserver | undefined;
+    if (typeof MutationObserver !== "undefined" && contentEl) {
+      observer = new MutationObserver(() => scheduleSettingsRebuild());
+      observer.observe(contentEl, { childList: true, subtree: true });
+    }
+    // 初始挂载必须显式重建一次（observer 只报告后续变化）。
+    scheduleSettingsRebuild();
+    return () => {
+      observer?.disconnect();
+      if (settingsRebuildTimer) clearTimeout(settingsRebuildTimer);
+    };
+  });
+  // 显式事件：语言切换、切分区、条件字段首次挂载太多无法逐个列举——后两者由 observer 覆盖；
+  // observer 不可用时这里仍是唯一兜底（await tick 后一次性重建，只由显式事件触发）。
   $effect(() => {
     locale();
     tab;
-    // 索引与 label 关联都是「这一刻的 DOM 快照」，而字段随配置条件与 AI 折叠增减。
-    // 旧写法逐个列举依赖键（mode / chapterTransition / bgImage / ai.enabled …），条件分支
-    // 有二十多处，列不全就会索引陈旧（改完配置搜不到、新字段 label 没关联上）。
-    // config 与 aiOpen 都是可 JSON 化的普通状态对象：各取一次深快照当依赖，
-    // 代价是每次改配置多跑一遍建索引（~150 条目的 DOM 遍历，微秒级），换来永不失效。
-    JSON.stringify(config);
-    JSON.stringify(aiOpen);
-    void (async () => {
-      await tick();
-      buildSearchIndex();
-      associateLabels();
-    })();
+    scheduleSettingsRebuild();
   });
 
   /** 搜索结果：仅取匹配的具体设置项（上限 80 条）。 */
@@ -497,6 +557,7 @@ let davState = $state<"" | "ok" | "bad">("");
   let maintenanceProgress = $state("");
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
     void listen<{
       phase: string;
       state: string;
@@ -516,10 +577,19 @@ let davState = $state<"" | "ok" | "bad">("");
             total: p.total ?? 0,
           });
       }
-    }).then((u) => {
-      unlisten = u;
-    });
-    return () => unlisten?.();
+    })
+      .then((u) => {
+        // P2-3②：listen 未 resolve 就卸载 → 立即解绑，不留悬空监听；已卸载则不再赋值。
+        if (disposed) u();
+        else unlisten = u;
+      })
+      .catch(() => {
+        /* 监听失败不影响设置页其余功能；不吞掉已挂载的清理逻辑。 */
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   });
 
   /* ---------- 默认封面底图设置 ---------- */
@@ -559,7 +629,7 @@ let davState = $state<"" | "ok" | "bad">("");
       coverPreviewBust++;
       toast(t("settings.cover.updated"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       coverBusy = false;
     }
@@ -576,7 +646,7 @@ let davState = $state<"" | "ok" | "bad">("");
       coverPreviewBust++;
       toast(t("settings.cover.restored"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       coverBusy = false;
     }
@@ -608,7 +678,7 @@ let davState = $state<"" | "ok" | "bad">("");
       toast(t("settings.cache.cleared", { label, size: fmtBytes(freed) }));
       await loadStorage();
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       storageBusy = false;
     }
@@ -797,10 +867,24 @@ let davState = $state<"" | "ok" | "bad">("");
     toast(t("settings.scheme.overwritten", { name: s.name }));
   }
 
+  // D13：WebView2 的 window.prompt 行为不确定且样式不可控，改用与「新建方案」同款内联弹窗。
+  let schemeRenameOpen = $state(false);
+  let schemeRenameId = $state<string | null>(null);
+  let schemeRenameName = $state("");
+
   function renameScheme(s: ReaderScheme) {
-    const n = window.prompt(t("settings.scheme.renamePrompt"), s.name);
-    if (n == null) return;
-    renameReaderScheme(s.id, n);
+    schemeRenameId = s.id;
+    schemeRenameName = schemeLabel(s);
+    schemeRenameOpen = true;
+  }
+
+  function confirmSchemeRename() {
+    const id = schemeRenameId;
+    const name = schemeRenameName.trim();
+    schemeRenameOpen = false;
+    schemeRenameId = null;
+    if (!id || !name) return;
+    renameReaderScheme(id, name);
   }
 
   async function delScheme(s: ReaderScheme) {
@@ -1045,7 +1129,7 @@ let davState = $state<"" | "ok" | "bad">("");
       await api.setMobiEncoding(mobiEnc);
       toast(t("settings.tts.encodingDone"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1100,7 +1184,7 @@ let davState = $state<"" | "ok" | "bad">("");
       await copyText(JSON.stringify(payload, null, 2));
       toast(t("settings.backup.copied"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1116,33 +1200,45 @@ let davState = $state<"" | "ok" | "bad">("");
           ? parsed.config
           : parsed;
       if (!obj || typeof obj !== "object" || !obj.reader) throw new Error(t("settings.backup.invalid"));
-      Object.assign(config, {
-        ...obj,
-        reader: { ...config.reader, ...obj.reader },
-        ai: {
-          ...config.ai,
-          ...(obj.ai || {}),
-          style: { ...config.ai.style, ...(obj.ai?.style || {}) },
-        },
-      });
-      // 旧版导出的配置可能带「每端点代理」字段：搬到全局并删除，避免其明文 proxyUrl 落进 localStorage。
-      const legacyProxy = absorbLegacyProfileProxy(config.ai);
-      if (legacyProxy) config.ai.proxy = legacyProxy;
-      // 密文原样写回（DPAPI 才能解），再解密回填。
+      // F4-H1：导入前先备份本机内存凭据与落盘密文；失败/无法解密时恢复。
+      const prevSecrets = collectSecrets(config);
+      const prevRaw = await api.getSetting("secret.config").catch(() => null);
+      // D10：配置归一化/迁移/H13/默认补齐（含 maintenance）统一交给 applyConfigJson，
+      // 不再手写 merge（旧实现会绕过这些归一化）。返回的 changes 用于后续凭据过滤。
+      const changes = applyConfigJson(JSON.stringify(obj));
       const secret = parsed && typeof parsed === "object" ? (parsed as any).secret : undefined;
+      let secretLost = false;
       if (typeof secret === "string" && secret) {
+        // 外来密文（旧版备份/跨机导入）：先写入再 secretRead 解密（DPAPI 机器绑定）。
+        // 成功则回填最终 config；失败恢复本机密文与「未改道端点」的本机凭据。
         try {
           await api.setSetting("secret.config", secret);
           const raw = await api.secretRead();
-          if (raw) applySecrets(config, JSON.parse(raw) as Record<string, unknown>);
+          if (!raw) throw new Error("empty secret");
+          applySecrets(config, JSON.parse(raw) as Record<string, unknown>);
         } catch {
-          /* 密钥与当前机器不匹配时静默跳过 */
+          secretLost = true;
+          try {
+            await api.setSetting("secret.config", prevRaw ?? "");
+          } catch { /* 恢复失败则由 saveConfigNow 用本机内存凭据重写 */ }
+          applySecrets(config, filterSecretsForUnchangedHosts(prevSecrets, changes));
         }
+      } else {
+        secretLost = true;
+        if (prevRaw === null) {
+          try { await api.setSetting("secret.config", ""); } catch { /* ignore */ }
+        }
+        // 无外来密文：只恢复 host 未变化的本机凭据（H13）。
+        applySecrets(config, filterSecretsForUnchangedHosts(prevSecrets, changes));
       }
+      // 导入的外来密文按最终 config 回填，不再二次 dropChangedEndpointSecrets：
+      // 备份自带的凭据属于备份配置，按「保留本机密文」条件过滤会被误删。
       saveConfigNow();
       toast(t("settings.backup.imported"));
+      if (secretLost) toast(t("settings.backup.secretsKept"), "info");
+      notifyHostChangedSecrets(changes);
     } catch (e) {
-      toast(t("settings.backup.importFailed", { err: String(e) }), "error");
+      toast(t("settings.backup.importFailed", { err: errText(e) }), "error");
     }
   }
 
@@ -1172,7 +1268,7 @@ let davState = $state<"" | "ok" | "bad">("");
       const total = s.progress + s.bookmarks + s.highlights + s.tags + s.bookTags;
       toast(t("settings.dataBackup.exported", { count: total, size: fmtBytes(s.sizeBytes) }));
     } catch (e) {
-      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+      toast(t("settings.dataBackup.failed", { err: errText(e) }), "error");
     } finally {
       backupBusy = false;
     }
@@ -1192,7 +1288,7 @@ let davState = $state<"" | "ok" | "bad">("");
       if (isBackupEmpty(p)) toast(t("settings.dataBackup.empty"));
     } catch (e) {
       dataBackupPreview = null;
-      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+      toast(t("settings.dataBackup.failed", { err: errText(e) }), "error");
     } finally {
       backupBusy = false;
     }
@@ -1205,8 +1301,9 @@ let davState = $state<"" | "ok" | "bad">("");
       const r = await api.restoreDataBackup(dataBackupPath, backupOverwrite);
       // 覆盖模式才应用备份配置；失败/取消不应用。
       if (backupOverwrite && r.configJson) {
-        applyConfigJson(r.configJson);
+        const changes = applyConfigJson(r.configJson);
         saveConfigNow();
+        notifyHostChangedSecrets(changes);
       }
       const total = r.progress + r.bookmarks + r.highlights + r.tags + r.bookTags;
       toast(t("settings.dataBackup.restored", { count: total, skipped: r.skipped, conflicts: r.conflicts }));
@@ -1214,7 +1311,7 @@ let davState = $state<"" | "ok" | "bad">("");
       dataBackupPath = "";
       backupOverwrite = false;
     } catch (e) {
-      toast(t("settings.dataBackup.failed", { err: String(e) }), "error");
+      toast(t("settings.dataBackup.failed", { err: errText(e) }), "error");
     } finally {
       backupBusy = false;
     }
@@ -1226,7 +1323,7 @@ let davState = $state<"" | "ok" | "bad">("");
       const n = await api.rebuildFts();
       toast(t("settings.backup.indexRebuilt", { n }));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       rebuildingFts = false;
     }
@@ -1303,6 +1400,9 @@ let davState = $state<"" | "ok" | "bad">("");
   );
 
   async function deleteCustomFont(family: string, file: string) {
+    // D12：删除字体前确认（复用设置内既有「删除该字体」文案，不新增 i18n 键）。
+    const ok = await appConfirm(t("settings.font.deleteTitle"));
+    if (!ok) return;
     const stem = file.replace(/\.(ttf|otf|ttc)$/i, "");
     try {
       await api.deleteCustomFont(stem);
@@ -1317,7 +1417,7 @@ let davState = $state<"" | "ok" | "bad">("");
       saveConfig();
       toast(fellBack ? t("settings.font.deletedFallbackToast", { name: family }) : t("settings.font.deletedToast", { name: family }));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1355,7 +1455,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       await api.setSetting("render.webviewArgs", grayAA ? "--disable-lcd-text" : "--enable-lcd-text");
       toast(t("settings.font.graySaved"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1584,7 +1684,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       saveConfig();
       toast(t("settings.font.installedToast", { name: family }));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1609,7 +1709,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       }
       if (!silent) toast(t("settings.font.namesFixed"));
     } catch (e) {
-      if (!silent) toast(String(e), "error");
+      if (!silent) toast(errText(e), "error");
     }
   }
 
@@ -1754,7 +1854,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       }
     } catch (e) {
       backupList = [];
-      toast(t("settings.dav.listFailed", { err: String(e) }), "error");
+      toast(t("settings.dav.listFailed", { err: errText(e) }), "error");
     } finally {
       backupListBusy = false;
     }
@@ -1774,7 +1874,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       await loadBackupList();
       toast(t("settings.dav.backupDone"));
     } catch (e) {
-      toast(t("settings.dav.backupFailed", { err: String(e) }), "error");
+      toast(t("settings.dav.backupFailed", { err: errText(e) }), "error");
     } finally {
       webdavBackupBusy = false;
     }
@@ -1810,9 +1910,12 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           toast(t("settings.dav.decryptFailed"), "error");
           return;
         }
-        applyConfigJson(JSON.stringify(parsed.config));
+        const changes = applyConfigJson(JSON.stringify(parsed.config));
         await api.secretWrite(credJson);
         applySecrets(config, JSON.parse(credJson) as Record<string, unknown>);
+        // H13：备份自带的密文同样不得留在 host 已变化的端点上。
+        dropChangedEndpointSecrets(changes);
+        notifyHostChangedSecrets(changes);
       } else {
         // v1 旧备份：非密文部分 + 本机 DPAPI 密文，尽力兼容。
         const obj =
@@ -1820,7 +1923,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
             ? (parsed as any).config
             : parsed;
         if (!obj || typeof obj !== "object" || !obj.reader) throw new Error(t("settings.dav.invalidFormat"));
-        applyConfigJson(JSON.stringify(obj));
+        const changes = applyConfigJson(JSON.stringify(obj));
         const secret = parsed && typeof parsed === "object" ? (parsed as any).secret : undefined;
         if (typeof secret === "string" && secret) {
           try {
@@ -1831,11 +1934,13 @@ let aiTestState = $state<"" | "ok" | "bad">("");
             /* 旧备份密钥与当前机器不匹配时跳过 */
           }
         }
+        dropChangedEndpointSecrets(changes);
+        notifyHostChangedSecrets(changes);
       }
       saveConfigNow();
       toast(t("settings.dav.restored"));
     } catch (e) {
-      toast(t("settings.dav.restoreFailed", { err: String(e) }), "error");
+      toast(t("settings.dav.restoreFailed", { err: errText(e) }), "error");
     } finally {
       webdavRestoreBusy = false;
     }
@@ -1848,7 +1953,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       saveConfig();
       toast(t("settings.split.saved"));
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1873,7 +1978,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       config.reader.bgImage = name;
       saveConfig();
     } catch (e) {
-      toast(String(e), "error");
+      toast(errText(e), "error");
     }
   }
 
@@ -1903,7 +2008,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       previewToc = await api.previewSplit(regexBookPath, regexText.trim());
     } catch (e) {
       previewToc = null;
-      toast(String(e), "error");
+      toast(errText(e), "error");
     } finally {
       previewing = false;
     }
@@ -2366,6 +2471,17 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           <div class="ss-new">
             <input placeholder={t("settings.scheme.newPlaceholder")} bind:value={schemeNameInput} />
             <button class="primary ico" onclick={openSchemeNew}><IconPlus />{t("settings.scheme.newBtn")}</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+    {#if schemeRenameOpen}
+      <div class="scheme-save-backdrop" out:outDissolve role="presentation" onclick={() => (schemeRenameOpen = false)}>
+        <div class="scheme-save" out:outFade={{ from: 0.97, up: false }} role="dialog" tabindex="-1" aria-label={t("settings.scheme.rename")} onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+          <div class="ss-head">{t("settings.scheme.rename")}</div>
+          <div class="ss-new">
+            <input placeholder={t("settings.scheme.renamePrompt")} bind:value={schemeRenameName} onkeydown={(e) => { if (e.key === "Enter") confirmSchemeRename(); }} />
+            <button class="primary ico" onclick={confirmSchemeRename}>{t("common.confirm.ok")}</button>
           </div>
         </div>
       </div>
@@ -2837,6 +2953,9 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     <div class="field">
       <label>{t("settings.dav.server")}</label>
       <input placeholder="https://dav.jianguoyun.com/dav/" bind:value={config.webdav.base} onchange={saveConfig} />
+      {#if isInsecurePublicWebdav(config.webdav.base)}
+        <p class="tip" style="color:var(--danger)">{t("settings.dav.insecureHttp")}</p>
+      {/if}
     </div>
     <div class="grid2">
       <div class="field">

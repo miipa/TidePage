@@ -247,7 +247,8 @@ fn single_flight<V: Clone>(
 /// 简单的按书维度 LRU 章节缓存：容量按条数限制，随书切换/规则变化整体失效。
 /// 用 Vec 记录访问顺序（章节数不大，线性查找成本可忽略），命中即移到末尾。
 pub struct ChapterCache {
-    map: HashMap<(i64, i64, bool), Arc<ChapterData>>,
+    /// S1：值里带源文件指纹——同路径文件被就地替换后，旧正文不再命中（key 只有 book/idx/keep_styles）。
+    map: HashMap<(i64, i64, bool), (Option<(i64, i64)>, Arc<ChapterData>)>,
     order: std::collections::VecDeque<(i64, i64, bool)>,
     max: usize,
 }
@@ -268,14 +269,24 @@ impl ChapterCache {
         self.order.push_back(key);
     }
 
-    pub fn get(&mut self, key: (i64, i64, bool)) -> Option<Arc<ChapterData>> {
-        let v = self.map.get(&key).cloned()?;
+    /// S1：命中必须同时校验文件指纹；不匹配则移除该条并按未命中处理。
+    pub fn get(
+        &mut self,
+        key: (i64, i64, bool),
+        stamp: Option<(i64, i64)>,
+    ) -> Option<Arc<ChapterData>> {
+        let (cached_stamp, val) = self.map.get(&key)?.clone();
+        if !stamp_matches(cached_stamp, stamp) {
+            self.map.remove(&key);
+            self.order.retain(|k| *k != key);
+            return None;
+        }
         self.touch(key);
-        Some(v)
+        Some(val)
     }
 
-    pub fn put(&mut self, key: (i64, i64, bool), val: Arc<ChapterData>) {
-        self.map.insert(key, val);
+    pub fn put(&mut self, key: (i64, i64, bool), stamp: Option<(i64, i64)>, val: Arc<ChapterData>) {
+        self.map.insert(key, (stamp, val));
         self.touch(key);
         while self.order.len() > self.max {
             if let Some(old) = self.order.pop_front() {
@@ -352,14 +363,14 @@ fn file_stamp_of(p: &Path) -> Option<(i64, i64)> {
     Some((m.len() as i64, mtime))
 }
 
-fn file_stamp(path: &str) -> Option<(i64, i64)> {
+pub(crate) fn file_stamp(path: &str) -> Option<(i64, i64)> {
     file_stamp_of(Path::new(path))
 }
 
 /// 缓存里的文件指纹是否仍然可用：两侧都得有值且完全一致。
 /// 缓存侧缺失 = 当初就没拿到指纹（这种条目不该入缓存）；当前侧缺失 = 现在读不到文件。
 /// 两种情况都不复用，绝不把「没有指纹」当成永远有效。
-fn stamp_matches(cached: Option<(i64, i64)>, current: Option<(i64, i64)>) -> bool {
+pub(crate) fn stamp_matches(cached: Option<(i64, i64)>, current: Option<(i64, i64)>) -> bool {
     matches!((cached, current), (Some(a), Some(b)) if a == b)
 }
 
@@ -1932,12 +1943,30 @@ fn touch_epub_cache_order(order: &mut Vec<i64>, book_id: i64) {
 
 /// C1：插入 EPUB 缓存并按权重淘汰；当前书 book_id 永不被本轮淘汰。
 fn push_epub_cache(state: &AppState, book_id: i64, value: Arc<CachedEpub>) {
+    // S1：fs::metadata 是阻塞 IO（外置盘可能卡住），绝不能放在 epub_cache/order 两把锁内。
+    // 第一段短锁：只做插入与 LRU 顺序更新，顺带快照 (id, path)。
+    let entries: Vec<(i64, String)> = {
+        let mut m = state.epub_cache.lock().unwrap();
+        let mut order = state.epub_cache_order.lock().unwrap();
+        m.insert(book_id, value);
+        touch_epub_cache_order(&mut order, book_id);
+        m.iter().map(|(k, v)| (*k, v.path.clone())).collect()
+    };
+    // 锁外逐项 stat 计算权重（路径在快照后可能被换/删，读不到按 0 估）。
+    let sizes: Vec<(i64, usize)> = entries
+        .iter()
+        .map(|(k, p)| {
+            (
+                *k,
+                std::fs::metadata(p)
+                    .map(|x| x.len() as usize)
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
+    // 第三段短锁：重新取 order 做淘汰计划；只删仍存在的项，避免把快照后被重新插入的书误删。
     let mut m = state.epub_cache.lock().unwrap();
     let mut order = state.epub_cache_order.lock().unwrap();
-    m.insert(book_id, value);
-    touch_epub_cache_order(&mut order, book_id);
-    // C13：按文件大小估算缓存权重（不再持有整本字节）。
-    let sizes: Vec<(i64, usize)> = m.iter().map(|(k, v)| (*k, std::fs::metadata(&v.path).map(|x| x.len() as usize).unwrap_or(0))).collect();
     for victim in plan_epub_evictions(
         &sizes,
         &order,
@@ -1945,8 +1974,10 @@ fn push_epub_cache(state: &AppState, book_id: i64, value: Arc<CachedEpub>) {
         EPUB_CACHE_MAX_BYTES,
         EPUB_CACHE_MAX_ITEMS,
     ) {
-        m.remove(&victim);
-        order.retain(|id| *id != victim);
+        if m.contains_key(&victim) {
+            m.remove(&victim);
+            order.retain(|id| *id != victim);
+        }
     }
 }
 
@@ -2068,7 +2099,7 @@ pub fn load_txt(
         let key = crate::parsecache::CacheKey {
             kind: crate::parsecache::KIND_TXT,
             book_id,
-            rules_ver: ver,
+            rules_ver: crate::parsecache::CACHE_RULES_VER,
             size,
             mtime,
         };
@@ -2130,7 +2161,7 @@ pub fn load_txt(
         let key = crate::parsecache::CacheKey {
             kind: crate::parsecache::KIND_TXT,
             book_id,
-            rules_ver: ver,
+            rules_ver: crate::parsecache::CACHE_RULES_VER,
             size,
             mtime,
         };
@@ -2170,7 +2201,7 @@ pub(crate) fn load_mobi(
             let key = crate::parsecache::CacheKey {
                 kind: crate::parsecache::KIND_MOBI,
                 book_id,
-                rules_ver: ver,
+                rules_ver: crate::parsecache::CACHE_RULES_VER,
                 size,
                 mtime,
             };
@@ -2203,7 +2234,7 @@ pub(crate) fn load_mobi(
         let key = crate::parsecache::CacheKey {
             kind: crate::parsecache::KIND_MOBI,
             book_id,
-            rules_ver: ver,
+            rules_ver: crate::parsecache::CACHE_RULES_VER,
             size,
             mtime,
         };
@@ -2434,10 +2465,19 @@ fn safe_slice(s: &str, start: usize, end: usize) -> String {
     s[s_i..e_i].to_string()
 }
 
+/// H11：改 async + 阻塞线程池（主线程不再持全局 DB 锁做重 IO）。
+/// Tauri 的 async 命令带引用入参时必须返回 Result，故返回 Ok(Vec)；
+/// 前端 invoke 的返回值形态不变（数组），join 失败按空数组处理（与旧实现一致）。
 #[tauri::command]
-pub fn list_folders(state: State<'_, Arc<AppState>>) -> Vec<String> {
-    let conn = state.db.0.lock().unwrap();
-    db::list_folders(&conn)
+pub async fn list_folders(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    let st = state.inner().clone();
+    let folders = tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_folders(&conn)
+    })
+    .await
+    .unwrap_or_default();
+    Ok(folders)
 }
 
 #[tauri::command]
@@ -2874,6 +2914,28 @@ pub async fn set_read_state(
             Err(e) => return Err(e.to_string()),
         }
         db::set_read_state(&conn, book_id, v)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// F3-H2：右键标记已读/未读的最小后端入口：只写 read_state/read_pct/progress，
+/// 不打开书、不解析整本、不触发 book-opened、不改 last_read。state 只接受 "read"/"unread"。
+#[tauri::command]
+pub async fn mark_book_read_state(
+    app: State<'_, Arc<AppState>>,
+    book_id: i64,
+    state: String,
+) -> Result<(), String> {
+    let read = match state.as_str() {
+        "read" => true,
+        "unread" => false,
+        _ => return Err("未知阅读状态".into()),
+    };
+    let st = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::mark_book_read_state(&conn, book_id, read)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3852,8 +3914,15 @@ fn migrate_epub_split_positions(
     } else if action == MarkerAction::LegacyMigrate {
         legacy_migrate_positions(&tx, book_id, chapters);
     }
-    db::set_setting(&tx, &key, &marker);
-    let _ = tx.commit();
+    // M31：marker 写入失败直接丢弃事务（下次仍会迁移，不写假标记）。
+    if let Err(e) = db::set_setting_checked(&tx, &key, &marker) {
+        eprintln!("[split-migrate] book={book_id} marker write failed: {e}");
+        return;
+    }
+    // M31：commit 失败必须留痕；事务回滚后 marker 不生效，下次打开会重试迁移。
+    if let Err(e) = tx.commit() {
+        eprintln!("[split-migrate] book={book_id} action={action:?} commit failed: {e}");
+    }
 }
 
 #[tauri::command]
@@ -4293,12 +4362,14 @@ pub async fn get_chapter(
     let idx = chapter_index.max(0) as usize;
     let st = state.inner().clone();
 
-    // 已渲染章节缓存：命中直接返回（零解析成本，快速连续翻页/来回翻页瞬时）。
+    // S1：缓存命中必须校验文件指纹（同路径文件被替换后不能返回旧正文）。
+    // PDF 走 chapter_text/页位图，文件在本函数不参与解析；取指纹是廉价的 metadata 调用。
+    let cache_stamp = file_stamp(&path);
     if let Some(hit) = st
         .chapter_cache
         .lock()
         .unwrap()
-        .get((book_id, idx as i64, keep_styles))
+        .get((book_id, idx as i64, keep_styles), cache_stamp)
     {
         return Ok(hit.as_ref().clone());
     }
@@ -4414,10 +4485,11 @@ pub async fn get_chapter(
                 data.html.len()
             );
         }
-        st.chapter_cache
-            .lock()
-            .unwrap()
-            .put((book_id, idx as i64, keep_styles), Arc::new(data.clone()));
+        st.chapter_cache.lock().unwrap().put(
+            (book_id, idx as i64, keep_styles),
+            cache_stamp,
+            Arc::new(data.clone()),
+        );
         return Ok(data);
     }
 
@@ -4480,21 +4552,27 @@ pub async fn get_chapter(
         body
     };
     let data = ChapterData { title, html, chars };
-    st.chapter_cache
-        .lock()
-        .unwrap()
-        .put((book_id, idx as i64, keep_styles), Arc::new(data.clone()));
+    st.chapter_cache.lock().unwrap().put(
+        (book_id, idx as i64, keep_styles),
+        cache_stamp,
+        Arc::new(data.clone()),
+    );
     Ok(data)
 }
 
 #[tauri::command]
-pub fn save_progress(state: State<'_, Arc<AppState>>, book_id: i64, p: Progress) -> Result<(), String> {
+pub async fn save_progress(state: State<'_, Arc<AppState>>, book_id: i64, p: Progress) -> Result<(), String> {
     let mut p = p;
+    // 时间戳在命令入口（spawn 之前）取：异步化后闭包里再取可能与新请求反序，导致旧进度反超。
     p.updated_at = db::now_ms();
     p.device = "tidepage-pc".into();
-    let conn = state.db.0.lock().unwrap();
-    db::set_progress(&conn, book_id, &p)?;
-    Ok(())
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::set_progress_monotonic(&conn, book_id, &p)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -4536,9 +4614,10 @@ fn cleanup_book_artifacts_for(app: &AppHandle, items: &[(i64, Option<String>)]) 
                 eprintln!("[cleanup] res remove failed id={id} dir={} err={e}", dir.display());
             }
         }
-        // 解析结果磁盘缓存（P10）随书清理：删掉的书不需要重启后还留着几十 MB 缓存。
-        crate::parsecache::cleanup_book(&crate::data_dir(app).join("parse_cache"), *id);
     }
+    // S1：解析缓存改为本批一次扫描删除（旧实现每本书各 read_dir 一次，O(书数×缓存文件数)）。
+    let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+    crate::parsecache::cleanup_books(&crate::data_dir(app).join("parse_cache"), &ids);
 }
 
 /// 删除书籍。`fromDisk`=删除本地文件；`keepNotes`=保留带笔记的划线（默认 true）。
@@ -4704,19 +4783,35 @@ pub fn book_note_info(state: State<'_, Arc<AppState>>, book_id: i64) -> serde_js
 
 /// 笔记界面：按书分组列出「有划线或添加过感想」的书（有划线即入列）。
 /// noteCount = 其中带感想的条数；hlCount = 划线条数（含无感想）。
+/// H11：改 async + 阻塞线程池；Tauri async 命令带引用入参须返回 Result，
+/// 前端 invoke 仍拿到数组（join 失败返回空数组，与旧实现一致）。
 #[tauri::command]
-pub fn list_note_books(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
-    let conn = state.db.0.lock().unwrap();
-    db::list_note_books(&conn)
-        .into_iter()
-        .map(|(id, title, author, deleted, hl, notes, last, cover, cover_ver)| {
-            serde_json::json!({
-                "bookId": id, "title": title, "author": author,
-                "deleted": deleted, "hlCount": hl, "noteCount": notes, "lastAt": last,
-                "coverPath": cover, "coverVer": cover_ver
+pub async fn list_note_books(state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
+    let st = state.inner().clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || {
+        let conn = st.db.0.lock().unwrap();
+        db::list_note_books(&conn)
+            .into_iter()
+            .map(|(id, title, author, deleted, hl, notes, last, cover, cover_ver)| {
+                serde_json::json!({
+                    "bookId": id, "title": title, "author": author,
+                    "deleted": deleted, "hlCount": hl, "noteCount": notes, "lastAt": last,
+                    "coverPath": cover, "coverVer": cover_ver
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    Ok(rows)
+}
+
+/// 批量判断选中书里是否有任何一本带笔记（批量删除时决定是否显示「笔记处理方式」）。
+/// 只读一行 SQL 的 EXISTS 汇总，不逐本读笔记内容。
+#[tauri::command]
+pub fn books_have_notes(state: State<'_, Arc<AppState>>, book_ids: Vec<i64>) -> bool {
+    let conn = state.db.0.lock().unwrap();
+    db::any_book_has_notes(&conn, &book_ids)
 }
 
 /// 某书的笔记明细。
@@ -4761,6 +4856,8 @@ pub fn append_highlight_note(
 #[tauri::command]
 pub async fn preview_split(path: String, pattern: String) -> Result<Vec<TocEntry>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // S1：只允许预览 txt/mobi/azw/azw3 且必须存在（前端只会传 txt）。
+        validate_source_path(&path, &["txt", "mobi", "azw", "azw3"])?;
         let pattern = if pattern.trim().is_empty() { crate::default_pattern().to_string() } else { pattern };
         let doc = txt::decode_and_split(&path, Some(&pattern), None)?;
         Ok(doc.toc.into_iter().take(300).collect())
@@ -4774,6 +4871,12 @@ pub fn save_split_rules(state: State<'_, Arc<AppState>>, pattern: String) -> Res
     {
         let conn = state.db.0.lock().unwrap();
         db::set_setting(&conn, "txt_rules", &pattern);
+    }
+    // M32：设置写入失败必须上抛；只有写入成功才递增版本并清缓存，
+    // 否则规则没落库但缓存被清、版本已增，下次启动仍按旧规则解析。
+    {
+        let conn = state.db.0.lock().unwrap();
+        db::set_setting_checked(&conn, "txt_rules", &pattern)?;
     }
     state.rules_ver.fetch_add(1, Ordering::Relaxed);
     state.txt_cache.lock().unwrap().clear();
@@ -4896,8 +4999,27 @@ pub fn set_mobi_encoding(state: State<'_, Arc<AppState>>, value: String) -> Resu
     Ok(())
 }
 
+/// P0-2：把设置里的正文字符编码（与阅读共用 mobi.encoding）归一化为 decode 可用的 label。
+/// 空/auto/未知编码名一律按 None（自动探测），未知非空值记一次日志但不让转换失败。
+fn normalize_text_encoding(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match encoding_rs::Encoding::for_label(s.as_bytes()) {
+        Some(enc) => Some(enc.name().to_string()),
+        None => {
+            let msg = format!("[convert] 未知正文字符编码 {s:?}，回退自动探测");
+            eprintln!("{msg}");
+            crate::memlog::stage_note("convert:encoding", &msg);
+            None
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn convert_book(
+    state: tauri::State<'_, Arc<AppState>>,
     path: String,
     target: String,
     pattern: String,
@@ -4907,15 +5029,25 @@ pub async fn convert_book(
     css: Option<String>,
     title: Option<String>,
 ) -> Result<String, String> {
+    // 前端 invoke 参数不变：State 由 Tauri 自动注入（不进入 JS 参数表）。
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let forced = {
+            let conn = st.db.0.lock().unwrap();
+            db::get_setting(&conn, "mobi.encoding")
+        };
+        let forced = normalize_text_encoding(forced.as_deref());
         let ext = ext_of(&path).unwrap_or_default();
         let is_mobi_like = is_mobi_ext(&ext);
         if (ext == "txt" && target == "epub")
             || (is_mobi_like && (target == "txt" || target == "epub"))
             || (ext == "epub" && target == "txt")
         {
+            // S1：输出路径白名单按 target 决定（txt→txt，epub→epub）。
+            let out_exts: &[&str] = if target == "txt" { &["txt"] } else { &["epub"] };
+            validate_output_path(&out_path, out_exts, true)?;
             let mut book = if ext == "txt" {
-                crate::convert::txt_to_epub_data(&path, &pattern)?
+                crate::convert::txt_to_epub_data(&path, &pattern, forced.as_deref())?
             } else if is_mobi_like {
                 crate::convert::mobi_to_ebook_data(&path)?
             } else {
@@ -4961,6 +5093,128 @@ fn ext_of_img(path: &str) -> String {
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| "png".into())
+}
+
+/// S1：Windows 保留设备名（不区分大小写；带扩展名同样不能用，如 CON.txt）。
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// S1：不得写入的系统目录环境变量（取不到该变量就跳过，不因此拒绝合法路径）。
+const WINDOWS_SYSTEM_ENV_DIRS: &[&str] = &["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"];
+
+/// 路径归一化：按组件消解 ".." 与 "."、统一分隔符为 / 并转小写，只用于系统目录前缀比较。
+/// 必须消解父目录：否则 C:\Windows\..\Windows\x.txt 这类路径能绕开前缀判断。
+fn normalize_path_key(path: &Path) -> String {
+    use std::path::Component;
+    let mut prefix = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => {
+                prefix = p.as_os_str().to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+            }
+            Component::RootDir => {
+                if !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(s) => parts.push(s.to_string_lossy().to_string()),
+        }
+    }
+    format!("{}{}", prefix, parts.join("/")).to_lowercase()
+}
+
+/// S1：写入类命令的纵深防御校验：
+/// 非空、绝对路径、文件名合法（非空/不以空格或点结尾/非 Windows 保留设备名）、
+/// 扩展名在白名单、目标不是已存在目录、父目录存在且为目录、不落在系统目录。
+/// 说明：这是 IPC 层的兜底，正常流程的路径来自 pickSave/pickFile 保存对话框。
+fn validate_output_path(path: &str, allowed_exts: &[&str], needs_existing_parent: bool) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("路径为空".into());
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("必须使用绝对路径：{path}"));
+    }
+    let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+        return Err("路径缺少文件名".into());
+    };
+    if name.is_empty() {
+        return Err("文件名为空".into());
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Err("文件名不能以空格或点结尾".into());
+    }
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if WINDOWS_RESERVED_STEMS
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r))
+    {
+        return Err(format!("文件名 {stem} 是 Windows 保留设备名"));
+    }
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !allowed_exts.iter().any(|e| *e == ext) {
+        return Err(format!("不允许的文件类型：.{ext}"));
+    }
+    if p.exists() && p.is_dir() {
+        return Err("目标是目录，不能写入".into());
+    }
+    if needs_existing_parent {
+        let Some(parent) = p.parent() else {
+            return Err("路径缺少父目录".into());
+        };
+        if !parent.exists() {
+            return Err("父目录不存在".into());
+        }
+        if !parent.is_dir() {
+            return Err("父路径不是目录".into());
+        }
+    }
+    let key = normalize_path_key(p);
+    for env in WINDOWS_SYSTEM_ENV_DIRS {
+        let Ok(dir) = std::env::var(env) else { continue };
+        if dir.trim().is_empty() {
+            continue;
+        }
+        let base = normalize_path_key(Path::new(&dir));
+        if !base.is_empty() && (key == base || key.starts_with(&format!("{base}/"))) {
+            return Err(format!("不允许写入系统目录：{dir}"));
+        }
+    }
+    Ok(())
+}
+
+/// S1：读取类命令（preview_split）的校验：绝对路径、存在且是普通文件、扩展名白名单。
+fn validate_source_path(path: &str, allowed_exts: &[&str]) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("路径为空".into());
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("必须使用绝对路径：{path}"));
+    }
+    if !p.is_file() {
+        return Err("文件不存在或不是普通文件".into());
+    }
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !allowed_exts.iter().any(|e| *e == ext) {
+        return Err(format!("不允许的文件类型：.{ext}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5027,6 +5281,8 @@ pub struct AiExportItemIn {
 #[tauri::command]
 pub async fn write_text_file(path: String, content: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // S1：文本导出只允许 txt/md/csv，且父目录必须已存在；拒绝保留设备名与系统目录。
+        validate_output_path(&path, &["txt", "md", "csv"], true)?;
         std::fs::write(&path, content).map_err(|e| format!("写入文件失败：{e}"))
     })
     .await
@@ -5042,6 +5298,9 @@ pub async fn export_ai(
     items: Vec<AiExportItemIn>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // S1：AI 导出只允许 txt/epub，且父目录必须已存在。
+        let out_exts: &[&str] = if target == "epub" { &["epub"] } else { &["txt"] };
+        validate_output_path(&path, out_exts, true)?;
         let items: Vec<crate::convert::AiExportItem> = items
             .into_iter()
             .map(|i| crate::convert::AiExportItem { title: i.title, html: i.html })
@@ -5057,33 +5316,83 @@ pub async fn export_ai(
     .map_err(|e| e.to_string())?
 }
 
+/// H11：图片类命令的源文件上限。比 read_book_bytes 的 256MiB 更保守——这里要
+/// 整图解码（内存 ≈ 宽×高×4），64MiB 压缩数据足以覆盖正常封面/背景图，再大只会放大 OOM 风险。
+const IMAGE_SOURCE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// P0-3：默认封面底图解码上限（image::load_from_memory 会按宽×高×4 分配）。
+/// 100MP/边长 20000 足够覆盖常见封面/背景图；超限在解码前拒绝，避免整图解码 OOM。
+const IMAGE_DIM_MAX_PIXELS: u64 = 100_000_000;
+const IMAGE_DIM_MAX_EDGE: u32 = 20_000;
+
+/// P0-3：尺寸上限判定（纯函数，便于测试边界）。返回 Some(可读错误) 表示超限/非法。
+fn image_dim_limit_error(w: u32, h: u32) -> Option<String> {
+    if w == 0 || h == 0 {
+        return Some("图片尺寸无效（宽或高为 0）".to_string());
+    }
+    let pixels = w as u64 * h as u64;
+    if pixels > IMAGE_DIM_MAX_PIXELS || w.max(h) > IMAGE_DIM_MAX_EDGE {
+        return Some(format!(
+            "图片尺寸过大（{w}x{h}，上限 100MP/边长 20000）"
+        ));
+    }
+    None
+}
+
+/// P0-3：只读图片 header 获取尺寸（不整图解码）；非图片/损坏文件给可读错误。
+fn check_image_dimensions(image_path: &str) -> Result<(u32, u32), String> {
+    image::image_dimensions(image_path)
+        .map_err(|e| format!("读取图片尺寸失败（不是有效图片或文件损坏）：{e}"))
+}
+
+fn image_source_too_large(len: u64) -> bool {
+    len > IMAGE_SOURCE_MAX_BYTES
+}
+
+/// 读取图片命令的公共前置：先看 metadata 卡上限，避免先整读再拒绝。
+fn check_image_source(image_path: &str) -> Result<(), String> {
+    let meta = std::fs::metadata(image_path).map_err(|e| format!("读取图片信息失败: {e}"))?;
+    if image_source_too_large(meta.len()) {
+        return Err(format!(
+            "图片过大（{}MB），上限 {}MB",
+            meta.len() / 1048576,
+            IMAGE_SOURCE_MAX_BYTES / 1048576
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub fn set_custom_cover(
+pub async fn set_custom_cover(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
     image_path: String,
 ) -> Result<(), String> {
-    let data = std::fs::read(&image_path).map_err(|e| e.to_string())?;
-    let dir = covers::covers_dir(&state.app);
-    let name = format!("custom-{book_id}.png");
-    let out = dir.join(&name);
-    covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
-    // 同 stem 清理：手动换封面时旧扩展名（如 PDF 首页生成的 .webp）必须删掉，
-    // 否则同一本书会留下多份不同扩展名的封面（白占磁盘、孤儿永不回收）。
-    // 保留刚写入的这一份（精确文件名，不按 mtime 猜）。
-    covers::clean_same_stem(&dir, &format!("custom-{book_id}"), &name);
-    let rel = name;
-    {
-        let conn = state.db.0.lock().unwrap();
-        conn.execute(
-            "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
-            rusqlite::params![book_id, rel],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    // 该本封面已变：通知前端刷新，per-book URL 因 cover_ver+1 而失效重取。
-    state.app.emit("book-updated", ()).ok();
-    Ok(())
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        check_image_source(&image_path)?;
+        let data = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+        let dir = covers::covers_dir(&st.app);
+        let name = format!("custom-{book_id}.png");
+        let out = dir.join(&name);
+        covers::make_thumbnail(&data, &out).map_err(|e| format!("图片处理失败: {e}"))?;
+        // 同 stem 清理：手动换封面时旧扩展名（如 PDF 首页生成的 .webp）必须删掉，
+        // 否则同一本书会留下多份不同扩展名的封面（白占磁盘、孤儿永不回收）。
+        // 保留刚写入的这一份（精确文件名，不按 mtime 猜）。
+        covers::clean_same_stem(&dir, &format!("custom-{book_id}"), &name);
+        {
+            let conn = st.db.0.lock().unwrap();
+            conn.execute(
+                "UPDATE books SET cover_path=?2, cover_ver=cover_ver+1 WHERE id=?1",
+                rusqlite::params![book_id, name],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // 该本封面已变：通知前端刷新，per-book URL 因 cover_ver+1 而失效重取。
+        st.app.emit("book-updated", ()).ok();
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 读取整本 PDF 的原始字节，供前端 pdf.js 解析。
@@ -5285,36 +5594,41 @@ pub fn set_book_cover_image(
 /// 前端回传的「某页纯文本」：写入既有 chapter_text（划词全文搜索 / FTS 的数据源）。
 /// 后端不解析 PDF —— 文字只能由前端 pdf.js 抽取后回传；乱码页前端不会回传（见 pdfTextUsable）。
 #[tauri::command]
-pub fn set_pdf_page_text(
+pub async fn set_pdf_page_text(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
     page_index: i64,
     title: String,
     text: String,
 ) -> Result<(), String> {
-    let conn = state.db.0.lock().unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![book_id, page_index, title, text],
-    )
-    .map_err(|e| e.to_string())?;
-    // 全库搜索（search_all_inner）查的是 fts 表，而 index_book_fts 只在打开后的 idle 跑一次
-    // 且以「fts 里该书 0 行」为建索引条件 —— 之后回传的页永远进不了 fts，全库搜索就搜不到 PDF。
-    // 所以这里同步补一条 FTS 行（先删同页再插，重复回传保持幂等）。
-    if db::has_fts(&conn) {
-        db::ensure_fts(&conn).ok();
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let conn = st.db.0.lock().unwrap();
         conn.execute(
-            "DELETE FROM fts WHERE book_id=?1 AND chapter_index=?2",
-            rusqlite::params![book_id, page_index],
-        )
-        .ok();
-        conn.execute(
-            "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+            "INSERT OR REPLACE INTO chapter_text(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
             rusqlite::params![book_id, page_index, title, text],
         )
-        .ok();
-    }
-    Ok(())
+        .map_err(|e| e.to_string())?;
+        // 全库搜索（search_all_inner）查的是 fts 表，而 index_book_fts 只在打开后的 idle 跑一次
+        // 且以「fts 里该书 0 行」为建索引条件 —— 之后回传的页永远进不了 fts，全库搜索就搜不到 PDF。
+        // 所以这里同步补一条 FTS 行（先删同页再插，重复回传保持幂等）。
+        if db::has_fts(&conn) {
+            db::ensure_fts(&conn).ok();
+            conn.execute(
+                "DELETE FROM fts WHERE book_id=?1 AND chapter_index=?2",
+                rusqlite::params![book_id, page_index],
+            )
+            .ok();
+            conn.execute(
+                "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![book_id, page_index, title, text],
+            )
+            .ok();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 默认底图变更后的统一收尾（F2 修正版）。
@@ -5357,32 +5671,45 @@ fn write_default_cover_atomic(out: &Path, data: &[u8]) -> Result<(), String> {
 ///   2) 同时分析底图「书名显示区域」（底部 42%）平均亮度，自动决定叠字用深色还是浅色，
 ///      结果存入 settings（dc_text / dc_text_light），渲染时直接取用（无需每次重解码大图）。
 #[tauri::command]
-pub fn set_default_cover(state: State<'_, Arc<AppState>>, image_path: String) -> Result<(), String> {
-    let data = std::fs::read(&image_path).map_err(|e| format!("读取图片失败: {e}"))?;
-    let img = image::load_from_memory(&data).map_err(|e| format!("不是有效图片: {e}"))?;
-    // 下采样到封面比例（2:3 居中裁切填满），再编码为 PNG。
-    let cover = img.resize_to_fill(320, 480, image::imageops::FilterType::Lanczos3);
-    let rgba = cover.to_rgba8();
-    let mut png: Vec<u8> = Vec::new();
-    cover
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| format!("编码封面失败: {e}"))?;
+pub async fn set_default_cover(state: State<'_, Arc<AppState>>, image_path: String) -> Result<(), String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        check_image_source(&image_path)?;
+        // P0-3：整读/解码前先只读 header 校验像素与边长，避免超大图直接把进程内存打爆。
+        let (w, h) = check_image_dimensions(&image_path)?;
+        if let Some(msg) = image_dim_limit_error(w, h) {
+            return Err(msg);
+        }
+        let data = std::fs::read(&image_path).map_err(|e| format!("读取图片失败: {e}"))?;
+        let img = image::load_from_memory(&data).map_err(|e| format!("不是有效图片: {e}"))?;
+        // 下采样到封面比例（2:3 居中裁切填满），再编码为 PNG。
+        let cover = img.resize_to_fill(320, 480, image::imageops::FilterType::Lanczos3);
+        let rgba = cover.to_rgba8();
+        let mut png: Vec<u8> = Vec::new();
+        cover
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| format!("编码封面失败: {e}"))?;
 
-    let out = covers::default_cover_path(&state.app);
-    write_default_cover_atomic(&out, &png)?;
+        let out = covers::default_cover_path(&st.app);
+        write_default_cover_atomic(&out, &png)?;
 
-    // 分析书名区亮度 → 自适应字色（偏亮配柔和深色、偏暗配柔和浅色；非纯黑纯白、护眼）。
-    let region_light = covers::region_is_light(&rgba);
-    let (text, is_light) = if region_light {
-        ("#2A2723", false)
-    } else {
-        ("#EFEBE4", true)
-    };
-    {
-        let conn = state.db.0.lock().unwrap();
-        db::set_setting(&conn, "dc_text", text);
-        db::set_setting(&conn, "dc_text_light", if is_light { "1" } else { "0" });
-    }
+        // 分析书名区亮度 → 自适应字色（偏亮配柔和深色、偏暗配柔和浅色；非纯黑纯白、护眼）。
+        let region_light = covers::region_is_light(&rgba);
+        let (text, is_light) = if region_light {
+            ("#2A2723", false)
+        } else {
+            ("#EFEBE4", true)
+        };
+        {
+            let conn = st.db.0.lock().unwrap();
+            db::set_setting(&conn, "dc_text", text);
+            db::set_setting(&conn, "dc_text_light", if is_light { "1" } else { "0" });
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    // 收尾按原顺序放在 await 之后：版本号失效 + 通知前端刷新。
     invalidate_covers_after_base_change(state.inner());
     Ok(())
 }
@@ -5412,7 +5739,7 @@ pub fn has_default_cover(state: State<'_, Arc<AppState>>) -> bool {
 
 #[tauri::command]
 pub async fn webdav_test(base: String, user: String, pass: String) -> Result<bool, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.test().await
 }
 
@@ -5430,7 +5757,7 @@ pub async fn webdav_backup_settings(
     if !valid_backup_name(&name) {
         return Err("备份文件名无效".into());
     }
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.ensure_dir("TidePage").await?;
     c.ensure_dir("TidePage/settings").await?;
     let path = format!("TidePage/settings/{name}");
@@ -5449,7 +5776,7 @@ pub async fn webdav_restore_settings(
     if !valid_backup_name(&name) {
         return Err("备份文件名无效".into());
     }
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     match c.get(&format!("TidePage/settings/{name}")).await? {
         Some(bytes) => String::from_utf8(bytes)
             .map(Some)
@@ -5478,7 +5805,7 @@ pub async fn webdav_sync_progress(
     book_path: String,
     local: Option<Progress>,
 ) -> Result<Progress, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.ensure_dir("TidePage").await.ok();
     // 确保自有同步进度子目录存在（严格服务器对未建父目录的深路径 PUT 会 409）。
     c.ensure_dir("TidePage/progress").await.ok();
@@ -5524,7 +5851,7 @@ pub async fn webdav_read_progress(
     pass: String,
     book_path: String,
 ) -> Result<Option<Progress>, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     let remote_key = format!("TidePage/progress/{}.json", db::path_id(&book_path));
     // get()：404 → Ok(None)，传输错误 → Err；两种失败都按「云端无进度」处理。
     Ok(match c.get(&remote_key).await {
@@ -5613,42 +5940,27 @@ pub async fn webdav_upload_book(
     pass: String,
     book_path: String,
 ) -> Result<String, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.ensure_dir("TidePage").await?;
     c.ensure_dir("TidePage/books").await?;
     let name = Path::new(&book_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or("路径无效")?;
-    // 整本读入前先按 metadata 卡上限，并放到阻塞线程池：async 命令里同步读大书会占住运行时。
-    let read_path = book_path.clone();
-    let data = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        use std::io::Read;
-        let meta = std::fs::metadata(&read_path).map_err(|e| e.to_string())?;
-        if meta.len() > WEBDAV_FILE_MAX_BYTES {
-            return Err(format!(
-                "文件超过上限 {} 字节，已取消上传",
-                WEBDAV_FILE_MAX_BYTES
-            ));
-        }
-        // take 在读取层再设一次硬上限：metadata 与读取之间文件变大也不会无界分配。
-        let file = std::fs::File::open(&read_path).map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        file.take(WEBDAV_FILE_MAX_BYTES + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| e.to_string())?;
-        if buf.len() as u64 > WEBDAV_FILE_MAX_BYTES {
-            return Err(format!(
-                "文件超过上限 {} 字节，已取消上传",
-                WEBDAV_FILE_MAX_BYTES
-            ));
-        }
-        Ok(buf)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    c.put(&format!("TidePage/books/{name}"), std::sync::Arc::new(data))
-        .await?;
+    // S2：流式上传，内存与文件大小无关。先 metadata 预检，再打开后重新取 metadata 校验
+    //（防 metadata 与打开之间文件被替换/变大），同时覆盖 32 位 >2GiB 的硬上限。
+    let f = std::fs::File::open(&book_path).map_err(|e| format!("打开文件失败：{e}"))?;
+    let meta = f.metadata().map_err(|e| format!("读取文件信息失败：{e}"))?;
+    if let Some(msg) = crate::dav::too_large_for_arch(meta.len(), usize::BITS) {
+        return Err(msg.to_string());
+    }
+    if meta.len() > WEBDAV_FILE_MAX_BYTES {
+        return Err(format!(
+            "文件超过上限 {} 字节，已取消上传",
+            WEBDAV_FILE_MAX_BYTES
+        ));
+    }
+    c.put_file(&format!("TidePage/books/{name}"), f).await?;
     Ok(format!("TidePage/books/{name}"))
 }
 
@@ -5660,7 +5972,7 @@ pub async fn webdav_download_books(
     pass: String,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     let items = c.list("TidePage/books").await?;
     let target = PathBuf::from(&target_dir);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
@@ -5685,11 +5997,9 @@ pub async fn webdav_download_books(
         if out.exists() {
             continue;
         }
-        if let Some(data) = c
-            .get_limited(&format!("TidePage/books/{safe_name}"), WEBDAV_FILE_MAX_BYTES)
-            .await?
-        {
-            std::fs::write(&out, &data).map_err(|e| e.to_string())?;
+        // S2：流式下载到同目录 tmp 再 rename；内存与文件大小无关，失败自动清理 tmp。
+        let remote = format!("TidePage/books/{safe_name}");
+        if c.download_to_file(&remote, &out, WEBDAV_FILE_MAX_BYTES).await? {
             imported.push(out.to_string_lossy().into_owned());
         }
     }
@@ -5743,7 +6053,7 @@ pub async fn webdav_list(
     pass: String,
     path: String,
 ) -> Result<Vec<DavEntry>, String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     let items = c.list(&path).await?;
     Ok(items
         .into_iter()
@@ -5759,7 +6069,7 @@ pub async fn webdav_delete(
     pass: String,
     path: String,
 ) -> Result<(), String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.delete(&path).await
 }
 
@@ -5772,7 +6082,7 @@ pub async fn webdav_copy(
     src: String,
     dst: String,
 ) -> Result<(), String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.copy(&src, &dst).await
 }
 
@@ -5785,7 +6095,7 @@ pub async fn webdav_move(
     src: String,
     dst: String,
 ) -> Result<(), String> {
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     c.move_path(&src, &dst).await
 }
 
@@ -5806,7 +6116,7 @@ pub async fn webdav_download_file(
     let target = PathBuf::from(&target_dir);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
     let out = safe_join_under(&target, &name).ok_or("无效文件名")?;
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     let data = c
         .get_limited(&remote_path, WEBDAV_FILE_MAX_BYTES)
         .await?
@@ -5855,7 +6165,7 @@ pub async fn webdav_download_progress(
         Some(n) => n,
         None => return Err("无效文件名".into()),
     };
-    let c = crate::dav::DavClient::new(&base, &user, &pass);
+    let c = crate::dav::DavClient::new(&base, &user, &pass)?;
     let g = state.app.clone();
     let resp = match c.get_stream(&remote_path).await {
         Ok(Some(r)) => r,
@@ -6169,7 +6479,7 @@ pub async fn storage_stats(state: State<'_, Arc<AppState>>) -> Result<StorageSta
 }
 
 #[cfg(windows)]
-fn disk_free_bytes(path: &Path) -> Option<u64> {
+pub(crate) fn disk_free_bytes(path: &Path) -> Option<u64> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
@@ -6182,7 +6492,7 @@ fn disk_free_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(windows))]
-fn disk_free_bytes(_path: &Path) -> Option<u64> {
+pub(crate) fn disk_free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
@@ -6649,6 +6959,14 @@ pub async fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Resul
         let mut freed: u64 = 0;
         for name in &targets {
             let p = dir.join(name);
+            if *name == "covers" {
+                // 封面目录不整体删除：里面还有用户自选封面（custom-*）、阅读背景图（bg-*、
+                // background.img）与默认底图；只按命名精确清理自动生成的封面文件。
+                let (b, _) = crate::covers::clean_auto_covers(&p);
+                freed += b;
+                std::fs::create_dir_all(&p).ok();
+                continue;
+            }
             let (b, _) = dir_size(&p);
             if p.exists() {
                 std::fs::remove_dir_all(&p).map_err(|e| format!("清理 {name} 失败: {e}"))?;
@@ -6662,8 +6980,13 @@ pub async fn clear_cache(state: State<'_, Arc<AppState>>, what: String) -> Resul
             st.cover_style_ver.fetch_add(1, Ordering::SeqCst);
             {
                 let conn = st.db.0.lock().unwrap();
-                conn.execute("UPDATE books SET cover_path=NULL, meta_done=0", [])
-                    .map_err(|e| e.to_string())?;
+                // 只复位自动封面行；custom-* 用户自选封面保持原值（文件也未被删除）。
+                conn.execute(
+                    "UPDATE books SET cover_path=NULL, meta_done=0 \
+                     WHERE cover_path IS NULL OR lower(cover_path) NOT LIKE 'custom-%'",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
             }
             // worker 已确认停止：重新拉起增量扫描（全局互斥，若已在跑则 no-op）。
             ensure_scan_worker(&st.app);
@@ -7268,32 +7591,99 @@ pub async fn search_all(state: State<'_, Arc<AppState>>, query: String) -> Resul
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || search_all_inner(&st, query))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
 }
 
-fn search_all_inner(state: &Arc<AppState>, query: String) -> Vec<SearchHit> {
-    {
-        let conn = state.db.0.lock().unwrap();
-        if !db::has_fts(&conn) || query.chars().count() < 2 {
-            return vec![];
-        }
+/// 非空白字符数：短查询分流的判据（空白不计入长度）。
+fn non_whitespace_chars(s: &str) -> usize {
+    s.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// H12：2 字符查询走正文回退时的库大小阈值（page_count * page_size 估算值）。
+/// trigram FTS 对 <3 字符不产生 token；全库 LIKE 在超大库上不可接受，超过阈值只搜书名/作者。
+const SEARCH_SHORT_BODY_DB_MAX_BYTES: i64 = 256 * 1024 * 1024;
+
+/// 规模守卫（纯函数）：取不到库大小一律保守跳过正文扫描；恰好等于阈值允许。
+fn short_body_allowed(db_bytes: Option<i64>) -> bool {
+    match db_bytes {
+        Some(b) => b <= SEARCH_SHORT_BODY_DB_MAX_BYTES,
+        None => false,
     }
-    // 直接用 FTS5 snippet() 生成片段：不再逐条 ensure_book_text（整书解析），首次搜索显著变快。
+}
+
+/// 估算库大小（毫秒级 pragma，不扫页）。取不到返回 None。
+fn estimate_db_bytes(conn: &rusqlite::Connection) -> Option<i64> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).ok()?;
+    let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).ok()?;
+    Some(pages.saturating_mul(size))
+}
+
+/// 原串上的 ASCII 大小写不敏感查找（返回原串字节偏移；禁止用 to_lowercase 偏移切串）。
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    (0..=h.len() - n.len()).find(|&i| {
+        h[i..i + n.len()]
+            .iter()
+            .zip(n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// 取命中前后约 40 字符的片段，并用 \u{1}/\u{2} 哨兵标出命中，
+/// 交给 snippet_highlight 统一转义与还原 <mark>（转义在哨兵还原之前）。
+fn short_snippet(raw: &str, needle: &str) -> String {
+    let q = needle.trim();
+    let Some(hit) = find_ci(raw, q) else {
+        return raw.chars().take(80).collect();
+    };
+    let before: Vec<usize> = raw[..hit].char_indices().map(|(i, _)| i).collect();
+    let begin = if before.len() > 40 {
+        before[before.len() - 40]
+    } else {
+        0
+    };
+    let hit_end = hit + q.len();
+    let after_end = raw[hit_end..]
+        .char_indices()
+        .nth(40)
+        .map(|(i, _)| hit_end + i)
+        .unwrap_or(raw.len());
+    format!(
+        "{}\u{1}{}\u{2}{}",
+        &raw[begin..hit],
+        &raw[hit..hit_end],
+        &raw[hit_end..after_end]
+    )
+}
+
+/// I23：把用户原始输入转成 FTS5 安全查询（整体短语 + 双引号加倍）。
+/// FTS5 的 MATCH 语法把 AND/OR/NOT/NEAR、冒号、连字符、括号、星号都当运算符；
+/// 直接拼进 MATCH 会语法错误（旧实现被 filter_map/ unwrap_or_default 吞成空结果）。
+/// 用整体短语引号后，所有特殊字符都按普通文本处理，查询不再报错。
+fn fts_user_query(raw: &str) -> String {
+    let trimmed = raw.trim();
+    format!("\"{}\"", trimmed.replace('"', "\"\""))
+}
+
+/// 旧 FTS 路径（≥3 字符）：LIMIT 80 与 snippet 规则保持原样，错误改为可读返回。
+fn search_fts(conn: &rusqlite::Connection, query: &str) -> Result<Vec<SearchHit>, String> {
+    // 直接用 FTS5 snippet() 生成片段：snippet 第二参 -1 = 首个命中列（title 或 body）。
     // snippet() 不做 HTML 转义，故用正文不会出现的哨兵字符包裹命中，取出后先在 Rust 侧
     // 按 highlight_snippet 同款规则转义（& < >），再把哨兵还原为 <mark>/</mark>。
-    // 书名用 JOIN 直接取，不再逐条 get_book。
-    let rows: Vec<(i64, i64, String, String, String)> = {
-        let conn = state.db.0.lock().unwrap();
-        let q = query.replace('"', "\"\"");
-        let sql = "SELECT fts.book_id, fts.chapter_index, fts.title, COALESCE(b.title,''), \
-                   snippet(fts, 3, ?2, ?3, '…', 12) \
-                   FROM fts LEFT JOIN books b ON b.id=fts.book_id \
-                   WHERE fts.body MATCH ?1 LIMIT 80";
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(rusqlite::params![&q, "\u{1}", "\u{2}"], |r| {
+    let q = fts_user_query(query);
+    let sql = "SELECT fts.book_id, fts.chapter_index, fts.title, COALESCE(b.title,''), \
+               snippet(fts, -1, ?2, ?3, '…', 12) \
+               FROM fts LEFT JOIN books b ON b.id=fts.book_id \
+               WHERE fts MATCH ?1 LIMIT 80";
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("搜索失败：{e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![&q, "\u{1}", "\u{2}"], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
@@ -7302,18 +7692,162 @@ fn search_all_inner(state: &Arc<AppState>, query: String) -> Vec<SearchHit> {
                 r.get::<_, String>(4)?,
             ))
         })
-        .map(|rs| rs.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    };
-    rows.into_iter()
-        .map(|(book_id, chapter_index, chapter_title, book_title, raw)| SearchHit {
+        .map_err(|e| format!("搜索失败：{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("搜索失败：{e}"))?;
+    let mut hits: Vec<SearchHit> = Vec::with_capacity(rows.len() + 8);
+    let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    for (book_id, chapter_index, chapter_title, book_title, raw) in rows {
+        seen.insert((book_id, chapter_index));
+        hits.push(SearchHit {
             book_id,
             book_title,
             chapter_index,
             chapter_title,
             snippet: snippet_highlight(&raw),
+        });
+    }
+    // P1-9：书名参与搜索（≥3 字路径与 2 字路径一致）。补充查询保持与 FTS 相同的可见性：
+    // 只返回 books 中现存、且确实存在 FTS 行（已索引、未被排除）的书；LIMIT 80。
+    let pat = format!("%{}%", db::escape_like(query.trim()));
+    let mut tstmt = conn
+        .prepare(
+            "SELECT b.id, COALESCE(b.title,'') FROM books b \
+             WHERE b.title LIKE ?1 ESCAPE '\\' \
+               AND EXISTS(SELECT 1 FROM fts f WHERE f.book_id=b.id) \
+             ORDER BY b.added_at DESC, b.id DESC LIMIT 80",
+        )
+        .map_err(|e| format!("搜索失败：{e}"))?;
+    let trows = tstmt
+        .query_map(rusqlite::params![&pat], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })
-        .collect()
+        .map_err(|e| format!("搜索失败：{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("搜索失败：{e}"))?;
+    for (book_id, title) in trows {
+        if hits.len() >= 80 {
+            break;
+        }
+        if !seen.insert((book_id, 0)) {
+            continue;
+        }
+        let escaped = title
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        hits.push(SearchHit {
+            book_id,
+            book_title: title.clone(),
+            chapter_index: 0,
+            chapter_title: String::new(),
+            snippet: format!("<mark>{escaped}</mark>"),
+        });
+    }
+    Ok(hits)
+}
+
+/// H12：2 字符查询的替代路径（trigram FTS 对 <3 字符恒 0 结果，旧实现静默返回空）。
+/// 顺序硬约定：先书名/作者 LIKE；有命中直接返回（即使正文被规模守卫跳过，也不返回 Err）；
+/// 只有书名/作者 0 命中且正文被守卫跳过时才返回 Err，消息说明需要至少 3 个字符。
+fn search_short(conn: &rusqlite::Connection, query: &str) -> Result<Vec<SearchHit>, String> {
+    let allow_body = short_body_allowed(estimate_db_bytes(conn));
+    search_short_with_body(conn, query, allow_body)
+}
+
+/// 可注入「是否允许正文回退」的实现（便于单测守卫分支；生产入口见 search_short）。
+fn search_short_with_body(
+    conn: &rusqlite::Connection,
+    query: &str,
+    allow_body: bool,
+) -> Result<Vec<SearchHit>, String> {
+    let pat = format!("%{}%", db::escape_like(query.trim()));
+    let mut hits: Vec<SearchHit> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, COALESCE(author,'') FROM books \
+                 WHERE title LIKE ?1 ESCAPE '\\' OR COALESCE(author,'') LIKE ?1 ESCAPE '\\' \
+                 ORDER BY added_at DESC, id DESC LIMIT 80",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![&pat], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, title, author) = row.map_err(|e| e.to_string())?;
+            let raw = if author.trim().is_empty() {
+                title.clone()
+            } else {
+                format!("{title} · {author}")
+            };
+            hits.push(SearchHit {
+                book_id: id,
+                book_title: title,
+                chapter_index: 0,
+                chapter_title: String::new(),
+                snippet: snippet_highlight(&short_snippet(&raw, query)),
+            });
+        }
+    }
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+    // 正文回退：先过规模守卫。
+    if !allow_body {
+        return Err("2 个字符的查询只匹配书名与作者；正文搜索需要至少 3 个字符".to_string());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT ct.book_id, ct.chapter_index, ct.title, COALESCE(b.title,''), ct.body \
+             FROM chapter_text ct LEFT JOIN books b ON b.id=ct.book_id \
+             WHERE ct.body LIKE ?1 ESCAPE '\\' LIMIT 80",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![&pat], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (book_id, chapter_index, chapter_title, book_title, body) = row.map_err(|e| e.to_string())?;
+        hits.push(SearchHit {
+            book_id,
+            book_title,
+            chapter_index,
+            chapter_title,
+            snippet: snippet_highlight(&short_snippet(&body, query)),
+        });
+    }
+    Ok(hits)
+}
+
+/// 分流：<2 非空白字符维持现状（返回空）；≥3 走 FTS；2 走 search_short。
+fn search_all_inner(state: &Arc<AppState>, query: String) -> Result<Vec<SearchHit>, String> {
+    let n = non_whitespace_chars(&query);
+    if n < 2 {
+        return Ok(vec![]);
+    }
+    let conn = state.db.0.lock().unwrap();
+    if n >= 3 {
+        if !db::has_fts(&conn) {
+            return Ok(vec![]);
+        }
+        return search_fts(&conn, &query);
+    }
+    search_short(&conn, &query)
 }
 
 /// 把 FTS5 snippet() 的原始片段转成安全 HTML：先转义 & < >，再把哨兵 \u{1}/\u{2}
@@ -7617,6 +8151,17 @@ fn search_in_book_inner(
     Ok(out)
 }
 
+/// S2：划线创建用的书指纹（大小+首尾 64KB sha256）。抽成 helper 以便单测；
+/// 文件不可读时返回 None（哈希为空串），调用方跳过 upsert 而不是写一条空指纹。
+fn highlight_fingerprint(path: &str) -> Option<(i64, i64, String)> {
+    let (size, mtime, hash) = db::file_fingerprint(path);
+    if hash.is_empty() {
+        None
+    } else {
+        Some((size, mtime, hash))
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn add_highlight(
@@ -7631,18 +8176,28 @@ pub fn add_highlight(
     color: String,
     note: String,
 ) -> Result<i64, String> {
-    let conn = state.db.0.lock().unwrap();
-    // 创建划线时 upsert 该书指纹（大小+首尾64KB sha256）与书名/作者快照。
-    // 书此时必然存在，写入最稳；每书一行，不冗余进 highlight。
-    if let Some(b) = db::get_book(&conn, book_id) {
-        let (size, mtime, hash) = db::file_fingerprint(&b.path);
+    // S2：读文件+sha256 是重 IO，绝不能持全局 DB 锁做（旧实现会让所有 DB 访问排队等哈希）。
+    // 第一段短锁只取 path/书名/作者快照；书不存在返回可读错误（旧实现静默跳过指纹）。
+    let (path, title_snap, author_snap) = {
+        let conn = state.db.0.lock().unwrap();
+        let b = db::get_book(&conn, book_id).ok_or("书籍不存在")?;
         let (t, a) = if b.title.trim().is_empty() {
-            let (ft, fa) = parse_filename(&b.path);
-            (ft, fa)
+            parse_filename(&b.path)
         } else {
             (b.title.clone(), b.author.clone())
         };
-        db::upsert_book_fingerprint(&conn, book_id, size, mtime, &hash, &t, &a).ok();
+        (b.path, t, a)
+    };
+    // 锁外算指纹。
+    let fp = highlight_fingerprint(&path);
+    let conn = state.db.0.lock().unwrap();
+    // 再确认书仍在：读盘期间可能被并发删除，避免给已删书写指纹孤儿行。
+    if db::get_book(&conn, book_id).is_none() {
+        return Err("书籍不存在".into());
+    }
+    if let Some((size, mtime, hash)) = fp {
+        // 指纹写失败必须上报（旧实现 .ok() 静默吞错）。
+        db::upsert_book_fingerprint(&conn, book_id, size, mtime, &hash, &title_snap, &author_snap)?;
     }
     let r = db::add_highlight(
         &conn,
@@ -7715,29 +8270,36 @@ pub fn update_book_meta(
     Ok(())
 }
 
-/// 把书名/作者直接写回原始电子书文件（当前支持 EPUB，直接覆盖，不生成备份），
-/// 同时更新数据库显示。
+/// 把书名/作者写回原始电子书文件（当前支持 EPUB），同时更新数据库显示。
+///
+/// 写文件在 spawn_blocking 里执行：重写整本 zip 是秒级磁盘 IO，不能占 Tauri 主线程；
+/// 失败时原文件字节不变（见 epub::write_meta 的同卷临时文件 + 原子替换）。
 #[tauri::command]
-pub fn write_book_meta(
+pub async fn write_book_meta(
     state: State<'_, Arc<AppState>>,
     book_id: i64,
     title: String,
     author: String,
 ) -> Result<(), String> {
-    let book = {
+    // 只取路径后立即释放 DB 锁：重写期间不阻塞其它 IPC。
+    let path = {
         let conn = state.db.0.lock().unwrap();
-        db::get_book(&conn, book_id).ok_or("书籍不存在")?
+        db::get_book(&conn, book_id).ok_or("书籍不存在")?.path
     };
-    let ext = ext_of(&book.path).unwrap_or_default();
+    let ext = ext_of(&path).unwrap_or_default();
     if ext != "epub" {
         return Err("写回原文件目前仅支持 EPUB；其他格式请先用「转换格式」转为 EPUB".into());
     }
-    crate::epub::write_meta(&book.path, &title, &author)?;
+    let st = state.inner().clone();
+    let (p, t, a) = (path, title.clone(), author.clone());
+    tauri::async_runtime::spawn_blocking(move || crate::epub::write_meta(&p, &t, &a))
+        .await
+        .map_err(|e| format!("写回任务失败：{e}"))??;
     {
-        let conn = state.db.0.lock().unwrap();
+        let conn = st.db.0.lock().unwrap();
         db::update_book_title_author(&conn, book_id, &title, &author)?;
     }
-    state.app.emit("library-changed", ()).ok();
+    st.app.emit("library-changed", ()).ok();
     Ok(())
 }
 
@@ -7754,6 +8316,17 @@ const FTS_BATCH_MAX_CHAPTERS: usize = 32;
 const FTS_BATCH_MAX_BYTES: usize = 256 * 1024;
 /// 批间让出 state.db.0 的停顿：给翻章/存进度等短 IPC 拿锁窗口，整本索引只多花毫秒级。
 const FTS_BATCH_PAUSE_MS: u64 = 2;
+/// S2：手动全库重建等待索引闸门的上限；持锁方卡死时不能永久挂起命令。
+const FTS_GUARD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 闸门等待是否超时（纯函数便于测试边界）。
+fn fts_guard_wait_exceeded(
+    start: std::time::Instant,
+    now: std::time::Instant,
+    limit: std::time::Duration,
+) -> bool {
+    now.saturating_duration_since(start) > limit
+}
 
 /// 自动索引的体积上限（P9）：超过只允许用户在搜索时显式建立（大书建索引实测 8~40s，
 /// 阅读中/关书时自动跑就是用户感知的「更卡」）。显式搜索仍可建（auto=false 不受限）。
@@ -7859,22 +8432,78 @@ fn expected_fts_rows(state: &Arc<AppState>, book_id: i64, path: &str, ext: &str)
     Ok(n as i64)
 }
 
-/// 写一批 fts 行（独立事务）；函数返回时 state.db.0 已释放。
-fn insert_fts_batch(
-    state: &Arc<AppState>,
+/// S2：单事务替换某书的全部 fts 行并写 meta。成功才动旧行：
+/// DELETE → 逐行 INSERT → meta=实际行数；任一步失败整体回滚，旧行与旧 meta 原样保留。
+fn replace_book_fts(
+    conn: &mut rusqlite::Connection,
     book_id: i64,
     chapters: &[(i64, String, String)],
-) -> Result<(), String> {
-    let mut conn = state.db.0.lock().unwrap();
+) -> Result<i64, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM fts WHERE book_id=?1", [book_id])
+        .map_err(|e| e.to_string())?;
     for (idx, title, body) in chapters {
         tx.execute(
             "INSERT INTO fts(book_id, chapter_index, title, body) VALUES(?1,?2,?3,?4)",
             rusqlite::params![book_id, idx, title, body],
         )
-        .ok();
+        .map_err(|e| format!("写入全文索引失败：{e}"))?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    // 直接写 fts_meta（不调 db::set_fts_meta）：meta 写入失败也必须回滚，不能静默吞错。
+    tx.execute(
+        "INSERT INTO fts_meta(book_id, rows) VALUES(?1,?2)
+         ON CONFLICT(book_id) DO UPDATE SET rows=?2",
+        rusqlite::params![book_id, chapters.len() as i64],
+    )
+    .map_err(|e| format!("写入全文索引标记失败：{e}"))?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(chapters.len() as i64)
+}
+
+/// S2：解析失败时保留旧 fts 行，把 meta 写成负哨兵 -1。
+/// 依据（已 grep 确认）：
+///  - 搜索路径只读 fts 表，不读 fts_meta（get_fts_meta 仅索引一致性检查使用）；
+///  - fts_meta_plan(Some(-1), _, expected) 中 -1 != expected 必为 Rebuild，因此下次索引会重建；
+///  - 同样的 -1 哨兵语义已在 db::invalidate_split_book_search_cache 使用（P11）。
+fn mark_book_fts_stale(conn: &rusqlite::Connection, book_id: i64) {
+    conn.execute(
+        "INSERT INTO fts_meta(book_id, rows) VALUES(?1,-1)
+         ON CONFLICT(book_id) DO UPDATE SET rows=-1",
+        [book_id],
+    )
+    .ok();
+}
+
+/// S2：解析结果 + 连接级重建动作。解析失败时保留旧 fts 行、只写 -1 哨兵并返回原错误；
+/// 解析成功才在单事务里替换（任一步失败回滚，旧行与旧 meta 不动）。
+/// 抽出连接级版本是为了在无 AppState 的单测里覆盖「失败保留旧行」语义。
+fn apply_book_fts_rebuild(
+    conn: &mut rusqlite::Connection,
+    book_id: i64,
+    chapters: Result<Vec<(i64, String, String)>, String>,
+) -> Result<i64, String> {
+    match chapters {
+        Ok(ch) => replace_book_fts(conn, book_id, &ch),
+        Err(e) => {
+            mark_book_fts_stale(conn, book_id);
+            Err(e)
+        }
+    }
+}
+
+/// S2：逐本重建的循环（单本失败跳过并记录，不中断其余书）；抽出来便于测试「多书一坏」语义。
+fn rebuild_fts_books_with<F>(ids: &[i64], mut one: F) -> i64
+where
+    F: FnMut(i64) -> Result<i64, String>,
+{
+    let mut total = 0i64;
+    for id in ids {
+        match one(*id) {
+            Ok(n) => total += n,
+            Err(e) => eprintln!("[fts] rebuild skip book={id}: {e}"),
+        }
+    }
+    total
 }
 
 #[tauri::command]
@@ -7882,9 +8511,14 @@ pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String>
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         // 与自动索引共用闸门；手动重建是用户显式操作，等后台索引让出后继续（不会静默返回 0）。
+        // S2：等待有超时——持锁方卡死时命令不能永久挂起，超时返回可读错误。
+        let start = std::time::Instant::now();
         let guard = loop {
             if let Some(g) = FtsIndexGuard::acquire(&st.fts_index_running) {
                 break g;
+            }
+            if fts_guard_wait_exceeded(start, std::time::Instant::now(), FTS_GUARD_WAIT_TIMEOUT) {
+                return Err("索引任务仍在运行，请稍后重试".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
@@ -7896,7 +8530,9 @@ pub async fn rebuild_fts(state: State<'_, Arc<AppState>>) -> Result<i64, String>
     .map_err(|e| e.to_string())?
 }
 
-/// 全库重建（调用方必须已持有索引闸门）：清空 fts 后逐本重建，返回总章数。
+/// 全库重建（调用方必须已持有索引闸门）：逐本重建，返回成功总章数。
+/// S2：不再开头 DELETE 全表 + 清 meta —— 那样一旦某本书解析失败，它的索引会永久丢失。
+/// 改为逐本走同一套「成功才替换、失败保留旧行 + 需重建标记」的流程。
 fn rebuild_fts_inner(state: &Arc<AppState>) -> Result<i64, String> {
     {
         let conn = state.db.0.lock().unwrap();
@@ -7904,21 +8540,24 @@ fn rebuild_fts_inner(state: &Arc<AppState>) -> Result<i64, String> {
             return Err("SQLite 编译未包含 FTS5".into());
         }
         db::ensure_fts(&conn)?;
-        // 先清空索引，再逐本重建（此前只 DELETE 不重建，会把索引清空）。
-        conn.execute("DELETE FROM fts", []).map_err(|e| e.to_string())?;
-        // P12：元信息同步清空；逐本重建后每本写回（搜索仍只读 fts 表，meta 仅服务检查）。
-        db::clear_fts_meta(&conn);
     }
     let ids: Vec<i64> = {
         let conn = state.db.0.lock().unwrap();
         db::all_book_paths(&conn).into_iter().map(|(id, _)| id).collect()
     };
-    let mut total = 0i64;
-    for id in ids {
-        // 单本失败（文件缺失等）跳过，不影响整体重建；全库重建是用户显式操作，传 auto=false。
-        if let Ok(n) = index_book_fts_inner(state, id, false) {
-            total += n;
-        }
+    // 单本失败（文件缺失/解析失败等）跳过，不影响整体重建；全库重建是用户显式操作，传 auto=false。
+    let total = rebuild_fts_books_with(&ids, |id| index_book_fts_inner(state, id, false));
+    // S2：重建结束后清理孤儿（已删书籍遗留的 fts 行与 meta）。
+    {
+        let conn = state.db.0.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM fts WHERE book_id NOT IN (SELECT id FROM books)",
+            [],
+        );
+        let _ = conn.execute(
+            "DELETE FROM fts_meta WHERE book_id NOT IN (SELECT id FROM books)",
+            [],
+        );
     }
     // R11-4：重建完成后整理 FTS5 索引（只压缩索引、不删数据）。副本库实测 14.6s
     //（远低于 60s 阈值，故放在重建命令内同步执行；启动期绝不执行）。
@@ -8004,28 +8643,12 @@ fn index_book_fts_inner(state: &Arc<AppState>, book_id: i64, auto: bool) -> Resu
         }
         FtsMetaPlan::Rebuild => {}
     }
-    // 3) 先清掉本书旧行与 meta（短事务）：部分行不会与本次写入叠加成重复行；
-    //    崩溃在批次中间时 meta 缺失，下次按「实例行数不符」重建立。
-    {
-        let conn = state.db.0.lock().unwrap();
-        conn.execute("DELETE FROM fts WHERE book_id=?1", [book_id])
-            .map_err(|e| e.to_string())?;
-        db::delete_fts_meta(&conn, book_id);
-    }
-    // 4) 取整本章节纯文本（warm 路径命中解析缓存），分批提交，批间释放锁并短暂让出。
-    //    不再顺带写 chapter_text：书内搜索首次会自己按需建（见 ensure_book_text），
-    //    非搜索用户少写一遍整本正文，DB 写入与体积约减半。
-    let chapters = collect_book_chapters(state, book_id)?;
-    for (start, end) in plan_fts_batches(&chapters) {
-        insert_fts_batch(state, book_id, &chapters[start..end])?;
-        std::thread::sleep(std::time::Duration::from_millis(FTS_BATCH_PAUSE_MS));
-    }
-    // P12：全部批次写完才写 meta；崩溃在中间时 meta 缺失，下次按不一致重建立。
-    {
-        let conn = state.db.0.lock().unwrap();
-        db::set_fts_meta(&conn, book_id, chapters.len() as i64);
-    }
-    Ok(chapters.len() as i64)
+    // 3) 先解析（warm 路径命中解析缓存）再做任何写入：解析失败时保留旧 fts 行，
+    //    只把 meta 写成 -1 哨兵，下次索引必然重建（旧实现先 DELETE 再解析，失败即永久丢索引）。
+    //    不持 DB 锁解析（collect 内部会短锁/读盘），完成后才进连接级替换。
+    let chapters = collect_book_chapters(state, book_id);
+    let mut conn = state.db.0.lock().unwrap();
+    apply_book_fts_rebuild(&mut conn, book_id, chapters)
 }
 
 #[tauri::command]
@@ -8163,6 +8786,11 @@ fn try_idle_optimize_fts(st: &Arc<AppState>) -> FtsOptimizeOutcome {
             return FtsOptimizeOutcome::Retry;
         }
     };
+    // H6：独立写连接同样要有等锁上限（与 VACUUM 的 5s 口径一致），否则并发写时
+    // optimize 直接报 BUSY 被当成普通失败。设置失败只记日志，不改变原有重试语义。
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+        memlog::stage_note("fts:optimize", &format!("busy_timeout_set_err={e}"));
+    }
     if !db::has_fts(&conn) {
         return FtsOptimizeOutcome::Done;
     }
@@ -10285,6 +10913,33 @@ mod epub_meta_tests {
         zw.finish().unwrap();
     }
 
+    /// 目录里是否有本次写回残留的临时文件（epub::write_meta 用 .tidepage-tmp-{pid}）。
+    fn tmp_leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tidepage-tmp"))
+            .collect()
+    }
+
+    /// 缺 dc:title 的 EPUB：write_meta 必须失败且原文件字节不变。
+    fn write_min_epub_no_title(path: &std::path::Path) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let stored =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("mimetype", stored).unwrap();
+        zw.write_all(b"application/epub+zip").unwrap();
+        zw.start_file("META-INF/container.xml", deflated).unwrap();
+        zw.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        zw.start_file("OEBPS/content.opf", deflated).unwrap();
+        zw.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator id="c">Old Author</dc:creator></metadata><manifest/><spine/></package>"#).unwrap();
+        zw.finish().unwrap();
+    }
+
     #[test]
     fn write_meta_overwrites_title_and_author() {
         let dir = std::env::temp_dir().join(format!("tp_epub_meta_{}", std::process::id()));
@@ -10297,6 +10952,28 @@ mod epub_meta_tests {
         let doc = crate::epub::parse(&data).unwrap();
         assert_eq!(doc.title, "新标题 & <tag>");
         assert_eq!(doc.author, "新作者");
+        // C1①：成功路径不得残留临时文件（同目录只应剩原 EPUB）。
+        assert!(tmp_leftovers(&dir).is_empty(), "成功写回后不得残留临时文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C1②：失败路径（OPF 缺 dc:title）返回 Err、原文件字节完全一致、无临时文件残留。
+    #[test]
+    fn write_meta_failure_keeps_original_bytes_and_cleans_tmp() {
+        let dir = std::env::temp_dir().join(format!("tp_epub_meta_fail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad.epub");
+        write_min_epub_no_title(&p);
+        let before = std::fs::read(&p).unwrap();
+        let ps = p.to_string_lossy().into_owned();
+        let err = crate::epub::write_meta(&ps, "新标题", "新作者").unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "失败时原文件字节必须完全不变"
+        );
+        assert!(tmp_leftovers(&dir).is_empty(), "失败路径必须清理临时文件");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -10647,5 +11324,496 @@ mod storage_tests {
         assert!(!super::prioritize_eligible(1));
         assert!(!super::prioritize_eligible(2), "pathological/超时失败 md=2 不得再入队");
         assert!(!super::prioritize_eligible(3), "处理中 md=3 不得再入队");
+    }
+}
+
+#[cfg(test)]
+mod round2_search_tests {
+    //! H11/H12：图片上限、短查询规模守卫、2 字查询回退路径与 3 字 FTS 路径。
+    use super::*;
+    use rusqlite::Connection;
+
+    fn tmpdb(tag: &str) -> Connection {
+        let p = std::env::temp_dir().join(format!("tp_lib_r2_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        db::init(&p).unwrap()
+    }
+
+    fn add_book(conn: &Connection, path: &str, title: &str, author: &str) -> i64 {
+        db::upsert_book(conn, path, title, "txt", 10, 1).unwrap();
+        conn.execute("UPDATE books SET author=?2 WHERE path=?1", rusqlite::params![path, author])
+            .unwrap();
+        conn.query_row("SELECT id FROM books WHERE path=?1", [path], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// H11：图片源文件上限边界（恰好等于上限允许，超过 1 字节拒绝）。
+    #[test]
+    fn image_source_limit_boundaries() {
+        assert!(!image_source_too_large(0));
+        assert!(!image_source_too_large(IMAGE_SOURCE_MAX_BYTES));
+        assert!(image_source_too_large(IMAGE_SOURCE_MAX_BYTES + 1));
+        assert_eq!(IMAGE_SOURCE_MAX_BYTES, 64 * 1024 * 1024, "图片命令上限应为 64MiB");
+    }
+
+    /// H12：规模守卫三分支（恰好等于阈值允许 / 超过 / 取不到）。
+    #[test]
+    fn short_body_guard_three_branches() {
+        assert!(short_body_allowed(Some(SEARCH_SHORT_BODY_DB_MAX_BYTES)));
+        assert!(!short_body_allowed(Some(SEARCH_SHORT_BODY_DB_MAX_BYTES + 1)));
+        assert!(!short_body_allowed(None), "取不到库大小必须保守跳过正文");
+        assert_eq!(non_whitespace_chars("  "), 0);
+        assert_eq!(non_whitespace_chars(" a b "), 2);
+    }
+
+    /// H12：2 字查询命中书名/作者时返回 <mark> 片段，即使正文回退被守卫跳过也不返回 Err。
+    #[test]
+    fn short_query_title_hit_wins_even_when_body_skipped() {
+        let conn = tmpdb("short_title");
+        let id = add_book(&conn, "C:/x/santi.txt", "三体", "刘慈欣");
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','人类文明与三体文明的碰撞')",
+            [id],
+        )
+        .unwrap();
+        let hits = search_short_with_body(&conn, "三体", false).expect("书名命中时不得因为正文被跳过而报错");
+        assert_eq!(hits.len(), 1, "书名命中应直接返回: {hits:?}");
+        assert_eq!(hits[0].book_id, id);
+        assert!(hits[0].snippet.contains("<mark>三体</mark>"), "snippet={}", hits[0].snippet);
+    }
+
+    /// H12：书名/作者 0 命中且正文被守卫跳过 → Err 且消息说明需要 3 个字符。
+    #[test]
+    fn short_query_no_title_hit_and_body_skipped_is_error() {
+        let conn = tmpdb("short_err");
+        let id = add_book(&conn, "C:/x/a.txt", "普通书名", "作者");
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(?1,0,'章','正文里有碰撞二字')",
+            [id],
+        )
+        .unwrap();
+        let err = search_short_with_body(&conn, "碰撞", false).unwrap_err();
+        assert!(err.contains("3 个字符"), "错误消息应说明需要 3 个字符: {err}");
+    }
+
+    /// H12：允许正文时，2 字查询命中正文并生成 <mark>；正文检查也走规模守卫。
+    #[test]
+    fn short_query_body_fallback_marks_hit() {
+        let conn = tmpdb("short_body");
+        let id = add_book(&conn, "C:/x/b.txt", "普通书名", "作者");
+        conn.execute(
+            "INSERT INTO chapter_text(book_id,chapter_index,title,body) VALUES(?1,2,'第二章','这是一段包含碰撞的正文')",
+            [id],
+        )
+        .unwrap();
+        assert!(short_body_allowed(estimate_db_bytes(&conn)), "临时库很小，应允许正文回退");
+        let hits = search_short(&conn, "碰撞").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].chapter_index, 2);
+        assert_eq!(hits[0].chapter_title, "第二章");
+        assert!(hits[0].snippet.contains("<mark>碰撞</mark>"), "snippet={}", hits[0].snippet);
+        // 无命中时返回空（不是错误）
+        assert!(search_short(&conn, "不存在").unwrap().is_empty());
+    }
+
+    /// H12：≥3 字符仍走 FTS（trigram），snippet 由 FTS 生成并高亮。
+    #[test]
+    fn three_char_query_still_uses_fts() {
+        let conn = tmpdb("fts3");
+        let id = add_book(&conn, "C:/x/c.txt", "书", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','人类文明与三体文明的碰撞')",
+            [id],
+        )
+        .unwrap();
+        let hits = search_fts(&conn, "人类文明").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].book_id, id);
+        assert!(hits[0].snippet.contains("<mark>"), "snippet={}", hits[0].snippet);
+    }
+
+    /// I23：用户输入中的 FTS5 运算符/符号被整体短语转义，MATCH 可执行且不报错。
+    #[test]
+    fn fts_user_query_escapes_operators_and_symbols() {
+        // 纯函数：双引号加倍、整体加引号。
+        assert_eq!(fts_user_query("3.14"), "\"3.14\"");
+        assert_eq!(fts_user_query("a-b"), "\"a-b\"");
+        assert_eq!(fts_user_query("C:"), "\"C:\"");
+        assert_eq!(fts_user_query("AND"), "\"AND\"");
+        assert_eq!(fts_user_query("a\"b"), "\"a\"\"b\"");
+        assert_eq!(fts_user_query("  "), "\"\"");
+
+        let conn = tmpdb("fts_escape");
+        let id = add_book(&conn, "C:/x/d.txt", "书", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','版本 3.14 与 C: 盘符，纯符号 *** 不算命中')",
+            [id],
+        )
+        .unwrap();
+        // 特殊字符/运算符查询不得报错；能命中的仍有结果。
+        for q in ["3.14", "a-b", "C:", "AND", "***", "()", "a\"b"] {
+            let hits = search_fts(&conn, q).unwrap_or_else(|e| panic!("查询 {q:?} 不应报错：{e}"));
+            let _ = hits;
+        }
+        let hits = search_fts(&conn, "3.14").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+    /// P1-9：书名参与搜索（≥3 字；FTS 正文无命中时由书名补充查询返回并带 <mark>）。
+    #[test]
+    fn long_query_matches_book_title_with_mark() {
+        let conn = tmpdb("title_hit");
+        let id = add_book(&conn, "C:/x/title.txt", "三体文明史诗", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','无关正文')",
+            [id],
+        )
+        .unwrap();
+        let hits = search_fts(&conn, "三体文明史诗").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].book_id, id);
+        assert_eq!(hits[0].chapter_index, 0);
+        assert!(hits[0].snippet.contains("<mark>三体文明史诗</mark>"), "snippet={}", hits[0].snippet);
+    }
+
+    /// P1-9：书名补充查询不得带出没有 FTS 行（未索引/已排除）的书。
+    #[test]
+    fn long_query_title_supplement_respects_fts_scope() {
+        let conn = tmpdb("title_scope");
+        let indexed = add_book(&conn, "C:/x/idx.txt", "索引书", "作者");
+        let _missing = add_book(&conn, "C:/x/miss.txt", "索引书二", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','无关正文')",
+            [indexed],
+        )
+        .unwrap();
+        let hits = search_fts(&conn, "索引书二").unwrap();
+        assert!(hits.is_empty(), "无 FTS 行的书不得被书名补充带出: {hits:?}");
+        let hits = search_fts(&conn, "索引书").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].book_id, indexed);
+    }
+
+    /// P1-9：正文与书名同时命中时按 (book_id, chapter_index) 去重，不重复返回。
+    #[test]
+    fn long_query_dedupes_title_and_body_hits() {
+        let conn = tmpdb("title_dedupe");
+        let id = add_book(&conn, "C:/x/dup.txt", "碰撞文明", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','碰撞文明在这里')",
+            [id],
+        )
+        .unwrap();
+        let hits = search_fts(&conn, "碰撞文明").unwrap();
+        let same: Vec<_> = hits.iter().filter(|h| h.book_id == id && h.chapter_index == 0).collect();
+        assert_eq!(same.len(), 1, "同书同章不得重复: {hits:?}");
+        assert!(same[0].snippet.contains("<mark>"), "snippet={}", same[0].snippet);
+    }
+
+    /// P1-9：书名含特殊字符不报错；FTS 运算符转义行为不受影响。
+    #[test]
+    fn long_query_title_special_chars_no_error() {
+        let conn = tmpdb("title_special");
+        let id = add_book(&conn, "C:/x/special.txt", "a-b 100%", "作者");
+        db::ensure_fts(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO fts(book_id,chapter_index,title,body) VALUES(?1,0,'第一章','无关正文')",
+            [id],
+        )
+        .unwrap();
+        for q in ["a-b 100%", "a-b", "100%", "C:", "AND", "\"quoted\""] {
+            assert!(search_fts(&conn, q).is_ok(), "查询 {q:?} 不应报错");
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod path_guard_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!(
+            "tp_pathguard_{}_{}_{}",
+            tag,
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    /// S1：写入路径白名单：合法路径通过；相对/错误扩展名/保留名/目录目标/父目录缺失/空格结尾拒绝。
+    #[test]
+    fn output_path_accepts_legal_and_rejects_invalid() {
+        let d = tmp("out");
+        assert!(validate_output_path(&s(&d.join("a.txt")), &["txt", "md", "csv"], true).is_ok());
+        assert!(validate_output_path("a.txt", &["txt"], true).is_err(), "相对路径必须拒绝");
+        assert!(validate_output_path(&s(&d.join("a.exe")), &["txt"], true).is_err(), "扩展名必须白名单");
+        assert!(validate_output_path(&s(&d.join("CON.txt")), &["txt"], true).is_err(), "保留设备名必须拒绝");
+        let dir_as_target = d.join("dir.txt");
+        std::fs::create_dir_all(&dir_as_target).unwrap();
+        assert!(validate_output_path(&s(&dir_as_target), &["txt"], true).is_err(), "已存在目录不能当目标");
+        assert!(validate_output_path(&s(&d.join("none").join("a.txt")), &["txt"], true).is_err(), "父目录必须存在");
+        assert!(validate_output_path(&s(&d.join("a.txt ")), &["txt"], true).is_err(), "空格结尾必须拒绝");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// S1：系统目录拒绝（环境变量存在时断言；取不到则跳过该项，不误伤其它机器）。
+    #[test]
+    fn output_path_rejects_system_dirs_when_env_available() {
+        let Ok(root) = std::env::var("SystemRoot") else { return; };
+        if root.trim().is_empty() {
+            return;
+        }
+        let p = Path::new(&root).join("tp_path_guard_should_not_exist.txt");
+        assert!(
+            validate_output_path(&s(&p), &["txt"], false).is_err(),
+            "系统目录必须拒绝: {}",
+            p.display()
+        );
+        // 用 ".." 绕回系统目录也必须被拒绝（组件归一化后再比较前缀）。
+        let sneaky = Path::new(&root)
+            .join("..")
+            .join(root.rsplit(['\\', '/']).next().unwrap_or(""))
+            .join("tp_path_guard_sneaky.txt");
+        assert!(
+            validate_output_path(&s(&sneaky), &["txt"], false).is_err(),
+            "经 .. 回到系统目录必须拒绝: {}",
+            sneaky.display()
+        );
+    }
+
+    /// S1：读取路径必须存在、是普通文件、扩展名白名单。
+    #[test]
+    fn source_path_requires_existing_file_and_ext() {
+        let d = tmp("src");
+        let txt = d.join("book.txt");
+        std::fs::write(&txt, b"x").unwrap();
+        assert!(validate_source_path(&s(&txt), &["txt", "mobi"]).is_ok());
+        assert!(validate_source_path(&s(&d.join("book.png")), &["txt"]).is_err());
+        assert!(validate_source_path(&s(&d.join("missing.txt")), &["txt"]).is_err());
+        assert!(validate_source_path("book.txt", &["txt"]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod r6_fts_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// 连接级单测不需要真实 AppState/FTS5：用普通表模拟 fts 与 fts_meta 的读写语义。
+    fn plain_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE fts(book_id INTEGER NOT NULL, chapter_index INTEGER NOT NULL, title TEXT, body TEXT);
+             CREATE TABLE fts_meta(book_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn ch(i: i64) -> (i64, String, String) {
+        (i, format!("第 {i} 章"), format!("正文 {i}"))
+    }
+
+    fn count_fts(conn: &Connection, book_id: i64) -> i64 {
+        conn.query_row("SELECT count(*) FROM fts WHERE book_id=?1", [book_id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn replace_book_fts_replaces_only_target_book() {
+        let mut conn = plain_conn();
+        conn.execute("INSERT INTO fts VALUES(2,0,'t','b')", []).unwrap();
+        conn.execute("INSERT INTO fts VALUES(1,0,'old','old')", []).unwrap();
+        conn.execute("INSERT INTO fts_meta VALUES(1,1)", []).unwrap();
+        let n = replace_book_fts(&mut conn, 1, &[ch(0), ch(1), ch(2)]).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(count_fts(&conn, 1), 3, "目标书旧行应被整体替换");
+        assert_eq!(count_fts(&conn, 2), 1, "其它书的行不得被删除");
+        let meta: i64 = conn.query_row("SELECT rows FROM fts_meta WHERE book_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(meta, 3);
+    }
+
+    #[test]
+    fn replace_book_fts_rolls_back_on_insert_failure() {
+        let mut conn = plain_conn();
+        conn.execute("INSERT INTO fts VALUES(1,0,'old','old')", []).unwrap();
+        conn.execute("INSERT INTO fts_meta VALUES(1,1)", []).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER r6_fts_fail BEFORE INSERT ON fts BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+        let err = replace_book_fts(&mut conn, 1, &[ch(0), ch(1)]).unwrap_err();
+        assert!(err.contains("写入全文索引失败"), "{err}");
+        assert_eq!(count_fts(&conn, 1), 1, "失败必须回滚，旧行仍在");
+        let meta: i64 = conn.query_row("SELECT rows FROM fts_meta WHERE book_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(meta, 1, "失败不得写 meta");
+    }
+
+    #[test]
+    fn parse_failure_keeps_old_rows_and_marks_rebuild() {
+        let mut conn = plain_conn();
+        conn.execute("INSERT INTO fts VALUES(1,0,'old','old')", []).unwrap();
+        conn.execute("INSERT INTO fts VALUES(1,1,'old2','old2')", []).unwrap();
+        conn.execute("INSERT INTO fts_meta VALUES(1,2)", []).unwrap();
+        let err = apply_book_fts_rebuild(&mut conn, 1, Err("解析失败".into())).unwrap_err();
+        assert_eq!(err, "解析失败");
+        assert_eq!(count_fts(&conn, 1), 2, "解析失败不得删除旧索引行");
+        let meta: i64 = conn.query_row("SELECT rows FROM fts_meta WHERE book_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(meta, -1, "失败后写 -1 哨兵");
+        assert_eq!(
+            fts_meta_plan(Some(meta), None, 2),
+            FtsMetaPlan::Rebuild,
+            "-1 哨兵必须让 fts_meta_plan 返回 Rebuild"
+        );
+        // 修复解析后重跑：旧行被替换、meta 等于实际行数。
+        let n = apply_book_fts_rebuild(&mut conn, 1, Ok(vec![ch(0)])) .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(count_fts(&conn, 1), 1);
+        let meta2: i64 = conn.query_row("SELECT rows FROM fts_meta WHERE book_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(meta2, 1);
+    }
+
+    #[test]
+    fn stale_sentinel_is_rebuild_for_any_expected() {
+        let conn = plain_conn();
+        mark_book_fts_stale(&conn, 7);
+        let meta: i64 = conn.query_row("SELECT rows FROM fts_meta WHERE book_id=7", [], |r| r.get(0)).unwrap();
+        assert_eq!(meta, -1);
+        for expected in [0i64, 1, 5, 5000] {
+            assert_eq!(fts_meta_plan(Some(-1), None, expected), FtsMetaPlan::Rebuild);
+        }
+    }
+
+    #[test]
+    fn rebuild_books_continue_after_single_failure() {
+        let ids = [1i64, 2, 3];
+        let total = rebuild_fts_books_with(&ids, |id| match id {
+            2 => Err("坏书".into()),
+            _ => Ok(5),
+        });
+        assert_eq!(total, 10, "失败书跳过、其余书仍计入总章数");
+    }
+
+    #[test]
+    fn guard_wait_timeout_boundaries() {
+        let start = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(60);
+        assert!(!fts_guard_wait_exceeded(start, start, limit), "未超时");
+        assert!(!fts_guard_wait_exceeded(start, start + limit, limit), "恰好等于上限不算超时");
+        assert!(fts_guard_wait_exceeded(start, start + limit + std::time::Duration::from_millis(1), limit));
+        assert!(!fts_guard_wait_exceeded(start, start + std::time::Duration::from_millis(1), std::time::Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
+mod r6_misc_tests {
+    use super::*;
+
+    fn cd(tag: &str) -> crate::models::ChapterData {
+        crate::models::ChapterData { title: tag.into(), html: format!("<p>{tag}</p>"), chars: 1 }
+    }
+
+    /// S1：章节缓存命中必须同时校验文件指纹；stamp 变化即失效并移除。
+    #[test]
+    fn chapter_cache_requires_matching_stamp() {
+        let mut c = ChapterCache::new(8);
+        let key = (1i64, 0i64, false);
+        c.put(key, Some((10, 20)), Arc::new(cd("旧")));
+        assert!(c.get(key, Some((10, 20))).is_some(), "同指纹应命中");
+        assert!(c.get(key, Some((11, 20))).is_none(), "size 变化不得命中");
+        assert!(c.get(key, Some((10, 21))).is_none(), "mtime 变化不得命中");
+        assert!(c.get(key, None).is_none(), "当前指纹取不到时不得复用");
+        // 失效条目应被移除：再次用旧指纹也不命中。
+        assert!(c.get(key, Some((10, 20))).is_none(), "失效条目必须被移除");
+        // 无指纹的条目同样不复用。
+        c.put(key, None, Arc::new(cd("无指纹")));
+        assert!(c.get(key, Some((10, 20))).is_none());
+    }
+
+    /// S2：指纹 helper：存在文件返回大小/哈希；不存在返回 None；内容变化后 size 跟着变。
+    #[test]
+    fn highlight_fingerprint_tracks_file() {
+        let dir = std::env::temp_dir().join(format!("tp_r6_hl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("book.txt");
+        std::fs::write(&p, b"hello").unwrap();
+        let (size, _, hash) = highlight_fingerprint(&p.to_string_lossy()).expect("存在的文件应有指纹");
+        assert_eq!(size, 5);
+        assert!(!hash.is_empty());
+        assert!(highlight_fingerprint(&dir.join("missing.txt").to_string_lossy()).is_none());
+        std::fs::write(&p, b"hello world").unwrap();
+        let (size2, _, _) = highlight_fingerprint(&p.to_string_lossy()).unwrap();
+        assert_eq!(size2, 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod r9_cover_tests {
+    use super::*;
+
+    /// P0-3：像素/边长上限边界（恰好上限通过，+1 拒绝，0 拒绝）。
+    #[test]
+    fn image_dim_limit_boundaries() {
+        assert!(image_dim_limit_error(10_000, 10_000).is_none(), "恰好 100MP 允许");
+        assert!(image_dim_limit_error(10_000, 10_001).is_some(), "超 100MP 拒绝");
+        assert!(image_dim_limit_error(20_000, 1).is_none(), "恰好边长上限允许");
+        assert!(image_dim_limit_error(20_001, 1).is_some(), "边长 +1 拒绝");
+        assert!(image_dim_limit_error(0, 10).is_some(), "0 宽拒绝");
+        assert!(image_dim_limit_error(10, 0).is_some(), "0 高拒绝");
+        assert!(image_dim_limit_error(1, 1).is_none());
+        // 大像素但乘积合法（100000 x 1000 = 100MP）允许；多 1 像素边 → 拒绝。
+        assert!(image_dim_limit_error(100_000, 1_000).is_some(), "边长超限优先拒绝");
+        assert!(image_dim_limit_error(20_000, 5_000).is_none(), "20k x 5k = 100MP 允许");
+    }
+
+    /// P0-3：非图片/损坏文件在 header 读取阶段给可读错误，不做整图解码。
+    #[test]
+    fn image_dimensions_rejects_non_image() {
+        let dir = std::env::temp_dir().join(format!("tp_r9_img_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("not-image.bin");
+        std::fs::write(&p, b"this is not an image").unwrap();
+        let err = check_image_dimensions(&p.to_string_lossy()).unwrap_err();
+        assert!(err.contains("读取图片尺寸失败"), "{err}");
+        let missing = dir.join("missing.png");
+        assert!(check_image_dimensions(&missing.to_string_lossy()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod r10_encoding_tests {
+    use super::*;
+
+    /// P0-2：编码设置归一化：空/auto/未知 → None，合法 label → 规范化名称。
+    #[test]
+    fn normalize_text_encoding_rules() {
+        assert_eq!(normalize_text_encoding(None), None);
+        assert_eq!(normalize_text_encoding(Some("")), None);
+        assert_eq!(normalize_text_encoding(Some("  auto ")), None);
+        assert_eq!(normalize_text_encoding(Some("AUTO")), None);
+        assert_eq!(normalize_text_encoding(Some("gb18030")).as_deref(), Some("gb18030"));
+        assert_eq!(normalize_text_encoding(Some("UTF-8")).as_deref(), Some("UTF-8"));
+        // 未知编码名：回退 None（自动探测），不让调用方失败。
+        assert_eq!(normalize_text_encoding(Some("not-a-real-encoding")), None);
+        assert_eq!(normalize_text_encoding(Some("  ")), None);
     }
 }

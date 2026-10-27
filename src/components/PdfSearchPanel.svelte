@@ -3,7 +3,9 @@
   import { t } from "../lib/i18n/index.svelte";
   import { IconArrowsSplit2, IconChevronDown, IconChevronUp, IconSearch, IconX } from "@tabler/icons-svelte";
   import { dragOutHandle } from "../lib/windowSnap";
+  import { onDestroy } from "svelte";
   import { searchPdfText, type PdfSearchResult } from "../lib/pdf";
+  import { RequestSeq } from "../lib/requestSeq";
   import { searchProgress, stepHit, type PdfSearchHit } from "../lib/pdfSearch";
 
   let {
@@ -26,10 +28,14 @@
   let currentHit = $state(0);
   let showFailed = $state(false);
   let ctrl: AbortController | null = null;
+  // F6：关闭/卸载后继续扫描没有意义；序号保证只有最新一次搜索能写结果。
+  let disposed = false;
+  const seq = new RequestSeq();
 
   async function run() {
     const q = query.trim();
     if (!q) return;
+    const token = seq.next();
     ctrl?.abort();
     ctrl = new AbortController();
     busy = true;
@@ -40,8 +46,11 @@
     try {
       const r = await searchPdfText(bookId, q, {
         signal: ctrl.signal,
-        onProgress: (done, total) => (progress = searchProgress(done, total)),
+        onProgress: (done, total) => {
+          if (!disposed && seq.isCurrent(token)) progress = searchProgress(done, total);
+        },
       });
+      if (disposed || !seq.isCurrent(token)) return;
       result = r;
       const g0 = r.groups[0];
       if (g0) {
@@ -49,11 +58,18 @@
         onjump(seg.page, { page: seg.page, start: seg.start, end: seg.end, occurrence: seg.occurrence, snippet: g0.snippet, segments: g0.segments }, q);
       }
     } catch (e) {
+      if (disposed || !seq.isCurrent(token)) return;
       if (!(e instanceof DOMException && e.name === "AbortError")) err = String(e);
     } finally {
-      busy = false;
+      if (!disposed && seq.isCurrent(token)) busy = false;
     }
   }
+
+  onDestroy(() => {
+    disposed = true;
+    ctrl?.abort();
+    seq.next(); // 让在途请求的 token 立即失效
+  });
 
   function go(dir: 1 | -1) {
     const groups = result?.groups ?? [];

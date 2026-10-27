@@ -2,7 +2,7 @@
   // B7：首屏只静态加载 Library/WindowControls；Reader、全部弹窗与独立窗口按需 import。
   import Library from "../components/Library.svelte";
   import WindowControls from "../components/WindowControls.svelte";
-  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES } from "../lib/stores.svelte";
+  import { confirmAnswer, confirmBox, choiceBox, choiceAnswer, convertState, toasts, ui, copyText, dismissToast, config, THEMES, OPEN_BOOK_EVENT, requestOpenBook } from "../lib/stores.svelte";
   import { AI_OPEN_KEY, AI_WIN_H_KEY, AI_WIN_W_KEY } from "../lib/aiPanelKeys";
   import { t } from "../lib/i18n/index.svelte";
   import { onMount } from "svelte";
@@ -163,6 +163,27 @@
     };
   });
 
+  // F6-H2：独立笔记窗请求主窗打开原书 —— 主窗切到阅读、显示并聚焦。
+  $effect(() => {
+    if (standalone || standalonePanel || standaloneBook) return;
+    const un = listen<{ bookId: number }>(OPEN_BOOK_EVENT, (e) => {
+      const id = e.payload?.bookId;
+      if (!id) return;
+      requestOpenBook(id);
+      void (async () => {
+        try {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          const w = getCurrentWindow();
+          await w.show();
+          await w.setFocus();
+        } catch { /* 聚焦失败不影响打开 */ }
+      })();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   $effect(() => {
     if (standalone) return;
     // 捕获阶段处理 Esc：弹窗打开时阻止事件继续传播，
@@ -183,7 +204,7 @@
     return () => window.removeEventListener("keydown", onKey, true);
   });
 
-  // 独立 AI 窗的尺寸与生命周期标记（fr.ai.winw/winh、fr.ai.open、ai-window-status）。
+  // 独立 AI 窗的尺寸与生命周期标记（tidepage.ai.winw/winh、tidepage.ai.open、ai-window-status）。
   // 守卫必须是 !standalone：只让 AI 窗自己记自己的尺寸，否则写进去的是主窗口的
   // innerWidth/innerHeight，openAiWindow() 会按「主窗口尺寸」创建 AI 窗。
   $effect(() => {
@@ -305,11 +326,24 @@
     <dialog open out:outFade={{ from: 0.97, up: false }} onclick={(e) => { if (e.target === e.currentTarget) choiceAnswer(null); }}>
       <div class="modal-body choice-body">
         <p class="confirm-msg">{choiceBox.msg}</p>
-        <div class="choice-row">
-          {#each choiceBox.actions as a (a.id)}
-            <button data-testid={"choice-" + a.id} class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
-          {/each}
-        </div>
+        {#if choiceBox.actions.some((a) => a.footer)}
+          <div class="choice-row choice-stack">
+            {#each choiceBox.actions.filter((a) => !a.footer) as a (a.id)}
+              <button data-testid={"choice-" + a.id} class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
+            {/each}
+          </div>
+          <div class="confirm-row" style="margin-top:10px">
+            {#each choiceBox.actions.filter((a) => a.footer) as a (a.id)}
+              <button data-testid={"choice-" + a.id} class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
+            {/each}
+          </div>
+        {:else}
+          <div class="choice-row">
+            {#each choiceBox.actions as a (a.id)}
+              <button data-testid={"choice-" + a.id} class={a.kind === "primary" ? "primary" : a.kind === "danger" ? "danger" : ""} onclick={() => choiceAnswer(a.id)}>{a.label}</button>
+            {/each}
+          </div>
+        {/if}
       </div>
     </dialog>
   {/if}
@@ -545,5 +579,11 @@
     gap: 8px;
     margin-top: 6px;
   }
+  /* 含底部操作的选项框：选项纵向铺满，操作按钮单独一行。 */
+  .choice-row.choice-stack {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .choice-row.choice-stack button { text-align: left; }
 </style>
 

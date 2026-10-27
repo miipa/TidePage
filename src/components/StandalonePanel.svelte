@@ -39,10 +39,15 @@
   let unBook: UnlistenFn | null = null;
   let unClosed: UnlistenFn | null = null;
   let unActive: UnlistenFn | null = null;
+  const loadSeq = new RequestSeq();
 
   async function loadTitle() {
+    // F6：只有最新一次加载可以写标题；换书后旧回包直接丢弃。
+    const token = loadSeq.next();
+    const bid = bookId;
     try {
-      const rows = await api.listBooksByIds([bookId]);
+      const rows = await api.listBooksByIds([bid]);
+      if (!loadSeq.isCurrent(token) || bid !== bookId) return;
       title = rows?.[0]?.title ?? "";
     } catch { /* ignore */ }
   }
@@ -50,14 +55,18 @@
   /** 按当前 bookId 载入本面板的数据：首屏与「主窗换书」都走这一条。 */
   async function load() {
     if (!bookId) return;
+    // F6：请求序号 + bookId 快照：主窗连续换书时只有最后一次能写 toc/curChapter/title。
+    const token = loadSeq.next();
+    const bid = bookId;
+    const current = () => loadSeq.isCurrent(token) && bid === bookId;
     if (panel === "toc") {
       try {
-        const r = await api.openBook(bookId);
+        const r = await api.openBook(bid);
         const raw = r.toc ?? [];
         if (r.book?.format === "pdf") {
           // PDF：后端只给「第 N 页」；真实章节名是阅读器解析 outline 后存下的（本窗不重解析 PDF，
           // 省一次整文件读取）。没有存过就回落本界语言的页码标题。
-          const saved = await api.getSetting("pdf.outline." + bookId).catch(() => null);
+          const saved = await api.getSetting("pdf.outline." + bid).catch(() => null);
           const outline = saved ? (JSON.parse(saved) as PdfOutlineItem[]) : [];
           const label = (n: number) => t("reader.pdf.page", { n });
           toc = outline.length
@@ -66,18 +75,24 @@
         } else {
           toc = raw;
         }
+        const p = await api.loadProgress(bid);
+        if (!current()) return;
         title = r.book?.title ?? "";
-        const p = await api.loadProgress(bookId);
         curChapter = p?.chapter_index ?? 0;
       } catch { /* ignore */ }
     } else if (panel === "bookmarks") {
       await loadTitle();
-      try { bookmarks = await api.listBookmarks(bookId); } catch { /* ignore */ }
+      try {
+        const rows = await api.listBookmarks(bid);
+        if (current()) bookmarks = rows;
+      } catch { /* ignore */ }
     } else if (panel === "highlights") {
       await loadTitle();
+      if (!current()) return;
       hlVersion++; // HighlightsPanel 只按 version 重载：换书也必须靠它把数据切过去
     } else if (panel === "stats") {
       await loadTitle();
+      if (!current()) return;
       statsVersion++;
     }
   }
@@ -160,6 +175,7 @@
   function gotoHighlight(h: HighlightRow) {
     void emit("tidepage-goto-highlight", { id: h.id });
   }
+  import { RequestSeq } from "../lib/requestSeq";
 </script>
 
 <div class="panel-window-root">

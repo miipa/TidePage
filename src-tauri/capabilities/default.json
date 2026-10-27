@@ -7,7 +7,15 @@
     "core:default",
     "opener:allow-reveal-item-in-dir",
     "opener:allow-open-url",
-    "opener:allow-open-path",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "$DESKTOP/**" },
+        { "path": "$DOCUMENT/**" },
+        { "path": "$DOWNLOAD/**" }
+      ]
+    },
     "opener:allow-default-urls",
     "core:webview:allow-create-webview-window",
     "core:window:allow-close",

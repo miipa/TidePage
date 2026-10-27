@@ -5,8 +5,9 @@
   import { dateLocale, errText, t } from "../lib/i18n/index.svelte";
   import { displayChapterTitle } from "../lib/chapterTitle";
   import { api, coverUrl, bumpCoverBust } from "../lib/api";
-  import { toast, ui, requestOpenBook, APP_VERSION, openPanelWindow } from "../lib/stores.svelte";
+  import { appConfirm, toast, ui, requestOpenBook, requestOpenBookFromPanel, APP_VERSION, openPanelWindow } from "../lib/stores.svelte";
   import { onMount } from "svelte";
+  import { RequestSeq } from "../lib/requestSeq";
   import ExportPreview from "./ExportPreview.svelte";
   import { sortExportRows, type HighlightExportRow } from "../lib/highlightExport";
   import { outDissolve, outSlideR } from "../lib/motion";
@@ -51,6 +52,8 @@
   let detail: NoteBook | null = $state(null);
   let detailNotes: NoteItem[] = $state([]);
   let detailLoading = $state(false);
+  // F6：详情加载的请求序号：连续点不同书时只有最新一次能写 detailNotes/loading。
+  const detailSeq = new RequestSeq();
 
   // 搜索/排序都只作用在这个小列表上（有划线的书通常远少于书库总量）。
   const shown = $derived.by(() => {
@@ -123,21 +126,37 @@
   }
 
   async function openDetail(b: NoteBook) {
+    const token = detailSeq.next();
     detail = b;
     detailLoading = true;
     try {
-      detailNotes = await api.listNotesOfBook(b.bookId);
+      const rows = await api.listNotesOfBook(b.bookId);
+      if (!detailSeq.isCurrent(token)) return;
+      detailNotes = rows;
     } catch (e) {
+      if (!detailSeq.isCurrent(token)) return;
+      // 失败保留旧内容，只提示。
       toast(errText(e), "error");
     } finally {
-      detailLoading = false;
+      if (detailSeq.isCurrent(token)) detailLoading = false;
     }
   }
 
-  /** 打开原书：先关掉本窗口（它是整屏覆盖层，留着会盖住阅读界面）。 */
-  function openBook(b: NoteBook) {
+  /** 打开原书：先关掉本窗口（它是整屏覆盖层，留着会盖住阅读界面）。
+   *  F6-H2：独立笔记窗没有阅读器，requestOpenBook 只改本窗状态会静默无效 ——
+   *  改为经 Tauri 事件请求主窗打开原书，失败/主窗不存在时给出可见提示。 */
+  async function openBook(b: NoteBook) {
     if (b.deleted || b.bookId < 0) {
       toast(t("notes.bookDeleted"), "error");
+      return;
+    }
+    if (standalone) {
+      const ok = await requestOpenBookFromPanel(b.bookId);
+      if (!ok) {
+        toast(t("reader.open.failed"), "error");
+        return;
+      }
+      detail = null;
       return;
     }
     detail = null;
@@ -147,6 +166,8 @@
 
   /** 删这条感想，保留划线。 */
   async function removeNote(n: NoteItem) {
+    // F6-H1：删除前确认，避免面板里误点直接抹掉内容。
+    if (!(await appConfirm(t("notes.delNoteTip")))) return;
     try {
       await api.setHighlightNote(n.id, "");
       detailNotes = detailNotes.map((x) => (x.id === n.id ? { ...x, note: "" } : x));
@@ -158,6 +179,8 @@
 
   /** 删划线本身（连带它的感想）。 */
   async function removeHighlight(n: NoteItem) {
+    // F6-H1：删除前确认（文案复用现有键，带被删文字前 60 字摘要）。
+    if (!(await appConfirm(t("highlight.deleteConfirm", { text: n.text.slice(0, 60) })))) return;
     try {
       await api.deleteHighlight(n.id);
       detailNotes = detailNotes.filter((x) => x.id !== n.id);

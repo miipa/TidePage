@@ -3,7 +3,7 @@
   import { onMount, onDestroy } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { api, type DuplicateBook, type DuplicateGroup } from "../lib/api";
-  import { appConfirm, toast } from "../lib/stores.svelte";
+  import { appConfirm, toast, type ConfirmDetailRow } from "../lib/stores.svelte";
   import { errText, t } from "../lib/i18n/index.svelte";
   import {
     clearGroupSelection,
@@ -135,6 +135,18 @@
     selection = next;
   }
 
+  /** 按文件夹批量选择：清掉本组已选，勾选该目录下全部副本，并展开便于核对。
+   *  只改变待删除选择，不直接删除；用户再点底部「移入回收站/仅从书库移除」。 */
+  function selectDirForDeletion(g: DuplicateGroup, dir: string) {
+    const next = { ...selection };
+    for (const b of g.books) delete next[b.id];
+    for (const b of groupDirBooks(g, dir)) next[b.id] = true;
+    selection = next;
+    const nextExpanded = new Set(expanded);
+    nextExpanded.add(g.key);
+    expanded = nextExpanded;
+  }
+
   function groupRepresentative(g: DuplicateGroup): DuplicateBook | null {
     return representativeForDir(g.books, dirFilter);
   }
@@ -159,6 +171,19 @@
     selection = r.selection;
   }
 
+  /** 删除确认里按文件夹汇总将删除的副本，用户能看清涉及哪些目录。 */
+  function selectedDirRows(): ConfirmDetailRow[] {
+    const counts = new Map<string, number>();
+    for (const b of selectedBooks) {
+      const d = parentDirOf(b.path);
+      counts.set(d, (counts.get(d) ?? 0) + 1);
+    }
+    return [...counts].map(([dir, n]) => ({
+      label: dir,
+      cells: [{ text: t("dupes.dirBookCount", { n }), align: "end" as const }],
+    }));
+  }
+
   function fmtSize(n: number): string {
     if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
     if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
@@ -173,7 +198,7 @@
   /** A：仅从书库移除（文件保留、路径进 ignoring/忽略表）。 */
   async function removeSelected() {
     if (!selectedBooks.length || scanning) return;
-    const ok = await appConfirm(t("dupes.removeConfirm", { n: selectedBooks.length }));
+    const ok = await appConfirm(t("dupes.removeConfirm", { n: selectedBooks.length }), { detail: selectedDirRows() });
     if (!ok) return;
     const ids = new Set(selectedBooks.map((b) => b.id));
     try {
@@ -189,7 +214,7 @@
   async function deleteSelected() {
     if (!selectedBooks.length || scanning) return;
     const suspectedSelected = dirGroups.some((g) => g.suspected && g.books.some((b) => selection[b.id]));
-    const ok = await appConfirm(t(suspectedSelected ? "dupes.deleteConfirmSuspected" : "dupes.deleteConfirm", { n: selectedBooks.length }));
+    const ok = await appConfirm(t(suspectedSelected ? "dupes.deleteConfirmSuspected" : "dupes.deleteConfirm", { n: selectedBooks.length }), { detail: selectedDirRows() });
     if (!ok) return;
     const ids = new Set(selectedBooks.map((b) => b.id));
     try {
@@ -272,7 +297,24 @@
                 {:else}<span class="badge">{t("dupes.exact")}</span>{" "}{/if}
                 {t("dupes.copies", { n: g.books.length, dirs: groupDirCount(g) })}
               </span>
-              <span style="display:flex; gap:6px;">
+              <span style="display:flex; gap:6px; align-items:center;">
+                {#if groupDirs(g).length > 1}
+                  <select
+                    class="dp-del-dir"
+                    value=""
+                    title={t("dupes.deleteDirPlaceholder")}
+                    onchange={(e) => {
+                      const dir = e.currentTarget.value;
+                      e.currentTarget.value = "";
+                      if (dir) selectDirForDeletion(g, dir);
+                    }}
+                  >
+                    <option value="" disabled>{t("dupes.deleteDirPlaceholder")}</option>
+                    {#each groupDirs(g) as d (d)}
+                      <option value={d}>{d}</option>
+                    {/each}
+                  </select>
+                {/if}
                 <button onclick={() => toggleExpand(g.key)}>{expanded.has(g.key) ? t("dupes.collapse") : t("dupes.expand")}</button>
                 <button onclick={() => ignoreGroup(g.key)}>{t("dupes.ignore")}</button>
               </span>
@@ -345,6 +387,7 @@
   .dp-group { border: 1px solid var(--border, #8884); border-radius: 8px; margin: 10px 0; }
   .dp-group-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: var(--hover-bg, #8881); font-size: 13px; }
   .dp-group-head button { font-size: 12px; }
+  .dp-del-dir { max-width: 220px; font-size: 12px; }
   .dp-row { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border-top: 1px solid var(--border, #8882); cursor: pointer; }
   .dp-idx { color: var(--accent); font-size: 12px; min-width: 70px; }
   .dp-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }

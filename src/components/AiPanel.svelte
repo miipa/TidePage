@@ -62,7 +62,25 @@ import { reorderByDrop } from "../lib/reorder";
   let streamBuf = "";
   let streamLast = 0;
   let streamTimer: ReturnType<typeof setTimeout> | undefined;
-  onDestroy(() => dropStream());
+  // F5：卸载/重开保护。流式回调、await 之后的写状态都要检查；监听句柄登记后统一注销。
+  let disposed = false;
+  let runToken = 0;
+  const unlisteners: Array<() => void | Promise<void>> = [];
+  function removeOwnedStyle() {
+    // 只移除本组件创建且仍是同一节点的 style：同 id 已被新实例替换时不删别人的。
+    if (aiStyleTag) {
+      if (aiStyleTag.isConnected) aiStyleTag.remove();
+      aiStyleTag = null;
+    }
+  }
+  function disposeAll() {
+    disposed = true;
+    dropStream();
+    removeOwnedStyle();
+    const pending = unlisteners.splice(0);
+    void Promise.allSettled(pending.map((fn) => Promise.resolve().then(fn))).catch(() => {});
+  }
+  onDestroy(disposeAll);
   let autoFiredFor = "";
   let sessionSeq = 0;
 
@@ -258,6 +276,7 @@ import { reorderByDrop } from "../lib/reorder";
       return;
     }
 
+    const myRun = ++runToken;
     streaming = true;
     push("user", userText.length > 120 ? userText.slice(0, 120) + "…" : userText);
     const reply = push("assistant", "");
@@ -290,12 +309,18 @@ import { reorderByDrop } from "../lib/reorder";
       let active = true;
       let un: (() => void) | null = null;
       const stop = listen<{ delta: string; done: boolean }>(`ai-token:${id}`, (e) => {
-        if (!active) return;
+        if (!active || disposed || myRun !== runToken) return;
         if (e.payload.delta) {
           pushDelta(reply, e.payload.delta);
         }
       });
-      un = () => stop.then((f) => f());
+      const reg = () => stop.then((f) => f()).catch(() => {});
+      unlisteners.push(reg);
+      un = () => {
+        const i = unlisteners.indexOf(reg);
+        if (i >= 0) unlisteners.splice(i, 1);
+        void reg();
+      };
       try {
         await api.aiChat({
           id,
@@ -311,6 +336,8 @@ import { reorderByDrop } from "../lib/reorder";
         });
         active = false;
         un?.();
+        // 卸载后（或已开始新一轮）不再落盘/改配置/动 streaming。
+        if (disposed || myRun !== runToken) return;
         flushStream(reply); // 收尾：把缓冲里最后一段立即落盘，不等下一个节拍
         if (config.ai.active !== idx) {
           config.ai.active = idx;
@@ -322,6 +349,7 @@ import { reorderByDrop } from "../lib/reorder";
       } catch (e) {
         active = false;
         un?.();
+        if (disposed) return;
         const err = normalizeAiError(e);
         failures.push({ name: label, kind: err.kind, code: err.code, message: err.message });
         if (!config.ai.failover) break;
@@ -503,8 +531,8 @@ ${readerStyle.extra}
       }
       aiStyleTag.textContent = readerCss;
     } else {
-      document.getElementById("tidepage-ai-reader-css")?.remove();
-      aiStyleTag = null;
+      // F5：style 可能已被新实例替换（同 id 不同节点）：只清理自己创建的那一个。
+      removeOwnedStyle();
     }
   });
 

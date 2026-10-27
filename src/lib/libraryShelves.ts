@@ -29,7 +29,11 @@ export function uniqueShelfName(base: string, existing: Shelf[]): string {
   const stem = m ? m[1] : want;
   const start = m ? Number(m[2]) + 1 : 2;
   for (let i = start; i < 1000; i++) {
-    const cand = `${stem} (${i})`;
+    // G17：后缀也要计入 32 字上限；先截短 stem 再拼，保证落库后 normalizeShelfName
+    // 不会把后缀截掉导致重名。
+    const suffix = ` (${i})`;
+    const stemMax = Math.max(1, MAX_NAME - suffix.length);
+    const cand = stem.slice(0, stemMax) + suffix;
     if (!used.has(cand.toLowerCase())) return cand;
   }
   return want;
@@ -43,7 +47,38 @@ function strArr(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim() !== "") : [];
 }
 
-/** 反序列化 + 字段校验；坏 JSON/坏条目返回空/被过滤，绝不抛错。 */
+/** 默认 id 工厂：保证与时间相关且带随机尾，避免同一毫秒内重复。 */
+function defaultShelfId(n: number): string {
+  return `shelf-${Date.now().toString(36)}-${n}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * F8-H1：按 id 去重。保留首次出现的 id；后续重复/空 id 用 idFactory 重新分配。
+ * 返回新数组（不修改入参），顺序与内容不变 —— D5 合并可能产生重复 id，
+ * Library keyed each (s.id) 遇到重复会直接抛错。
+ */
+export function dedupeShelfIds(
+  list: Shelf[],
+  idFactory: (n: number) => string = defaultShelfId,
+): Shelf[] {
+  const seen = new Set<string>();
+  let seq = 0;
+  return list.map((s) => {
+    const id = typeof s.id === "string" ? s.id : "";
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      return s;
+    }
+    let fresh = "";
+    do {
+      fresh = idFactory(++seq);
+    } while (!fresh || seen.has(fresh));
+    seen.add(fresh);
+    return { ...s, id: fresh };
+  });
+}
+
+/** 反序列化 + 字段校验；坏 JSON/坏条目返回空/被过滤，绝不抛错。返回前按 id 去重（F8-H1）。 */
 export function deserializeShelves(raw: string | null | undefined): Shelf[] {
   if (!raw) return [];
   try {
@@ -67,7 +102,7 @@ export function deserializeShelves(raw: string | null | undefined): Shelf[] {
         updatedAt: typeof e.updatedAt === "number" && e.updatedAt > 0 ? e.updatedAt : (typeof e.createdAt === "number" ? e.createdAt : 0),
       });
     }
-    return out;
+    return dedupeShelfIds(out);
   } catch {
     return [];
   }

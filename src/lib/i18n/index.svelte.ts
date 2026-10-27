@@ -181,6 +181,11 @@ const ERR_CODES: ReadonlyArray<readonly [string, MessageKey]> = [
   ["ai.edgeConnect", "err.aiEdgeConnect"],
   ["ai.edgeSend", "err.aiEdgeSend"],
   ["ai.edgeReceive", "err.aiEdgeReceive"],
+  ["ai.edgeProxyUnsupported", "err.aiEdgeProxyUnsupported"],
+  // davsync.rs 稳定数据同步错误码（G18）；前缀匹配：jsonBroken/notFile 共用文件无效文案。
+  ["dataSync.jsonBroken", "err.dataSyncFileInvalid"],
+  ["dataSync.notFile", "err.dataSyncFileInvalid"],
+  ["dataSync.versionUnsupported", "err.dataSyncVersionUnsupported"],
   ["ai.noApiAddr", "err.aiNoApiAddr"],
   ["ai.invalidModelId", "err.aiInvalidModelId"],
   ["ai.azureNeedDeployment", "err.aiAzureNeedDeployment"],
