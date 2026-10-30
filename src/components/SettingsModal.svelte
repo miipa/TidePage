@@ -99,6 +99,7 @@ function notifyHostChangedSecrets(changes: EndpointSecretChanges) {
     IconColorSwatch,
     IconAdjustments,
     IconBrandGithub,
+    IconBrush,
     IconBrandQq,
     IconExternalLink,
     IconKeyboard,
@@ -113,6 +114,8 @@ function notifyHostChangedSecrets(changes: EndpointSecretChanges) {
   import { dragSort } from "../lib/dragSort";
 import { reorderByDrop } from "../lib/reorder";
   import { seedEndpointLabel, seedPromptLabel, seedTtsLabel } from "../lib/seedNames.svelte";
+  import "../lib/elementSettings.css";
+  import { DEFAULT_ELEMENT_ACCENT, ELEMENT_CODE_TEMPLATES, ELEMENT_GROUPS, ELEMENT_PRESETS, DEFAULT_ELEMENT_STYLES, elementStyleActive, type ElementStyleKey } from "../lib/elementStyles";
   import { slide } from "svelte/transition";
   // i18n：第一阶段仅「通用 → 界面语言」这一小块接线（其余分区文案留给后续阶段）。
   import { dateLocale, aiErrDetail, aiPieceText, errText, hasLabelOf, labelOfId, locale, localeSetting, setLocale, t } from "../lib/i18n/index.svelte";
@@ -138,7 +141,7 @@ IconPlus,
   import { onReducedMotionChange, prefersReducedMotion } from "../lib/reducedMotion";
   import { checkForUpdates, updateState } from "../lib/update.svelte";
 
-  type SettingsTab = "appearance" | "reader" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
+  type SettingsTab = "appearance" | "reader" | "elements" | "manga" | "split" | "keys" | "tts" | "webdav" | "ai" | "prefs" | "other";
   // 默认不硬编码分区：initialTab 不传时用「排序后的第一项」，以区分调用方显式指定与未指定。
   let { initialTab = undefined as SettingsTab | undefined }: { initialTab?: SettingsTab } = $props();
 
@@ -146,6 +149,7 @@ IconPlus,
   // 分区 label 走 labelKey（t() 渲染时才求值，故切语言即时生效）；持久化只存 id。
   const TAB_META: Record<SettingsTab, { labelKey: MessageKey; icon: TablerIcon }> = {
     reader: { labelKey: "settings.tab.reader", icon: IconTypography },
+    elements: { labelKey: "settings.tab.elements", icon: IconBrush },
     appearance: { labelKey: "settings.tab.appearance", icon: IconColorSwatch },
     manga: { labelKey: "settings.tab.manga", icon: IconPhoto },
     tts: { labelKey: "settings.tab.tts", icon: IconVolume },
@@ -201,6 +205,67 @@ IconPlus,
   // 故此初始化即按当前 settingsOrder 生效——显式传入（如 AI 入口 initialTab="ai"）优先，
   // 否则取排序后的第一项；orderedTabs 为空时兜底 "reader"。
   let tab = $state<SettingsTab>(initialTab ?? navItems[0]?.id ?? "reader");
+
+  /** 元素样式：整体方案、单项切换、每个元素追加自定义 CSS。 */
+  let elementCodeEditor = $state<{ key: ElementStyleKey; value: string } | null>(null);
+
+  function elementGroup(key: ElementStyleKey) {
+    return ELEMENT_GROUPS.find((g) => g.key === key);
+  }
+
+  function applyElementPreset(p: (typeof ELEMENT_PRESETS)[number]) {
+    config.reader.elementStyles = { ...p.state };
+    config.reader.elementAccent = p.accent;
+    saveConfig();
+  }
+
+  function setElementStyle(key: ElementStyleKey, value: string) {
+    config.reader.elementStyles = { ...config.reader.elementStyles, [key]: value };
+    saveConfig();
+  }
+
+  function openElementCode(key: ElementStyleKey) {
+    const existing = config.reader.elementCss[key] || "";
+    elementCodeEditor = { key, value: existing || ELEMENT_CODE_TEMPLATES[key] };
+  }
+
+  function saveElementCode() {
+    if (!elementCodeEditor) return;
+    config.reader.elementCss = { ...config.reader.elementCss, [elementCodeEditor.key]: elementCodeEditor.value.trim() };
+    elementCodeEditor = null;
+    saveConfig();
+  }
+
+  function clearElementCode() {
+    if (!elementCodeEditor) return;
+    const key = elementCodeEditor.key;
+    config.reader.elementCss = { ...config.reader.elementCss, [key]: "" };
+    elementCodeEditor = null;
+    saveConfig();
+  }
+
+  function resetElementStyles() {
+    config.reader.elementStyles = { ...DEFAULT_ELEMENT_STYLES };
+    config.reader.elementAccent = DEFAULT_ELEMENT_ACCENT;
+    saveConfig();
+    toast(t("settings.elements.resetDone"));
+  }
+
+  /** 随机搭配：跳过「默认/无装饰」这类没有可见效果的项，避免随机后看起来没变化。 */
+  function randomElementStyles() {
+    const noop = new Set(["default", "none", "plain"]);
+    const next = { ...config.reader.elementStyles };
+    for (const g of ELEMENT_GROUPS) {
+      const visible = g.options.filter((o) => !noop.has(o.v));
+      const pool = visible.length ? visible : g.options;
+      next[g.key] = pool[Math.floor(Math.random() * pool.length)].v;
+    }
+    config.reader.elementStyles = next;
+    // 换一组灵感：强调色也随机取一套预设配色（与网页原型一致）。
+    const rp = ELEMENT_PRESETS[Math.floor(Math.random() * ELEMENT_PRESETS.length)];
+    if (rp) config.reader.elementAccent = rp.accent;
+    saveConfig();
+  }
 
   /** 当前标签的显示名（用于头部面包屑）。 */
   const tabLabel = $derived(TAB_META[tab] ? t(TAB_META[tab].labelKey) : t("settings.title"));
@@ -2563,6 +2628,70 @@ let aiTestState = $state<"" | "ok" | "bad">("");
       <button onclick={resetReader}>{t("settings.reader.reset")}</button>
     </div>
   </div>
+
+  <div class="set-pane" data-pane="elements" id="set-pane-elements" role="tabpanel" aria-labelledby="set-tab-elements" tabindex="-1" hidden={tab !== "elements"}>
+    <p class="tip">{t("settings.elements.tip")}</p>
+    <p class="tip">{t("settings.elements.preprocessTip")}</p>
+    <div class="el-preset-head">
+      <p class="sec-title">{t("settings.elements.presets")}</p>
+      <button class="el-random" onclick={randomElementStyles}>{t("settings.elements.random")}</button>
+    </div>
+    <div class="el-presets">
+      {#each ELEMENT_PRESETS as p (p.id)}
+        <button class="el-preset" class:on={elementStyleActive(config.reader.elementStyles, p)} style="--p-accent:{p.accent}" onclick={() => applyElementPreset(p)}>
+          <i></i><b>{p.name}</b><small>{p.sub}</small>
+        </button>
+      {/each}
+    </div>
+
+    {#each ELEMENT_GROUPS as g (g.key)}
+      <div class="field el-field">
+        <div class="el-field-head">
+          <span class="el-label">{g.label}<span>{g.code}</span></span>
+          <button
+            class="el-plus"
+            class:has={!!config.reader.elementCss[g.key]}
+            title={t("settings.elements.plusTitle")}
+            aria-label={t("settings.elements.plusTitle")}
+            onclick={() => openElementCode(g.key)}
+          ><IconPlus size={13} stroke={1.8} /></button>
+        </div>
+        <div class="tp-seg el-seg">
+          {#each g.options as op (op.v)}
+            <button class:active={config.reader.elementStyles[g.key] === op.v} onclick={() => setElementStyle(g.key, op.v)}>{op.t}</button>
+          {/each}
+        </div>
+        {#if config.reader.elementCss[g.key]}
+          <p class="tip">{t("settings.elements.customCodeTip")}</p>
+        {/if}
+      </div>
+    {/each}
+
+    <div class="close-row" style="margin-top:12px">
+      <button onclick={resetElementStyles}>{t("settings.elements.reset")}</button>
+    </div>
+
+    {#if elementCodeEditor}
+      <div class="el-code-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) elementCodeEditor = null; }}>
+        <div class="el-code-dialog" role="dialog" aria-modal="true" aria-label={t("settings.elements.customCode")}>
+          <div class="el-code-head">
+            <b>{t("settings.elements.codeTitle", { name: elementGroup(elementCodeEditor.key)?.label ?? "" })}</b>
+            <button class="icon" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={() => (elementCodeEditor = null)}><IconX size={16} stroke={1.5} /></button>
+          </div>
+          <p class="tip">{t("settings.elements.codeHint")}</p>
+          <textarea class="el-code-input" rows="12" spellcheck="false" bind:value={elementCodeEditor.value}></textarea>
+          <div class="el-code-foot">
+            <button onclick={clearElementCode}>{t("settings.elements.codeClear")}</button>
+            <div class="el-code-actions">
+              <button onclick={() => (elementCodeEditor = null)}>{t("settings.elements.codeCancel")}</button>
+              <button class="primary" onclick={saveElementCode}>{t("settings.elements.codeSave")}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    {/if}
+  </div>
+
   <div class="set-pane" data-pane="manga" id="set-pane-manga" role="tabpanel" aria-labelledby="set-tab-manga" tabindex="-1" hidden={tab !== "manga"}>
     <p class="tip">{t("settings.manga.scopeTip")}</p>
 
@@ -2719,7 +2848,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     <h4 class="sub-h">{t("settings.keys.zonesTitle")}</h4>
     <p class="tip">{t("settings.keys.zonesTip")}</p>
     <div class="checks" style="margin:6px 0">
-      <label><input type="checkbox" bind:checked={config.reader.zoneHints} onchange={saveConfig}  /> {t("settings.keys.zoneHints")}</label>
+      <label><input type="checkbox" bind:checked={config.reader.zoneHints} onchange={saveConfigNow}  /> {t("settings.keys.zoneHints")}</label>
     </div>
     <div class="zone-grid">
       {#each ZONE_DEFS as z (z.id)}
@@ -2728,7 +2857,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
           <select
             aria-label={labelOfId("zone", z.id)}
             value={config.reader.zones[z.id]}
-            onchange={(e) => { config.reader.zones[z.id] = (e.currentTarget as HTMLSelectElement).value as ZoneAction; saveConfig(); }}
+            onchange={(e) => { config.reader.zones[z.id] = (e.currentTarget as HTMLSelectElement).value as ZoneAction; saveConfigNow(); }}
           >
             <option value="none">{t("settings.keys.zoneNone")}</option>
             {#each BIND_DEFS as d (d.id)}
@@ -2740,7 +2869,7 @@ let aiTestState = $state<"" | "ok" | "bad">("");
     </div>
 
     <div class="close-row">
-      <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfig(); toast(t("settings.keys.resetDone")); }}>{t("settings.keys.reset")}</button>
+      <button onclick={() => { config.reader.bindings = structuredClone(DEFAULT_BINDINGS); config.reader.zones = structuredClone(DEFAULT_ZONES); saveConfigNow(); toast(t("settings.keys.resetDone")); }}>{t("settings.keys.reset")}</button>
     </div>
   </div>
   <div class="set-pane" data-pane="tts" id="set-pane-tts" role="tabpanel" aria-labelledby="set-tab-tts" tabindex="-1" hidden={tab !== "tts"}>

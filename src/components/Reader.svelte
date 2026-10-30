@@ -60,6 +60,8 @@ import { reorderByDrop } from "../lib/reorder";
   import { pageFromLeftPosition, pageFromRatio, ratioFromPage } from "../lib/pagination";
   import { parseInternalHref, pickSameDocAnchorTarget } from "../lib/readerLinks";
   import { displayChapterTitle, normalizeChapterTitle } from "../lib/chapterTitle";
+  import { extractFootnoteHtml, footnoteHtmlFromElement } from "../lib/footnotes";
+  import { normalizeChapterHtml } from "../lib/contentNormalize";
   import {
     detectPagedStyleConflict,
     tallBlockAction,
@@ -104,6 +106,7 @@ import {
   type PageTransition,
 } from "../lib/chapterTx";
   import { outSlideL, outSlideR } from "../lib/motion";
+  import { ELEMENT_STYLE_CSS } from "../lib/elementStylesCss";
 
   // 侧面板退场的承载层。
   //
@@ -204,6 +207,14 @@ import {
    *  连按/连滚指向同一章时不再重复 ++loadGeneration（见 loadChapter）。非响应式即可。 */
   let loadingIdx = -1;
   let chapterNum = $state(0);
+
+  /** 章内语义预处理后的 HTML：只加 class、不改文字，供元素样式选择器命中不同书的结构。 */
+  const renderedChapterHtml = $derived(
+    normalizeChapterHtml(
+      (chapter as ChapterData | null)?.html ?? "",
+      displayChapterTitle((chapter as ChapterData | null)?.title ?? "", chapterNum, (n) => t("common.sectionN", { n })),
+    ),
+  );
 
   let scrollArea: HTMLDivElement | undefined = $state();
   let pageWrap: HTMLDivElement | undefined = $state();
@@ -2958,7 +2969,10 @@ import {
     // 翻页模式：只清**滑块**上的过渡位移（`.clip` 是静止视口，从不动它）；
     // 内部 .col-page 的页码 transform 一律不动（它由 applyPage 独家维护）。
     const slider = pageSlide();
-    if (slider) slider.style.transform = "";
+    if (slider) {
+      slider.style.transform = "";
+      slider.classList.remove("tx-front", "tx-paper");
+    }
     lastBounce = "";
     // 复核：maxScroll 必须等于 scrollHeight - clientHeight（锁定期内不落地，故在解锁前补一次）
     if (scrollLayout()) measureScroll();
@@ -2979,7 +2993,10 @@ import {
     txAnimDone = true;
     // 翻页模式：位移在滑块上（`.clip` 是静止视口，不动它）；滚动模式清滚动容器。
     const slider = pageSlide();
-    if (slider) slider.style.transform = "";
+    if (slider) {
+      slider.style.transform = "";
+      slider.classList.remove("tx-front", "tx-paper");
+    }
     if (scrollArea) scrollArea.style.transform = "";
     lastPageX = Number.NaN;
     if (!scrollLayout()) applyPage(true);
@@ -3035,18 +3052,24 @@ import {
    *  两种模式的载体不同：
    *   · 滚动模式：真实 `.scroll-area` 纵向滑入，克隆 `.scroll-area`（在舞台里）纵向视差移出；
    *   · 翻页模式：**静止视口 + 文字层滑块** —— `.clip` 不动，动的是 `.clip` 内的滑块：
-   *     真实滑块横向滑入、克隆滑块（append 在 `.clip` 里的 `.tx-snap`）横向移出。
-   *     两层共用同一条缓动，因此始终首尾相接、互不重叠（透明纸质下重叠会露出双层文字）；
-   *     越出视口的部分被 `.clip` 裁掉，正文因此永不进入窗口边距区。
+   *     真实滑块横向滑入，克隆滑块（append 在 `.clip` 里的 `.tx-snap`）在 120ms 内淡出；
+   *     不再让两张透明文字层整段同屏（否则切章时会出现半屏旧章、半屏新章的叠读观感）。
+   *     无背景图时真实滑块临时铺纸色，新页是完整不透明页面；有背景图时保留透明，
+   *     避免纯色盖住唯一背景面。越出视口的部分被 `.clip` 裁掉，正文因此永不进入窗口边距区。
    *     `.col-page` 的页码 transform 一律不碰（往它身上加偏移会把相邻栏拉进静止视口）。 */
   async function playTransition(dir: number, mode: ChapterTransition | PageTransition, hasSnap: boolean) {
     const stage = txStageEl;
     const pageMode = !scrollLayout();
     const shell = pageMode ? pageSlide() : scrollArea;
     if (!shell) return;
+    // 没有可播放的过渡时不挂任何临时层：否则 tx-front / tx-paper 会留在滑块上。
+    if (mode === "none" || !hasSnap || !txSnapEl) return;
     if (pageMode) {
       // 翻页模式不挂 tx-bg（纸质由 .bg-layer 提供，纯色会盖掉背景图）；层序靠 .tx-slide/.tx-snap 的 z-index。
+      // 无背景图时给入场的真实滑块铺阅读纸色：两张透明文字层同时在屏时，旧页会被透成
+      // 「双层文字」；铺纸后新页是一张真正的不透明页面，接缝处不会出现两章文字叠读。
       shell.classList.add("tx-front");
+      if (!bgImageUrl) shell.classList.add("tx-paper");
     } else {
       if (!stage) return;
       stage.classList.add("behind"); // 舞台退到下面（局部 z-index 1）
@@ -3055,7 +3078,6 @@ import {
       shell.classList.add("tx-front");
       if (!bgImageUrl) shell.classList.add("tx-bg");
     }
-    if (mode === "none" || !hasSnap || !txSnapEl) return;
     const snap = txSnapEl;
     const anims: Animation[] = [];
     if (pageMode) {
@@ -3065,12 +3087,13 @@ import {
           [{ transform: `translate3d(${g.inFrom}px,0,0)` }, { transform: "translate3d(0,0,0)" }],
           { duration: g.durMs, easing: g.easingIn, fill: "none" },
         ),
-        // 退场层只动位移：不加 opacity / filter / scale ——
-        // 旧实现给弹簧档退场淡到 0.45，中段帧会在底色上留下旧页的半透明虚影（必修 2）。
-        // 缓动与入场层**同一条**：两层共用进度才能保持首尾相接（弹簧过冲时整对一起过冲）。
+        // 退场层只做短淡出：两张文字层都是透明的，整段动画都保留旧页会在接缝处出现
+        // 「两章文字同屏」的错乱观感（真实截图：翻到章末切章时半屏旧章、半屏新章）。
+        // 120ms 内淡掉旧页，后续只让新页滑入；不再与入场层共用整段时长。
         snap.animate(
-          [{ transform: "translate3d(0,0,0)" }, { transform: `translate3d(${g.outTo}px,0,0)` }],
-          { duration: g.durMs, easing: g.easingIn, fill: "forwards" },
+          [{ transform: "translate3d(0,0,0)", opacity: "1" },
+           { transform: `translate3d(${Math.round(g.outTo * 0.25)}px,0,0)`, opacity: "0" }],
+          { duration: Math.min(g.durMs, 120), easing: "ease-out", fill: "forwards" },
         ),
       );
     } else {
@@ -5133,6 +5156,19 @@ import {
     if (sel && !sel.isCollapsed) sel.removeAllRanges();
   }
 
+  // 标题类元素（标签标题 + 预处理出的标题块）。阅读器里标题内的 <a> 是 EPUB 的目录回链，
+  // 不是行内链接：点击时静默忽略，既不跳转也不复制。
+  const HEADING_HOST_SEL = "h1,h2,h3,h4,h5,h6,.tp-el-heading,.tp-el-subhead";
+
+  /** 是否「标题内锚点」：预处理已打 .tp-el-heading-link；旧缓存章节再用祖先标题兜底。
+   *  脚注上标（.tp-el-noteref）即使落在标题里也仍然可点，不在此列。 */
+  function isHeadingAnchor(el: Element | null | undefined): boolean {
+    if (!el || el.tagName !== "A") return false;
+    if (el.classList.contains("tp-el-noteref")) return false;
+    if (el.classList.contains("tp-el-heading-link")) return true;
+    return !!el.closest(HEADING_HOST_SEL);
+  }
+
   function onContentPointerUp(e: PointerEvent) {
     if (mangaHorizontal()) return; // 漫画双页：手势由横向视口单独处理
     // 长按已触发（图库已开）：不再走点击/选区判定，避免同一次手势触发两件事。
@@ -5199,6 +5235,8 @@ import {
     }
     // 可交互元素分流：链接交给 onBodyClick（跳章/复制），button/input 等交给各自处理器；
     // 只有正文空白处才按 config.reader.zones 热区翻页，否则点控件会「既点它又翻页」。
+    // 标题内锚点仍按可交互元素早退（onBodyClick 里静默忽略）：否则点标题会落到热区动作，
+    // 例如标题所在的左上热区默认是「上一章」。
     if (tgt?.closest?.("a, button, input, textarea, select")) return;
     const rect = contentEl.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
@@ -5299,9 +5337,163 @@ import {
     alignStatsBaseline();
   }
 
+  interface FootnotePop {
+    html: string;
+    left: number;
+    top: number;
+    maxHeight: number;
+    loading: boolean;
+    error: string;
+  }
+
+  let footnotePop = $state<FootnotePop | null>(null);
+  /** 请求代号：关闭/再次打开后，旧的异步取章结果不得覆盖新弹窗。 */
+  let footnoteReq = 0;
+
+  function footnotePosition(rect: DOMRect): { left: number; top: number; maxHeight: number } {
+    const width = Math.min(380, Math.max(240, window.innerWidth - 24));
+    const left = Math.min(Math.max(12, rect.left), Math.max(12, window.innerWidth - width - 12));
+    let top = rect.bottom + 10;
+    let maxHeight = Math.min(340, window.innerHeight - top - 24);
+    if (maxHeight < 150) {
+      maxHeight = Math.min(340, window.innerHeight - 80);
+      top = Math.max(60, rect.top - maxHeight - 10);
+      maxHeight = Math.min(maxHeight, window.innerHeight - top - 24);
+    }
+    return { left, top, maxHeight: Math.max(120, maxHeight) };
+  }
+
+  function closeFootnote() {
+    footnoteReq++;
+    footnotePop = null;
+  }
+
+  /** 解析脚注链接：当前章优先；跨章 / 同文件切分章通过 book.docs + locateEpubAnchor 定位。 */
+  async function resolveFootnoteHtml(href: string): Promise<string | null> {
+    const parsed = parseInternalHref(href);
+    if (!parsed || !parsed.fragment) return null;
+    const fragment = parsed.fragment;
+    const root = contentRoot();
+    const cur = chapterNum;
+    const bid = book?.book.id ?? -1;
+    const base = parsed.fileBase;
+    const baseName = base ? (base.split("/").pop() || base) : "";
+
+    if (!base) {
+      const local = root ? findAnchorElement(root, fragment) : null;
+      if (local) return footnoteHtmlFromElement(local);
+      if (bid >= 0 && book?.book.format === "epub") {
+        const file = book.docs?.[cur];
+        if (file) {
+          try {
+            const located = await api.locateEpubAnchor(bid, file.toLowerCase(), fragment);
+            if (located != null && located >= 0) {
+              const ch = located === cur && chapter ? chapter : await fetchChapter(located);
+              return extractFootnoteHtml(ch.html, fragment);
+            }
+          } catch { /* 回退当前章原始 HTML */ }
+        }
+      }
+      return chapter ? extractFootnoteHtml(chapter.html, fragment) : null;
+    }
+
+    let idx = -1;
+    if (book?.docs) {
+      idx = book.docs.findIndex((d) => {
+        const dl = d.toLowerCase();
+        return dl === base.toLowerCase() || dl === baseName.toLowerCase();
+      });
+    }
+    if (bid >= 0 && book?.book.format === "epub") {
+      try {
+        const located = await api.locateEpubAnchor(bid, baseName.toLowerCase(), fragment);
+        if (located != null && located >= 0) idx = located;
+      } catch { /* 回退 book.docs 首个匹配 */ }
+    }
+    if (idx < 0) return null;
+    if (idx === cur) {
+      const local = root ? findAnchorElement(root, fragment) : null;
+      if (local) return footnoteHtmlFromElement(local);
+      return chapter ? extractFootnoteHtml(chapter.html, fragment) : null;
+    }
+    const ch = await fetchChapter(idx);
+    return extractFootnoteHtml(ch.html, fragment);
+  }
+
+  async function openFootnote(a: HTMLAnchorElement) {
+    const href = a.getAttribute("href") || "";
+    if (!href) return;
+    const pos = footnotePosition(a.getBoundingClientRect());
+    const token = ++footnoteReq;
+    footnotePop = { html: "", ...pos, loading: true, error: "" };
+    try {
+      const html = await resolveFootnoteHtml(href);
+      if (token !== footnoteReq) return;
+      footnotePop = html
+        ? { html, ...pos, loading: false, error: "" }
+        : { html: "", ...pos, loading: false, error: t("reader.footnote.notFound") };
+    } catch {
+      if (token !== footnoteReq) return;
+      footnotePop = { html: "", ...pos, loading: false, error: t("reader.footnote.notFound") };
+    }
+  }
+
+  // 弹窗外点击/滚动/Escape 关闭；弹窗内滚动与点击不关闭。
+  $effect(() => {
+    if (!footnotePop) return;
+    const onPointer = (e: PointerEvent) => {
+      const target = e.target as Element | null;
+      if (target?.closest?.(".tp-fn-pop")) return;
+      if (target?.closest?.("a.tp-el-noteref")) return;
+      closeFootnote();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeFootnote();
+    };
+    const onScroll = (e: Event) => {
+      const target = e.target as Element | null;
+      if (target?.closest?.(".tp-fn-pop")) return;
+      closeFootnote();
+    };
+    const onResize = () => closeFootnote();
+    window.addEventListener("pointerdown", onPointer, true);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer, true);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+    };
+  });
+
+  // 章节切换后脚注目标已失效。
+  $effect(() => {
+    void chapterNum;
+    void book?.book.id;
+    closeFootnote();
+  });
+
   function onBodyClick(e: MouseEvent) {
     const a = (e.target as HTMLElement | null)?.closest?.("a") as HTMLAnchorElement | null;
     if (!a) return;
+    if (a.classList.contains("tp-el-noteref")) {
+      e.preventDefault();
+      e.stopPropagation();
+      void openFootnote(a);
+      return;
+    }
+    // 标题内锚点（EPUB 常见 <h1><a href="...">标题</a></h1> 的目录回链）不是行内链接：
+    // 点击标题既不跳章/跳目录，也不复制 URL。
+    if (isHeadingAnchor(a)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     const href = a.getAttribute("href") || "";
@@ -6047,12 +6239,26 @@ import {
     ].join(";");
   }
 
+  /** 标题编号：优先取章节名里的「第 N 章/节/回/卷/篇」，否则用章序号。 */
+  function chapterNumberText(): string {
+    const raw = chapter?.title ?? "";
+    const m = raw.match(/第\s*([0-9０-９]+)\s*[章节回卷篇]/);
+    const digits = m?.[1] ?? raw.match(/^\s*([0-9０-９]+)/)?.[1];
+    const n = digits
+      ? Number(digits.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0)))
+      : chapterNum + 1;
+    return String(Number.isFinite(n) && n > 0 ? n : chapterNum + 1).padStart(2, "0");
+  }
+
   function readerVars(): string {
     // 有效阅读配色：优先本书单独套用的方案，其次全局。主题预设取有效主题。
     const t = THEMES[effTheme()];
     const { bg, fg } = readerColors();
     return [
       ...readerSurfaceVars().split(";"),
+      `--serif:"Source Han Serif SC","Noto Serif SC","Songti SC",STSong,SimSun,serif`,
+      `--sans:"Source Han Sans SC","Noto Sans SC","Microsoft YaHei","Segoe UI",sans-serif`,
+      `--mono:Consolas,"Courier New",monospace`,
       `--rdr-font:${fontStack(effFontFamily(), effLatinFont())}`,
       `--rdr-fs:${effFontSize()}px`,
       `--rdr-lh:${effLineHeight()}`,
@@ -6068,7 +6274,10 @@ import {
       `--rdr-align:${effTextAlign()}`,
       `--rdr-fw:${effFontWeight()}`,
       `--rdr-sel:${t.sel}`,
+      `--el-chapter:"${chapterNumberText()}"`,
       `--hl-color:${config.reader.highlightColor || "#c0392b"}`,
+      // 元素特效强调色：随整体预设切换（web 原型 --fx-accent），与用户划线高亮色 --hl-color 分离。
+      `--fx-accent:${config.reader.elementAccent || "#8a5a3b"}`,
       `--rdr-top:${config.reader.topbarColor || "color-mix(in srgb, " + bg + " 90%, black 10%)"}`,
       `--rdr-stat:${config.reader.statusColor || t.fg}`,
     ].join(";");
@@ -6080,7 +6289,7 @@ import {
       ? `
 #chapter-content { color: var(--rdr-fg) !important; font-family: var(--rdr-font) !important; text-align: var(--rdr-align) !important; }
 #chapter-content p { font-size: var(--rdr-fs) !important; text-indent: var(--rdr-indent) !important; margin: var(--rdr-ps) 0 !important; line-height: var(--rdr-lh) !important; font-weight: var(--rdr-fw) !important; }
-#chapter-content :is(h1,h2,h3,h4,h5,h6) { font-size: 1.2em !important; font-weight: 600 !important; text-align: center !important; margin: 0.4em 0 0.8em !important; }
+#chapter-content :is(h1,h2,h3,h4,h5,h6,.tp-el-heading,.tp-el-subhead) { font-size: 1.2em !important; font-weight: 600 !important; text-align: center !important; margin: 0.4em 0 0.8em !important; }
 #chapter-content sup { font-size: 0.7em !important; }
 `
       : "";
@@ -6108,12 +6317,27 @@ import {
 .reader.hide-text .manga-block :is(p,div,span,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption):not(:has(img,svg,video)) { display: none !important; }
 `
       : "";
+    // 中文微观排版与分页避让：不支持的属性会被浏览器忽略，不影响正常阅读。
+    const microTypographyRule = `
+#chapter-content { text-spacing-trim: trim-start; hanging-punctuation: allow-end; text-autospace: normal; line-break: strict; overflow-wrap: break-word; }
+#chapter-content p { orphans: 2; widows: 2; }
+#chapter-content :is(h1,h2,h3,h4,h5,h6,.tp-el-heading,.tp-el-subhead) { break-after: avoid; }
+#chapter-content :is(figure, table, pre, .tp-el-figure) { break-inside: avoid; }
+#chapter-content :is(.tp-el-figure, figure) { break-after: avoid; }
+`;
+    // 元素级样式：静态特效表按 .reader[data-el-*] 命中；每元素自定义 CSS 最后注入，便于逐项覆盖。
+    const elementCustomCss = Object.values(r.elementCss || {})
+      .filter((code) => typeof code === "string" && code.trim())
+      .join("\n");
     // i18n-allow:算法输入：注入样式表里的 CSS 注释，随 CSS 文本进样式块，不是界面文案。
     return `
 ${overrideRule}
 ${imgRules}
 ${hideTextRule}
+${microTypographyRule}
+${ELEMENT_STYLE_CSS}
 ${effCssExtra() || ""}
+${elementCustomCss}
 /* 硬编码根治发糊：正文统一禁止合成加粗/斜体（与 .ai-mark 一致），避免第三方字体假粗假斜发糊 */
 :root #chapter-content { font-synthesis: none !important; }
 `;
@@ -6126,6 +6350,8 @@ ${effCssExtra() || ""}
     void book?.image_pages;
     void isPdfBook();
     void effCssExtra();
+    void Object.values(r.elementStyles || {}).join("|");
+    void Object.values(r.elementCss || {}).join("|");
     void effFitHeight();
     void r.manga.hideText;
     void r.manga.layout;
@@ -7575,6 +7801,18 @@ ${effCssExtra() || ""}
   class:no-images={!effShowImages()}
   class:vfade={!isMangaMode() && config.reader.mode === "scroll" && effMarginV() > 0}
   class:has-bg={!!bgImageUrl}
+  data-el-heading={config.reader.elementStyles.heading}
+  data-el-subhead={config.reader.elementStyles.subhead}
+  data-el-lead={config.reader.elementStyles.lead}
+  data-el-quote={config.reader.elementStyles.quote}
+  data-el-list={config.reader.elementStyles.list}
+  data-el-image={config.reader.elementStyles.image}
+  data-el-table={config.reader.elementStyles.table}
+  data-el-link={config.reader.elementStyles.link}
+  data-el-em={config.reader.elementStyles.em}
+  data-el-hr={config.reader.elementStyles.hr}
+  data-el-chrome={config.reader.elementStyles.chrome}
+  data-el-footnote={config.reader.elementStyles.footnote}
   style={readerVars()}
   onwheel={onWheel}
   onmousemove={onReaderMove}
@@ -7885,7 +8123,7 @@ ${effCssExtra() || ""}
             <!-- 普通（非漫画）滚动模式：维持原有单章渲染 + SmoothScroller（overflow:hidden）。不改动。 -->
             <div class="scroll-area" bind:this={scrollArea}>
               <div class="col-scroll">
-                <div id="chapter-content">{@html chapter?.html ?? ""}</div>
+                <div id="chapter-content">{@html renderedChapterHtml}</div>
               </div>
             </div>
             <div
@@ -7907,7 +8145,7 @@ ${effCssExtra() || ""}
             <div class="clip">
               <div class="tx-slide" bind:this={pageSlideEl}>
                 <div class="col-page" bind:this={pageWrap}>
-                  <div id="chapter-content">{@html chapter?.html ?? ""}</div>
+                  <div id="chapter-content">{@html renderedChapterHtml}</div>
                 </div>
               </div>
             </div>
@@ -7994,6 +8232,32 @@ ${effCssExtra() || ""}
               {#if i > 0}<span class="fsep">·</span>{/if}<span class="fitem">{x.text}</span>
             {/each}
           </span>
+        {/if}
+      </div>
+    {/if}
+
+    {#if footnotePop}
+      <div
+        class="tp-fn-pop"
+        class:loading={footnotePop.loading}
+        style="left:{footnotePop.left}px; top:{footnotePop.top}px; max-height:{footnotePop.maxHeight}px;"
+        role="dialog"
+        aria-modal="false"
+        tabindex="-1"
+        aria-label={t("reader.footnote.title")}
+      >
+        <div class="tp-fn-head">
+          <span>{t("reader.footnote.title")}</span>
+          <button class="icon tp-fn-close" title={t("common.action.close")} aria-label={t("common.action.close")} onclick={closeFootnote}>
+            <IconX size={15} stroke={1.5} />
+          </button>
+        </div>
+        {#if footnotePop.loading}
+          <div class="tp-fn-loading">{t("reader.footnote.loading")}</div>
+        {:else if footnotePop.error}
+          <div class="tp-fn-empty">{footnotePop.error}</div>
+        {:else}
+          <div class="tp-fn-body">{@html footnotePop.html}</div>
         {/if}
       </div>
     {/if}
@@ -8819,6 +9083,12 @@ ${effCssExtra() || ""}
     z-index: 1;
   }
 
+  /* 翻页过渡期间的入场页：无背景图时铺纸色，避免透明双层文字叠读。
+     只在 playTransition 期间挂，cleanupTx 移除；不能常驻，否则会盖住背景图。 */
+  .tx-slide.tx-paper {
+    background: var(--rdr-bg);
+  }
+
   .col-page {
     position: absolute;
     left: 0;
@@ -9329,6 +9599,32 @@ ${effCssExtra() || ""}
   #chapter-content :global(a) {
     color: inherit;
     text-decoration: none;
+  }
+
+  /* 标题内锚点：EPUB 常把标题文字包成 <a>（指向目录的回链），原书 CSS 作用域化后的类选择器
+     （#chapter-content a.calibre8，比上面的 a 规则更具体）会把标题上成链接色、加下划线；
+     用户设置的链接元素样式（data-el-link）也会命中它。标题文字不是链接，这里全部还原成标题自身
+     的颜色与排版（预处理已给这些锚点打 .tp-el-heading-link，点击由 onBodyClick 忽略）。
+     特异性必须高于 readFix 的 #chapter-content *:not(...) ×4（实际 (1,4,4)）!important 纸色，
+     否则标题内 a 会被画成一块纸色白块；四个 data-el-* 都恒在阅读器根上。 */
+  .reader[data-el-image][data-el-footnote][data-el-chrome][data-el-table] #chapter-content :global(:is(h1, h2, h3, h4, h5, h6, .tp-el-heading, .tp-el-subhead) a:not(.tp-el-noteref)),
+  .reader[data-el-image][data-el-footnote][data-el-chrome][data-el-table] #chapter-content :global(.tp-el-heading-link:not(.tp-el-noteref)) {
+    color: inherit !important;
+    -webkit-text-fill-color: inherit !important;
+    text-decoration: none !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: 0 !important;
+    padding: 0 !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    cursor: inherit;
+  }
+  /* 「外链箭头」链接样式用 a::after 加 “↗”，标题内锚点同样不该出现。 */
+  .reader[data-el-image][data-el-footnote][data-el-chrome][data-el-table] #chapter-content :global(:is(h1, h2, h3, h4, h5, h6, .tp-el-heading, .tp-el-subhead) a:not(.tp-el-noteref)::after),
+  .reader[data-el-image][data-el-footnote][data-el-chrome][data-el-table] #chapter-content :global(.tp-el-heading-link:not(.tp-el-noteref)::after) {
+    content: none !important;
   }
 
   #chapter-content :global(table) {

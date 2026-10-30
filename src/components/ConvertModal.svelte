@@ -5,6 +5,7 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
   import { api } from "../lib/api";
   import { config, convertState, saveConfig, toast } from "../lib/stores.svelte";
   import { stripBookExt } from "../lib/bookExt";
+  import { buildEpubCss } from "../lib/elementStyles";
 
   let coverPath = $state("");
   let author = $state("");
@@ -13,6 +14,7 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
   let busy = $state(false);
   let suggested = $state(false);
   let target = $state<"txt" | "epub">("epub");
+  let applyStyle = $state(false);
 
   const book = $derived(convertState.book);
 
@@ -32,6 +34,7 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
     // 导致 effect_update_depth_exceeded，整个界面更新冻结
     untrack(() => {
       css = config.reader.conv?.css || "";
+      applyStyle = config.reader.conv?.applyStyle === true;
       coverPath = "";
       author = "";
       title = b.title;
@@ -78,17 +81,21 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
     if (!out) return;
     busy = true;
     try {
+      const exportCss = showMeta
+        ? (applyStyle ? buildEpubCss(config.reader) : css.trim() || undefined)
+        : undefined;
       await api.convertBook(book.path, target, out, {
         title: showMeta && title.trim() ? title.trim() : undefined,
         author: showMeta && author.trim() ? author.trim() : undefined,
         coverPath: showMeta ? coverPath || undefined : undefined,
-        css: showMeta ? css.trim() || undefined : undefined,
+        css: exportCss,
         pattern: config.regex || undefined,
       });
       config.reader.conv = {
-        ...(config.reader.conv || { title: "", author: "", css: "", coverPath: "" }),
+        ...(config.reader.conv || { title: "", author: "", css: "", coverPath: "", applyStyle: false }),
         css: css,
         coverPath: coverPath,
+        applyStyle: applyStyle,
       };
       saveConfig();
       toast(t("convert.done", { out }));
@@ -150,10 +157,21 @@ import { IconRestore, IconX } from "@tabler/icons-svelte";
         <p class="tip">{t("convert.coverAutoRemember")}</p>
       </div>
       <div class="field">
-        <label>{t("convert.embeddedCss")}</label>
-        <textarea rows="8" bind:value={css} spellcheck="false" placeholder={"body { font-family: 'Songti SC', serif; }\np { line-height: 2; text-indent: 2em; }"}></textarea>
-        <p class="tip">{t("convert.cssAutoRemember")}</p>
+        <label class="check">
+          <input type="checkbox" data-testid="conv-apply-style" bind:checked={applyStyle} />
+          {t("convert.applyStyle")}
+        </label>
+        <p class="tip">{t("convert.applyStyleTip")}</p>
       </div>
+      {#if applyStyle}
+        <p class="tip">{t("convert.applyStyleOn")}</p>
+      {:else}
+        <div class="field">
+          <label>{t("convert.embeddedCss")}</label>
+          <textarea rows="8" bind:value={css} spellcheck="false" placeholder={"body { font-family: 'Songti SC', serif; }\np { line-height: 2; text-indent: 2em; }"}></textarea>
+          <p class="tip">{t("convert.cssAutoRemember")}</p>
+        </div>
+      {/if}
     {:else}
       <p class="src">{t("convert.stripStyleHint")}</p>
     {/if}

@@ -1,3 +1,5 @@
+import { DEFAULT_ELEMENT_ACCENT, DEFAULT_ELEMENT_CSS, DEFAULT_ELEMENT_STYLES, ELEMENT_PRESETS, elementStyleActive, normalizeElementCss, normalizeElementStyles, type ElementCustomCss, type ElementStyles } from "./elementStyles";
+
 export type ReadMode = "page" | "scroll";
 export type ThemeKey = "paper" | "white" | "green" | "dark" | "night";
 export type ZoneKey = "tl" | "tr" | "bl" | "br" | "c";
@@ -249,6 +251,12 @@ export interface ReaderConfig {
   bgImage: string;
   bgOpacity: number;
   cssExtra: string;
+  /** 元素级样式：标题/首段/引用等各自的装饰变体；default=不额外改变。 */
+  elementStyles: ElementStyles;
+  /** 元素级自定义 CSS：每个元素一段完整规则，注入在元素样式之后。 */
+  elementCss: ElementCustomCss;
+  /** 元素样式整体强调色（随预设切换；阅读器以 --fx-accent 注入，与划线色 --hl-color 分离）。 */
+  elementAccent: string;
   overrideBookCss: boolean;
   wheelTurnPage: boolean;
   bindings: Record<BindAction, string[]>;
@@ -290,7 +298,7 @@ export interface ReaderConfig {
   highlightColors: string[];
   /** 划词「浏览器搜索」的链接模板，%s 会被替换为选中文字 */
   browserSearchUrl: string;
-  conv: { title: string; author: string; css: string; coverPath: string };
+  conv: { title: string; author: string; css: string; coverPath: string; applyStyle: boolean };
 }
 
 /** 阅读区当前生效的边距作用域：滚动模式用 scroll，否则按栏数取 duo/page。
@@ -1026,6 +1034,7 @@ export interface AppConfig {
 /** 设置面板全部分区 id（扁平列表默认顺序，去分组后的唯一顺序来源）。 */
 export const SETTINGS_TABS = [
   "reader",
+  "elements",
   "appearance",
   "manga",
   "tts",
@@ -1047,6 +1056,12 @@ export function normSettingsOrder(v: any): string[] {
     }
   }
   for (const id of all) if (!out.includes(id)) out.push(id);
+  // 「元素样式」固定在「阅读排版」后面：旧配置没有该分区时不会排到最后；
+  // 用户仍可在设置里拖拽调整顺序。
+  if (out.includes("reader") && out.includes("elements")) {
+    out.splice(out.indexOf("elements"), 1);
+    out.splice(out.indexOf("reader") + 1, 0, "elements");
+  }
   return out;
 }
 
@@ -1100,6 +1115,9 @@ const DEFAULTS: AppConfig = {
   text-indent: 1em !important;
   margin: 0 0 1rem !important;
 }`,
+    elementStyles: structuredClone(DEFAULT_ELEMENT_STYLES),
+    elementCss: structuredClone(DEFAULT_ELEMENT_CSS),
+    elementAccent: DEFAULT_ELEMENT_ACCENT,
     overrideBookCss: true,
     wheelTurnPage: true,
     bindings: structuredClone(DEFAULT_BINDINGS),
@@ -1175,7 +1193,7 @@ p {
   p {
     margin-bottom: 0.8rem;
   }
-}`, coverPath: "" },
+}`, coverPath: "", applyStyle: false },
   },
   library: {
     topbarOrder: [...LIBRARY_TOPBAR_IDS],
@@ -1505,6 +1523,13 @@ function normalizeMargins(r: any, src?: any): boolean {
 
 /// 归一化 reader 配置：清理已废弃键、修正非法新字段、
 /// 迁移旧默认 cssExtra 与旧滚动缓冲数值。返回是否发生了需要落盘的清理。
+/** 元素强调色只接受十六进制颜色（预设里的写法）；非法/缺失返回 null 交给预设推断。 */
+function normalizeElementAccent(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  return /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s) ? s : null;
+}
+
 function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
   let dirty = false;
   // 边距迁移必须先于废弃键清理：旧标量 marginH/marginV 的取值要在被 delete 前读出来播种三作用域。
@@ -1668,6 +1693,23 @@ function normalizeReaderConfig(r: any, savedRaw?: any): boolean {
   if (r.manga.autoDetect !== mad) { r.manga.autoDetect = mad; dirty = true; }
   const mgd = r.mangaGuideDone === true;
   if (r.mangaGuideDone !== mgd) { r.mangaGuideDone = mgd; dirty = true; }
+  // 元素级样式：旧配置没有这两个字段，补默认并过滤非法键；自定义 CSS 只接受字符串。
+  const es = normalizeElementStyles(r.elementStyles);
+  if (JSON.stringify(es) !== JSON.stringify(r.elementStyles)) { r.elementStyles = es; dirty = true; }
+  const ec = normalizeElementCss(r.elementCss);
+  if (JSON.stringify(ec) !== JSON.stringify(r.elementCss)) { r.elementCss = ec; dirty = true; }
+  // 元素强调色：旧配置没有该字段，按当前元素样式命中的预设推断，再退回默认预设色。
+  const accentPreset = ELEMENT_PRESETS.find((p) => elementStyleActive(es, p));
+  const accent = normalizeElementAccent(r.elementAccent) ?? accentPreset?.accent ?? DEFAULT_ELEMENT_ACCENT;
+  if (r.elementAccent !== accent) { r.elementAccent = accent; dirty = true; }
+  // 导出选项：旧 conv 对象没有 applyStyle，补 false；缺失 conv 整体补默认。
+  if (!r.conv || typeof r.conv !== "object") {
+    r.conv = structuredClone(DEFAULTS.reader.conv);
+    dirty = true;
+  } else if (r.conv.applyStyle !== true && r.conv.applyStyle !== false) {
+    r.conv.applyStyle = false;
+    dirty = true;
+  }
   return dirty;
 }
 

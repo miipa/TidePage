@@ -183,6 +183,12 @@ pub fn split_custom(text: &str, pattern: &str) -> Result<PlainDoc, String> {
     for m in re.find_iter(text) {
         let m = m.map_err(|e| format!("正则执行出错: {e}"))?;
         let (s, _e) = line_bounds(text, m.start());
+        // 章节标记必须位于行首（允许行首空白，兼容缩进/居中的标题）。
+        // 旧实现只要行内出现「第X篇/章」就把整行当章节标题：正文里的「仅仅是第一篇…」
+        // 「到了第二篇…」会凭空多出目录项（真实样本：万世之名，第9章与第10章之间有 3 条假章节）。
+        if !text[s..m.start()].trim().is_empty() {
+            continue;
+        }
         if starts.last().map(|(p, _)| *p) == Some(s) {
             continue;
         }
@@ -630,6 +636,27 @@ mod tests {
         let doc = split_custom(&text, crate::default_pattern()).unwrap();
         assert_eq!(doc.toc.len(), 1);
         assert_eq!(doc.toc[0].title, "全文");
+        assert_doc_invariants(&doc);
+    }
+
+    #[test]
+    fn mid_line_chapter_words_do_not_split() {
+        // 真实样本：正文句子里出现「第一篇」「第二篇」时，旧规则会把整行当章节标题，
+        // 在第 9 章与第 10 章之间凭空插入目录项。章节标记必须位于行首才能切章。
+        let text = "第1章 开端\n　　正文第一段。\n　　仅仅是第一篇，太初秘法就需要打开肉身的密藏之门。\n　　到了第二篇，就是接引星辰力量入体。\n第2章 继续\n　　正文第二段。\n";
+        let doc = split_custom(text, crate::default_pattern()).unwrap();
+        let titles: Vec<&str> = doc.toc.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["第1章 开端", "第2章 继续"], "正文中的『第X篇』不应切章: {titles:?}");
+        assert_doc_invariants(&doc);
+    }
+
+    #[test]
+    fn indented_chapter_heading_is_accepted() {
+        // 行首只有空白时仍算标题（部分 TXT 用空格/全角空格居中章节名）。
+        let text = "　　第1章 缩进标题\n正文。\n　　第2章 另一个标题\n正文。\n";
+        let doc = split_custom(text, crate::default_pattern()).unwrap();
+        let titles: Vec<&str> = doc.toc.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["第1章 缩进标题", "第2章 另一个标题"], "缩进标题应保留: {titles:?}");
         assert_doc_invariants(&doc);
     }
 
