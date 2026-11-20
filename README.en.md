@@ -1,3 +1,5 @@
+<img src="docs/images/social-preview.png" width="100%" alt="TidePage: manage and read local e-books with multiple folders, tags, shelves, multiple windows, and AI assistance">
+
 <div align="center">
 
 # TidePage
@@ -7,8 +9,6 @@
 Windows 10 / 11 · TXT · EPUB · MOBI · AZW3 · PRC · PDF
 
 [Download](https://github.com/miipa/TidePage/releases/latest) · [Local library](#local-library) · [Multiple windows and AI](#multiple-windows-and-ai) · [简体中文](README.md)
-
-<img src="docs/images/social-preview.png" width="100%" alt="TidePage: manage and read local e-books with multiple folders, tags, shelves, multiple windows, and AI assistance">
 
 </div>
 
