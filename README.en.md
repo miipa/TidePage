@@ -8,7 +8,7 @@ Windows 10 / 11 · TXT · EPUB · MOBI · AZW3 · PRC · PDF
 
 [Download](https://github.com/miipa/TidePage/releases/latest) · [Local library](#local-library) · [Multiple windows and AI](#multiple-windows-and-ai) · [简体中文](README.md)
 
-<img src="docs/images/readme-library.png" width="100%" alt="TidePage local library with Chinese and English classics, folders and shelves; composite illustration">
+<img src="docs/images/social-preview.png" width="100%" alt="TidePage: manage and read local e-books with multiple folders, tags, shelves, multiple windows, and AI assistance">
 
 </div>
 

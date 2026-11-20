@@ -8,7 +8,7 @@ Windows 10 / 11 · TXT · EPUB · MOBI · AZW3 · PRC · PDF
 
 [下载最新版](https://github.com/miipa/TidePage/releases/latest) · [本地书库](#本地书库) · [多窗口与 AI](#多窗口与-ai) · [English](README.en.md)
 
-<img src="docs/images/readme-library.png" width="100%" alt="TidePage 本地书库：中英文名著、多目录管理与书架，界面合成示意">
+<img src="docs/images/social-preview.png" width="100%" alt="TidePage：本地书籍管理与阅读，支持多目录、标签、书架、多窗口和 AI 助手">
 
 </div>
 
