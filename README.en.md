@@ -1,151 +1,84 @@
 <div align="center">
 
-<img src="docs/images/readme-hero2-en.jpg" width="100%" alt="TidePage — Books stay local. Reading, unhurried.">
+# TidePage
 
-<br>
+**Manage and read your local e-book collection**
 
-**A desktop e-book reader that keeps your books on your machine**
+Windows 10 / 11 · TXT · EPUB · MOBI · AZW3 · PRC · PDF
 
-TXT · EPUB · MOBI · AZW3 · PRC · PDF　｜　Typography · Comic mode · AI · Text-to-speech
+[Download](https://github.com/miipa/TidePage/releases/latest) · [Local library](#local-library) · [Multiple windows and AI](#multiple-windows-and-ai) · [简体中文](README.md)
 
-[![Version](https://img.shields.io/badge/version-0.1.31-C79A3B?style=flat-square&labelColor=0A111E)](https://github.com/miipa/TidePage/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-4E7FB5?style=flat-square&labelColor=0A111E)](#system-requirements)
-[![License](https://img.shields.io/badge/license-MIT-8A94A6?style=flat-square&labelColor=0A111E)](LICENSE)
-
-[Download](#download-and-install) · [Features](#features) · [Screenshots](#screenshots) · [简体中文](README.md)
+<img src="docs/images/readme-library.png" width="100%" alt="TidePage local library with Chinese and English classics, folders and shelves; composite illustration">
 
 </div>
 
----
+## Local library
 
-## Before anything else
+TidePage organizes and reads the e-books on your PC. Add local folders to browse books from different locations in one library. Importing leaves the original files in place. Reading progress, bookmarks, highlights, and notes are stored locally.
 
-TidePage is not an online bookstore and it does not keep a cloud library. It does one job: **organize the e-books you already own, render them comfortably, and keep your reading history on your own machine.**
+| Manage books | What you can do |
+| --- | --- |
+| Multiple folders | Add folders, follow scan progress, and refresh to pick up added or removed files |
+| Tags and shelves | Organize books with tags; save selected books or the current filtered results as a shelf |
+| Search and sort | Search titles and authors; filter by format, folder, reading status, or tags; use the full-text index to find text and chapters |
+| Duplicate books | Review duplicates and their locations, then choose which copies to keep |
+| Details and batch actions | Edit titles and authors, reveal files in Explorer, and add tags or remove library entries in batches |
 
-There is no sign-up and no upload. Only four things reach the network: AI chat, online text-to-speech, WebDAV sync, and the update check that runs automatically after launch.
+Switch between grid and list views, and sort by last read, date added, title, file time, or file size. Removing a library entry keeps its file; deleting a local file sends it to the Recycle Bin. In book details, Save info changes only the app record. For EPUB files, Save to book can also write the changes to the original file.
 
-- **Local first** — books, covers, progress, highlights, notes and stats live in a local SQLite database; credentials are encrypted with Windows DPAPI.
-- **Built for volume** — virtual scrolling and rank-based paging are designed for libraries of 100,000+ books; search and filtering run locally.
-- **Made for long reading** — Chinese serif typography, a separate Latin font, five reading themes, comic mode, an AI assistant and text-to-speech.
+## Multiple windows and AI
 
-## Features
+With multiple windows enabled, the main window stays in the library. Double-click different books to read them in separate windows. Windows can snap together and move as a group, useful for reading an original alongside a translation or reference book.
 
-### Library
+Keep the AI assistant in the reading sidebar or pop it out into a separate window, then dock it again. Questions can include the current title and a chapter excerpt. Translate or explain selected text and save the result to a highlight note. Local Ollama and online model services are supported and require configuration.
 
-- Register several local folders at once. Existing files are never moved or renamed (the only exception is an explicit title / author write-back to EPUB).
-- Virtual scrolling and rank-based paging for large libraries; grid and list views, with instant search and filters.
-- Sort by last read, date added, title, file time or size, in either direction.
-- Multi-select and batch actions, open a random book, drag and drop to import.
-- Open each book in its own window; windows can snap together and move as a group.
-- A live status line shows progress while folders are scanned or removed.
-- Book details: edit title and author (written back to EPUB), suggest metadata from the file name, reveal in Explorer, reading history.
+<img src="docs/images/readme-multiwindow.png" width="100%" alt="Walden and Lu Xun’s Hometown in separate readers, with an independent AI window; composite illustration">
 
-### Reading
+## Reading and typography
 
-- Three presentations: vertical scroll, single-page and two-column paging. Margins are remembered per mode.
-- **Five reading themes** (Paper / White / Eye-care green / Night / Black), plus custom background color, text color, background image and opacity.
-- Font size, line height, paragraph spacing, weight, alignment and first-line indent are all adjustable; install TTF / OTF / TTC fonts.
-- Table of contents, bookmarks, in-book search, progress rings; reading stats for the last 14 days and per book (characters, time, average speed, sessions).
-- Different chapter-transition effects for scrolling and paging.
-- Per-book overrides for font, image scale, image display and CSS; rebindable shortcuts and click zones.
+Read with vertical scrolling, single-column paging, or two-column paging. Choose from five reading themes, then adjust fonts, font size, line height, paragraph spacing, indentation, alignment, and backgrounds. Individual books can keep their own settings.
 
-### Chinese and English typography
+Element styles control headings, opening paragraphs, quotes, lists, images, tables, and emphasis. Choose a preset such as Classic, Traditional, Magazine, Journal, or Academic, or adjust individual elements and add custom CSS. The image below uses different passages from Hometown, Zhuangzi, and Alice’s Adventures in Wonderland to show double rules, drop caps, seals, quotation frames, and highlighted emphasis.
 
-- Chinese text can use a serif face with first-line indents; English can use its own Latin font without changing the Chinese glyphs.
-- Font size, line height and line breaks keep one reading rhythm when the two scripts are mixed.
-- Custom fonts can be applied per book; typography and margins stay independent.
+<img src="docs/images/readme-typography.png" width="100%" alt="Classic, Traditional, and Magazine element styles applied to Chinese and English classics; composite illustration">
 
-### Comic mode
+## Comic reading
 
-- Detects comic-like books from image count and sparse body text, or switch manually from the toolbar.
-- Vertical continuous (webtoon-style) and horizontal continuous (drag to pan) modes; horizontal supports left-to-right and right-to-left.
-- Adjustable image scale, fit width / height, margins and gap (0 = seamless); built-in image viewer with wheel paging and click-to-zoom.
-- Hide all images, block individual pages and restore them later.
+Image-based e-books can use comic mode, with automatic detection or a manual switch. Vertical scrolling arranges pages in a continuous column. Horizontal continuous mode supports drag-to-pan and both left-to-right and right-to-left reading.
 
-### AI assistant
+Fit images to width or height, or adjust scale and spacing. Set the gap to zero for seamless pages. Hide all images, block individual pages, or restore them later.
 
-- Chat with the current book or chapter, with the chapter injected as context and streaming output.
-- Select text to translate or explain; results can be added to a highlight note.
-- Custom prompts can be bound to shortcuts, reordered by dragging, and the first prompt can run automatically on each new chapter.
-- Supports OpenAI-compatible, Ollama (local), Anthropic, Google Gemini and Azure OpenAI; multi-endpoint failover and connection tests.
-- Proxy modes: direct / system / manual, with SOCKS5; applies to AI and online TTS.
-- Export conversations as TXT or EPUB.
+<img src="docs/images/readme-comics.png" width="100%" alt="The original comic Harbor Light shown in horizontal continuous and vertical scrolling modes; composite illustration">
 
-### Text-to-speech
+## More reading tools
 
-- System speech and online speech engines.
-- Online protocols include OpenAI-compatible, VoiceStudio, Azure, DashScope, MiniMax, Fish Audio, GPT-SoVITS, Breeze, Volcano (Doubao), Baidu and Edge TTS.
-- Rate, pitch and volume controls; sleep timer, sentence highlighting with scroll-follow, and automatic continuation to the next chapter.
-
-### Highlights, notes and conversion
-
-- Seven highlight styles (underline, wavy, dotted, double underline, highlighter, strikethrough, box) and eight preset colors.
-- Notes are grouped per book, searchable and jumpable; highlights survive book deletion.
-- Convert TXT → EPUB, EPUB → TXT, and MOBI / AZW3 / PRC → TXT or EPUB. Conversion writes a new file and never changes the original.
-- AI conversations can also be exported as TXT or EPUB.
-
-### Sync and backup
-
-- WebDAV sync for reading progress, book upload / download, remote folder browsing and settings backup / restore.
-- Copy or import settings through the clipboard; exported settings have secrets stripped.
-- Local credentials (AI / TTS / WebDAV keys and proxy URLs with accounts) are encrypted with Windows DPAPI.
-- Cloud settings backups use a key derived from the WebDAV account (PBKDF2-HMAC-SHA256 + AES-256-GCM).
-
-### Privacy and network
-
-- Book files and reading data live in the system app-data directory by default; override it with the `TIDEPAGE_DATA_DIR` environment variable. The database file is `tidepage.db`.
-- No account, no telemetry; only AI, online TTS, WebDAV and the update check use the network.
-- The update check runs three seconds after launch and reads only public GitHub Releases information, without credentials.
-- When Volcano or Baidu TTS is selected, custom base URLs are ignored and the official endpoint is used.
-
-### More
-
-- SQLite FTS5 full-text index for whole-library search, with one-click rebuild.
-- Storage usage and cache cleanup; window-state persistence and immersive mode.
-- UI languages: Auto / Simplified Chinese / English, switchable instantly.
-- Built-in update check at launch and a manual check in Settings.
+| Feature | Includes |
+| --- | --- |
+| Bookmarks and notes | Table of contents, in-book search, seven highlight styles, notes grouped by book, and reading statistics |
+| Text-to-speech | System or online voices, highlighting that follows speech, chapter continuation, and a sleep timer |
+| Format conversion | TXT ⇄ EPUB; MOBI / AZW3 / PRC → TXT or EPUB, saved as new files |
+| WebDAV | Reading progress sync, book upload and download, and settings backup and restore |
 
 ## Supported formats
 
 | Type | Support |
 | --- | --- |
 | E-books | TXT, EPUB, MOBI, AZW3, PRC, PDF |
-| Text encoding | Auto-detected (UTF-8 / UTF-16 / GB18030 / Big5, …), with manual override |
-| Covers / comic images | PNG, JPG / JPEG, GIF, BMP, WebP; EPUB / MOBI content images also support SVG |
+| Text encoding | Automatic detection of UTF-8, UTF-16, GB18030, Big5, and others; manual selection is available |
 
+## Files, data, and network
 
-## Screenshots
+Original books are read from the local folders you add. Library records, reading data, settings, and caches use the system app-data directory by default. Set `TIDEPAGE_DATA_DIR` to use another location. Cache usage and cleanup are available in Settings.
 
-<p align="center">
-  <img src="docs/images/readme-reading-zh.jpg" width="48%" alt="Chinese reading view">
-  <img src="docs/images/readme-reading-en.jpg" width="48%" alt="English reading view">
-</p>
-
-<p align="center">
-  <img src="docs/images/readme-appearance.jpg" width="72%" alt="Appearance settings">
-</p>
-
-The two books shown are Lu Xun's *Nahan · Guxiang* and Thoreau's *Walden · Economy*; the interface language is Simplified Chinese.
+AI chat, selected-text actions, and AI tagging send relevant book information and text to the configured model service. Ollama requests also go to the configured service address. Online speech connects to the selected voice provider. WebDAV transfers books and reading data through sync actions. TidePage checks GitHub Releases for updates at startup; a manual check is also available in Settings.
 
 ## Download and install
 
-| Architecture | File | Notes |
-| --- | --- | --- |
-| 64-bit | `TidePage-0.1.31-windows-x64-portable.zip` | Most Windows 10 / 11 devices |
-| 32-bit | `TidePage-0.1.31-windows-x86-portable.zip` | 32-bit systems or x86 compatibility environments |
+1. Visit [GitHub Releases](https://github.com/miipa/TidePage/releases/latest) and download the Windows portable archive for your device architecture.
+2. Extract it and run `TidePage.exe`.
+3. The WebView2 runtime is required. It is included with Windows 11; on Windows 10, make sure it is installed.
 
-1. Download the matching archive from [Releases](https://github.com/miipa/TidePage/releases/latest).
-2. Extract it and run `TidePage.exe`; no installation is required.
-3. The first launch needs the **WebView2 runtime** (built into Windows 11; usually a separate install on Windows 10).
-4. To upgrade, extract the new version over the old program files. Library and reading data are not stored in the program folder.
-
-> Only Windows builds are published: credential encryption relies on Windows DPAPI and the UI relies on WebView2.
-
-### System requirements
-
-- Windows 10 / 11, 64-bit or 32-bit
-- WebView2 runtime
-- Portable build: no installer; data goes to the app-data directory by default
+TidePage currently provides Windows 10 / 11 builds. App data uses the system app-data directory by default, so you can replace the program files while keeping your library and reading history.
 
 ## Development
 
@@ -153,40 +86,21 @@ Requires [Node.js](https://nodejs.org/) and the [Rust](https://www.rust-lang.org
 
 ```bash
 npm install
-
-npm run tauri dev    # desktop development
-npm run check        # svelte-check
-npm run test         # vitest
-npm run check:name   # legacy-name guard
+npm run tauri dev
+npm run check
+npm run test
+npm run check:name
 ```
 
-Build both portable architectures:
+Tech stack: Tauri 2, Rust, SvelteKit, Svelte 5, TypeScript, and SQLite.
 
-```bash
-npm run release:exe                                       # x64
-npx tauri build --no-bundle --target i686-pc-windows-msvc # x86
-```
+Images are composite illustrations of current features, with the interface shown in Chinese. The demo library uses Chinese and English classics with original cover designs. Reading samples use original passages from Lu Xun’s Hometown, Zhuangzi, Walden, and Alice’s Adventures in Wonderland, structured for the illustration. Harbor Light is an original comic, and the AI conversation is sample content. These books are not bundled with the app.
 
-- x64 output: `src-tauri/target/release/tidepage.exe`
-- x86 output: `src-tauri/target/i686-pc-windows-msvc/release/tidepage.exe`
-- When packaging, rename `tidepage.exe` to `TidePage.exe` and place it at the archive root.
-
-> Do not publish a bare `cargo build --release` binary: it does not embed frontend assets and the result points at the dev URL.
-
-## Tech stack
-
-- **Tauri 2** + Rust (`rusqlite`, `reqwest`, `image`, `zip`, `quick-xml`, `mobi`, and more)
-- **SvelteKit 2** + **Svelte 5 (runes)** + TypeScript + Vite
-- **PDF**: pdf.js (`pdfjs-dist`) in the frontend + native `Windows.Data.Pdf` on x64
-- **Local storage**: SQLite (WAL); **credentials**: Windows DPAPI; **cloud settings backup**: PBKDF2-HMAC-SHA256 + AES-256-GCM
-- Hand-written CSS design tokens, no Tailwind or preprocessor
-
-## Feedback & support
+## Feedback and support
 
 - Issues and suggestions: [GitHub Issues](https://github.com/miipa/TidePage/issues)
 - Project home: <https://github.com/miipa/TidePage>
 - QQ group (Chinese): <https://qm.qq.com/q/5bbjW2NIUU>
-- If TidePage is useful, you can support development via the QR code in **Settings → About**.
 
 ## License
 

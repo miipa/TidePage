@@ -1,154 +1,84 @@
 <div align="center">
 
-<img src="docs/images/readme-hero2.jpg" width="100%" alt="TidePage：书在本地，读得从容">
+# TidePage
 
-<br>
+**本地书籍管理与阅读工具**
 
-**一款把书留在本地的 Windows 桌面阅读器**
+Windows 10 / 11 · TXT · EPUB · MOBI · AZW3 · PRC · PDF
 
-TXT · EPUB · MOBI · AZW3 · PRC · PDF　｜　中文排版 · 漫画 · AI · 朗读
+[下载最新版](https://github.com/miipa/TidePage/releases/latest) · [本地书库](#本地书库) · [多窗口与 AI](#多窗口与-ai) · [English](README.en.md)
 
-[![Version](https://img.shields.io/badge/version-0.1.31-C79A3B?style=flat-square&labelColor=0A111E)](https://github.com/miipa/TidePage/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-4E7FB5?style=flat-square&labelColor=0A111E)](#系统要求)
-[![License](https://img.shields.io/badge/license-MIT-8A94A6?style=flat-square&labelColor=0A111E)](LICENSE)
-
-[下载](#下载与安装) · [功能](#功能) · [界面](#界面) · [English](README.en.md)
+<img src="docs/images/readme-library.png" width="100%" alt="TidePage 本地书库：中英文名著、多目录管理与书架，界面合成示意">
 
 </div>
 
----
+## 本地书库
 
-## 写在前面
+TidePage 用于整理和阅读电脑里的电子书。添加本地文件夹后，散落在不同目录的书籍可以在同一书库中查看。导入时保留原文件的位置，阅读进度、书签、划线和笔记保存在本机。
 
-TidePage 不做在线书城，也不维护云端书架。它只解决一件事：**把电脑里已有的电子书整理好，用舒服的排版读完，并把阅读痕迹留在本机。**
+| 管理书籍 | 使用方式 |
+| --- | --- |
+| 多目录管理 | 添加多个文件夹，查看扫描进度，刷新目录中的新增和移除项 |
+| 标签与书架 | 按标签分类，把选中的书或当前筛选结果保存为书架 |
+| 搜索与排序 | 搜索书名、作者，按格式、目录、阅读状态和标签筛选；全文索引可查找正文与章节 |
+| 重复书管理 | 集中查看重复书籍及其所在目录，选择保留的副本 |
+| 详情与批量操作 | 编辑书名、作者，打开文件所在目录，批量添加标签或移出书库 |
 
-打开应用不需要注册，阅读内容也不会被上传。会主动联网的只有四处：AI 对话、在线朗读、WebDAV 同步，以及启动后自动执行的版本检查。
+书库提供网格和列表视图，可按最近阅读、添加时间、书名、文件时间或文件大小排序。仅移出书库会保留本地文件；删除本地文件会将其移入回收站。书籍详情中的「保存信息」只修改应用内记录，EPUB 另可选择「保存到书籍」写回原文件。
 
-- **本地优先**：书籍、封面、进度、划线、笔记、统计都保存在本机 SQLite；凭据用 Windows DPAPI 加密。
-- **装得下**：虚拟滚动与分级寻址按十万级书库设计；书名 / 作者搜索与筛选都在本地完成。
-- **读得久**：中文衬线排版、英文拉丁字体、5 套阅读主题、漫画模式、AI 助手与语音朗读。
+## 多窗口与 AI
 
-## 功能
+开启多窗口选项后，主窗口保留在书库，双击不同的书即可分别阅读。阅读窗口支持吸附和成组移动，适合同时翻阅原文、译本或参考书。
 
-### 书库
+AI 助手可以放在阅读侧栏，也可以弹出为独立窗口，再停靠回来。提问可附带当前书名与章节节选；选中文本可翻译或释义，结果可以加入划线笔记。支持本地 Ollama 和在线模型服务，使用前需自行配置。
 
-- 同时登记多个本地目录；原文件不移动、不改名（仅在主动编辑书名 / 作者并写回 EPUB 时除外）。
-- 虚拟滚动与分级寻址面向十万级书库；网格 / 列表两种视图，搜索与筛选即时生效。
-- 支持按最近阅读、加入时间、书名、文件时间、大小排序，并可反向。
-- 多选与批量操作、随机开书、拖拽文件入库。
-- 每本书可在独立窗口中打开；窗口支持吸附与整组移动。
-- 扫描目录、移除目录时，状态栏会显示当前进度。
-- 书籍详情可改书名与作者（EPUB 可写回），可按文件名识别信息、打开所在目录、查看阅读历史。
+<img src="docs/images/readme-multiwindow.png" width="100%" alt="Walden 与鲁迅《故乡》分别阅读，右侧为独立 AI 窗口，界面合成示意">
 
-### 阅读
+## 阅读与排版
 
-<img src="docs/images/readme-panel-zh.jpg" width="100%" alt="中文阅读与排版">
+正文支持上下滚动、单栏翻页和双栏翻页。五套阅读主题之外，还能调整字体、字号、行高、段距、缩进、对齐和背景，并为不同书籍保留单独的设置。
 
-- 三种呈现方式：上下滚动、左右翻页（单栏 / 双栏）；边距按各自模式记忆。
-- **5 套阅读主题**（纸质 / 白纸 / 护眼绿 / 夜间 / 纯黑），可自定义底色、文字色、背景图与透明度。
-- 字号、行高、段距、字重、对齐、首行缩进逐项可调；支持 TTF / OTF / TTC 自定义字体。
-- 目录、书签、书内搜索、进度环；阅读统计覆盖近 14 天与单本字数、时长、平均速度、阅读次数。
-- 章节过渡可选不同动效，滚动与翻页分别设置。
-- 每本书可单独覆盖字体、图片缩放、图片显示与样式；快捷键与点击区域可重绑。
+元素样式用于调整标题、首段、引用、列表、插图、表格和强调等内容的呈现。内置书卷、古籍、杂志、手账、学术等方案，也可逐项选择样式或添加自定义 CSS。下图用《故乡》《庄子》和 Alice’s Adventures in Wonderland 的不同段落，展示双线标题、首字下沉、朱印、引用框和荧光强调。
 
-### 中英文排版
+<img src="docs/images/readme-typography.png" width="100%" alt="书卷、古籍与杂志三种元素样式，分别展示中英文名著原文，界面合成示意">
 
-<img src="docs/images/readme-panel-en.jpg" width="100%" alt="英文阅读与排版">
+## 漫画阅读
 
-- 中文可选择衬线字体与首行缩进；英文可单独指定拉丁字体，不影响正文的中文字形。
-- 中英混排时，字号、行高与断行保持同一套阅读节奏。
-- 自定义字体可按书覆盖；排版与边距设置互不干扰。
+图片型电子书可切换到漫画模式，支持自动识别与手动切换。上下滚动时，页面纵向连续排列；横向连续模式可拖动平移，并选择从左到右或从右到左阅读。
 
-### 漫画
+图片可适应宽度或高度，也可调整缩放与间距；间距设为 0 时无缝连接。支持隐藏全部图片、单独屏蔽页面和恢复显示。
 
-- 依据图片数量与正文密度自动识别漫画书，也可在顶栏手动切换「漫 / 文」。
-- 纵向连续（上下滚动）与横向连续（拖动平移）；横向支持左→右 / 右→左。
-- 可调图片倍率、适应宽高、边距与图片间距（0 为无缝）；内置图片查看器支持滚轮翻页与点击放大。
-- 可整体隐藏图片、逐张屏蔽并恢复。
+<img src="docs/images/readme-comics.png" width="100%" alt="原创漫画《港口的灯》分别展示横向连续与上下滚动，界面合成示意">
 
-### AI 助手
+## 更多阅读工具
 
-- 以当前书、当前章节作为上下文对话，输出流式显示。
-- 划词翻译 / 释义浮窗，结果可一键加进划线笔记。
-- 自定义提示词可绑定快捷键、拖拽排序，进入新章节可自动执行第一条。
-- 支持 OpenAI 兼容、Ollama（本地）、Anthropic、Google Gemini、Azure OpenAI；多端点故障转移与连接测试。
-- 代理支持直连 / 系统 / 手动与 SOCKS5；对 AI 与在线朗读同时生效。
-- 对话可导出为 TXT / EPUB。
-
-### 语音朗读
-
-- 系统语音与在线语音两种方式。
-- 在线支持 OpenAI 兼容、VoiceStudio、Azure、DashScope、MiniMax、Fish Audio、GPT-SoVITS、Breeze、火山引擎（豆包）、百度、Edge TTS 等协议。
-- 语速 / 音调 / 音量可调；支持定时停止、朗读高亮跟随与自动续读下一章。
-
-### 划线、笔记与转换
-
-- 7 种划线样式（下划线 / 波浪线 / 点线 / 双下划线 / 荧光笔 / 删除线 / 方框）与 8 个预设色。
-- 笔记按书汇总，可搜索、跳转；删除书籍后划线仍保留。
-- 支持 TXT → EPUB、EPUB → TXT、MOBI / AZW3 / PRC → TXT 或 EPUB；转换只写新文件，不改原书。
-- AI 对话也可导出为 TXT / EPUB。
-
-### 同步与备份
-
-- WebDAV 可同步阅读进度、上传 / 下载书籍、浏览远端的目录、备份与恢复设置。
-- 设置支持剪贴板复制 / 导入；导出配置自动剔除密钥。
-- 本地凭据（AI / TTS / WebDAV 密钥及带账号的代理）用 Windows DPAPI 加密。
-- 云端设置备份使用 WebDAV 账号派生的密钥（PBKDF2-HMAC-SHA256 + AES-256-GCM）加密。
-
-### 隐私与联网
-
-- 书籍内容与阅读数据默认保存在系统应用数据目录，可用环境变量 `TIDEPAGE_DATA_DIR` 指定其他位置；数据库文件为 `tidepage.db`。
-- 无账号、无遥测；只有 AI、在线朗读、WebDAV 与版本检查会联网。
-- 版本检查在启动 3 秒后进行，只读取 GitHub Releases 的公开信息，不携带任何凭据。
-- 选择火山引擎 / 百度 TTS 时会忽略自定义地址，固定请求对应官方端点。
-
-### 其他
-
-- SQLite FTS5 全文索引支持全库搜索，可一键重建。
-- 存储用量查看与缓存清理；窗口状态记忆与沉浸模式。
-- 界面语言支持自动 / 简体中文 / English，切换即时生效。
-- 启动时自动检查更新，设置页也可手动检查。
+| 功能 | 内容 |
+| --- | --- |
+| 书签与笔记 | 目录、书内搜索、七种划线样式、按书汇总笔记与阅读统计 |
+| 语音朗读 | 系统语音或在线语音，支持高亮跟随、自动续读和定时停止 |
+| 格式转换 | TXT ⇄ EPUB；MOBI / AZW3 / PRC → TXT 或 EPUB，另存为新文件 |
+| WebDAV | 同步阅读进度、上传或下载书籍、备份和恢复设置 |
 
 ## 支持格式
 
 | 类型 | 支持 |
 | --- | --- |
 | 电子书 | TXT、EPUB、MOBI、AZW3、PRC、PDF |
-| 文本编码 | 自动识别（UTF-8 / UTF-16 / GB18030 / Big5 等），可手动指定 |
-| 封面 / 漫画图片 | PNG、JPG / JPEG、GIF、BMP、WebP；EPUB / MOBI 内容图片另支持 SVG |
+| 文本编码 | 自动识别 UTF-8、UTF-16、GB18030、Big5 等；支持手动指定 |
 
-## 界面
+## 文件、数据与联网
 
-<p align="center">
-  <img src="docs/images/readme-reading-zh.jpg" width="48%" alt="中文阅读界面">
-  <img src="docs/images/readme-reading-en.jpg" width="48%" alt="英文阅读界面">
-</p>
+原书从已添加的本地目录读取。书库记录、阅读数据、配置和缓存默认保存在系统应用数据目录，可用 `TIDEPAGE_DATA_DIR` 指定其他位置。设置中可查看缓存用量并清理缓存。
 
-<p align="center">
-  <img src="docs/images/readme-appearance.jpg" width="72%" alt="界面外观设置">
-</p>
-
-截图中的两本书分别为鲁迅《吶喊·故鄉》与梭罗《Walden·Economy》；界面语言为简体中文。
+使用 AI 对话、划词或 AI 标签时，相关书目信息与文本会发送到所配置的模型服务；Ollama 请求也发往配置的服务地址。在线朗读连接所选语音服务，WebDAV 按同步操作传输书籍与阅读数据。应用启动时会查询 GitHub Releases 检查更新，设置中也可手动检查。
 
 ## 下载与安装
 
-| 架构 | 文件 | 适用 |
-| --- | --- | --- |
-| 64 位 | `TidePage-0.1.31-windows-x64-portable.zip` | 大多数 Windows 10 / 11 设备 |
-| 32 位 | `TidePage-0.1.31-windows-x86-portable.zip` | 32 位系统或 x86 兼容环境 |
+1. 前往 [GitHub Releases](https://github.com/miipa/TidePage/releases/latest)，下载对应设备架构的 Windows 便携版。
+2. 解压后运行 `TidePage.exe`。
+3. 程序需要 WebView2 运行时；Windows 11 已内置，Windows 10 设备需确认已安装。
 
-1. 前往 [Releases](https://github.com/miipa/TidePage/releases/latest) 下载对应压缩包。
-2. 解压后运行 `TidePage.exe`，无需安装。
-3. 首次运行需要 **WebView2 运行时**（Windows 11 已内置，Windows 10 一般需要安装）。
-4. 升级时用新版本覆盖程序文件即可；书库与阅读数据不在程序目录中。
-
-> 目前仅发布 Windows 版本：凭据加密依赖 Windows DPAPI，界面依赖 WebView2。
-
-### 系统要求
-
-- Windows 10 / 11，64 位或 32 位
-- WebView2 运行时
-- 便携版无需安装；数据默认写入应用数据目录
+TidePage 目前提供 Windows 10 / 11 版本。应用数据默认保存在系统应用数据目录，更新程序文件时可保留原有书库与阅读记录。
 
 ## 本地开发
 
@@ -156,40 +86,21 @@ TidePage 不做在线书城，也不维护云端书架。它只解决一件事�
 
 ```bash
 npm install
-
-npm run tauri dev    # 桌面端开发
-npm run check        # svelte-check
-npm run test         # vitest
-npm run check:name   # 旧名守门
+npm run tauri dev
+npm run check
+npm run test
+npm run check:name
 ```
 
-构建双架构便携版：
+技术栈：Tauri 2、Rust、SvelteKit、Svelte 5、TypeScript 与 SQLite。
 
-```bash
-npm run release:exe                                       # x64
-npx tauri build --no-bundle --target i686-pc-windows-msvc # x86
-```
-
-- x64 产物：`src-tauri/target/release/tidepage.exe`
-- x86 产物：`src-tauri/target/i686-pc-windows-msvc/release/tidepage.exe`
-- 打包时把 `tidepage.exe` 重命名为 `TidePage.exe`，放入压缩包根目录。
-
-> 发布不要直接用裸 `cargo build --release`：它不会嵌入前端资源，产物会指向开发地址而无法运行。
-
-## 技术栈
-
-- **Tauri 2** + Rust（`rusqlite`、`reqwest`、`image`、`zip`、`quick-xml`、`mobi` 等）
-- **SvelteKit 2** + **Svelte 5（runes）** + TypeScript + Vite
-- **PDF**：前端 pdf.js（`pdfjs-dist`）+ 原生 `Windows.Data.Pdf`（x64）
-- **本地存储**：SQLite（WAL）；**凭据**：Windows DPAPI；**云端设置备份**：PBKDF2-HMAC-SHA256 + AES-256-GCM
-- 原生 CSS 设计令牌，无 Tailwind / 预处理器
+配图为基于当前功能制作的界面合成示意。书库选用中英文名著作为演示书目，封面自绘；阅读图节选鲁迅《故乡》、古籍《庄子》、Walden 与 Alice’s Adventures in Wonderland 原文，结构按展示需要编排。漫画《港口的灯》为原创，AI 问答为演示内容；应用不预置这些图书。
 
 ## 反馈与支持
 
 - 问题与建议：[GitHub Issues](https://github.com/miipa/TidePage/issues)
 - 项目主页：<https://github.com/miipa/TidePage>
 - QQ 交流群：<https://qm.qq.com/q/5bbjW2NIUU>
-- 如果它帮到了你，可以在 **设置 → 关于** 中扫码支持开发。
 
 ## 许可
 
